@@ -10,12 +10,12 @@ class PipelineInputs:
     pr_data: any
     pr_diff_ctx: any
     problem_statement: str
-    filename_to_insert_test: str | None = None
-    test_file_content: str | None = None
-    test_file_content_sliced: str | None = None
-    available_packages: str | None = None
-    available_relative_imports: str | None = None
-    code_sliced: list[str] | None = None
+    # filename_to_insert_test: str | None = None
+    # test_file_content: str | None = None
+    # test_file_content_sliced: str | None = None
+    # available_packages: str | None = None
+    # available_relative_imports: str | None = None
+    # code_sliced: list[str] | None = None
 
     def __post_init__(self):
         # ensure instance types
