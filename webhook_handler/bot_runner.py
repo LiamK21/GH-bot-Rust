@@ -1,10 +1,17 @@
-import json
+import logging
 from pathlib import Path
 
+from webhook_handler.helper import logger
 from webhook_handler.models import LLM, PipelineInputs, PullRequestData
-from webhook_handler.services import (Config, CSTBuilder, DockerService,
-                                      GitHubService, LLMHandler,
-                                      PullRequestDiffContext, TestGenerator)
+from webhook_handler.services import (
+    Config,
+    CSTBuilder,
+    DockerService,
+    GitHubService,
+    LLMHandler,
+    PullRequestDiffContext,
+    TestGenerator,
+)
 
 
 class BotRunner:
@@ -28,6 +35,11 @@ class BotRunner:
         self._docker_service = None
         self._cst_builder = None
 
+    def _setup_logging(self) -> None:
+        assert self._config.pr_log_dir
+        logger.configure_logger(self._config.pr_log_dir, self._execution_id)
+        self._logger = logging.getLogger()
+
     def is_valid_pr(self) -> tuple[str, bool]:
         """
         PR must have linked issue and source code changes.
@@ -37,8 +49,10 @@ class BotRunner:
             bool: True if PR is valid, False otherwise
         """
 
-        # self._logger.marker(f"=============== Running Payload #{self._pr_data.number} ===============")
-        # self._logger.marker("================ Preparing Environment ===============")
+        self._logger.marker(
+            f"=============== Running Payload #{self._pr_data.number} ==============="
+        )
+        self._logger.marker("================ Preparing Environment ===============")
         self._issue_statement = self._gh_service.get_linked_data()
         if not self._issue_statement:
             # helpers.remove_dir(self._config.pr_log_dir)
@@ -110,32 +124,23 @@ class BotRunner:
 
     def prepare_environment(self, curr_attempt: int, model: LLM) -> None:
         """
-        Prepares all services and data used in each attempt. Only has to execute once to cut down on API calls.
+        Prepares all services and data used in each attempt.
         """
+        if self._environment_prepared:
+            self._create_model_attempt_dir(curr_attempt, model)
+            return
 
-        # Check if PR has a linked issue and verify that it is a bug
+        self._setup_logging()
+        # Check if PR has a linked issue (and verify that it is a bug)
         self._issue_statement = self._gh_service.get_linked_data()
         if self._issue_statement:
-            print("Linked issue found")
-            # logger.info("Linked issue found")
+            self._logger.info("Linked issue found")
         else:
-            print("No linked issue found, raising exception")
-            # logger.info("No Linked issue found, raising exception")
+            self._logger.info("No Linked issue found, raising exception")
             raise Exception("No linked issue found")
 
         # Prepare directories
-        assert (
-            self._config.pr_log_dir is not None
-        ), "PR log directory must be set before preparing environment."
-
-        # Create a directory for the current attempt with the current model
-        attempt_instance_dir = Path(
-            self._config.pr_log_dir, f"i{curr_attempt + 1}_{model}"
-        )
-        attempt_instance_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create a generation subdirectory within the attempt directory
-        Path(attempt_instance_dir, "generation").mkdir(parents=True, exist_ok=True)
+        self._create_model_attempt_dir(curr_attempt, model)
 
         # Get the file contents
         if self._pr_diff_ctx is None:
@@ -151,12 +156,12 @@ class BotRunner:
         ), "Cloned repo dir name must be set"
 
         # If repository has not been cloned yet, clone it
-        # if not Path(self._config.cloned_repo_dir).exists():
-        #     self._gh_service.clone_repo()
+        if not Path(self._config.cloned_repo_dir).exists():
+            self._gh_service.clone_repo()
 
-        # # If it is a different repository, clone the new one
-        # if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
-        #     self._gh_service.clone_repo(update=True)
+        # If it is a different repository, clone the new one
+        if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
+            self._gh_service.clone_repo(update=True)
 
         # Get the PR diff and stuff like that
 
@@ -166,12 +171,7 @@ class BotRunner:
 
         # Build docker image if not exists
         self._docker_service = DockerService(self._config.root_dir, self._pr_data)
-
-        owner = self._pr_data.owner
-        dockerfile_path = Path(
-            self._config.root_dir, "dockerfiles", f"Dockerfile_{owner}"
-        )
-        self._docker_service.build_image(dockerfile_path)
+        self._docker_service.build_image()
 
         # Gather Pipeline data
         self._pipeline_inputs = PipelineInputs(
@@ -183,6 +183,27 @@ class BotRunner:
 
         # Setup LLM handler
         self._llm_handler = LLMHandler(self._config, self._pipeline_inputs)
+        self._environment_prepared = True
+
+    def _create_model_attempt_dir(self, curr_attempt: int, model: LLM) -> None:
+        """
+        Creates a directory for the current attempt with the current model.
+
+        Parameters:
+            curr_attempt (int): The current attempt number
+            model (LLM): The model being used
+        """
+        assert (
+            self._config.pr_log_dir is not None
+        ), "PR log directory must be set before creating model attempt directory."
+
+        attempt_instance_dir = Path(
+            self._config.pr_log_dir, f"i{curr_attempt + 1}_{model}"
+        )
+        attempt_instance_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a generation subdirectory within the attempt directory
+        Path(attempt_instance_dir, "generation").mkdir(parents=True, exist_ok=True)
 
     def _record_result(
         self, number: str, model: LLM, i_attempt: int, stop: bool | str
