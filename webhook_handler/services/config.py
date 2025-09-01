@@ -7,6 +7,7 @@ import tree_sitter_rust
 from dotenv import load_dotenv
 from tree_sitter import Language
 
+from webhook_handler.helper import general
 from webhook_handler.models import LLM
 
 
@@ -28,7 +29,6 @@ class Config:
         self.execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.curr_attempt = 0
         self.root_dir = Path.cwd()
-        self.generated_tests_dir = Path(self.root_dir, "generated_tests")
         self.is_server = Path("/home/runner").is_dir()
 
         self.parsing_language = Language(tree_sitter_rust.language())
@@ -48,7 +48,7 @@ class Config:
 
         Path(self.webhook_raw_log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.bot_log_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.generated_tests_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.gen_test_dir).mkdir(parents=True, exist_ok=True)
 
     def setup_pr_related_dirs(
         self, pr_id: str, owner: str, repo: str, payload: dict
@@ -117,3 +117,15 @@ class Config:
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         Path(self.output_dir, "generation").mkdir(parents=True)
         self.curr_attempt += 1
+
+    def _teardown(self) -> None:
+        """
+        Cleans up resources, if any.
+        """
+        if self.cloned_repo_dir:
+            cloned_repo_dir = Path(Path.cwd(), self.cloned_repo_dir)
+            if cloned_repo_dir.exists():
+                general.remove_dir(cloned_repo_dir)
+     
+     
+            
