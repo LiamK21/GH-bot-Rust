@@ -65,10 +65,10 @@ class PullRequestFileDiff:
         return (
             not self.is_source_code_file
             and not self.is_test_file
-            and self.name.endswith(".js")
+            and self.name.endswith(".rs")
         )
 
-    def unified_code_diff(self) -> str:
+    def unified_code_diff(self, full_function: bool = False) -> str:
         """
         Computes diff between before and after code files including function context.
 
@@ -77,7 +77,10 @@ class PullRequestFileDiff:
         """
 
         return git_diff.unified_diff_with_function_context(
-            self.before, self.after, fname=self.name
+            self.before,
+            self.after,
+            fname=self.name,
+            include_function_params=full_function,
         )
 
     def unified_test_diff(self) -> str:
@@ -91,3 +94,6 @@ class PullRequestFileDiff:
         return git_diff.unified_diff(
             self.before, self.after, fromfile=self.name, tofile=self.name
         )
+
+    def passed_path_matches_name(self, relative_path: str) -> bool:
+        return self.name == relative_path
