@@ -28,7 +28,7 @@ class TestGeneration605(TestCase):
         self.repo = self.runner._pr_data.repo
 
     def tearDown(self) -> None:
-        return super().tearDown()
+        self.config._teardown()
 
     def test_generation605(self):
         self.config.setup_pr_related_dirs(
@@ -59,7 +59,7 @@ class TestGeneration616(TestCase):
         self.repo = self.runner._pr_data.repo
 
     def tearDown(self) -> None:
-        return super().tearDown()
+        self.config._teardown()
 
     def test_generation616(self):
         self.config.setup_pr_related_dirs(
@@ -90,7 +90,7 @@ class TestGeneration620(TestCase):
         self.repo = self.runner._pr_data.repo
 
     def tearDown(self) -> None:
-        return super().tearDown()
+        self.config._teardown()
 
     def test_generation620(self):
         self.config.setup_pr_related_dirs(
