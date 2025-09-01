@@ -87,6 +87,25 @@ class PullRequestDiffContext:
             + "\n\n"
         )
 
+    def get_golden_code_patch(self) -> str:
+        return (
+            "\n\n".join(
+                pr_file_diff.unified_code_diff(True)
+                for pr_file_diff in self.source_code_file_diffs
+            )
+            + "\n\n"
+        )
+
+    def get_absolute_file_path(self, file_path: str) -> str | None:
+        return next(
+            (
+                pr_file_diff.name
+                for pr_file_diff in self.source_code_file_diffs
+                if pr_file_diff.passed_path_matches_name(file_path)
+            ),
+            None,
+        )
+
     def remove_tests_from_code_before(self) -> list[str]:
         """
         Removes all test functions/classes from the code before the PR changes.
