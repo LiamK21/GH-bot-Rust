@@ -1,8 +1,12 @@
+import logging
 import os
 import shutil
 import stat
+import subprocess
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def remove_dir(
@@ -32,8 +36,60 @@ def remove_dir(
             return
         except Exception as e:
             if attempt < max_retries:
-                #   logger.warning(f"Failed attempt {attempt} removing {path}: {e}, retrying in {delay}s")
+                logger.warning(
+                    f"Failed attempt {attempt} removing {path}: {e}, retrying in {delay}s"
+                )
                 time.sleep(delay)
             else:
                 pass
-                #  logger.error(f"Final attempt failed removing {path}, must be removed manually: {e}")
+                logger.error(
+                    f"Final attempt failed removing {path}, must be removed manually: {e}"
+                )
+
+
+def run_command(command: str, cwd: str = None) -> str | None:
+    """
+    Helper method to run a command in subprocess.
+
+    Parameters:
+        command (str): The command to execute
+        cwd (str): The location in which the command should be executed
+
+    Returns:
+        str: Output of the command
+    """
+
+    result = subprocess.run(
+        command, cwd=cwd, shell=True, text=True, capture_output=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def get_candidate_file(base_commit: str, filename: str, tmp_repo_dir: str) -> str:
+    """
+    Finds a fitting test file and its content to inject the newly generated test into.
+
+    Parameters:
+        base_commit (str): The base commit used to check out
+        patch (str): The golden code patch
+        tmp_repo_dir (str): The directory to look for test files in
+
+    Returns:
+        str: The name of the test file
+        str: The contents of the test file
+    """
+    current_branch = run_command("git rev-parse --abbrev-ref HEAD", cwd=tmp_repo_dir)
+    run_command(f"git checkout {base_commit}", cwd=tmp_repo_dir)
+
+    file_content = ""
+    file_path = Path(tmp_repo_dir, filename)
+    if not file_path.exists():
+        print(f"File {filename} does not exist in base commit {base_commit}")
+        return ""
+
+    print(f"File {filename} exists in base commit {base_commit}")
+    file_content = file_path.read_text(encoding="utf-8")
+
+    run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
+
+    return file_content
