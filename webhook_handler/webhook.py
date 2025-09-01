@@ -5,13 +5,11 @@ import logging
 import threading
 from pathlib import Path
 
-from django.http import (
-    HttpResponse,
-    HttpResponseForbidden,
-    HttpResponseNotAllowed,
-    JsonResponse,
-)
+from django.http import (HttpResponse, HttpResponseForbidden,
+                         HttpResponseNotAllowed, JsonResponse)
 from django.views.decorators.csrf import csrf_exempt
+
+from webhook_handler.constants import USED_MODELS, get_total_attempts
 
 from .bot_runner import BotRunner
 from .services.config import Config
@@ -86,7 +84,19 @@ def github_webhook(request):
     def _execute_runner_in_background():
         try:
             bootstrap.info(f"[#{pr_number}] Starting runner execution...")
-            generation_completed = runner.execute_runner()
+            total_attempts_per_model = get_total_attempts()
+            generation_completed = False
+            for model in USED_MODELS:
+                i = 0
+                while i < total_attempts_per_model:
+                    generation_completed = runner.execute_runner(i, model)
+                    if generation_completed:
+                        break
+                    i += 1
+
+                if generation_completed:
+                    break
+
             completed_message = (
                 "Test generated successfully"
                 if generation_completed
@@ -96,6 +106,9 @@ def github_webhook(request):
             bootstrap.info(f"[#{pr_number}] {completed_message}")
         except:
             bootstrap.critical(f"[#{pr_number}] Pipeline execution failed")
+        finally:
+            config._teardown()
+            bootstrap.info(f"[#{pr_number}] Resources cleaned up")
 
     # 9) Save payload
     payload_path = Path(
