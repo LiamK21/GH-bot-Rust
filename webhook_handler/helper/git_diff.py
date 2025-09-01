@@ -1,8 +1,12 @@
+import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
 from webhook_handler.helper import general
+
+logger = logging.getLogger(__name__)
 
 
 def unified_diff(
@@ -57,7 +61,11 @@ def unified_diff(
 
 
 def unified_diff_with_function_context(
-    original: str, modified: str, fname: str = "tempfile.rs", context_lines: int = 3
+    original: str,
+    modified: str,
+    fname: str = "tempfile.rs",
+    context_lines: int = 3,
+    include_function_params: bool = False,
 ) -> str:
     """
     Writes two input strings to temporary files and uses `git diff --no-index`
@@ -111,10 +119,46 @@ def unified_diff_with_function_context(
         diff = diff.replace(f"{fname}.newfordiffonly", fname)  # >>
         diff_lines = diff.splitlines()
         diff_lines.pop(1)  # this is the "index 09b...." line
-        diff = "\n".join(diff_lines)
-        return diff
+
+        if include_function_params:
+            return _insert_function_params_in_signature(modified, diff_lines)
+        else:
+            diff = "\n".join(diff_lines)
+            return diff
     finally:
         general.remove_dir(Path(temp_dir))
+
+
+# TODO: Fix this function
+def _insert_function_params_in_signature(
+    file_content: str, diff_list: list[str]
+) -> str:
+    full_function_pattern = r"^def\s+([a-zA-Z_][a-zA-Z0-9_]*\s*\([^)]*\))"
+    matches: list[str] = re.findall(full_function_pattern, file_content, re.MULTILINE)
+    if matches:
+        for i, line in enumerate(diff_list):
+            if line.startswith("+++ ") or line.startswith("--- "):
+                continue
+            if line.startswith("@@"):
+                # Extract the function name from the hunk header
+                hunk_header = line
+                function_name_match = re.search(
+                    r"@@.*@@\s*(def\s+([a-zA-Z_][a-zA-Z0-9_]*))", hunk_header
+                )
+                if function_name_match:
+                    function_name = function_name_match.group(2)
+                    # Find the full function signature from the matches
+                    full_signature = next(
+                        (m for m in matches if m.startswith(function_name + "(")), None
+                    )
+                    if full_signature:
+                        # Replace the function name with the full signature in the hunk header
+                        new_hunk_header = hunk_header.replace(
+                            f"def {function_name}", full_signature
+                        )
+                        diff_list[i] = new_hunk_header
+        return "\n".join(diff_list)
+    return ""
 
 
 def apply_patch(file_content_arr: list[str], patch: str) -> tuple[list[str], str]:
@@ -202,7 +246,7 @@ def apply_patch(file_content_arr: list[str], patch: str) -> tuple[list[str], str
         Path(temp_dir, ".git").rmdir
         general.remove_dir(Path(temp_dir))
 
-        # logger.critical(f"Failed to apply patch: {e}")
+        logger.critical(f"Failed to apply patch: {e}")
         raise AssertionError(f"Failed to apply patch")
 
     updated_content_arr: list[str] = []
