@@ -1,3 +1,4 @@
+import logging
 import re
 import subprocess
 import time
@@ -9,6 +10,8 @@ from webhook_handler.services import Config
 
 GH_API_URL = "https://api.github.com/repos"
 GH_RAW_URL = "https://raw.githubusercontent.com"
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubService:
@@ -29,7 +32,7 @@ class GitHubService:
         if response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
             reset_time = int(response.headers["X-RateLimit-Reset"])
             wait_time = reset_time - int(time.time()) + 1
-            # logger.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
+            logger.warning(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
             time.sleep(max(wait_time, 1))
             return self.fetch_pr_files()
 
@@ -42,7 +45,6 @@ class GitHubService:
 
         Returns:
             str: The linked issue title and description
-            str: The candidate PDF filename
         """
         owner = self._pr_data.owner
         repo = self._pr_data.repo
@@ -50,7 +52,7 @@ class GitHubService:
         pr_title = self._pr_data.title
         # The regex patterns look for phrases like "Closes #123", "Fixes #123", "Resolves #123" in the PR title and description.
         # It will actually only capture the issue/bug number.
-        issue_pattern = r"\b(?:Closes|Fixes|Resolves)\s+#(\d+)\b"
+        issue_pattern = r"#(\d+)"
         url_pattern = rf"\bhttps://github\.com/{re.escape(owner)}/{re.escape(repo)}/issues/(\d+)\b"
 
         issue_description: str = f"{pr_title} {pr_description}"
@@ -97,7 +99,9 @@ class GitHubService:
         if update:
             self._config.cloned_repo_dir = f"tmp_repo_dir_{self._pr_data.owner}_{self._pr_data.repo}_{self._pr_data.id}"
         assert self._config.cloned_repo_dir, "Cloned repo dir not set in config"
-        # logger.info(f"Cloning repository https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git")
+        logger.info(
+            f"Cloning repository https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git"
+        )
         _ = subprocess.run(
             [
                 "git",
@@ -108,7 +112,7 @@ class GitHubService:
             capture_output=True,
             check=True,
         )
-        # logger.success(f"Cloning successful")
+        logger.success(f"Cloning successful")
 
     def _get_github_issue(self, number: int) -> str | None:
         """
@@ -126,26 +130,43 @@ class GitHubService:
             issue_data: dict = response.json()
 
             if "pull_request" in issue_data:
-                # logger.warning(f"Linked issue #{number} is a pull request, not an issue")
+                logger.warning(
+                    f"Linked issue #{number} is a pull request, not an issue"
+                )
                 return None
 
             # Check that it is a bug issue (label contains 'bug')
-            issue_is_bug = False
-            issue_type: str | None = issue_data.get("type", "")
-            if issue_type != None and issue_type.lower() == "bug":
-                issue_is_bug = True
+            # issue_is_bug = False
+            # issue_type: str | None = issue_data.get("type", "")
+            # if issue_type != None and issue_type.lower() == "bug":
+            #     issue_is_bug = True
 
-            issue_labels: list[dict[str, str]] = issue_data.get("labels", [])
-            if any(label.get("name", "").__contains__("bug") for label in issue_labels):
-                issue_is_bug = True
-            if issue_is_bug:
-                return "\n".join(
-                    value
-                    for value in (issue_data["title"], issue_data["body"])
-                    if value
-                )
+            # issue_labels: list[dict[str, str]] = issue_data.get("labels", [])
+            # if any(label.get("name", "").__contains__("bug") for label in issue_labels):
+            #     issue_is_bug = True
+            # if issue_is_bug:
+            return "\n".join(
+                value for value in (issue_data["title"], issue_data["body"]) if value
+            )
 
             return None
 
-        # logger.warning("No GitHub issue found")
+        logger.warning("No GitHub issue found")
         return None
+
+    def add_comment_to_pr(self, comment) -> tuple[int, dict]:
+        """
+        Adds a comment to the pull request.
+
+        Parameters:
+            comment (str): Comment to add
+
+        Returns:
+            int: Status code
+            dict: The response data
+        """
+
+        url = f"{GH_API_URL}/{self._pr_data.owner}/{self._pr_data.repo}/issues/{self._pr_data.number}/comments"
+        data = {"body": comment}
+        response = requests.post(url, json=data, headers=self._config.HEADER)
+        return response.status_code, response.json()
