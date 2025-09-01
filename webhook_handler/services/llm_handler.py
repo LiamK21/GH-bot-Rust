@@ -27,8 +27,6 @@ class LLMHandler:
         # include_predicted_test_file: bool,
         # test_filename: str,
         # test_file_content_sliced: str,
-        # available_packages: str,
-        # available_relative_imports: str
     ) -> str:
         """
         Builds prompt with available data.
@@ -40,8 +38,6 @@ class LLMHandler:
             include_predicted_test_file (bool): Whether to include test file
             test_filename (str): The filename of the test file
             test_file_content_sliced (str): The content of the test file
-            available_packages (str): The available packages
-            available_relative_imports (str): The relative imports of all unit test files
 
         Returns:
             str: Prompt
@@ -58,10 +54,13 @@ class LLMHandler:
             f"Issue:\n<issue>\n{self._pipeline_inputs.problem_statement}\n</issue>\n\n"
         )
 
-        patch = f"Patch:\n<patch>\n{self._pr_diff_ctx.golden_code_patch}\n</patch>\n\n"
+        # golden_code_patch = self._pr_diff_ctx.golden_code_patch
+        # src_code_file_diffs = self._pr_diff_ctx.source_code_file_diffs
+
+        patch = f"Patch:\n<patch>\n{self._pr_diff_ctx.get_golden_code_patch()}\n</patch>\n\n"
         # available_imports = f"Imports:\n<imports>\n{available_packages}\n{available_relative_imports}\n</imports>\n\n"
 
-        golden_code = ""
+        # golden_code = ""
         # if include_golden_code:
         #     code_filenames = self._pr_diff_ctx.code_names
         #     if sliced:
@@ -83,29 +82,35 @@ class LLMHandler:
         #         golden_code += "</code>\n\n"
 
         instructions: str = (
-            "Your task:\n"
-            f"You are a software tester at {self._pr_data.repo}.\n"
-            '1. Write exactly one rust test `#[test]fn test_...(){...}` block.\n'
+            f"You are a software tester at {self._pr_data.repo} and your are reviewing the above <patch> for the above <issue>\n"
+            "Identify whether a unit test is needed.\n"
+            "If there is no test needed, return <NO>.\n"
+            "If a test is needed, your task is:\n"
+            "1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.\n"
             "2. Your test must fail on the code before the patch, and pass after, hence "
             "the test will verify that the patch resolves the issue.\n"
             "3. The test must be self-contained and to-the-point.\n"
-            "4. Use only the provided imports (respect the paths exactly how they are given) by importing "
-            "dynamically for compatibility with Node.js — no new dependencies. "
-            "5. Return only the rust code (no comments or explanations).\n\n"
+            "4. All 'use' declarations must be inside a <imports>...</imports> block.\n "
+            "Use `use super::<function name> for the function under test.\n"
+            "5. Return only the filename, the use statements, and rust test (no comments or explanations).\n\n"
         )
 
         example: str = (
-            "Example structure:\n"
+            "Here is an example structure:\n"
+            "<Filename> ... </Filename>\n"
+            "<imports> ... </imports>\n"
+            "'''rust\n"
             "#[test]\n"
-            'fn test_<describe_behavior>() {\n'
+            "fn test_<describe_behavior>() {\n"
             "  <initialize required variables>;\n"
             "  <define expected variable>;\n"
             "  <generate actual variables>;\n"
             "  <compare expected with actual>;\n"
-            "};\n\n"
+            "};"
+            "'''rust\n\n"
         )
 
-        test_code: str = ""
+        # test_code: str = ""
         # if include_predicted_test_file:
         #     if test_file_content_sliced:
         #         test_code += f"Test file:\n<test_file>\nFile:\n{test_filename}\n{test_file_content_sliced}\n</test_file>\n\n"
@@ -146,7 +151,7 @@ class LLMHandler:
         #                    "  });\n"
         #                    "});\n\n")
 
-        pr_summary = ""
+        # pr_summary = ""
         # if include_pr_summary:
         #     pr_summary += f"PR summary:\n<pr_summary>\n{
         #         self._pr_data.title
@@ -159,9 +164,9 @@ class LLMHandler:
             f"{linked_issue}"
             f"{patch}"
             # f"{available_imports}"
-            f"{golden_code}"
-            f"{test_code}"
-            f"{pr_summary}"
+            # f"{golden_code}"
+            # f"{test_code}"
+            # f"{pr_summary}"
             f"{instructions}"
             f"{example}"
         )
@@ -226,7 +231,7 @@ class LLMHandler:
         except:
             return ""
 
-    def postprocess_response(self, response: str) -> str:
+    def postprocess_response(self, response: str) -> tuple[str, list[str], str] | None:
         """
         Postprocess the response from the LLM.
 
@@ -234,14 +239,60 @@ class LLMHandler:
             response (str): Response from the LLM
 
         Returns:
+            str: Filename
+            list[str]: List of imports
             str: Postprocessed response
         """
-        cleaned_test = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
-        cleaned_test = cleaned_test.replace("```rust", "")
-        cleaned_test = cleaned_test.replace("```", "")
+        cleaned_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+        if cleaned_response.strip() == "<NO>":
+            return None
+        lines = cleaned_response.splitlines()
+        # Extract filename
+        filename, cleaned_response = lines[0].strip(), lines[1:]
+        if not filename.startswith("<Filename>") or not filename.endswith(
+            "</Filename>"
+        ):
+            raise Exception("Filename not found in response")
+        filename = filename.lstrip("<Filename>").rstrip("</Filename>").strip()
+
+        # Extract imports
+        imports: list[str] = []
+        imports_starting_idx = next(
+            (
+                idx
+                for idx, val in enumerate(cleaned_response)
+                if val.strip() == "<imports>"
+            ),
+            None,
+        )
+        imports_ending_idx = next(
+            (
+                idx
+                for idx, val in enumerate(cleaned_response)
+                if val.strip() == "</imports>"
+            ),
+            None,
+        )
+        if imports_starting_idx is not None and imports_ending_idx is not None:
+            imports.extend(
+                val
+                for val in cleaned_response[
+                    imports_starting_idx + 1 : imports_ending_idx
+                ]
+                if val.strip()
+            )
+            cleaned_test = "\n".join(cleaned_response[imports_ending_idx + 1 :])
+        else:
+            cleaned_test = "\n".join(cleaned_response)
+
+        # Extract test
+        cleaned_test = cleaned_test.replace(
+            "'''rust", ""
+        )  # Check the replace statements, the model might use different ones
+        cleaned_test = cleaned_test.replace("'''", "")
         cleaned_test = cleaned_test.lstrip("\n")
         cleaned_test = self._clean_descriptions(cleaned_test)
-        return self._adjust_function_indentation(cleaned_test)
+        return filename, imports, self._adjust_function_indentation(cleaned_test)
 
     @staticmethod
     def _clean_descriptions(function_code: str) -> str:
