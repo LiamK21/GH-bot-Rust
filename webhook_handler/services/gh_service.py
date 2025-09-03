@@ -87,17 +87,19 @@ class GitHubService:
         """
 
         url = f"{GH_RAW_URL}/{self._pr_data.owner}/{self._pr_data.repo}/{commit}/{file_name}"
-        response = requests.get(url, headers=self._config.HEADER)
+        try:
+            response = requests.get(url, headers=self._config.HEADER, timeout=10)
+        except requests.Timeout:
+            logger.error(f"Request timed out while fetching file: {file_name}")
+            return ""
         if response.status_code == 200:
             return response.text  # File exists
         return ""  # File most likely does not exist (anymore)
 
-    def clone_repo(self, update: bool = False) -> None:
+    def clone_repo(self) -> None:
         """
         Clones a GitHub repository.
         """
-        if update:
-            self._config.cloned_repo_dir = f"tmp_repo_dir_{self._pr_data.owner}_{self._pr_data.repo}_{self._pr_data.id}"
         assert self._config.cloned_repo_dir, "Cloned repo dir not set in config"
         logger.info(
             f"Cloning repository https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git"
