@@ -151,12 +151,9 @@ class CSTBuilder:
             assert (
                 declaration_list is not None
             ), "Expected a declaration_list in the mod tests module, no mod block exists!"
-            print("declaration list found")
             # Check if there need to be imports added
             i = 0
-            print("entering while loop")
             while i < len(declaration_list.named_children):
-                print(f"Current idx: {i}")
                 curr_child = declaration_list.named_children[i]
                 i += 1
                 child_type = curr_child.type

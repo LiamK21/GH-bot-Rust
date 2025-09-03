@@ -5,8 +5,12 @@ import logging
 import threading
 from pathlib import Path
 
-from django.http import (HttpResponse, HttpResponseForbidden,
-                         HttpResponseNotAllowed, JsonResponse)
+from django.http import (
+    HttpResponse,
+    HttpResponseForbidden,
+    HttpResponseNotAllowed,
+    JsonResponse,
+)
 from django.views.decorators.csrf import csrf_exempt
 
 from webhook_handler.constants import USED_MODELS, get_total_attempts

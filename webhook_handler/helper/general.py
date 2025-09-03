@@ -84,10 +84,10 @@ def get_candidate_file(base_commit: str, filename: str, tmp_repo_dir: str) -> st
     file_content = ""
     file_path = Path(tmp_repo_dir, filename)
     if not file_path.exists():
-        print(f"File {filename} does not exist in base commit {base_commit}")
+        logger.marker(f"File {filename} does not exist in base commit {base_commit}")
         return ""
 
-    print(f"File {filename} exists in base commit {base_commit}")
+    logger.marker(f"File {filename} exists in base commit {base_commit}")
     file_content = file_path.read_text(encoding="utf-8")
 
     run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)

@@ -37,7 +37,7 @@ class DockerService:
 
         tag = f"{self._pr_data.image_tag}:latest"
         docker_image: Image | None = None
-        
+
         try:
             docker_image = self._client.images.get(tag)
             return
@@ -50,7 +50,7 @@ class DockerService:
         if docker_image:
             logger.marker("Docker image already exists, skipping build")
             return
-        
+
         build_args = {"commit_hash": self._pr_data.base_commit}
         repo_name = self._pr_data.repo.lower()
         dockerfile_path = Path("dockerfiles", f"Dockerfile_{repo_name}")
@@ -65,7 +65,9 @@ class DockerService:
                 rm=True,
             )
             build_succeeded = True
-            logger.success(f"Docker image '{self._pr_data.image_tag}' built successfully")
+            logger.success(
+                f"Docker image '{self._pr_data.image_tag}' built successfully"
+            )
         except BuildError as e:
             log_lines = []
             for chunk in e.build_log:
@@ -97,7 +99,9 @@ class DockerService:
                         try:
                             self._client.images.remove(image=img.id, force=True)
                         except APIError as img_err:
-                            logger.error(f"Failed to remove image {img.id[:12]}: {img_err}")
+                            logger.error(
+                                f"Failed to remove image {img.id[:12]}: {img_err}"
+                            )
                 except APIError as list_err:
                     logger.error(f"Error listing dangling images: {list_err}")
 
@@ -165,7 +169,8 @@ class DockerService:
             logger.info("[+] Test patch applied successfully.")
 
             if golden_code_patch is not None:
-
+                logger.marker("[+] Applying golden code patch")
+                print(f"Golden code patch {golden_code_patch}")
                 # Create a temporary patch file
                 with tempfile.NamedTemporaryFile(delete=False, mode="w") as patch_file:
                     patch_file.write(golden_code_patch)
@@ -192,9 +197,9 @@ class DockerService:
 
                 if exec_result.exit_code != 0:
                     logger.info(
-                        f"[!] Failed to apply patch: {exec_result.output.decode()}"
+                        f"[!] Failed to apply golden patch: {exec_result.output.decode()}"
                     )
-                    return False, exec_result.exit_code
+                    return False, exec_result.output.decode()
 
                 logger.info("[+] Code patch applied successfully.")
 

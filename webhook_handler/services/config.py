@@ -126,6 +126,3 @@ class Config:
             cloned_repo_dir = Path(Path.cwd(), self.cloned_repo_dir)
             if cloned_repo_dir.exists():
                 general.remove_dir(cloned_repo_dir)
-     
-     
-            
