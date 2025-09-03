@@ -68,7 +68,7 @@ class PullRequestFileDiff:
             and self.name.endswith(".rs")
         )
 
-    def unified_code_diff(self, full_function: bool = False) -> str:
+    def unified_code_diff(self) -> str:
         """
         Computes diff between before and after code files including function context.
 
@@ -80,8 +80,14 @@ class PullRequestFileDiff:
             self.before,
             self.after,
             fname=self.name,
-            include_function_params=full_function,
         )
+
+    def get_modified_functions(self, patch: str) -> list[str]:
+        patch_lines = patch.splitlines()
+        updated_funcs = git_diff.find_modified_function_signatures(
+            self.name, self.after, patch_lines
+        )
+        return updated_funcs
 
     def unified_test_diff(self) -> str:
         """

@@ -65,7 +65,6 @@ def unified_diff_with_function_context(
     modified: str,
     fname: str = "tempfile.rs",
     context_lines: int = 3,
-    include_function_params: bool = False,
 ) -> str:
     """
     Writes two input strings to temporary files and uses `git diff --no-index`
@@ -112,53 +111,68 @@ def unified_diff_with_function_context(
             stderr=subprocess.PIPE,
             text=True,
         )
-
         diff = result.stdout.strip()
         diff = diff.replace(temp_dir, "")  # make paths relative to target repo again
         diff = diff.replace(f"{fname}.oldfordiffonly", fname)  # >>
         diff = diff.replace(f"{fname}.newfordiffonly", fname)  # >>
         diff_lines = diff.splitlines()
         diff_lines.pop(1)  # this is the "index 09b...." line
-
-        if include_function_params:
-            return _insert_function_params_in_signature(modified, diff_lines)
-        else:
-            diff = "\n".join(diff_lines)
-            return diff
+        diff = "\n".join(diff_lines)
+        return diff
     finally:
         general.remove_dir(Path(temp_dir))
 
 
 # TODO: Fix this function
-def _insert_function_params_in_signature(
-    file_content: str, diff_list: list[str]
-) -> str:
-    full_function_pattern = r"^def\s+([a-zA-Z_][a-zA-Z0-9_]*\s*\([^)]*\))"
-    matches: list[str] = re.findall(full_function_pattern, file_content, re.MULTILINE)
-    if matches:
-        for i, line in enumerate(diff_list):
-            if line.startswith("+++ ") or line.startswith("--- "):
-                continue
-            if line.startswith("@@"):
-                # Extract the function name from the hunk header
-                hunk_header = line
-                function_name_match = re.search(
-                    r"@@.*@@\s*(def\s+([a-zA-Z_][a-zA-Z0-9_]*))", hunk_header
-                )
-                if function_name_match:
-                    function_name = function_name_match.group(2)
-                    # Find the full function signature from the matches
-                    full_signature = next(
-                        (m for m in matches if m.startswith(function_name + "(")), None
-                    )
-                    if full_signature:
-                        # Replace the function name with the full signature in the hunk header
-                        new_hunk_header = hunk_header.replace(
-                            f"def {function_name}", full_signature
-                        )
-                        diff_list[i] = new_hunk_header
-        return "\n".join(diff_list)
-    return ""
+
+
+def find_modified_function_signatures(
+    f_name: str, file_content: str, diff_list: list[str]
+) -> list[str]:
+    file_found: bool = False
+    current_f_name_funcs: set[str] = set()
+    for line in diff_list:
+        # Find the diff part that includes the file
+        if line.startswith("+++ ") or line.startswith("--- "):
+            match = re.search(f_name, line)
+            file_found = bool(match)
+
+        if not file_found:
+            continue
+
+        # Extract function name where a change occured
+        if line.startswith("@@"):
+            func_name_pattern = r"(?:pub\s+)?fn\s+([a-zA-Z_][a-zA-Z0-9_]*)"
+            match = re.search(func_name_pattern, line)
+            if match and match.group(1).startswith("test_") is False:
+                current_f_name_funcs.add(match.group(1))
+
+    func_signatures: list[str] = []
+
+    for func in current_f_name_funcs:
+        # Capture the full signature prefix, parameters, and return type
+        full_function_pattern = (
+            rf"((?:pub\s+)?fn\s+{re.escape(func)}(?:\s*<[^>]*>)?)\s*\(([^)]*)\)"
+            r"(?:\s*->\s*([^{]+))?"
+        )
+        matches = re.finditer(full_function_pattern, file_content, re.MULTILINE)
+        for match in matches:
+            signature_prefix = match.group(
+                1
+            )  # The 'pub fn ...' part (with generics if present)
+            params = (
+                match.group(2).rstrip().rstrip(",")
+                if isinstance(match.group(2), str)
+                else ""
+            )  # The parameters; remove trailing spaces and comma
+            return_type = (
+                match.group(3).rstrip() if isinstance(match.group(3), str) else "()"
+            )  # The return type (if present); remove trailing spaces
+            params = "\n".join([p.strip() for p in params.splitlines()])
+            func_signature = f"{signature_prefix}({params}) -> {return_type}"
+            func_signatures.append(func_signature)
+
+    return func_signatures
 
 
 def apply_patch(file_content_arr: list[str], patch: str) -> tuple[list[str], str]:

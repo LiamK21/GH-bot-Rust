@@ -87,15 +87,6 @@ class PullRequestDiffContext:
             + "\n\n"
         )
 
-    def get_golden_code_patch(self) -> str:
-        return (
-            "\n\n".join(
-                pr_file_diff.unified_code_diff(True)
-                for pr_file_diff in self.source_code_file_diffs
-            )
-            + "\n\n"
-        )
-
     def get_absolute_file_path(self, file_path: str) -> str | None:
         return next(
             (
@@ -105,6 +96,14 @@ class PullRequestDiffContext:
             ),
             None,
         )
+
+    @property
+    def get_patch_and_modified_functions(self) -> tuple[str, list[str]]:
+        patch = self.golden_code_patch
+        modified_functions: list[str] = []
+        for pr_file_diff in self.source_code_file_diffs:
+            modified_functions.extend(pr_file_diff.get_modified_functions(patch))
+        return patch, modified_functions
 
     def remove_tests_from_code_before(self) -> list[str]:
         """
