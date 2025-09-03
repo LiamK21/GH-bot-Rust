@@ -46,7 +46,7 @@ class TestGenerator:
 
         self._generation_dir: Path | None = None
 
-    def generate(self) -> bool:
+    def generate(self) -> bool | None:
         """
         Runs the pipeline to generate a fail-to-pass test.
 
@@ -83,7 +83,6 @@ class TestGenerator:
         logger.marker(
             "New prompt written to %s" % (self._generation_dir / "prompt.txt")
         )
-        logger.marker("Stopping execution for debugging purposes")
 
         # print("Mocking response for debugging...")
         # response = Path(Path.cwd(), "bot_logs", "raw_model_response.txt").read_text(
@@ -95,8 +94,8 @@ class TestGenerator:
             prompt, model=self._model, temperature=0.0
         )
         if not response:
-           logger.critical("Failed to query model")
-           raise Exception("Failed to query model")
+            logger.critical("Failed to query model")
+            raise Exception("Failed to query model")
 
         logger.success("LLM response received")
         (self._generation_dir / "raw_model_response.txt").write_text(
@@ -104,8 +103,9 @@ class TestGenerator:
         )
         postprocess_response = self._llm_handler.postprocess_response(response)
         if postprocess_response is None:
+            logger.info("Model did not return a test, skipping...")
             # self._handle_commenting()
-            return True
+            return None
 
         response_filename, imports, new_test = postprocess_response
 
@@ -172,10 +172,16 @@ class TestGenerator:
         test_to_run = self._cst_builder.extract_changed_tests(test_file_diff)
 
         logger.marker("Running test in pre-PR codebase...")
+
+        test_passed_before = False
+        stdout_before = "Empty stdout because file did not exist before"
         # TODO: Does this method actually need to be called if the file_content doesn't exist (file was only created later)
-        test_passed_before, stdout_before = self._docker_service.run_test_in_container(
-            model_test_patch, test_to_run, test_file_diff
-        )
+        if old_file_content:
+            test_passed_before, stdout_before = (
+                self._docker_service.run_test_in_container(
+                    model_test_patch, test_to_run, test_file_diff
+                )
+            )
         (self._generation_dir / "before.txt").write_text(
             stdout_before, encoding="utf-8"
         )
