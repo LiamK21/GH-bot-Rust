@@ -56,8 +56,11 @@ class LLMHandler:
 
         # golden_code_patch = self._pr_diff_ctx.golden_code_patch
         # src_code_file_diffs = self._pr_diff_ctx.source_code_file_diffs
+        diff, funcs = self._pr_diff_ctx.get_patch_and_modified_functions
 
-        patch = f"Patch:\n<patch>\n{self._pr_diff_ctx.get_golden_code_patch()}\n</patch>\n\n"
+        patch = f"Patch:\n<patch>\n{diff}\n</patch>\n\n"
+        funcs = f"Function signatures\n<Signatures>\n{"\n\n".join(funcs)}\n</Signatures>\n\n"
+
         # available_imports = f"Imports:\n<imports>\n{available_packages}\n{available_relative_imports}\n</imports>\n\n"
 
         # golden_code = ""
@@ -92,7 +95,11 @@ class LLMHandler:
             "3. The test must be self-contained and to-the-point.\n"
             "4. All 'use' declarations must be inside a <imports>...</imports> block.\n "
             "Use `use super::<function name> for the function under test.\n"
-            "5. Return only the filename, the use statements, and rust test (no comments or explanations).\n\n"
+            "5. To help you write the test, <Signatures> contains all modified function's:\n"
+            "- name\n"
+            "- parameters\n"
+            "- Return type (assume '()' if empty)\n"
+            "6. Return only the filename, the use statements, and rust test (no comments or explanations).\n\n"
         )
 
         example: str = (
@@ -163,6 +170,7 @@ class LLMHandler:
             f"{guidelines}"
             f"{linked_issue}"
             f"{patch}"
+            f"{funcs}"
             # f"{available_imports}"
             # f"{golden_code}"
             # f"{test_code}"
@@ -286,9 +294,8 @@ class LLMHandler:
             cleaned_test = "\n".join(cleaned_response)
 
         # Extract test
-        cleaned_test = cleaned_test.replace(
-            "'''rust", ""
-        )  # Check the replace statements, the model might use different ones
+        cleaned_test = cleaned_test.replace("'''rust", "")
+        cleaned_test = cleaned_test.replace("```rust", "")
         cleaned_test = cleaned_test.replace("'''", "")
         cleaned_test = cleaned_test.lstrip("\n")
         cleaned_test = self._clean_descriptions(cleaned_test)
