@@ -108,15 +108,18 @@ class BotRunner:
 
         try:
             result = generator.generate()
-            assert self._config.output_dir is not None
-            gen_test = Path(
-                self._config.output_dir, "generation", "generated_test.txt"
-            ).read_text(encoding="utf-8")
-            new_filename = f"{self._execution_id}_{self._config.output_dir.name}.txt"
-            Path(self._config.gen_test_dir, new_filename).write_text(
-                gen_test, encoding="utf-8"
-            )
-            return result
+            if result is True:
+                assert self._config.output_dir is not None
+                gen_test = Path(
+                    self._config.output_dir, "generation", "generated_test.txt"
+                ).read_text(encoding="utf-8")
+                new_filename = (
+                    f"{self._execution_id}_{self._config.output_dir.name}.txt"
+                )
+                Path(self._config.gen_test_dir, new_filename).write_text(
+                    gen_test, encoding="utf-8"
+                )
+            return result if result is not None else False
 
         except Exception as e:
             print(f"Failed with unexpected error:\n{e}")
@@ -127,6 +130,7 @@ class BotRunner:
         Prepares all services and data used in each attempt.
         """
         if self._environment_prepared:
+            self._logger.info("Environment already prepared, skipping...")
             self._create_model_attempt_dir(curr_attempt, model)
             return
 
@@ -157,11 +161,13 @@ class BotRunner:
 
         # If repository has not been cloned yet, clone it
         if not Path(self._config.cloned_repo_dir).exists():
+            self._logger.info("Repository does not exist yet, cloning...")
             self._gh_service.clone_repo()
 
         # If it is a different repository, clone the new one
         if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
-            self._gh_service.clone_repo(update=True)
+            print("Different repository exists, cloning new one...")
+            self._gh_service.clone_repo()
 
         # Get the PR diff and stuff like that
 
@@ -204,6 +210,7 @@ class BotRunner:
 
         # Create a generation subdirectory within the attempt directory
         Path(attempt_instance_dir, "generation").mkdir(parents=True, exist_ok=True)
+        self._logger.info(f"Created model attempt directory: {attempt_instance_dir}")
 
     def _record_result(
         self, number: str, model: LLM, i_attempt: int, stop: bool | str
