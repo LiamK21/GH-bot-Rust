@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 from webhook_handler.helper import logger
+from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import LLM, PipelineInputs, PullRequestData
 from webhook_handler.services import (
     Config,
@@ -35,11 +36,6 @@ class BotRunner:
         self._docker_service = None
         self._cst_builder = None
 
-    def _setup_logging(self) -> None:
-        assert self._config.pr_log_dir
-        logger.configure_logger(self._config.pr_log_dir, self._execution_id)
-        self._logger = logging.getLogger()
-
     def is_valid_pr(self) -> tuple[str, bool]:
         """
         PR must have linked issue and source code changes.
@@ -49,10 +45,10 @@ class BotRunner:
             bool: True if PR is valid, False otherwise
         """
 
-        self._logger.marker(
+        self._logger.marker(  # type: ignore[attr-defined]
             f"=============== Running Payload #{self._pr_data.number} ==============="
         )
-        self._logger.marker("================ Preparing Environment ===============")
+        self._logger.marker("================ Preparing Environment ===============")  # type: ignore[attr-defined]
         self._issue_statement = self._gh_service.get_linked_data()
         if not self._issue_statement:
             # helpers.remove_dir(self._config.pr_log_dir)
@@ -76,10 +72,11 @@ class BotRunner:
 
     def execute_runner(self, curr_attempt: int, model: LLM) -> bool:
         """
-        Execute whole pipeline with 5 attempts per model (optional o4-mini execution).
+        Execute the bot runner once with the current attempt and provided model.
 
         Parameters:
-            execute_mini (bool, optional): If True, executes additional attempt with mini model
+            curr_attempt (int): The current attempt number
+            model (LLM): The model to be queried
 
         Returns:
             bool: True if the generation was successful, False otherwise
@@ -87,11 +84,24 @@ class BotRunner:
         # Prepare environment
         self.prepare_environment(curr_attempt, model)
 
-        assert self._pipeline_inputs is not None
-        assert self._llm_handler is not None
-        assert self._cst_builder is not None
-        assert self._docker_service is not None
-        assert self._gh_service is not None
+        if self._pipeline_inputs is None:
+            raise DataMissingError(
+                "pipeline_inputs", "None", "Pipeline inputs not prepared"
+            )
+
+        if self._llm_handler is None:
+            raise DataMissingError("llm_handler", "None", "LLM Handler not prepared")
+
+        if self._cst_builder is None:
+            raise DataMissingError("cst_builder", "None", "CST Builder not prepared")
+
+        if self._docker_service is None:
+            raise DataMissingError(
+                "docker_service", "None", "Docker Service not prepared"
+            )
+
+        if self._config.output_dir is None:
+            raise DataMissingError("output_dir", "None", "Output directory not set")
 
         generator = TestGenerator(
             self._config,
@@ -109,28 +119,31 @@ class BotRunner:
         try:
             result = generator.generate()
             if result is True:
-                assert self._config.output_dir is not None
-                gen_test = Path(
+                generated_test: str = Path(
                     self._config.output_dir, "generation", "generated_test.txt"
                 ).read_text(encoding="utf-8")
                 new_filename = (
                     f"{self._execution_id}_{self._config.output_dir.name}.txt"
                 )
                 Path(self._config.gen_test_dir, new_filename).write_text(
-                    gen_test, encoding="utf-8"
+                    generated_test, encoding="utf-8"
                 )
             return result if result is not None else False
 
+        except (FileExistsError, FileNotFoundError, PermissionError) as e:
+            self._logger.warning(f"File error occurred: {e}")
+            return False
         except Exception as e:
-            print(f"Failed with unexpected error:\n{e}")
+            self._logger.warning(f"Another error occurred: {e}")
             return False
 
     def prepare_environment(self, curr_attempt: int, model: LLM) -> None:
-        """
-        Prepares all services and data used in each attempt.
-        """
+        """Prepares all services and data used in each attempt"""
+
         if self._environment_prepared:
-            self._logger.info("Environment already prepared, skipping...")
+            self._logger.info(
+                "Environment already prepared, skipping preparation phase..."
+            )
             self._create_model_attempt_dir(curr_attempt, model)
             return
 
@@ -140,8 +153,8 @@ class BotRunner:
         if self._issue_statement:
             self._logger.info("Linked issue found")
         else:
-            self._logger.info("No Linked issue found, raising exception")
-            raise Exception("No linked issue found")
+            self._logger.critical("No Linked issue found, raising exception")
+            raise ExecutionError("No linked issue found for PR")
 
         # Prepare directories
         self._create_model_attempt_dir(curr_attempt, model)
@@ -152,12 +165,13 @@ class BotRunner:
                 self._pr_data.base_commit, self._pr_data.head_commit, self._gh_service
             )
         if len(self._pr_diff_ctx.source_code_file_diffs) == 0:
-            raise Exception("No source code changes found in PR")
+            raise ExecutionError("No source code changes found in PR")
 
         # Clone repository and checkout to the PR branch
-        assert (
-            self._config.cloned_repo_dir is not None
-        ), "Cloned repo dir name must be set"
+        if self._config.cloned_repo_dir is None:
+            raise DataMissingError(
+                "cloned_repo_dir", "None", "Path to cloned repository directory not set"
+            )
 
         # If repository has not been cloned yet, clone it
         if not Path(self._config.cloned_repo_dir).exists():
@@ -166,18 +180,15 @@ class BotRunner:
 
         # If it is a different repository, clone the new one
         if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
-            print("Different repository exists, cloning new one...")
+            self._logger.info("Different repository exists, cloning new one...")
             self._gh_service.clone_repo()
 
-        # Get the PR diff and stuff like that
-
         self._cst_builder = CSTBuilder(self._config.parsing_language, self._pr_diff_ctx)
-        # Check if this line is necessary
         # code_sliced = self._cst_builder.get_sliced_code_files()
 
         # Build docker image if not exists
         self._docker_service = DockerService(self._config.root_dir, self._pr_data)
-        self._docker_service.build_image()
+        self._docker_service.check_and_build_image()
 
         # Gather Pipeline data
         self._pipeline_inputs = PipelineInputs(
@@ -191,20 +202,27 @@ class BotRunner:
         self._llm_handler = LLMHandler(self._config, self._pipeline_inputs)
         self._environment_prepared = True
 
-    def _create_model_attempt_dir(self, curr_attempt: int, model: LLM) -> None:
-        """
-        Creates a directory for the current attempt with the current model.
+    def _setup_logging(self) -> None:
+        """Sets up logging for the current PR run"""
 
-        Parameters:
-            curr_attempt (int): The current attempt number
-            model (LLM): The model being used
-        """
-        assert (
-            self._config.pr_log_dir is not None
-        ), "PR log directory must be set before creating model attempt directory."
+        if self._config.pr_log_dir is None:
+            raise DataMissingError(
+                "pr_log_dir", "None", "Pull Request logging directory not set"
+            )
+        assert self._config.pr_log_dir
+        logger.configure_logger(self._config.pr_log_dir, self._execution_id)
+        self._logger = logging.getLogger()
+
+    def _create_model_attempt_dir(self, curr_attempt: int, model: LLM) -> None:
+        """Creates a directory for the current attempt with the current model"""
+
+        if self._config.pr_log_dir is None:
+            raise DataMissingError(
+                "pr_log_dir", "None", "Pull Request logging directory not set"
+            )
 
         attempt_instance_dir = Path(
-            self._config.pr_log_dir, f"i{curr_attempt + 1}_{model}"
+            self._config.pr_log_dir, f"{model}_i{curr_attempt + 1}"
         )
         attempt_instance_dir.mkdir(parents=True, exist_ok=True)
 

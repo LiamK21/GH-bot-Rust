@@ -53,8 +53,8 @@ class TestGenerator:
             bool: True if a fail-to-pass test has been generated, False otherwise
         """
 
-        logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model)) # type: ignore[attr-defined]
-        logger.marker("=============== Test Generation Started ==============") # type: ignore[attr-defined]
+        logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model))  # type: ignore[attr-defined]
+        logger.marker("=============== Test Generation Started ==============")  # type: ignore[attr-defined]
 
         # include_golden_code = bool(self._prompt_combinations["include_golden_code"][self._i_attempt])
         # sliced = bool(self._prompt_combinations["sliced"][self._i_attempt])
@@ -79,7 +79,7 @@ class TestGenerator:
         assert self._config.output_dir is not None
         self._generation_dir = Path(self._config.output_dir, "generation")
         (self._generation_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
-        logger.marker( # type: ignore[attr-defined]
+        logger.marker(  # type: ignore[attr-defined]
             "New prompt written to %s" % (self._generation_dir / "prompt.txt")
         )
 
@@ -96,7 +96,7 @@ class TestGenerator:
             logger.critical("Failed to query model")
             raise Exception("Failed to query model")
 
-        logger.success("LLM response received") # type: ignore[attr-defined]
+        logger.success("LLM response received")  # type: ignore[attr-defined]
         (self._generation_dir / "raw_model_response.txt").write_text(
             response, encoding="utf-8"
         )
@@ -135,13 +135,13 @@ class TestGenerator:
         )
 
         if is_pass_2_fail:
-            logger.success("Fail-to-Pass test generated") # type: ignore[attr-defined]
+            logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
             self._handle_commenting(filename)
-            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return True
         else:
-            logger.fail("No Fail-to-Pass test generated") # type: ignore[attr-defined]
-            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
+            logger.fail("No Fail-to-Pass test generated")  # type: ignore[attr-defined]
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return False
 
     def _run_test_pre_and_post_pr(
@@ -170,7 +170,7 @@ class TestGenerator:
 
         test_to_run = self._cst_builder.extract_changed_tests(test_file_diff)
 
-        logger.marker("Running test in pre-PR codebase...") # type: ignore[attr-defined]
+        logger.marker("Running test in pre-PR codebase...")  # type: ignore[attr-defined]
 
         test_passed_before = False
         stdout_before = "Empty stdout because file did not exist before"
@@ -192,10 +192,10 @@ class TestGenerator:
 
         if test_passed_before:
             logger.warning("No Fail-to-Pass test generated")
-            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return False
 
-        logger.marker("Running test in post-PR codebase...") # type: ignore[attr-defined]
+        logger.marker("Running test in post-PR codebase...")  # type: ignore[attr-defined]
         test_passed_after, stdout_after = self._docker_service.run_test_in_container(
             model_test_patch,
             test_to_run,
@@ -219,7 +219,7 @@ class TestGenerator:
                 )
                 status_code, response_data = self._gh_service.add_comment_to_pr(comment)
                 if status_code == 201:
-                    logger.success("Comment added successfully:\n\n%s" % comment) # type: ignore[attr-defined]
+                    logger.success("Comment added successfully:\n\n%s" % comment)  # type: ignore[attr-defined]
                 else:
                     logger.error(f"Failed to add comment: {status_code}", response_data)
         return
