@@ -47,7 +47,7 @@ def remove_dir(
                 )
 
 
-def run_command(command: str, cwd: str = None) -> str | None:
+def run_command(command: str, cwd: str) -> str | None:
     """
     Helper method to run a command in subprocess.
 
@@ -84,7 +84,7 @@ def get_candidate_file(base_commit: str, filename: str, tmp_repo_dir: str) -> st
     file_content = ""
     file_path = Path(tmp_repo_dir, filename)
     if not file_path.exists():
-        logger.marker(f"File {filename} does not exist in base commit {base_commit}")
+        logger.warning(f"File {filename} does not exist in base commit {base_commit}")
         return ""
 
     logger.marker(f"File {filename} exists in base commit {base_commit}")
