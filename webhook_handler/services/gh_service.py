@@ -5,6 +5,7 @@ import time
 
 import requests
 
+from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import PullRequestData
 from webhook_handler.services import Config
 
@@ -50,8 +51,9 @@ class GitHubService:
         repo = self._pr_data.repo
         pr_description = self._pr_data.description
         pr_title = self._pr_data.title
-        # The regex patterns look for phrases like "Closes #123", "Fixes #123", "Resolves #123" in the PR title and description.
-        # It will actually only capture the issue/bug number.
+
+        # The regex patterns look for instances of "#123" or direct links in the PR title and description.
+        # It will only capture the issue/bug number.
         issue_pattern = r"#(\d+)"
         url_pattern = rf"\bhttps://github\.com/{re.escape(owner)}/{re.escape(repo)}/issues/(\d+)\b"
 
@@ -100,21 +102,30 @@ class GitHubService:
         """
         Clones a GitHub repository.
         """
-        assert self._config.cloned_repo_dir, "Cloned repo dir not set in config"
+        if self._config.cloned_repo_dir is None:
+            raise DataMissingError(
+                "cloned_repo_dir", "None", "Path to cloned repository directory not set"
+            )
         logger.info(
             f"Cloning repository https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git"
         )
-        _ = subprocess.run(
-            [
-                "git",
-                "clone",
-                f"https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git",
-                self._config.cloned_repo_dir,
-            ],
-            capture_output=True,
-            check=True,
-        )
-        logger.success(f"Cloning successful")
+
+        try:
+            _ = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    f"https://github.com/{self._pr_data.owner}/{self._pr_data.repo}.git",
+                    self._config.cloned_repo_dir,
+                ],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.critical(f"Cloning failed: {e.stderr.decode().strip()}")
+            raise ExecutionError("Git cloning failed")
+
+        logger.success(f"Cloning successful")  # type: ignore[attr-defined]
 
     def _get_github_issue(self, number: int) -> str | None:
         """
@@ -127,7 +138,12 @@ class GitHubService:
             str | None: The GitHub issue title and description
         """
         url = f"{GH_API_URL}/{self._pr_data.owner}/{self._pr_data.repo}/issues/{number}"
-        response = requests.get(url, headers=self._config.HEADER)
+        try:
+            response = requests.get(url, headers=self._config.HEADER, timeout=10)
+        except requests.Timeout:
+            logger.error(f"Request timed out while fetching issue: #{number}")
+            return None
+
         if response.status_code == 200:
             issue_data: dict = response.json()
 
@@ -151,9 +167,9 @@ class GitHubService:
                 value for value in (issue_data["title"], issue_data["body"]) if value
             )
 
-            return None
+            # return None
 
-        logger.warning("No GitHub issue found")
+        logger.error("No GitHub issue found")
         return None
 
     def add_comment_to_pr(self, comment) -> tuple[int, dict]:
