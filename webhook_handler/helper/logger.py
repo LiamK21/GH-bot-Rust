@@ -12,7 +12,7 @@ def marker(self, message, *args, **kws):
         self._log(MARKER_LEVEL_NUM, message, args, **kws)
 
 
-logging.Logger.marker = marker
+logging.Logger.marker = marker # type: ignore[attr-defined]
 
 # Success: used to mark the successful completion of an action
 SUCCESS_LEVEL_NUM = 25
@@ -24,20 +24,7 @@ def success(self, message, *args, **kws):
         self._log(SUCCESS_LEVEL_NUM, message, args, **kws)
 
 
-logging.Logger.success = success
-
-# Fail: used to mark the failure of an action
-FAIL_LEVEL_NUM = 35
-logging.addLevelName(FAIL_LEVEL_NUM, "FAIL")
-
-
-def fail(self, message, *args, **kws):
-    if self.isEnabledFor(FAIL_LEVEL_NUM):
-        self._log(FAIL_LEVEL_NUM, message, args, **kws)
-
-
-logging.Logger.fail = fail
-
+logging.Logger.success = success # type: ignore[attr-defined]
 
 class ColoredFormatter(logging.Formatter):
     """
@@ -46,15 +33,14 @@ class ColoredFormatter(logging.Formatter):
 
     RESET = "\x1b[0m"
     COLORS = {
-        logging.DEBUG: "\x1b[90m",  # grey
-        logging.INFO: "\x1b[94m",  # bright blue
-        MARKER_LEVEL_NUM: "\x1b[96m",  # bright cyan
-        SUCCESS_LEVEL_NUM: "\x1b[32m",  # green
-        logging.WARNING: "\x1b[38;5;208m",  # bright orange
-        FAIL_LEVEL_NUM: "\x1b[31m",  # red
-        logging.ERROR: "\x1b[31;1m",  # bold red
-        logging.CRITICAL: "\x1b[91;1m",  # bold bright red
-    }
+        logging.DEBUG:     "\x1b[90m",        # gray 
+        logging.INFO:      "\x1b[94m",        # bright blue
+        MARKER_LEVEL_NUM:  "\x1b[95m",        # bright magenta 
+        SUCCESS_LEVEL_NUM: "\x1b[32m",        # green 
+        logging.WARNING:   "\x1b[33m",        # yellow 
+        logging.ERROR:     "\x1b[31m",        # red 
+        logging.CRITICAL:  "\x1b[41;1m",      # bold red background 
+}
 
     def format(self, record) -> str:
         """
