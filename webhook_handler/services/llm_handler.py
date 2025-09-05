@@ -3,6 +3,7 @@ import re
 from groq import Groq
 from openai import OpenAI
 
+from webhook_handler.helper import templates
 from webhook_handler.models import LLM, PipelineInputs
 from webhook_handler.services.config import Config
 
@@ -31,24 +32,9 @@ class LLMHandler:
         """
         Builds prompt with available data.
 
-        Parameters:
-            include_golden_code (bool): Whether to include golden code
-            sliced (bool): Whether to slice source code or not
-            include_pr_summary (bool): Whether to include pull request title & description
-            include_predicted_test_file (bool): Whether to include test file
-            test_filename (str): The filename of the test file
-            test_file_content_sliced (str): The content of the test file
-
         Returns:
             str: Prompt
         """
-
-        guidelines: str = (
-            "Before you begin:\n"
-            "- Keep going until the job is completely solved — don’t stop halfway.\n"
-            "- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.\n"
-            "- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.\n\n"
-        )
 
         linked_issue: str = (
             f"Issue:\n<issue>\n{self._pipeline_inputs.problem_statement}\n</issue>\n\n"
@@ -84,38 +70,7 @@ class LLMHandler:
         #                             f"{f_code}\n")
         #         golden_code += "</code>\n\n"
 
-        instructions: str = (
-            f"You are a software tester at {self._pr_data.repo} and your are reviewing the above <patch> for the above <issue>\n"
-            "Identify whether a unit test is needed.\n"
-            "If there is no test needed, return <NO>.\n"
-            "If a test is needed, your task is:\n"
-            "1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.\n"
-            "2. Your test must fail on the code before the patch, and pass after, hence "
-            "the test will verify that the patch resolves the issue.\n"
-            "3. The test must be self-contained and to-the-point.\n"
-            "4. All 'use' declarations must be inside a <imports>...</imports> block.\n "
-            "Use `use super::<function name> for the function under test.\n"
-            "5. To help you write the test, <Signatures> contains all modified function's:\n"
-            "- name\n"
-            "- parameters\n"
-            "- Return type (assume '()' if empty)\n"
-            "6. Return only the filename, the use statements, and rust test (no comments or explanations).\n\n"
-        )
-
-        example: str = (
-            "Here is an example structure:\n"
-            "<Filename> ... </Filename>\n"
-            "<imports> ... </imports>\n"
-            "'''rust\n"
-            "#[test]\n"
-            "fn test_<describe_behavior>() {\n"
-            "  <initialize required variables>;\n"
-            "  <define expected variable>;\n"
-            "  <generate actual variables>;\n"
-            "  <compare expected with actual>;\n"
-            "};"
-            "'''rust\n\n"
-        )
+        instructions = templates.get_instructions_template(self._pr_data.repo)
 
         # test_code: str = ""
         # if include_predicted_test_file:
@@ -167,7 +122,7 @@ class LLMHandler:
         #     }\n</pr_summary>\n\n"
 
         return (
-            f"{guidelines}"
+            f"{templates.GUIDELINES}"
             f"{linked_issue}"
             f"{patch}"
             f"{funcs}"
@@ -176,7 +131,7 @@ class LLMHandler:
             # f"{test_code}"
             # f"{pr_summary}"
             f"{instructions}"
-            f"{example}"
+            f"{templates.EXAMPLE_TEST_STRUCTURE}"
         )
 
     def query_model(self, prompt: str, model: LLM, temperature: float = 0.0) -> str:
@@ -226,7 +181,7 @@ class LLMHandler:
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are an experienced software tester specializing in developing regression tests. Follow the user's instructions for generating a regression test. The output format is STRICT: do all your reasoning in the beginning, but the end of your output should ONLY contain javascript code, i.e., NO natural language after the code.",
+                            "content": "You are an experienced software tester specializing in developing regression tests. Follow the user's instructions for generating a regression test. The output format is STRICT: do all your reasoning in the beginning, but the end of your output should ONLY contain rust code, i.e., NO natural language after the code.",
                         },
                         {"role": "user", "content": prompt},
                     ],
