@@ -2,7 +2,7 @@ COMMENT_TEMPLATE = """Hi! 🤖 The test below is automatically generated and cou
 - passes, and
 - fails in the codebase before the PR.
 
-```python
+```rust
 %s
 ```
 
