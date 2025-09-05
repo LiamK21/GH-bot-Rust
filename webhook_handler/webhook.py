@@ -5,12 +5,8 @@ import logging
 import threading
 from pathlib import Path
 
-from django.http import (
-    HttpResponse,
-    HttpResponseForbidden,
-    HttpResponseNotAllowed,
-    JsonResponse,
-)
+from django.http import (HttpRequest, HttpResponse, HttpResponseForbidden,
+                         HttpResponseNotAllowed, JsonResponse)
 from django.views.decorators.csrf import csrf_exempt
 
 from webhook_handler.constants import USED_MODELS, get_total_attempts
@@ -23,7 +19,7 @@ bootstrap = logging.getLogger("bootstrap")
 
 #################### Webhook ####################
 @csrf_exempt
-def github_webhook(request):
+def github_webhook(request: HttpRequest) -> HttpResponse | JsonResponse:
     """
     Handles GitHub webhook events.
 
@@ -54,7 +50,7 @@ def github_webhook(request):
         return HttpResponseForbidden("Invalid signature")
 
     # 5) Empty payload check
-    payload = json.loads(request.body)
+    payload: dict = json.loads(request.body)
     if not payload:
         bootstrap.critical("Empty payload")
         return HttpResponseForbidden("Empty payload")
@@ -84,6 +80,10 @@ def github_webhook(request):
     if not valid:
         bootstrap.critical(f"[#{pr_number}] {message}")
         return JsonResponse({"status": "success", "message": message}, status=200)
+    
+    #9) Setup PR related directories
+    pr_id = runner._pr_data.id
+    config.setup_pr_related_dirs(pr_id, payload)
 
     def _execute_runner_in_background():
         try:
@@ -91,12 +91,12 @@ def github_webhook(request):
             total_attempts_per_model = get_total_attempts()
             generation_completed = False
             for model in USED_MODELS:
-                i = 0
-                while i < total_attempts_per_model:
-                    generation_completed = runner.execute_runner(i, model)
+                curr_attempt = 0
+                while curr_attempt < total_attempts_per_model:
+                    generation_completed = runner.execute_runner(curr_attempt, model)
                     if generation_completed:
                         break
-                    i += 1
+                    curr_attempt += 1
 
                 if generation_completed:
                     break
@@ -114,7 +114,7 @@ def github_webhook(request):
             config._teardown()
             bootstrap.info(f"[#{pr_number}] Resources cleaned up")
 
-    # 9) Save payload
+    # 10) Save payload
     payload_path = Path(
         config.webhook_raw_log_dir,
         f"{runner._pr_data.repo}_{pr_number}_{config.execution_timestamp}.json",
@@ -123,14 +123,14 @@ def github_webhook(request):
         json.dump(payload, f, indent=4)
     bootstrap.info(f"[#{pr_number}] Payload saved to {payload_path}")
 
-    # 10) Execute pipeline
+    # 11) Execute Runner
     thread = threading.Thread(target=_execute_runner_in_background, daemon=True)
     thread.start()
 
     return JsonResponse({"status": "accepted", "message": message}, status=202)
 
 
-def _verify_signature(request, github_webhook_secret) -> bool:
+def _verify_signature(request: HttpRequest, github_webhook_secret) -> bool:
     """
     Verifies the webhook signature.
 
