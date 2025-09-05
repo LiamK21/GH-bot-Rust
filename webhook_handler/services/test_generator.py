@@ -1,8 +1,8 @@
 import logging
 from pathlib import Path
 
-from webhook_handler.constants import PROMPT_COMBINATIONS_GEN
 from webhook_handler.helper import general, git_diff, templates
+from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import LLM, PipelineInputs, PullRequestFileDiff
 from webhook_handler.services import Config
 from webhook_handler.services.cst_builder import CSTBuilder
@@ -34,9 +34,8 @@ class TestGenerator:
         self._pipeline_inputs = data
         self._pr_data = data.pr_data
         self._pr_diff_ctx = data.pr_diff_ctx
-        self._prompt_combinations = PROMPT_COMBINATIONS_GEN
+        # self._prompt_combinations = PROMPT_COMBINATIONS_GEN
         self._post_comment = post_comment
-        self._comment_template = templates.COMMENT_TEMPLATE
         self._gh_service = gh_service
         self._cst_builder = cst_builder
         self._docker_service = docker_service
@@ -54,8 +53,8 @@ class TestGenerator:
             bool: True if a fail-to-pass test has been generated, False otherwise
         """
 
-        logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model))
-        logger.marker("=============== Test Generation Started ==============")
+        logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model)) # type: ignore[attr-defined]
+        logger.marker("=============== Test Generation Started ==============") # type: ignore[attr-defined]
 
         # include_golden_code = bool(self._prompt_combinations["include_golden_code"][self._i_attempt])
         # sliced = bool(self._prompt_combinations["sliced"][self._i_attempt])
@@ -75,12 +74,12 @@ class TestGenerator:
 
         if len(prompt) >= 1048576:  # gpt4o limit
             logger.critical("Prompt exceeds limits, skipping...")
-            raise Exception("Prompt is too long.")
+            raise ExecutionError("Prompt is too long.")
 
         assert self._config.output_dir is not None
         self._generation_dir = Path(self._config.output_dir, "generation")
         (self._generation_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
-        logger.marker(
+        logger.marker( # type: ignore[attr-defined]
             "New prompt written to %s" % (self._generation_dir / "prompt.txt")
         )
 
@@ -97,7 +96,7 @@ class TestGenerator:
             logger.critical("Failed to query model")
             raise Exception("Failed to query model")
 
-        logger.success("LLM response received")
+        logger.success("LLM response received") # type: ignore[attr-defined]
         (self._generation_dir / "raw_model_response.txt").write_text(
             response, encoding="utf-8"
         )
@@ -136,13 +135,13 @@ class TestGenerator:
         )
 
         if is_pass_2_fail:
-            logger.success("Fail-to-Pass test generated")
+            logger.success("Fail-to-Pass test generated") # type: ignore[attr-defined]
             self._handle_commenting(filename)
-            logger.marker("=============== Test Generation Finished =============")
+            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
             return True
         else:
-            logger.fail("No Fail-to-Pass test generated")
-            logger.marker("=============== Test Generation Finished =============")
+            logger.fail("No Fail-to-Pass test generated") # type: ignore[attr-defined]
+            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
             return False
 
     def _run_test_pre_and_post_pr(
@@ -171,7 +170,7 @@ class TestGenerator:
 
         test_to_run = self._cst_builder.extract_changed_tests(test_file_diff)
 
-        logger.marker("Running test in pre-PR codebase...")
+        logger.marker("Running test in pre-PR codebase...") # type: ignore[attr-defined]
 
         test_passed_before = False
         stdout_before = "Empty stdout because file did not exist before"
@@ -192,11 +191,11 @@ class TestGenerator:
         )
 
         if test_passed_before:
-            logger.fail("No Fail-to-Pass test generated")
-            logger.marker("=============== Test Generation Finished =============")
+            logger.warning("No Fail-to-Pass test generated")
+            logger.marker("=============== Test Generation Finished =============") # type: ignore[attr-defined]
             return False
 
-        logger.marker("Running test in post-PR codebase...")
+        logger.marker("Running test in post-PR codebase...") # type: ignore[attr-defined]
         test_passed_after, stdout_after = self._docker_service.run_test_in_container(
             model_test_patch,
             test_to_run,
@@ -212,7 +211,7 @@ class TestGenerator:
         assert self._generation_dir is not None
         if self._post_comment:
             if no_test_gen_reason is None:
-                comment = self._comment_template % (
+                comment = templates.COMMENT_TEMPLATE % (
                     (self._generation_dir / "generated_test.txt").read_text(
                         encoding="utf-8"
                     ),
@@ -220,9 +219,9 @@ class TestGenerator:
                 )
                 status_code, response_data = self._gh_service.add_comment_to_pr(comment)
                 if status_code == 201:
-                    logger.success("Comment added successfully:\n\n%s" % comment)
+                    logger.success("Comment added successfully:\n\n%s" % comment) # type: ignore[attr-defined]
                 else:
-                    logger.fail(f"Failed to add comment: {status_code}", response_data)
+                    logger.error(f"Failed to add comment: {status_code}", response_data)
         return
 
     def _get_relevant_file(
