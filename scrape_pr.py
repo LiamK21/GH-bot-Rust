@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-type Repo = Literal["grcov", "rust-code-analysis"]
+type Repo = Literal["grcov", "rust_code_analysis"]
 
 class FileType(StrEnum):
     TEST = "test"
@@ -67,9 +67,15 @@ def _fetch_pr_list(curr_page: int, repo: Repo) -> dict:
     Returns:
         dict: PR list.
     """
+    url_repo: str = ""
+    
+    if repo == "rust_code_analysis":
+        url_repo = "rust-code-analysis"
+    else:
+        url_repo = repo
 
     list_url = (
-        f"{API_URL}/{OWNER}/{repo}/pulls"
+        f"{API_URL}/{OWNER}/{url_repo}/pulls"
         f"?state=all&sort=created&direction=desc"
         f"&per_page=100&page={curr_page}"
     )
@@ -327,7 +333,7 @@ page = 1
 if __name__ == "__main__":
     while (valid_grcov_payloads + valid_rust_code_analysis_payloads) < SCRAPE_TARGET:
         pr_list_grcov = _fetch_pr_list(page, "grcov")
-        pr_list_rust_code_analysis = _fetch_pr_list(page, "rust-code-analysis")
+        pr_list_rust_code_analysis = _fetch_pr_list(page, "rust_code_analysis")
         if not pr_list_grcov and not pr_list_rust_code_analysis:
             break
 
@@ -335,7 +341,7 @@ if __name__ == "__main__":
             if _process_pr(pr, "grcov") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
                 break
         for pr in pr_list_rust_code_analysis:
-            if _process_pr(pr, "rust-code-analysis") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
+            if _process_pr(pr, "rust_code_analysis") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
                 break
 
         page += 1
