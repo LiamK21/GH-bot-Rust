@@ -123,9 +123,6 @@ def unified_diff_with_function_context(
         general.remove_dir(Path(temp_dir))
 
 
-# TODO: Fix this function
-
-
 def find_modified_function_signatures(
     f_name: str, file_content: str, diff_list: list[str]
 ) -> list[str]:
@@ -175,7 +172,10 @@ def find_modified_function_signatures(
     return func_signatures
 
 
-def apply_patch(file_content_arr: list[str], patch: str) -> tuple[list[str], str]:
+type PatchResult = tuple[list[str], str]
+
+
+def apply_patch(file_content_arr: list[str], patch: str) -> PatchResult:
     """
     Apply a patch to file_content using the equivalent of "git apply".
 
