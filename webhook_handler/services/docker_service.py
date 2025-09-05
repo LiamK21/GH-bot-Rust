@@ -13,9 +13,12 @@ from docker.errors import APIError, BuildError, ImageNotFound
 from docker.models.containers import Container
 from docker.models.images import Image
 
+from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import PullRequestData, PullRequestFileDiff
 
 logger = logging.getLogger(__name__)
+
+type TestResult = tuple[bool, str]  # (test_passed, output)
 
 
 class DockerService:
@@ -28,12 +31,10 @@ class DockerService:
         self._pr_data = pr_data
         self._client = docker.from_env()
 
-    def build_image(self) -> None:
-        """
-        Build a Docker image from the Dockerfiles in the dockerfiles directory.
-        """
+    def check_and_build_image(self) -> None:
+        """Check if the Docker image exists, and if not, build it from the Dockerfiles in the dockerfile directory"""
 
-        logger.marker("Building Docker image...")
+        logger.marker("Checking Docker image...")  # type: ignore[attr-defined]
 
         tag = f"{self._pr_data.image_tag}:latest"
         docker_image: Image | None = None
@@ -42,15 +43,19 @@ class DockerService:
             docker_image = self._client.images.get(tag)
             return
         except ImageNotFound:
-            print("Image not found. Building image...")
+            logger.marker("Image not found. Building image...")  # type: ignore[attr-defined]
         except APIError as e:
-            print(f"Error while accessing Docker API: {e.explanation}")
+            logger.critical(f"Error while accessing Docker API: {e.explanation}")
             return
 
         if docker_image:
-            logger.marker("Docker image already exists, skipping build")
+            logger.marker("Docker image already exists, skipping build")  # type: ignore[attr-defined]
             return
 
+        self._build_image(tag)
+
+    def _build_image(self, tag: str) -> None:
+        """Builds the Docker image from the Dockerfiles in the dockerfile directory"""
         build_args = {"commit_hash": self._pr_data.base_commit}
         repo_name = self._pr_data.repo.lower()
         dockerfile_path = Path("dockerfiles", f"Dockerfile_{repo_name}")
@@ -65,8 +70,8 @@ class DockerService:
                 rm=True,
             )
             build_succeeded = True
-            logger.success(
-                f"Docker image '{self._pr_data.image_tag}' built successfully"
+            logger.success(  # type: ignore[attr-defined]
+                f"Docker image '{tag}' built successfully"
             )
         except BuildError as e:
             log_lines = []
@@ -74,17 +79,22 @@ class DockerService:
                 if "stream" in chunk:
                     log_lines.append(chunk["stream"].rstrip())
             full_build_log = "\n".join(log_lines)
-            logger.error(f"Build failed for image '{tag}' with error: {e}")
-            raise AssertionError("Docker build failed")
+            logger.critical(f"Build failed for image '{tag}':\n{full_build_log}")
+            raise ExecutionError("Docker build failed")
         except APIError as e:
-            logger.error(f"Docker API error: {e}")
-            raise AssertionError("Docker API error")
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+        except TypeError as e:
+            logger.critical(f"Docker Type error: {e}")
+            raise ExecutionError(
+                "Docker Type error: Check if path or fileobj is specified as args"
+            )
         finally:
             if not build_succeeded:
-                logger.marker("Cleaning up leftover containers and dangling images...")
+                logger.marker("Cleaning up leftover containers and dangling images...")  # type: ignore[attr-defined]
                 for container in self._client.containers.list(all=True):
-                    img = container.image.tags or container.image.id
-                    if img == "<none>:<none>" or not container.image.tags:
+                    img_str: str = container.image.tags or container.image.id
+                    if img_str == "<none>:<none>" or not container.image.tags:
                         try:
                             if container.status == "running":
                                 container.stop()
@@ -111,7 +121,7 @@ class DockerService:
         tests_to_run: list,
         file_diff: PullRequestFileDiff,
         golden_code_patch: str | None = None,
-    ) -> tuple[bool, str]:
+    ) -> TestResult:
         """
         Creates a container, applies the patch, runs the test, and returns the result.
 
@@ -125,13 +135,10 @@ class DockerService:
             bool: True if the test has passed, False otherwise
             str: The output from running the test
         """
-        with tempfile.NamedTemporaryFile(delete=False, mode="w") as patch_file:
-            patch_file.write(test_patch)
-            patch_file_path: str = patch_file.name
-
+        patch_file_path: str = ""
         container: Container | None = None
         try:
-            logger.marker("Creating container...")
+            logger.marker("Creating container...")  # type: ignore[attr-defined]
             container = self._client.containers.create(
                 image=self._pr_data.image_tag,
                 command="/bin/sh -c 'sleep infinity'",  # keep the container running
@@ -139,71 +146,29 @@ class DockerService:
                 detach=True,
             )
             container.start()
-            logger.marker(f"Container {container.short_id} started")
+            logger.marker(f"Container {container.short_id} started")  # type: ignore[attr-defined]
 
             # Create placeholder empty files for PRs that add new files
             self._handle_newly_added_files(test_patch, container)
 
             #### A) Test patch (Always)
-            test_patch_fname: str = "test_patch.diff"
-            patch_dest_path: str = f"/app/testbed/{test_patch_fname}"
-            # Create a tar archive
-            tar_stream = io.BytesIO()
-            with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                tar.add(patch_file_path, arcname=test_patch_fname)
-            tar_stream.seek(0)
-            # Copy the tar archive to the container
-            container.put_archive("/app/testbed", tar_stream.getvalue())
-            logger.info(f"[+] Patch file copied to {patch_dest_path}")
-
-            # Apply the patch inside the container
-            apply_patch_cmd = (
-                f"/bin/sh -c 'cd /app/testbed && git apply {test_patch_fname}'"
+            patch_result = self._add_file_and_apply_patch_in_container(
+                container, test_patch
             )
-            exec_result = container.exec_run(apply_patch_cmd)
-
-            if exec_result.exit_code != 0:
-                logger.info(f"[!] Failed to apply patch: {exec_result.output.decode()}")
-                return False, exec_result.output.decode()
-
-            logger.info("[+] Test patch applied successfully.")
-
+            if isinstance(patch_result, tuple):
+                return patch_result
+            patch_file_path = patch_result
             if golden_code_patch is not None:
-                logger.marker("[+] Applying golden code patch")
-                print(f"Golden code patch {golden_code_patch}")
-                # Create a temporary patch file
-                with tempfile.NamedTemporaryFile(delete=False, mode="w") as patch_file:
-                    patch_file.write(golden_code_patch)
-                    patch_file_path = patch_file.name
-
-                # Create placeholder empty files for PRs that add new files
-                self._handle_newly_added_files(golden_code_patch, container)
-
                 #### B) Model patch (Only in post-PR code)
-                golden_code_patch_fname = "golden_code_patch.diff"
-                patch_dest_path = f"/app/testbed/{golden_code_patch_fname}"
-                # Create a tar archive
-                tar_stream = io.BytesIO()
-                with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-                    tar.add(patch_file_path, arcname=golden_code_patch_fname)
-                tar_stream.seek(0)
-                # Copy the tar archive to the container
-                container.put_archive("/app/testbed", tar_stream.getvalue())
-                logger.info(f"[+] Patch file copied to {patch_dest_path}")
+                patch_result = self._add_file_and_apply_patch_in_container(
+                    container, golden_code_patch, is_golden_patch=True
+                )
+                if isinstance(patch_result, tuple):
+                    return patch_result
 
-                # Apply the patch inside the container
-                apply_patch_cmd = f"/bin/sh -c 'cd /app/testbed && git apply {golden_code_patch_fname}'"
-                exec_result = container.exec_run(apply_patch_cmd)
+                patch_file_path = patch_result
 
-                if exec_result.exit_code != 0:
-                    logger.info(
-                        f"[!] Failed to apply golden patch: {exec_result.output.decode()}"
-                    )
-                    return False, exec_result.output.decode()
-
-                logger.info("[+] Code patch applied successfully.")
-
-            logger.marker("Tests to run: %s" % ", ".join(tests_to_run))
+            logger.marker("Tests to run: %s" % ", ".join(tests_to_run))  # type: ignore[attr-defined]
             # Run the test command
             coverage_report_separator: str = "COVERAGE_REPORT_STARTING_HERE"
             test_command: str = (
@@ -216,7 +181,6 @@ class DockerService:
             exec_result = container.exec_run(test_command, stdout=True, stderr=True)
             stdout_output_all = exec_result.output.decode()
             stdout = ""
-            coverage_report = ""
             test_result: bool = False
             try:  # TODO: fix, find a better way to handle the "test-not-ran" error
                 stdout, coverage_report = stdout_output_all.split(
@@ -224,7 +188,7 @@ class DockerService:
                 )
             except:
                 test_result = False
-                logger.info(
+                logger.warning(
                     "Internal error: docker command failed with: %s" % stdout_output_all
                 )
                 return test_result, stdout_output_all
@@ -241,10 +205,17 @@ class DockerService:
                 test_result = True
 
             logger.info(f"[+] Test result: {test_result}")
-            print(f"Coverage report: \n{coverage_report}")
-
             return test_result, stdout
 
+        except ImageNotFound as e:
+            logger.critical(f"Docker image not found: {e}")
+            raise ExecutionError("Docker image not found")
+        except APIError as e:
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+        except Exception as e:
+            logger.critical(f"Unexpected error: {e}")
+            raise ExecutionError("Unexpected Docker error")
         finally:
             # Cleanup
             os.remove(patch_file_path)
@@ -273,7 +244,7 @@ class DockerService:
             # If the file should be created, ensure it exists
             if current_file and create_file:
                 new_files.add(current_file)
-                print(f"Creating empty file in Docker: {current_file}")
+                logger.marker(f"Creating empty file in Docker: {current_file}")  # type: ignore[attr-defined]
 
                 # Ensure parent directory exists inside the container
                 parent_dir = os.path.dirname(current_file)
@@ -282,7 +253,7 @@ class DockerService:
                         f"mkdir -p {parent_dir}", stdout=True, stderr=True
                     )
                     if exec_result.exit_code != 0:
-                        print(
+                        logger.warning(
                             f"Error creating directory: {exec_result.stderr.decode()}"
                         )
 
@@ -291,17 +262,19 @@ class DockerService:
                     f"touch {current_file}", stdout=True, stderr=True
                 )
                 if exec_result.exit_code != 0:
-                    print(f"Error creating file: {exec_result.stderr.decode()}")
+                    logger.warning(
+                        f"Error creating file: {exec_result.stderr.decode()}"
+                    )
 
-                print(f"Created empty file in Docker: {current_file}")
+                logger.marker(f"Created empty file in Docker: {current_file}")  # type: ignore[attr-defined]
                 create_file = False  # Reset flag after creating
 
         return new_files
 
     @staticmethod
-    def _add_file_to_container(
-        container: Container, file_path: str, file_content: str | bytes = ""
-    ) -> None:
+    def _add_file_and_apply_patch_in_container(
+        container: Container, patch: str, is_golden_patch: bool = False
+    ) -> TestResult | str:
         """
         Adds file to Docker container.
 
@@ -310,21 +283,37 @@ class DockerService:
             file_path (str): Path to the file to add to the container
             file_content (str | bytes, optional): Content to add to the file
         """
+        # Create a temporary patch file
+        with tempfile.NamedTemporaryFile(delete=False, mode="w") as patch_file:
+            patch_file.write(patch)
+            patch_file_path: str = patch_file.name
 
-        if isinstance(file_content, str):
-            content = file_content.encode("utf-8")
+        patch_fname: str = ""
+        if is_golden_patch:
+            patch_fname = "golden_code_patch.diff"
+            logger.marker("[+] Applying golden code patch")  # type: ignore[attr-defined]
         else:
-            content = file_content
-
+            patch_fname: str = "test_patch.diff"
+        # Create a tar archive
         tar_stream = io.BytesIO()
         with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            ti = tarfile.TarInfo(name=file_path)
-            ti.size = len(file_content)
-            tar.addfile(ti, io.BytesIO(content))
+            tar.add(patch_file_path, arcname=patch_fname)
         tar_stream.seek(0)
         try:
+            # Copy the tar archive to the container
             container.put_archive("/app/testbed", tar_stream.read())
-            print(f"File {file_path} added to container successfully")
+            logger.marker(f"File {file_path} added to container successfully")  # type: ignore[attr-defined]
         except APIError as e:
-            print(f"Docker API error: {e}")
-            raise AssertionError("Docker API error")
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+
+        # Apply the patch inside the container
+        apply_patch_cmd = f"/bin/sh -c 'cd /app/testbed && git apply {patch_fname}'"
+        exec_result = container.exec_run(apply_patch_cmd)
+
+        if exec_result.exit_code != 0:
+            logger.info(f"[!] Failed to apply patch: {exec_result.output.decode()}")
+            return False, exec_result.output.decode()
+
+        logger.info("[+] Patch applied successfully.")
+        return patch_file_path
