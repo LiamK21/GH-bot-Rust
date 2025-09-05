@@ -1,6 +1,5 @@
 import json
 import os
-from datetime import datetime
 
 from django.test import TestCase
 
@@ -16,6 +15,9 @@ def _get_payload(rel_path: str) -> dict:
         payload = json.load(f)
     return payload
 
+def _setup_dirs(config: Config, runner: BotRunner, payload) -> None:
+    pr_id = runner._pr_data.id
+    config.setup_pr_related_dirs(pr_id, payload)
 
 #
 # RUN With: python manage.py test webhook_handler.test.tests_grcov.<testname>
@@ -25,20 +27,15 @@ class TestGeneration1180(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_1180.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
+        self.config._teardown()
         del self.payload
         del self.config
         del self.runner
-        self.config._teardown()
 
     def test_generation1180(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
@@ -60,18 +57,12 @@ class TestGeneration1362(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_1362.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
         self.config._teardown()
 
     def test_generation1362(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
@@ -92,18 +83,12 @@ class TestGeneration1394(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_1394.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
         self.config._teardown()
 
     def test_generation1394(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
@@ -125,18 +110,12 @@ class TestGeneration34(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_34.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
         self.config._teardown()
 
     def test_generation1394(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
@@ -158,18 +137,12 @@ class TestGeneration1326(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_1326.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
         self.config._teardown()
 
     def test_generation1326(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
@@ -191,18 +164,12 @@ class TestGeneration1321(TestCase):
         self.payload = _get_payload("test_data/grcov/pr_1321.json")
         self.config = Config()
         self.runner = BotRunner(self.payload, self.config)
-        self.pr_id = self.runner._pr_data.id
-        self.pr_id = self.runner._pr_data.id
-        self.owner = self.runner._pr_data.owner
-        self.repo = self.runner._pr_data.repo
+        _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
         self.config._teardown()
 
     def test_generation1326(self):
-        self.config.setup_pr_related_dirs(
-            self.pr_id, self.owner, self.repo, self.payload
-        )
         generation_completed = False
         total_attempts = get_total_attempts()
         # This approach is only temporary until prompt combinations are defined
