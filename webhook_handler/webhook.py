@@ -5,8 +5,13 @@ import logging
 import threading
 from pathlib import Path
 
-from django.http import (HttpRequest, HttpResponse, HttpResponseForbidden,
-                         HttpResponseNotAllowed, JsonResponse)
+from django.http import (
+    HttpRequest,
+    HttpResponse,
+    HttpResponseForbidden,
+    HttpResponseNotAllowed,
+    JsonResponse,
+)
 from django.views.decorators.csrf import csrf_exempt
 
 from webhook_handler.constants import USED_MODELS, get_total_attempts
@@ -80,8 +85,8 @@ def github_webhook(request: HttpRequest) -> HttpResponse | JsonResponse:
     if not valid:
         bootstrap.critical(f"[#{pr_number}] {message}")
         return JsonResponse({"status": "success", "message": message}, status=200)
-    
-    #9) Setup PR related directories
+
+    # 9) Setup PR related directories
     pr_id = runner._pr_data.id
     config.setup_pr_related_dirs(pr_id, payload)
 

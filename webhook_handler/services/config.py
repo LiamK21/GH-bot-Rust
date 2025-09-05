@@ -50,9 +50,7 @@ class Config:
         Path(self.bot_log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.gen_test_dir).mkdir(parents=True, exist_ok=True)
 
-    def setup_pr_related_dirs(
-        self, pr_id: str, payload: dict
-    ) -> None:
+    def setup_pr_related_dirs(self, pr_id: str, payload: dict) -> None:
         """
         Sets up all directories related to a specific PR.
 
@@ -63,9 +61,7 @@ class Config:
         self._setup_pr_log_dir(pr_id, payload)
         self._setup_log_paths()
 
-    def _setup_pr_log_dir(
-        self, pr_id: str, payload: dict
-    ) -> None:
+    def _setup_pr_log_dir(self, pr_id: str, payload: dict) -> None:
         """
         Sets up directory for logger output file (one directory per PR)
 

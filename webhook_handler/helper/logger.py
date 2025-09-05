@@ -12,7 +12,7 @@ def marker(self, message, *args, **kws):
         self._log(MARKER_LEVEL_NUM, message, args, **kws)
 
 
-logging.Logger.marker = marker # type: ignore[attr-defined]
+logging.Logger.marker = marker  # type: ignore[attr-defined]
 
 # Success: used to mark the successful completion of an action
 SUCCESS_LEVEL_NUM = 25
@@ -24,7 +24,8 @@ def success(self, message, *args, **kws):
         self._log(SUCCESS_LEVEL_NUM, message, args, **kws)
 
 
-logging.Logger.success = success # type: ignore[attr-defined]
+logging.Logger.success = success  # type: ignore[attr-defined]
+
 
 class ColoredFormatter(logging.Formatter):
     """
@@ -33,14 +34,14 @@ class ColoredFormatter(logging.Formatter):
 
     RESET = "\x1b[0m"
     COLORS = {
-        logging.DEBUG:     "\x1b[90m",        # gray 
-        logging.INFO:      "\x1b[94m",        # bright blue
-        MARKER_LEVEL_NUM:  "\x1b[95m",        # bright magenta 
-        SUCCESS_LEVEL_NUM: "\x1b[32m",        # green 
-        logging.WARNING:   "\x1b[33m",        # yellow 
-        logging.ERROR:     "\x1b[31m",        # red 
-        logging.CRITICAL:  "\x1b[41;1m",      # bold red background 
-}
+        logging.DEBUG: "\x1b[90m",  # gray
+        logging.INFO: "\x1b[94m",  # bright blue
+        MARKER_LEVEL_NUM: "\x1b[95m",  # bright magenta
+        SUCCESS_LEVEL_NUM: "\x1b[32m",  # green
+        logging.WARNING: "\x1b[33m",  # yellow
+        logging.ERROR: "\x1b[31m",  # red
+        logging.CRITICAL: "\x1b[41;1m",  # bold red background
+    }
 
     def format(self, record) -> str:
         """
@@ -58,7 +59,7 @@ def configure_logger(pr_log_dir: Path, execution_id: str) -> None:
     Sets up the global logger for PR test generation
 
     Parameters:
-        pr_log_dir (Path): Path to the PR log directory
+        pr_log_dir (Path): Path to the PR logging directory
         execution_id (str): ID of the PR test generation execution
     """
 
