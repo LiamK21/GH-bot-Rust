@@ -22,68 +22,68 @@ class CSTBuilder:
         except SyntaxError:
             raise ValueError("Failed to parse source code")
 
-    def get_sliced_code_files(self):
-        """
-        Detects which files have been modified to call slice_javascript_code.
+    # def get_sliced_code_files(self):
+    #     """
+    #     Detects which files have been modified to call slice_javascript_code.
 
-        Returns:
-            list: Sliced code for modified code, unsliced for untouched code.
-        """
+    #     Returns:
+    #         list: Sliced code for modified code, unsliced for untouched code.
+    #     """
 
-        if not self._pr_diff_ctx.code_names:
-            return self._pr_diff_ctx.code_before
+    #     if not self._pr_diff_ctx.code_names:
+    #         return self._pr_diff_ctx.code_before
 
-        print("--- Golden Code Patch ---")
-        print(self._pr_diff_ctx.golden_code_patch)
+    #     print("--- Golden Code Patch ---")
+    #     print(self._pr_diff_ctx.golden_code_patch)
 
-        code_after, stderr = git_diff.apply_patch(
-            self._pr_diff_ctx.code_before, self._pr_diff_ctx.golden_code_patch
-        )
+    #     code_after, stderr = git_diff.apply_patch(
+    #         self._pr_diff_ctx.code_before, self._pr_diff_ctx.golden_code_patch
+    #     )
 
-        patches = [
-            "diff --git" + x
-            for x in self._pr_diff_ctx.golden_code_patch.split("diff --git")[1:]
-        ]
-        result = []
+    #     patches = [
+    #         "diff --git" + x
+    #         for x in self._pr_diff_ctx.golden_code_patch.split("diff --git")[1:]
+    #     ]
+    #     result = []
 
-        for before, after, diff in zip(
-            self._pr_diff_ctx.code_before, code_after, patches
-        ):
-            # before_map is lines removed, after_map is lines added
-            before_map, after_map = self._build_changed_lines_scope_map(
-                before, after, diff
-            )
-            # print("--- Before Map ---")
-            # print(before_map)
-            # if no changes, keep original code
-            if not before_map and not after_map:
-                result.append(before)
-                continue
+    #     for before, after, diff in zip(
+    #         self._pr_diff_ctx.code_before, code_after, patches
+    #     ):
+    #         # before_map is lines removed, after_map is lines added
+    #         before_map, after_map = self._build_changed_lines_scope_map(
+    #             before, after, diff
+    #         )
+    #         # print("--- Before Map ---")
+    #         # print(before_map)
+    #         # if no changes, keep original code
+    #         if not before_map and not after_map:
+    #             result.append(before)
+    #             continue
 
-            funcs_before = [list(x.values())[0] for x in before_map]
-            # print("--- funcs before ---")
-            # print(funcs_before)
-            funcs_after = [list(x.values())[0] for x in after_map]
+    #         funcs_before = [list(x.values())[0] for x in before_map]
+    #         # print("--- funcs before ---")
+    #         # print(funcs_before)
+    #         funcs_after = [list(x.values())[0] for x in after_map]
 
-            map_cls = self._build_function_class_maps(
-                funcs_before
-            ) + self._build_function_class_maps(funcs_after)
+    #         map_cls = self._build_function_class_maps(
+    #             funcs_before
+    #         ) + self._build_function_class_maps(funcs_after)
 
-            # print("--- Function-Class Maps ---")
-            # print(map_cls)
+    #         # print("--- Function-Class Maps ---")
+    #         # print(map_cls)
 
-            class2methods = {}
-            for m2c in map_cls:
-                for k, v in m2c.items():
-                    class2methods[v] = class2methods.get(v, []) + [k]
+    #         class2methods = {}
+    #         for m2c in map_cls:
+    #             for k, v in m2c.items():
+    #                 class2methods[v] = class2methods.get(v, []) + [k]
 
-            global_funcs = class2methods.pop("global", [])
+    #         global_funcs = class2methods.pop("global", [])
 
-            sliced = self._slice_rust_code(before, global_funcs, class2methods)
-            # print("--- Sliced Code ---")
-            # print(sliced)
-            result.append(sliced)
-        return result
+    #         sliced = self._slice_rust_code(before, global_funcs, class2methods)
+    #         # print("--- Sliced Code ---")
+    #         # print(sliced)
+    #         result.append(sliced)
+    #     return result
 
     def extract_changed_tests(self, pr_file_diff) -> list[str]:
         """
@@ -95,7 +95,6 @@ class CSTBuilder:
         Returns:
             list: All function names of changed tests
         """
-
         tests_old = self._extract_test_fname(self._parse(pr_file_diff.before))
         tests_new = self._extract_test_fname(self._parse(pr_file_diff.after))
 
@@ -126,12 +125,6 @@ class CSTBuilder:
         if tree is not None:
             mod_test_item: Node | None = self._get_mod_test_node(tree.root_node)
 
-            # for root_child in tree.root_node.children:
-            #     if root_child.type == "mod_item" and self._get_node_name(root_child).strip() == "tests":
-            #         print(f"node name: {self._get_node_name(root_child)}")
-            #         mod_test_item = root_child
-            #         break
-
             if not mod_test_item:
                 print(
                     "No 'mod tests' module found, creating one at the end of the file."
@@ -139,7 +132,7 @@ class CSTBuilder:
                 test_block = self._create_test_block(new_test, imports)
                 return "\n".join([file_content, test_block])
 
-            # if a mod tests already exists, I need to walk it
+            # if a mod tests already exists, walk it
             declaration_list = next(
                 (
                     child
@@ -226,7 +219,6 @@ class CSTBuilder:
                 )
                 + "\n"
             )
-            print(f"Indented new imports:\n{indented_new_imports}")
             last_func_line_content = lines[last_func_line]
             func_indentation = len(last_func_line_content) - len(
                 last_func_line_content.lstrip()
@@ -262,209 +254,16 @@ class CSTBuilder:
         )
         return test_block
 
-    def _build_changed_lines_scope_map(
-        self, before: str, after: str, diff: str
-    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-        """
-        Extracts added and removed lines from diff and retrieves the scope for each of those lines.
-
-        Parameters:
-            before (str): The code before the patch
-            after (str): The code after the patch
-            diff (str): The diff between the before and after
-
-        Returns:
-            list: Mapping of each line before to its scope
-            list: Mapping of each line after to its scope
-        """
-
-        def _build_line_scope_map(tree: Tree) -> dict[int, str]:
-            line_scope_map: dict[int, str] = {}
-
-            def _add_scope(node: Node, scope_name: str) -> None:
-                if any(
-                    [
-                        node.start_point is None,
-                        node.end_point is None,
-                        node.start_point[0] is None,
-                        node.end_point[0] is None,
-                    ]
-                ):
-                    return
-
-                start_line = node.start_point[0] + 1
-                end_line = node.end_point[0] + 1
-                for ln in range(start_line, end_line + 1):
-                    line_scope_map[ln] = scope_name
-
-            def _handle_decorators(node: Node, scope_name: str) -> None:
-                prev = node.prev_sibling
-                if prev:
-                    txt = prev.text.decode("utf-8")
-                    # Handle decorators and JSDocs
-                    if all(
-                        [
-                            (txt.startswith("@") or txt.startswith("/**")),
-                            node.start_point[0] - 1 == prev.end_point[0],
-                        ]
-                    ):
-                        _add_scope(prev, scope_name)
-                        _handle_decorators(prev, scope_name)
-
-            def _visit_body(node: Node, scope_name: str) -> None:
-                for child in self._get_node_body(node):
-                    _visit_node(child, scope_name)
-
-            def _visit_node(node: Node, scope_name: str = "global") -> None:
-
-                if node.type == "mod_item":
-                    new_scope = self._get_node_name(node, "<module>")
-                    scope_name = f"{scope_name}:{new_scope}"  # concatenate with colon for modules
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, scope_name)
-
-                elif node.type == "function_item":
-                    new_scope = self._get_node_name(node, "<function>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}.{new_scope}"  # concatenate with dot for functions
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "attribute_item":
-                    new_scope = self._get_node_name(node, "<attribute>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "macro_definition":
-                    new_scope = self._get_node_name(node, "<macro>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "inner-attribute_item":
-                    new_scope = self._get_node_name(node, "<inner-attribute>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "struct_item":
-                    new_scope = self._get_node_name(node, "<struct>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "impl_item":
-                    new_scope = self._get_node_name(node, "<impl>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "enum_item":
-                    new_scope = self._get_node_name(node, "<enum>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "use_declaration":
-                    new_scope = self._get_node_name(node, "<attribute>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                elif node.type == "static_item":
-                    new_scope = self._get_node_name(node, "<attribute>")
-                    if scope_name != "global":
-                        new_scope = f"{scope_name}:{new_scope}"  # concatenate with colon for classes
-
-                    _handle_decorators(node, scope_name)
-                    _add_scope(node, scope_name)
-                    _visit_body(node, new_scope)
-
-                else:
-                    if any(
-                        [
-                            node.start_point is None,
-                            node.end_point is None,
-                            node.start_point[0] is None,
-                            node.end_point[0] is None,
-                            all(
-                                [
-                                    scope_name == "global",
-                                    node.type == "comment",
-                                    not node.text.decode("utf-8").startswith("/**"),
-                                ]
-                            ),
-                        ]
-                    ):
-                        pass
-                    else:
-                        _add_scope(node, scope_name)
-
-            for root_child in tree.root_node.children:
-                _visit_node(root_child)
-
-            # print("--- Line Scope Map ---")
-            # print(line_scope_map)
-
-            # print("--- Diff ---")
-            # print(diff)
-            return line_scope_map
-
-        # extract all the added and removed lines from the diff together with their line numbers
-        added, removed = self._get_added_removed_lines(diff)
-
-        tree_after = self._parse(after)
-        after_map: list[dict[str, str]] = []
-        if tree_after is not None:
-            line_scope_map_after = _build_line_scope_map(tree_after)
-            for added_line_number, added_line_text in added:
-                scope = line_scope_map_after.get(added_line_number, "global")
-                after_map.append({added_line_text: scope})
-
-        tree_before = self._parse(before)
-        before_map: list[dict[str, str]] = []
-        if tree_before is not None:
-            line_scope_map_before = _build_line_scope_map(tree_before)
-            for removed_line_number, removed_line_text in removed:
-                scope = line_scope_map_before.get(removed_line_number, "global")
-                before_map.append({removed_line_text: scope})
-
-        return before_map, after_map
-
     def _get_mod_test_node(self, node: Node) -> Node | None:
         """Extract the tests module of a rust file"""
+        passed_children = 0
         for child in node.named_children:
             if (
                 child.type == "mod_item"
                 and self._get_node_name(child).strip() == "tests"
             ):
                 return child
+            passed_children += 1
 
         return None
 
@@ -533,153 +332,153 @@ class CSTBuilder:
 
         return added, removed
 
-    def _slice_rust_code(
-        self, source_code: str, global_funcs: list[str], class2methods: dict
-    ) -> str:
-        """
-        Returns a 'sliced' version of the given source code, preserving
-        original whitespace (and optionally annotating lines with original line numbers).
+    # def _slice_rust_code(
+    #     self, source_code: str, global_funcs: list[str], class2methods: dict
+    # ) -> str:
+    #     """
+    #     Returns a 'sliced' version of the given source code, preserving
+    #     original whitespace (and optionally annotating lines with original line numbers).
 
-        The resulting code includes:
-            1. All global variables (including import statements).
-            2. Global functions whose names are in `global_funcs`.
-            3. Classes (defined in the global scope) whose names are keys in `class_methods`.
-                For each kept class:
-                    - Keep all class-level assignments (properties).
-                    - Keep the constructor (constructor()) if defined.
-                    - Keep only the methods listed in class_methods[class_name].
-                    - Keep JSDocs (which appear outside of class).
-                    - Keep nested classes
+    #     The resulting code includes:
+    #         1. All global variables (including import statements).
+    #         2. Global functions whose names are in `global_funcs`.
+    #         3. Classes (defined in the global scope) whose names are keys in `class_methods`.
+    #             For each kept class:
+    #                 - Keep all class-level assignments (properties).
+    #                 - Keep the constructor (constructor()) if defined.
+    #                 - Keep only the methods listed in class_methods[class_name].
+    #                 - Keep JSDocs (which appear outside of class).
+    #                 - Keep nested classes
 
-        Parameters:
-            source_code (str): The source code to slice
-            global_funcs (list): The functions with a 'global' scope
-            class2methods (dict): Holds which methods belong to a class
+    #     Parameters:
+    #         source_code (str): The source code to slice
+    #         global_funcs (list): The functions with a 'global' scope
+    #         class2methods (dict): Holds which methods belong to a class
 
-        Returns:
-            str: The sliced source code
-        """
+    #     Returns:
+    #         str: The sliced source code
+    #     """
 
-        tree = self._parse(source_code)
-        lines_to_skip: set[int] = set()
-        source_lines = source_code.splitlines(keepends=True)
+    #     tree = self._parse(source_code)
+    #     lines_to_skip: set[int] = set()
+    #     source_lines = source_code.splitlines(keepends=True)
 
-        def _is_jsdoc(node: Node) -> bool:
-            return node.type == "comment" and node.text.decode("utf-8").startswith(
-                "/**"
-            )
+    #     def _is_jsdoc(node: Node) -> bool:
+    #         return node.type == "comment" and node.text.decode("utf-8").startswith(
+    #             "/**"
+    #         )
 
-        def _skip_lines(start: int, end: int) -> None:
-            for ln in range(start, end + 1):
-                lines_to_skip.add(ln)
+    #     def _skip_lines(start: int, end: int) -> None:
+    #         for ln in range(start, end + 1):
+    #             lines_to_skip.add(ln)
 
-        def _keep_lines(start: int, end: int) -> None:
-            lines_to_skip.difference_update(list(range(start, end + 1)))
+    #     def _keep_lines(start: int, end: int) -> None:
+    #         lines_to_skip.difference_update(list(range(start, end + 1)))
 
-        def _keep_top_level_node(node: Node) -> bool:
-            # print(f"Top-level node type: {node.type}")
-            if node.type == "mod_item":
-                return True
-            if node.type == "function_item":
-                return True
-            if node.type == "attribute_item":
-                return True
-            if node.type in {"variable_declaration", "lexical_declaration"}:
-                return True
-            if node.type == "use_declaration":
-                return self._get_node_name(node) in global_funcs
-            if node.type == "class_declaration":
-                return self._get_node_name(node) in class2methods
-            if node.type == "comment":
-                return not _is_jsdoc(node)
-            return False
+    #     def _keep_top_level_node(node: Node) -> bool:
+    #         # print(f"Top-level node type: {node.type}")
+    #         if node.type == "mod_item":
+    #             return True
+    #         if node.type == "function_item":
+    #             return True
+    #         if node.type == "attribute_item":
+    #             return True
+    #         if node.type in {"variable_declaration", "lexical_declaration"}:
+    #             return True
+    #         if node.type == "use_declaration":
+    #             return self._get_node_name(node) in global_funcs
+    #         if node.type == "class_declaration":
+    #             return self._get_node_name(node) in class2methods
+    #         if node.type == "comment":
+    #             return not _is_jsdoc(node)
+    #         return False
 
-        def _keep_class_child(node: Node, class_name: str) -> bool:
-            if node.type in {
-                "variable_declaration",
-                "lexical_declaration",
-                "field_definition",
-            }:
-                return True
-            if node.type == "comment":
-                return not _is_jsdoc(node)
-            if node.type == "method_definition":
-                if self._get_node_name(node) == "constructor":
-                    return True
-                allowed_list = [
-                    method_name.split(".") for method_name in class2methods[class_name]
-                ]
-                if any(
-                    self._get_node_name(node) in sublist for sublist in allowed_list
-                ):
-                    return True
-            return False
+    #     def _keep_class_child(node: Node, class_name: str) -> bool:
+    #         if node.type in {
+    #             "variable_declaration",
+    #             "lexical_declaration",
+    #             "field_definition",
+    #         }:
+    #             return True
+    #         if node.type == "comment":
+    #             return not _is_jsdoc(node)
+    #         if node.type == "method_definition":
+    #             if self._get_node_name(node) == "constructor":
+    #                 return True
+    #             allowed_list = [
+    #                 method_name.split(".") for method_name in class2methods[class_name]
+    #             ]
+    #             if any(
+    #                 self._get_node_name(node) in sublist for sublist in allowed_list
+    #             ):
+    #                 return True
+    #         return False
 
-        def _handle_decorators(node: Node) -> None:
-            prev = node.prev_sibling
-            if prev:
-                txt = prev.text.decode("utf-8")
-                if all(
-                    [
-                        (txt.startswith("@") or txt.startswith("/**")),
-                        node.start_point[0] - 1 == prev.end_point[0],
-                    ]
-                ):
-                    _mark_lines(prev, True)
-                    _handle_decorators(prev)
+    #     def _handle_decorators(node: Node) -> None:
+    #         prev = node.prev_sibling
+    #         if prev:
+    #             txt = prev.text.decode("utf-8")
+    #             if all(
+    #                 [
+    #                     (txt.startswith("@") or txt.startswith("/**")),
+    #                     node.start_point[0] - 1 == prev.end_point[0],
+    #                 ]
+    #             ):
+    #                 _mark_lines(prev, True)
+    #                 _handle_decorators(prev)
 
-        def _mark_lines(node: Node, keep: bool) -> None:
-            if any(
-                [
-                    node.start_point is None,
-                    node.end_point is None,
-                    node.start_point[0] is None,
-                    node.end_point[0] is None,
-                ]
-            ):
-                return
+    #     def _mark_lines(node: Node, keep: bool) -> None:
+    #         if any(
+    #             [
+    #                 node.start_point is None,
+    #                 node.end_point is None,
+    #                 node.start_point[0] is None,
+    #                 node.end_point[0] is None,
+    #             ]
+    #         ):
+    #             return
 
-            start_line = node.start_point[0] + 1
-            end_line = node.end_point[0] + 1
-            if keep:
-                _keep_lines(start_line, end_line)
-            else:
-                _skip_lines(start_line, end_line)
-                return
+    #         start_line = node.start_point[0] + 1
+    #         end_line = node.end_point[0] + 1
+    #         if keep:
+    #             _keep_lines(start_line, end_line)
+    #         else:
+    #             _skip_lines(start_line, end_line)
+    #             return
 
-            if node.type in {
-                "mod_item",
-                "function_item",
-                "method_definition",
-            }:
-                _handle_decorators(node)
-            if node.type == "mod_item":
-                for child in self._get_node_body(node):
-                    child_keep = _keep_class_child(child, self._get_node_name(node))
-                    _mark_lines(child, child_keep)
+    #         if node.type in {
+    #             "mod_item",
+    #             "function_item",
+    #             "method_definition",
+    #         }:
+    #             _handle_decorators(node)
+    #         if node.type == "mod_item":
+    #             for child in self._get_node_body(node):
+    #                 child_keep = _keep_class_child(child, self._get_node_name(node))
+    #                 _mark_lines(child, child_keep)
 
-        if tree is not None:
-            for root_child in tree.root_node.children:
-                keep_flag = _keep_top_level_node(root_child)
-                _mark_lines(root_child, keep_flag)
+    #     if tree is not None:
+    #         for root_child in tree.root_node.children:
+    #             keep_flag = _keep_top_level_node(root_child)
+    #             _mark_lines(root_child, keep_flag)
 
-            result_lines = []
-            for i, original_line in enumerate(source_lines, start=1):
-                if i not in lines_to_skip:
-                    stripped_line = original_line.rstrip("\n")
-                    annotated_line = f"{i} {stripped_line}\n"
-                    result_lines.append(annotated_line)
+    #         result_lines = []
+    #         for i, original_line in enumerate(source_lines, start=1):
+    #             if i not in lines_to_skip:
+    #                 stripped_line = original_line.rstrip("\n")
+    #                 annotated_line = f"{i} {stripped_line}\n"
+    #                 result_lines.append(annotated_line)
 
-            # print("--- REsult lines ---")
-            # print(result_lines)
-            # print("--- End Result lines ---")
+    #         # print("--- REsult lines ---")
+    #         # print(result_lines)
+    #         # print("--- End Result lines ---")
 
-            res = "".join(result_lines)
-            res_cln = self._filter_stray_decorators(res)
-            res_cln = re.sub(r"(^\d+ \n)(\d+ \n)+", r"\1", res_cln, flags=re.MULTILINE)
-            return res_cln
+    #         res = "".join(result_lines)
+    #         res_cln = self._filter_stray_decorators(res)
+    #         res_cln = re.sub(r"(^\d+ \n)(\d+ \n)+", r"\1", res_cln, flags=re.MULTILINE)
+    #         return res_cln
 
-        return ""
+    #     return ""
 
     @staticmethod
     def _build_function_class_maps(function_list: list[str]) -> list[dict[str, str]]:
@@ -722,7 +521,10 @@ class CSTBuilder:
             dict: A mapping of call expressions to their scopes and content
         """
         test_node = self._get_mod_test_node(tree.root_node)
-        assert test_node
+        if test_node is None:
+            return {}
+
+        assert isinstance(test_node, Node)
         declaration_list = next(
             (
                 child
@@ -945,12 +747,3 @@ class CSTBuilder:
 
         identifier = node.child_by_field_name("name")
         return identifier.text.decode("utf-8") if identifier else fallback
-        """
-        Returns the call expression of an expression statement.
-
-        Parameters:
-            node (Node): The node to extract the call expression from
-
-        Returns:
-            Node: The call expression
-        """
