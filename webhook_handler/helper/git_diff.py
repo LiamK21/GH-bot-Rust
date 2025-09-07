@@ -53,11 +53,38 @@ def unified_diff(
     diff = difflib.unified_diff(
         lines1, lines2, fromfile=fromfile, tofile=tofile, n=context_lines
     )
+    diff = _normalize_patch(list(diff))
 
     git_header = f"diff --git {fromfile} {tofile}\n"
 
     # Print the diff
     return git_header + "".join(diff)
+
+
+def _normalize_patch(diff_lines: list[str]) -> list[str]:
+    """
+    Normalize a unified diff so that 'remove + re-add of the same line with insertions'
+    becomes a pure insertion before the unchanged line.
+
+    Parameters:
+        diff_lines (list): List of lines in the diff.
+
+    Returns:
+        list: Normalized list of diff lines.
+    """
+    new_diff: list[str] = []
+    removed_closing_brace = False
+
+    for line in diff_lines:
+        if line.startswith("-}"):
+            removed_closing_brace = True
+            continue
+        elif line.startswith("+}") and removed_closing_brace:
+            new_diff.append(" }")
+        else:
+            new_diff.append(line)
+
+    return new_diff
 
 
 def unified_diff_with_function_context(
