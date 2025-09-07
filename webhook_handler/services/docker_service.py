@@ -100,7 +100,7 @@ class DockerService:
                                 container.stop()
                             container.remove()
                         except APIError as stop_err:
-                            print(
+                            logger.error(
                                 f"Failed to remove container {container.id[:12]}: {stop_err}"
                             )
                 try:
@@ -119,7 +119,6 @@ class DockerService:
         self,
         test_patch: str,
         tests_to_run: list,
-        file_diff: PullRequestFileDiff,
         golden_code_patch: str | None = None,
     ) -> TestResult:
         """
@@ -135,7 +134,6 @@ class DockerService:
             bool: True if the test has passed, False otherwise
             str: The output from running the test
         """
-        patch_file_path: str = ""
         container: Container | None = None
         try:
             logger.marker("Creating container...")  # type: ignore[attr-defined]
@@ -152,59 +150,24 @@ class DockerService:
             self._handle_newly_added_files(test_patch, container)
 
             #### A) Test patch (Always)
-            patch_result = self._add_file_and_apply_patch_in_container(
-                container, test_patch
-            )
-            if isinstance(patch_result, tuple):
-                return patch_result
-            patch_file_path = patch_result
+            self._add_file_and_apply_patch_in_container(container, test_patch)
             if golden_code_patch is not None:
                 #### B) Model patch (Only in post-PR code)
-                patch_result = self._add_file_and_apply_patch_in_container(
-                    container, golden_code_patch, is_golden_patch=True
+                self._add_file_and_apply_patch_in_container(
+                    container,
+                    golden_code_patch,
+                    is_golden_patch=True,
                 )
-                if isinstance(patch_result, tuple):
-                    return patch_result
-
-                patch_file_path = patch_result
 
             logger.marker("Tests to run: %s" % ", ".join(tests_to_run))  # type: ignore[attr-defined]
-            # Run the test command
-            coverage_report_separator: str = "COVERAGE_REPORT_STARTING_HERE"
+
             test_command: str = (
                 "/bin/sh -c 'cd /app/testbed && "
-                f"cargo test -- --nocapture " + " ".join(tests_to_run) + " ; "
-                "coverage report -m > coverage_report.txt && "
-                f"echo '{coverage_report_separator}' && "
-                "cat coverage_report.txt'"
+                f"cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
             )
             exec_result = container.exec_run(test_command, stdout=True, stderr=True)
-            stdout_output_all = exec_result.output.decode()
-            stdout = ""
-            test_result: bool = False
-            try:  # TODO: fix, find a better way to handle the "test-not-ran" error
-                stdout, coverage_report = stdout_output_all.split(
-                    coverage_report_separator
-                )
-            except:
-                test_result = False
-                logger.warning(
-                    "Internal error: docker command failed with: %s" % stdout_output_all
-                )
-                return test_result, stdout_output_all
-            logger.info("[+] Test command executed.")
-
-            # Determine PASS/FAIL from output
-            if (
-                "= FAILURES =" in stdout or "= ERRORS =" in stdout
-            ):  # if at least one test failed, we consider it a failure
-                test_result = (
-                    False  # because we may run one AI test with many developer tests
-                )
-            else:
-                test_result = True
-
-            logger.info(f"[+] Test result: {test_result}")
+            stdout = exec_result.output.decode()
+            test_result = self._evaluate_test(stdout)
             return test_result, stdout
 
         except ImageNotFound as e:
@@ -213,16 +176,18 @@ class DockerService:
         except APIError as e:
             logger.critical(f"Docker API error: {e}")
             raise ExecutionError("Docker API error")
+        except GoldenCodePatchApplicationError:
+            raise GoldenCodePatchApplicationError()
         except Exception as e:
             logger.critical(f"Unexpected error: {e}")
             raise ExecutionError("Unexpected Docker error")
         finally:
             # Cleanup
-            os.remove(patch_file_path)
+            # os.remove(patch_file_path)
             if container is not None:
                 container.stop()
                 container.remove()
-            logger.info("[*] Container stopped and removed.")
+                logger.info("[*] Container stopped and removed.")
 
     def _handle_newly_added_files(self, patch: str, container: Container) -> set[str]:
         """Finds and creates files only if their patch chunk starts with '@@ -0,0 +'."""
@@ -273,8 +238,10 @@ class DockerService:
 
     @staticmethod
     def _add_file_and_apply_patch_in_container(
-        container: Container, patch: str, is_golden_patch: bool = False
-    ) -> TestResult | str:
+        container: Container,
+        patch: str,
+        is_golden_patch: bool = False,
+    ) -> None:
         """
         Adds file to Docker container.
 
@@ -302,18 +269,64 @@ class DockerService:
         try:
             # Copy the tar archive to the container
             container.put_archive("/app/testbed", tar_stream.read())
-            logger.marker(f"File {file_path} added to container successfully")  # type: ignore[attr-defined]
+            logger.marker(f"File {patch_file_path} added to container successfully")  # type: ignore[attr-defined]
         except APIError as e:
             logger.critical(f"Docker API error: {e}")
             raise ExecutionError("Docker API error")
 
-        # Apply the patch inside the container
+        DockerService._apply_patch_in_container(
+            container, patch_fname
+        )
+
+    @staticmethod
+    def _apply_patch_in_container(
+        container: Container, patch_fname: str
+    ) -> None:
+        """
+        Applies a patch file inside the Docker container.
+
+        Parameters:
+            container (Container): Container to apply the patch in
+            patch_fname (str): Name of the patch file inside the container
+        """
+        logger.marker("[+] Applying patch")  # type: ignore[attr-defined]
         apply_patch_cmd = f"/bin/sh -c 'cd /app/testbed && git apply {patch_fname}'"
+
         exec_result = container.exec_run(apply_patch_cmd)
 
         if exec_result.exit_code != 0:
-            logger.info(f"[!] Failed to apply patch: {exec_result.output.decode()}")
-            return False, exec_result.output.decode()
+            logger.warning(f"[!] Failed to apply patch: {exec_result.output.decode()}")
+            raise GoldenCodePatchApplicationError()
 
         logger.info("[+] Patch applied successfully.")
-        return patch_file_path
+
+    @staticmethod
+    def _evaluate_test(stdout: str) -> bool:
+        """
+        Evaluates the test result from the stdout.
+
+        Parameters:
+            stdout (str): The stdout from running the test command
+
+        Returns:
+            bool: True if the test has passed, False otherwise
+        """
+        logger.info("[+] Test command executed.")
+        test_result: bool = False
+
+        # Determine matches that indicate test results
+        # Could not compile errors:
+        compilation_error_pattern = re.compile(r"could not compile", re.IGNORECASE)
+        # Failed tests: test <test_name> ... FAILED
+        test_failed_pattern = re.compile(r"test\s+\S+\s+\.\.\.\s+FAILED", re.IGNORECASE)
+
+        compilation_error_matches = compilation_error_pattern.findall(stdout)
+        test_failed_matches = test_failed_pattern.findall(stdout)
+
+        if compilation_error_matches or test_failed_matches:
+            test_result = False
+        else:
+            test_result = True
+
+        logger.info(f"[+] Test result: {test_result}")
+        return test_result
