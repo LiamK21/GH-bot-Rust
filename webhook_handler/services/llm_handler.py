@@ -1,3 +1,4 @@
+import logging
 import re
 
 from groq import Groq
@@ -6,6 +7,8 @@ from openai import OpenAI
 from webhook_handler.helper import templates
 from webhook_handler.models import LLM, PipelineInputs
 from webhook_handler.services.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class LLMHandler:
@@ -207,53 +210,39 @@ class LLMHandler:
             str: Postprocessed response
         """
         cleaned_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
-        if cleaned_response.strip() == "<NO>":
+
+        # Check for <NO> tag
+        no_test_generated = re.search(r"<NO>", cleaned_response)
+        if no_test_generated:
+            logger.info("Model determined no test is needed.")
+            logger.marker("=============== Test Generation Finished ==============")  # type: ignore[attr-defined]
             return None
-        lines = cleaned_response.splitlines()
+
         # Extract filename
-        filename, cleaned_response = lines[0].strip(), lines[1:]
-        if not filename.startswith("<Filename>") or not filename.endswith(
-            "</Filename>"
-        ):
+        filename_pattern = re.compile(r"<Filename>(.*?)</Filename>", re.DOTALL)
+        filename_match = filename_pattern.search(cleaned_response)
+        if not filename_match:
             raise Exception("Filename not found in response")
-        filename = filename.lstrip("<Filename>").rstrip("</Filename>").strip()
+        filename: str = filename_match.group(1).strip()
 
         # Extract imports
+        imports_pattern = re.compile(r"<imports>(.*?)</imports>", re.DOTALL)
+        imports_match = imports_pattern.search(cleaned_response)
         imports: list[str] = []
-        imports_starting_idx = next(
-            (
-                idx
-                for idx, val in enumerate(cleaned_response)
-                if val.strip() == "<imports>"
-            ),
-            None,
-        )
-        imports_ending_idx = next(
-            (
-                idx
-                for idx, val in enumerate(cleaned_response)
-                if val.strip() == "</imports>"
-            ),
-            None,
-        )
-        if imports_starting_idx is not None and imports_ending_idx is not None:
-            imports.extend(
-                val
-                for val in cleaned_response[
-                    imports_starting_idx + 1 : imports_ending_idx
-                ]
-                if val.strip()
-            )
-            cleaned_test = "\n".join(cleaned_response[imports_ending_idx + 1 :])
-        else:
-            cleaned_test = "\n".join(cleaned_response)
+        if imports_match:
+            imports = [
+                line.strip()
+                for line in imports_match.group(1).strip().splitlines()
+                if line.strip()
+            ]
 
-        # Extract test
-        cleaned_test = cleaned_test.replace("'''rust", "")
-        cleaned_test = cleaned_test.replace("```rust", "")
-        cleaned_test = cleaned_test.replace("'''", "")
-        cleaned_test = cleaned_test.lstrip("\n")
-        cleaned_test = self._clean_descriptions(cleaned_test)
+        # Extract test code
+        code_pattern = re.compile(r"<Rust>(.*?)</Rust>", re.DOTALL)
+        code_match = code_pattern.search(cleaned_response)
+        if not code_match:
+            raise Exception("Test code not found in response")
+        cleaned_test = code_match.group(1).strip()
+
         return filename, imports, self._adjust_function_indentation(cleaned_test)
 
     @staticmethod
