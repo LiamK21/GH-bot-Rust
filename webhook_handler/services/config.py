@@ -113,7 +113,6 @@ class Config:
         ), "PR log directory must be set before setting up output directory."
         self.output_dir = Path(self.pr_log_dir, "i%s" % (i_attempt + 1) + "_%s" % model)
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.output_dir, "generation").mkdir(parents=True)
         self.curr_attempt += 1
 
     def _teardown(self) -> None:
