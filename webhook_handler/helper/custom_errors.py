@@ -15,9 +15,3 @@ class ExecutionError(Exception):
 
     def __init__(self, message: str = "An error occurred during execution") -> None:
         super().__init__(message)
-
-class GoldenCodePatchApplicationError(Exception):
-    """Raised whenever an error occurs during the application of the golden code patch"""
-
-    def __init__(self) -> None:
-        super().__init__("Failed to apply patch")
