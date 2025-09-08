@@ -62,10 +62,13 @@ def run_command(command: str, cwd: str) -> str | None:
     result = subprocess.run(
         command, cwd=cwd, shell=True, text=True, capture_output=True
     )
+    if result.returncode != 0:
+        logger.error(f"Command failed: {command}")
+        logger.error(f"stderr: {result.stderr}")
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def get_candidate_file(base_commit: str, filename: str, tmp_repo_dir: str) -> str:
+def get_candidate_file(commit_hash: str, filename: str, tmp_repo_dir: str) -> str:
     """
     Finds a fitting test file and its content to inject the newly generated test into.
 
@@ -79,16 +82,15 @@ def get_candidate_file(base_commit: str, filename: str, tmp_repo_dir: str) -> st
         bool: if the file is from the base commit
     """
     current_branch = run_command("git rev-parse --abbrev-ref HEAD", cwd=tmp_repo_dir)
-    run_command(f"git checkout {base_commit}", cwd=tmp_repo_dir)
+    run_command(f"git checkout {commit_hash}", cwd=tmp_repo_dir)
 
     file_content = ""
     file_path = Path(tmp_repo_dir, filename)
-    if not file_path.exists():
-        run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
-        return ""
-
-    logger.marker(f"File {filename} exists in base commit {base_commit}")  # type: ignore[attr-defined]
-    file_content = file_path.read_text(encoding="utf-8")
+    if file_path.exists():
+        logger.marker(f"File {filename} exists in commit {commit_hash}")  # type: ignore[attr-defined]
+        file_content = file_path.read_text(encoding="utf-8")
+    else:
+        logger.marker(f"File {filename} does not exist in commit {commit_hash}")  # type: ignore[attr-defined]
 
     run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
 
