@@ -1,9 +1,7 @@
 import io
-import json
 import logging
 import os
 import re
-import shlex
 import tarfile
 import tempfile
 from pathlib import Path
@@ -14,7 +12,7 @@ from docker.models.containers import Container
 from docker.models.images import Image
 
 from webhook_handler.helper.custom_errors import *
-from webhook_handler.models import PullRequestData, PullRequestFileDiff
+from webhook_handler.models import PullRequestData
 
 logger = logging.getLogger(__name__)
 
@@ -117,18 +115,17 @@ class DockerService:
 
     def run_test_in_container(
         self,
-        test_patch: str,
+        patch: str,
         tests_to_run: list,
-        golden_code_patch: str | None = None,
+        is_golden_patch: bool,
     ) -> TestResult:
         """
         Creates a container, applies the patch, runs the test, and returns the result.
 
         Parameters:
-            test_patch (str): Patch to apply to the model test
+            patch (str): Patch to apply
             tests_to_run (list): List of tests to run
-            added_test_file (str): Path to the file to add to the added tests
-            golden_code_patch (str): Patch content for source code
+            is_test_patch (bool): Flag indicating if the patch is a test patch or a golden code patch
 
         Returns:
             bool: True if the test has passed, False otherwise
@@ -147,17 +144,12 @@ class DockerService:
             logger.marker(f"Container {container.short_id} started")  # type: ignore[attr-defined]
 
             # Create placeholder empty files for PRs that add new files
-            self._handle_newly_added_files(test_patch, container)
+            self._handle_newly_added_files(patch, container)
 
-            #### A) Test patch (Always)
-            self._add_file_and_apply_patch_in_container(container, test_patch)
-            if golden_code_patch is not None:
-                #### B) Model patch (Only in post-PR code)
-                self._add_file_and_apply_patch_in_container(
-                    container,
-                    golden_code_patch,
-                    is_golden_patch=True,
-                )
+            # Add the patch file to the container and apply it
+            self._add_file_and_apply_patch_in_container(
+                container, patch, is_golden_patch
+            )
 
             logger.marker("Tests to run: %s" % ", ".join(tests_to_run))  # type: ignore[attr-defined]
 
@@ -176,8 +168,6 @@ class DockerService:
         except APIError as e:
             logger.critical(f"Docker API error: {e}")
             raise ExecutionError("Docker API error")
-        except GoldenCodePatchApplicationError:
-            raise GoldenCodePatchApplicationError()
         except Exception as e:
             logger.critical(f"Unexpected error: {e}")
             raise ExecutionError("Unexpected Docker error")
@@ -247,8 +237,8 @@ class DockerService:
 
         Parameters:
             container (Container): Container to add file to
-            file_path (str): Path to the file to add to the container
-            file_content (str | bytes, optional): Content to add to the file
+            patch (str): Patch to add to the container and apply
+            is_golden_patch (bool): Flag to indicate if the patch is a golden code patch or not
         """
         # Create a temporary patch file
         with tempfile.NamedTemporaryFile(delete=False, mode="w") as patch_file:
@@ -274,14 +264,10 @@ class DockerService:
             logger.critical(f"Docker API error: {e}")
             raise ExecutionError("Docker API error")
 
-        DockerService._apply_patch_in_container(
-            container, patch_fname
-        )
+        DockerService._apply_patch_in_container(container, patch_fname)
 
     @staticmethod
-    def _apply_patch_in_container(
-        container: Container, patch_fname: str
-    ) -> None:
+    def _apply_patch_in_container(container: Container, patch_fname: str) -> None:
         """
         Applies a patch file inside the Docker container.
 
@@ -296,7 +282,7 @@ class DockerService:
 
         if exec_result.exit_code != 0:
             logger.warning(f"[!] Failed to apply patch: {exec_result.output.decode()}")
-            raise GoldenCodePatchApplicationError()
+            raise ExecutionError()
 
         logger.info("[+] Patch applied successfully.")
 
