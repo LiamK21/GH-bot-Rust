@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-type Repo = Literal["grcov", "rust_code_analysis"]
+type Repo = Literal["grcov", "rust-code-analysis"]
 
 class FileType(StrEnum):
     TEST = "test"
@@ -67,15 +67,8 @@ def _fetch_pr_list(curr_page: int, repo: Repo) -> dict:
     Returns:
         dict: PR list.
     """
-    url_repo: str = ""
-    
-    if repo == "rust_code_analysis":
-        url_repo = "rust-code-analysis"
-    else:
-        url_repo = repo
-
     list_url = (
-        f"{API_URL}/{OWNER}/{url_repo}/pulls"
+        f"{API_URL}/{OWNER}/{repo}/pulls"
         f"?state=all&sort=created&direction=desc"
         f"&per_page=100&page={curr_page}"
     )
@@ -91,7 +84,7 @@ def _fetch_pr_files(pr_number: int, repo: Repo) -> dict:
 
     Returns:
         dict: All files modified in that PR.
-    """
+    """ 
 
     url = f"{API_URL}/{OWNER}/{repo}/pulls/{pr_number}/files"
     return _fetch_github_data(url)
@@ -257,9 +250,12 @@ def _process_pr(curr_pr: dict, repo: Repo) -> bool:
     Returns:
         bool: True if PR fulfills requirements, False otherwise.
     """
-    valid_payloads = next(v for k, v in globals().items() if k == f"valid_{repo}_payloads")
-    valid_payloads_amp = next(v for k, v in globals().items() if k == f"valid_{repo}_payloads_amp")
-
+    if repo == "grcov":
+        global valid_grcov_payloads
+        global valid_grcov_payloads_amp
+    else:
+        global valid_rust_code_analysis_payloads
+        global valid_rust_code_analysis_payloads_amp
 
     pr_number = curr_pr["number"]
     print(f"[*] Processing PR #{pr_number}...")
@@ -309,10 +305,12 @@ def _process_pr(curr_pr: dict, repo: Repo) -> bool:
     # Requirement #4: PR must modify at least one .rs file
     if "src" in file_types:
         if "test" in file_types:
-            valid_payloads_amp += 1
+            valid_grcov_payloads_amp += 1 if repo == "grcov" else 0
+            valid_rust_code_analysis_payloads_amp += 1 if repo == "rust-code-analysis" else 0
             _save_pr_amp(current_payload, repo)
         else:
-            valid_payloads += 1
+            valid_grcov_payloads_amp += 1 if repo == "grcov" else 0
+            valid_rust_code_analysis_payloads_amp += 1 if repo == "rust-code-analysis" else 0
             _save_pr(current_payload, repo)
         return True
     else:
@@ -333,20 +331,22 @@ page = 1
 if __name__ == "__main__":
     while (valid_grcov_payloads + valid_rust_code_analysis_payloads) < SCRAPE_TARGET:
         pr_list_grcov = _fetch_pr_list(page, "grcov")
-        pr_list_rust_code_analysis = _fetch_pr_list(page, "rust_code_analysis")
+        pr_list_rust_code_analysis = _fetch_pr_list(page, "rust-code-analysis")
         if not pr_list_grcov and not pr_list_rust_code_analysis:
+            print("[*] No PRs to process")
             break
 
         for pr in pr_list_grcov:
             if _process_pr(pr, "grcov") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
                 break
+        print("Processing rust-code-analysis PRs...")
         for pr in pr_list_rust_code_analysis:
-            if _process_pr(pr, "rust_code_analysis") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
+            if _process_pr(pr, "rust-code-analysis") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
                 break
 
         page += 1
 
-    print(f"[+] Found {valid_grcov_payloads} valid payloads")
-    print(f"[+] Found {valid_rust_code_analysis_payloads} valid payloads")
-    print(f"[+] Found {valid_grcov_payloads_amp} valid payloads with test files\n")
-    print(f"[+] Found {valid_rust_code_analysis_payloads_amp} valid payloads with test files\n")
+    print(f"[+] Found {valid_grcov_payloads} valid grcov payloads")
+    print(f"[+] Found {valid_rust_code_analysis_payloads} valid rust-code-analysis payloads")
+    print(f"[+] Found {valid_grcov_payloads_amp} valid grcov payloads with integration test files\n")
+    print(f"[+] Found {valid_rust_code_analysis_payloads_amp} valid rust-code-analysis payloads with integration test files\n")
