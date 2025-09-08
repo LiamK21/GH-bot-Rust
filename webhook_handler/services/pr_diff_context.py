@@ -1,6 +1,7 @@
 import logging
 from typing import cast
 
+from webhook_handler.helper import git_diff
 from webhook_handler.models import PullRequestFileDiff
 from webhook_handler.services.gh_service import GitHubService
 
@@ -105,28 +106,23 @@ class PullRequestDiffContext:
             modified_functions.extend(pr_file_diff.get_modified_functions(patch))
         return patch, modified_functions
 
-    def remove_tests_from_code_before(self) -> list[str]:
+    def get_updated_golden_code_patch(self, filename: str, content: str) -> str:
         """
-        Removes all test functions/classes from the code before the PR changes.
+        Returns the golden code patch for all files except the passed one.
+        It uses the provided content for the passed file instead of the original "before" content.
 
         Returns:
-            list[str]: List of code files with test functions/classes removed
+            str: Updated diff between before and after code files
         """
-        res: list[str] = []
-        code_before = self.code_before
-        for before in code_before:
-            lines = before.splitlines()
-            test_begin_idx = next(
-                (
-                    idx
-                    for idx, line in enumerate(lines)
-                    if line.strip().startswith("#[cfg(test)]")
-                ),
-                None,
-            )
-            if test_begin_idx is not None:
-                res.append("\n".join(lines[:test_begin_idx]))
+        patch: list[str] = []
+        for pr_file_diff in self.source_code_file_diffs:
+            if filename == pr_file_diff.name:
+                diff = git_diff.unified_diff_with_function_context(
+                    content,
+                    pr_file_diff.after,
+                    fname=pr_file_diff.name,
+                )
             else:
-                res.append(before)
-
-        return res
+                diff = pr_file_diff.unified_code_diff()
+            patch.append(diff)
+        return "\n\n".join(patch) + "\n\n"

@@ -4,15 +4,9 @@ from pathlib import Path
 from webhook_handler.helper import logger
 from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import LLM, PipelineInputs, PullRequestData
-from webhook_handler.services import (
-    Config,
-    CSTBuilder,
-    DockerService,
-    GitHubService,
-    LLMHandler,
-    PullRequestDiffContext,
-    TestGenerator,
-)
+from webhook_handler.services import (Config, CSTBuilder, DockerService,
+                                      GitHubService, LLMHandler,
+                                      PullRequestDiffContext, TestGenerator)
 
 
 class BotRunner:
@@ -81,9 +75,11 @@ class BotRunner:
         Returns:
             bool: True if the generation was successful, False otherwise
         """
+        # setup the output directory
+        self._config.setup_output_dir(curr_attempt, model)
+
         # Prepare environment
         self.prepare_environment(curr_attempt, model)
-
         if self._pipeline_inputs is None:
             raise DataMissingError(
                 "pipeline_inputs", "None", "Pipeline inputs not prepared"
@@ -118,9 +114,10 @@ class BotRunner:
 
         try:
             result = generator.generate()
+            self._logger.success(f"Attempt %d with model %s finished successfully" % (curr_attempt + 1, model))  # type: ignore[attr-defined]
             if result is True:
                 generated_test: str = Path(
-                    self._config.output_dir, "generation", "generated_test.txt"
+                    self._config.output_dir, "generated_test.txt"
                 ).read_text(encoding="utf-8")
                 new_filename = (
                     f"{self._execution_id}_{self._config.output_dir.name}.txt"
@@ -131,11 +128,29 @@ class BotRunner:
             return result if result is not None else False
 
         except (FileExistsError, FileNotFoundError, PermissionError) as e:
-            self._logger.warning(f"File error occurred: {e}")
+            self._logger.critical(f"File error occurred during runner execution: {e}")
+            # raise ExecutionError("File error occurred during execution")
+            return False
+        except DataMissingError as e:
+            self._logger.critical(
+                f"Data missing error occurred during runner execution: {e}"
+            )
+            # raise ExecutionError("Data missing error occurred during execution")
+            return False
+        except ExecutionError as e:
+            self._logger.critical(
+                f"Execution error occurred during runner execution: {e}"
+            )
+            # raise ExecutionError("Data missing error occurred during execution")
             return False
         except Exception as e:
-            self._logger.warning(f"Another error occurred: {e}")
+            self._logger.critical(
+                f"Another error occurred during runner execution: {e}"
+            )
+            # raise ExecutionError("File error occurred during execution")
             return False
+        finally:
+            self._record_result(curr_attempt, model)
 
     def prepare_environment(self, curr_attempt: int, model: LLM) -> None:
         """Prepares all services and data used in each attempt"""
@@ -144,7 +159,7 @@ class BotRunner:
             self._logger.info(
                 "Environment already prepared, skipping preparation phase..."
             )
-            self._create_model_attempt_dir(curr_attempt, model)
+            # self._create_model_attempt_dir(curr_attempt, model)
             return
 
         self._setup_logging()
@@ -157,7 +172,6 @@ class BotRunner:
             raise ExecutionError("No linked issue found for PR")
 
         # Prepare directories
-        self._create_model_attempt_dir(curr_attempt, model)
 
         # Get the file contents
         if self._pr_diff_ctx is None:
@@ -227,11 +241,12 @@ class BotRunner:
         attempt_instance_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a generation subdirectory within the attempt directory
-        Path(attempt_instance_dir, "generation").mkdir(parents=True, exist_ok=True)
         self._logger.info(f"Created model attempt directory: {attempt_instance_dir}")
 
     def _record_result(
-        self, number: str, model: LLM, i_attempt: int, stop: bool | str
+        self,
+        i_attempt: int,
+        model: LLM,
     ) -> None:
         """
         Writes result to csv.
@@ -245,5 +260,7 @@ class BotRunner:
 
         with open(Path(self._config.bot_log_dir, "results.csv"), "a") as f:
             f.write(
-                "{:<9},{:<30},{:<9},{:<45}\n".format(number, model, i_attempt, stop)
+                "{:<9},{:<30},{:<9},{:<45}\n".format(
+                    self._pr_data.number, model, i_attempt, self._generation_completed
+                )
             )

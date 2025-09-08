@@ -24,15 +24,15 @@ EXAMPLE_TEST_STRUCTURE: str = (
     "Here is an example structure:\n"
     "<Filename> ... </Filename>\n"
     "<imports> ... </imports>\n"
-    "'''rust\n"
+    "<Rust>\n"
     "#[test]\n"
     "fn test_<describe_behavior>() {\n"
     "  <initialize required variables>;\n"
     "  <define expected variable>;\n"
     "  <generate actual variables>;\n"
     "  <compare expected with actual>;\n"
-    "};"
-    "'''rust\n\n"
+    "}"
+    "</Rust>\n\n"
 )
 
 
@@ -47,10 +47,11 @@ def get_instructions_template(repo: str) -> str:
         "the test will verify that the patch resolves the issue.\n"
         "3. The test must be self-contained and to-the-point.\n"
         "4. All 'use' declarations must be inside a <imports>...</imports> block.\n "
-        "Use `use super::<function name> for the function under test.\n"
+        "Use `use super::<function name> for the function under test.\n."
+        "If multiple 'use' statements are needed, list each on a separate line.\n"
         "5. To help you write the test, <Signatures> contains all modified function's:\n"
         "- name\n"
         "- parameters\n"
         "- Return type (assume '()' if empty)\n"
-        "6. Return only the filename, the use statements, and rust test (no comments or explanations).\n\n"
+        "6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).\n\n"
     )

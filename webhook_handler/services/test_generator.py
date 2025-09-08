@@ -34,7 +34,6 @@ class TestGenerator:
         self._pipeline_inputs = data
         self._pr_data = data.pr_data
         self._pr_diff_ctx = data.pr_diff_ctx
-        # self._prompt_combinations = PROMPT_COMBINATIONS_GEN
         self._post_comment = post_comment
         self._gh_service = gh_service
         self._cst_builder = cst_builder
@@ -56,28 +55,14 @@ class TestGenerator:
         logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model))  # type: ignore[attr-defined]
         logger.marker("=============== Test Generation Started ==============")  # type: ignore[attr-defined]
 
-        # include_golden_code = bool(self._prompt_combinations["include_golden_code"][self._i_attempt])
-        # sliced = bool(self._prompt_combinations["sliced"][self._i_attempt])
-        # include_pr_summary = bool(self._prompt_combinations["include_pr_summary"][self._i_attempt])
-        # include_predicted_test_file = bool(self._prompt_combinations["include_predicted_test_file"][self._i_attempt])
-
-        prompt = self._llm_handler.build_prompt(
-            # include_golden_code,
-            # sliced,
-            # include_pr_summary,
-            # include_predicted_test_file,
-            # self._pipeline_inputs.test_filename,
-            # self._pipeline_inputs.test_file_content_sliced,
-            # self._pipeline_inputs.available_packages,
-            # self._pipeline_inputs.available_relative_imports
-        )
+        prompt = self._llm_handler.build_prompt()
 
         if len(prompt) >= 1048576:  # gpt4o limit
             logger.critical("Prompt exceeds limits, skipping...")
             raise ExecutionError("Prompt is too long.")
 
         assert self._config.output_dir is not None
-        self._generation_dir = Path(self._config.output_dir, "generation")
+        self._generation_dir = Path(self._config.output_dir)
         (self._generation_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
         logger.marker(  # type: ignore[attr-defined]
             "New prompt written to %s" % (self._generation_dir / "prompt.txt")
@@ -87,7 +72,6 @@ class TestGenerator:
         # response = Path(Path.cwd(), "bot_logs", "raw_model_response.txt").read_text(
         #     encoding="utf-8"
         # )
-        # if self._mock_response is None:
         logger.info("Querying LLM...")
         response = self._llm_handler.query_model(
             prompt, model=self._model, temperature=0.0
@@ -122,13 +106,14 @@ class TestGenerator:
             response_filename, self._config.cloned_repo_dir, self._pr_data.base_commit
         )
 
-        new_file_content = ""
         if file_content:
+            logger.marker(f"File {filename} exists in base commit")  # type: ignore[attr-defined]
             new_file_content = self._cst_builder.append_test(
                 file_content, new_test, imports
             )
         else:
-            new_file_content = new_test
+            logger.marker(f"File {filename} does not exist in base commit")  # type: ignore[attr-defined]
+            new_file_content = self._cst_builder._create_test_block(new_test, imports)
 
         is_pass_2_fail = self._run_test_pre_and_post_pr(
             file_content, new_file_content, filename
@@ -140,7 +125,7 @@ class TestGenerator:
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return True
         else:
-            logger.fail("No Fail-to-Pass test generated")  # type: ignore[attr-defined]
+            logger.info("No Fail-to-Pass test generated")  # type: ignore[attr-defined]
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return False
 
@@ -148,19 +133,18 @@ class TestGenerator:
         self, old_file_content: str, new_file_content: str, filename: str
     ) -> bool:
         assert self._generation_dir is not None
-        model_test_patch: str = ""
-        if old_file_content:
-            model_test_patch = (
-                git_diff.unified_diff(
-                    old_file_content,
-                    new_file_content,
-                    fromfile=filename,
-                    tofile=filename,
-                )
-                + "\n\n"
+        model_test_patch = (
+            git_diff.unified_diff(
+                old_file_content,
+                new_file_content,
+                fromfile=filename,
+                tofile=filename,
             )
-        else:
-            model_test_patch = new_file_content + "\n\n"
+            + "\n\n"
+        )
+        Path(Path.cwd(), "model_test_patch.diff").write_text(
+            model_test_patch, encoding="utf-8"
+        )
 
         test_file_diff = PullRequestFileDiff(
             filename,
@@ -170,15 +154,13 @@ class TestGenerator:
 
         test_to_run = self._cst_builder.extract_changed_tests(test_file_diff)
 
-        logger.marker("Running test in pre-PR codebase...")  # type: ignore[attr-defined]
-
         test_passed_before = False
         stdout_before = "Empty stdout because file did not exist before"
-        # TODO: Does this method actually need to be called if the file_content doesn't exist (file was only created later)
         if old_file_content:
+            logger.marker("Running test in pre-PR codebase...")  # type: ignore[attr-defined]
             test_passed_before, stdout_before = (
                 self._docker_service.run_test_in_container(
-                    model_test_patch, test_to_run, test_file_diff
+                    model_test_patch, test_to_run
                 )
             )
         (self._generation_dir / "before.txt").write_text(
@@ -196,13 +178,50 @@ class TestGenerator:
             return False
 
         logger.marker("Running test in post-PR codebase...")  # type: ignore[attr-defined]
-        test_passed_after, stdout_after = self._docker_service.run_test_in_container(
-            model_test_patch,
-            test_to_run,
-            test_file_diff,
-            golden_code_patch=self._pr_diff_ctx.golden_code_patch,
+        Path(Path.cwd(), "golden_code_patch.diff").write_text(
+            self._pr_diff_ctx.golden_code_patch or "", encoding="utf-8"
         )
-        (self._generation_dir / "after.txt").write_text(stdout_after, encoding="utf-8")
+        golden_code_patch = ""
+        # Only include golden code patch if the file existed before
+        if old_file_content:
+            golden_code_patch = self._pr_diff_ctx.golden_code_patch
+        else:
+            # The golden code patch must be equal to all other files the test was not generated for
+            # For the file the test was generated for, we need to modify the patch to
+            golden_code_patch = self._pr_diff_ctx.get_updated_golden_code_patch(
+                filename, new_file_content
+            )
+
+        try:
+            test_passed_after, stdout_after = (
+                self._docker_service.run_test_in_container(
+                    model_test_patch,
+                    test_to_run,
+                    golden_code_patch=golden_code_patch,
+                )
+            )
+            (self._generation_dir / "after.txt").write_text(
+                stdout_after, encoding="utf-8"
+            )
+        except (
+            GoldenCodePatchApplicationError
+        ):  # If only the golden code patch could not be applied, use the new file content to create an updated patch
+            logger.info(
+                "Retrying with rebasing golden code patch for newly added file..."
+            )
+            updated_golden_code_patch = self._pr_diff_ctx.get_updated_golden_code_patch(
+                filename, new_file_content
+            )
+            test_passed_after, stdout_after = (
+                self._docker_service.run_test_in_container(
+                    model_test_patch,
+                    test_to_run,
+                    updated_golden_code_patch,
+                )
+            )
+            (self._generation_dir / "after.txt").write_text(
+                stdout_after, encoding="utf-8"
+            )
         return test_passed_after
 
     def _handle_commenting(
@@ -231,4 +250,5 @@ class TestGenerator:
         assert filename is not None, "Absolute filename should not be None"
 
         file_content = general.get_candidate_file(base_commit, filename, repo_dir)
+
         return filename, file_content
