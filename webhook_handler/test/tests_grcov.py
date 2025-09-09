@@ -1,16 +1,29 @@
 import json
 import os
+from pathlib import Path
 
-from django.test import TestCase
+import pytest
 
 from webhook_handler.bot_runner import BotRunner
-from webhook_handler.constants import USED_MODELS, get_total_attempts
-from webhook_handler.models import LLM
+from webhook_handler.constants import USED_MODELS
 from webhook_handler.services.config import Config
 
 
+def _setup(payload: dict) -> tuple[Config, BotRunner]:
+        config = Config()
+        runner = BotRunner(payload, config)
+        _setup_dirs(config, runner, payload)
+        return config, runner
+
+def _teardown(payload: dict, config: Config, runner: BotRunner) -> None:
+        config._teardown()
+        del payload
+        del config
+        del runner
+
+
 def _get_payload(rel_path: str) -> dict:
-    abs_path = os.path.join(os.path.dirname(__file__), rel_path)
+    abs_path = os.path.join(os.path.dirname(__file__), "test_data", "grcov", rel_path)
     with open(abs_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     return payload
@@ -18,126 +31,21 @@ def _get_payload(rel_path: str) -> dict:
 def _setup_dirs(config: Config, runner: BotRunner, payload) -> None:
     pr_id = runner._pr_data.id
     config.setup_pr_related_dirs(pr_id, payload)
+    
+TEST_DIR = Path(Path.cwd(), "webhook_handler", "test", "test_data", "rust-code-analysis")
+payload_files = [f.name for f in TEST_DIR.iterdir() if f.is_file() and f.suffix == ".json"]
 
-#
-# RUN With: python manage.py test webhook_handler.test.tests_grcov.<testname>
-#
-class TestGeneration1180(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_1180.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
 
-    def tearDown(self) -> None:
-        self.config._teardown()
-        del self.payload
-        del self.config
-        del self.runner
-
-    def test_generation1180(self):
+@pytest.mark.parametrize("filename", payload_files)
+def test_generate_test(filename: str) -> None:
+        payload = _get_payload(filename)
+        config, runner = _setup(payload)
         generation_completed = False
         for model in USED_MODELS:
             if generation_completed:
                 break
-            self.config.setup_output_dir(0, model)
-            generation_completed = self.runner.execute_runner(0, model)
+            config.setup_output_dir(0, model)
+            generation_completed = runner.execute_runner(0, model)
 
-        self.assertTrue(generation_completed)
-
-
-class TestGeneration1394(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_1394.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
-
-    def tearDown(self) -> None:
-        self.config._teardown()
-        del self.payload
-        del self.config
-        del self.runner
-
-    def test_generation1394(self):
-       generation_completed = False
-       for model in USED_MODELS:
-            if generation_completed:
-                break
-            self.config.setup_output_dir(0, model)
-            generation_completed = self.runner.execute_runner(0, model)
-
-       self.assertTrue(generation_completed)
-
-
-# class TestGeneration34(TestCase):
-#     def setUp(self) -> None:
-#         self.payload = _get_payload("test_data/grcov/pr_34.json")
-#         self.config = Config()
-#         self.runner = BotRunner(self.payload, self.config)
-#         _setup_dirs(self.config, self.runner, self.payload)
-
-#     def tearDown(self) -> None:
-#         self.config._teardown()
-
-#     def test_generation1394(self):
-#         generation_completed = False
-#         total_attempts = get_total_attempts()
-#         # This approach is only temporary until prompt combinations are defined
-#         model = LLM.GPT4o
-#         # for model in USED_MODELS:
-#         # # for curr_attempt in range(total_attempts):
-#         #     if generation_completed:
-#         #         break
-#         self.config.setup_output_dir(0, model)
-#         generation_completed = self.runner.execute_runner(0, model)
-
-#         self.assertTrue(generation_completed)
-
-
-class TestGeneration1326(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_1326.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
-
-    def tearDown(self) -> None:
-        self.config._teardown()
-        del self.payload
-        del self.config
-        del self.runner
-
-    def test_generation1326(self):
-        generation_completed = False
-        for model in USED_MODELS:
-            if generation_completed:
-                break
-            self.config.setup_output_dir(0, model)
-            generation_completed = self.runner.execute_runner(0, model)
-
-        self.assertTrue(generation_completed)
-
-
-class TestGeneration1321(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_1321.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
-
-    def tearDown(self) -> None:
-        self.config._teardown()
-        del self.payload
-        del self.config
-        del self.runner
-
-    def test_generation1326(self):
-        generation_completed = False
-        for model in USED_MODELS:
-            if generation_completed:
-                break
-            self.config.setup_output_dir(0, model)
-            generation_completed = self.runner.execute_runner(0, model)
-
-        self.assertTrue(generation_completed)
+        _teardown(payload, config, runner)
+        assert generation_completed is True
