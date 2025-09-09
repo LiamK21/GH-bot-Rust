@@ -56,7 +56,12 @@ class DockerService:
         """Builds the Docker image from the Dockerfiles in the dockerfile directory"""
         build_args = {"commit_hash": self._pr_data.base_commit}
         repo_name = self._pr_data.repo.lower()
-        dockerfile_path = Path("dockerfiles", f"Dockerfile_{repo_name}")
+        if self._pr_data.repo == "grcov" and int(self._pr_data.number) < 703:
+            logger.warning("Using old Dockerfile for grcov")  # type: ignore[attr-defined]
+            dockerfile_path = Path("dockerfiles", f"Dockerfile_grcov_old")
+        else:
+            logger.marker(f"Using standard Dockerfile for {repo_name}")  # type: ignore[attr-defined]
+            dockerfile_path = Path("dockerfiles", f"Dockerfile_{repo_name}")
         build_succeeded = False
         try:
             self._client.images.build(
