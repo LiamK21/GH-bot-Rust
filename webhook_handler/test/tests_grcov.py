@@ -37,43 +37,11 @@ class TestGeneration1180(TestCase):
 
     def test_generation1180(self):
         generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
-        model = LLM.GPT4o
-        # for model in USED_MODELS:
-        # for curr_attempt in range(total_attempts):
-        # if generation_completed:
-        # break
-        self.config.setup_output_dir(0, model)
-        generation_completed = self.runner.execute_runner(0, model)
-        # if generation_completed:
-        #     break
-
-        self.assertTrue(generation_completed)
-
-
-class TestGeneration1362(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_1362.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
-
-    def tearDown(self) -> None:
-        self.config._teardown()
-
-    def test_generation1362(self):
-        generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
         for model in USED_MODELS:
-            for curr_attempt in range(total_attempts):
-                if generation_completed:
-                    break
-                self.config.setup_output_dir(curr_attempt, model)
-                generation_completed = self.runner.execute_runner(curr_attempt, model)
             if generation_completed:
                 break
+            self.config.setup_output_dir(0, model)
+            generation_completed = self.runner.execute_runner(0, model)
 
         self.assertTrue(generation_completed)
 
@@ -87,49 +55,44 @@ class TestGeneration1394(TestCase):
 
     def tearDown(self) -> None:
         self.config._teardown()
+        del self.payload
+        del self.config
+        del self.runner
 
     def test_generation1394(self):
-        generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
-        model = LLM.GPT4o
-        # for model in USED_MODELS:
-        # for curr_attempt in range(total_attempts):
-        # if generation_completed:
-        # break
-        self.config.setup_output_dir(0, model)
-        generation_completed = self.runner.execute_runner(0, model)
-        # if generation_completed:
-        #     break
+       generation_completed = False
+       for model in USED_MODELS:
+            if generation_completed:
+                break
+            self.config.setup_output_dir(0, model)
+            generation_completed = self.runner.execute_runner(0, model)
 
-        self.assertTrue(generation_completed)
+       self.assertTrue(generation_completed)
 
 
-class TestGeneration34(TestCase):
-    def setUp(self) -> None:
-        self.payload = _get_payload("test_data/grcov/pr_34.json")
-        self.config = Config()
-        self.runner = BotRunner(self.payload, self.config)
-        _setup_dirs(self.config, self.runner, self.payload)
+# class TestGeneration34(TestCase):
+#     def setUp(self) -> None:
+#         self.payload = _get_payload("test_data/grcov/pr_34.json")
+#         self.config = Config()
+#         self.runner = BotRunner(self.payload, self.config)
+#         _setup_dirs(self.config, self.runner, self.payload)
 
-    def tearDown(self) -> None:
-        self.config._teardown()
+#     def tearDown(self) -> None:
+#         self.config._teardown()
 
-    def test_generation1394(self):
-        generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
-        model = LLM.GPT4o
-        # for model in USED_MODELS:
-        #     for curr_attempt in range(total_attempts):
-        #         if generation_completed:
-        #             break
-        self.config.setup_output_dir(0, model)
-        generation_completed = self.runner.execute_runner(0, model)
-        # if generation_completed:
-        #     break
+#     def test_generation1394(self):
+#         generation_completed = False
+#         total_attempts = get_total_attempts()
+#         # This approach is only temporary until prompt combinations are defined
+#         model = LLM.GPT4o
+#         # for model in USED_MODELS:
+#         # # for curr_attempt in range(total_attempts):
+#         #     if generation_completed:
+#         #         break
+#         self.config.setup_output_dir(0, model)
+#         generation_completed = self.runner.execute_runner(0, model)
 
-        self.assertTrue(generation_completed)
+#         self.assertTrue(generation_completed)
 
 
 class TestGeneration1326(TestCase):
@@ -141,20 +104,17 @@ class TestGeneration1326(TestCase):
 
     def tearDown(self) -> None:
         self.config._teardown()
+        del self.payload
+        del self.config
+        del self.runner
 
     def test_generation1326(self):
         generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
-        model = LLM.GPT4o
-        # for model in USED_MODELS:
-        # for curr_attempt in range(total_attempts):
-        # if generation_completed:
-        # break
-        self.config.setup_output_dir(0, model)
-        generation_completed = self.runner.execute_runner(0, model)
-        # if generation_completed:
-        #     break
+        for model in USED_MODELS:
+            if generation_completed:
+                break
+            self.config.setup_output_dir(0, model)
+            generation_completed = self.runner.execute_runner(0, model)
 
         self.assertTrue(generation_completed)
 
@@ -168,19 +128,16 @@ class TestGeneration1321(TestCase):
 
     def tearDown(self) -> None:
         self.config._teardown()
+        del self.payload
+        del self.config
+        del self.runner
 
     def test_generation1326(self):
         generation_completed = False
-        total_attempts = get_total_attempts()
-        # This approach is only temporary until prompt combinations are defined
-        model = LLM.GPT4o
-        # for model in USED_MODELS:
-        # for curr_attempt in range(total_attempts):
-        # if generation_completed:
-        # break
-        self.config.setup_output_dir(0, model)
-        generation_completed = self.runner.execute_runner(0, model)
-        # if generation_completed:
-        #     break
+        for model in USED_MODELS:
+            if generation_completed:
+                break
+            self.config.setup_output_dir(0, model)
+            generation_completed = self.runner.execute_runner(0, model)
 
         self.assertTrue(generation_completed)

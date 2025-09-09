@@ -109,7 +109,7 @@ class PullRequestDiffContext:
     def get_updated_golden_code_patch(self, filename: str, content: str) -> str:
         """
         Returns the golden code patch for all files except the passed one.
-        It uses the provided content for the passed file instead of the original "before" content.
+        It uses the provided content for the passed file instead of the original "after" content.
 
         Returns:
             str: Updated diff between before and after code files
@@ -118,11 +118,30 @@ class PullRequestDiffContext:
         for pr_file_diff in self.source_code_file_diffs:
             if filename == pr_file_diff.name:
                 diff = git_diff.unified_diff_with_function_context(
+                    pr_file_diff.before,
                     content,
-                    pr_file_diff.after,
-                    fname=pr_file_diff.name,
+                    pr_file_diff.name,
                 )
             else:
                 diff = pr_file_diff.unified_code_diff()
             patch.append(diff)
         return "\n\n".join(patch) + "\n\n"
+
+    def get_specific_file_diff(self, filename: str) -> PullRequestFileDiff | None:
+        """
+        Returns the PullRequestFileDiff for a specific file if it exists.
+
+        Parameters:
+            filename (str): The name of the file to look for
+
+        Returns:
+            PullRequestFileDiff | None: The file diff or None if not found
+        """
+        return next(
+            (
+                pr_file_diff
+                for pr_file_diff in self.source_code_file_diffs
+                if pr_file_diff.name == filename
+            ),
+            None,
+        )

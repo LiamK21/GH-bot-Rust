@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 
 from webhook_handler.helper import general, git_diff, templates
@@ -99,11 +100,58 @@ class TestGenerator:
             "src/", ""
         )  # temporary replacement to run in lib-legacy
 
-        # Retrieve the test file content from the filename
-        assert self._config.cloned_repo_dir is not None, "Cloned repo dir must be set"
+        filename = self._pr_diff_ctx.get_absolute_file_path(response_filename)
+        assert filename is not None, "Filename received from model does not exist"
 
-        filename, file_content = self._get_relevant_file(
-            response_filename, self._config.cloned_repo_dir, self._pr_data.base_commit
+        test_name_pattern = r"fn (\w+)"
+        match = re.search(test_name_pattern, new_test)
+        if not match:
+            logger.error("Could not extract test name from generated test")
+            return None
+
+        test_to_run: str = match.group(1)
+
+        test_passed_before = self.run_test_pre_pr(
+            filename, new_test, imports, test_to_run
+        )
+
+        if test_passed_before:
+            logger.warning("No Fail-to-Pass test generated")
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
+            return False
+
+        test_passed_after = self.run_test_post_pr(
+            filename, new_test, imports, test_to_run
+        )
+
+        fail_2_pass = (not test_passed_before) and test_passed_after
+
+        if fail_2_pass:
+            logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
+            self._handle_commenting(filename)
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
+            return True
+        else:
+            logger.info("No Fail-to-Pass test generated")  # type: ignore[attr-defined]
+            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
+            return False
+
+    def run_test_pre_pr(
+        self, filename: str, new_test: str, imports: list[str], test_to_run: str
+    ) -> bool:
+        if not self._config.cloned_repo_dir:
+            raise DataMissingError(
+                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+            )
+        if not self._generation_dir:
+            raise DataMissingError(
+                "generation_dir", "None", "Generation dir should not be None"
+            )
+
+        self._pr_diff_ctx
+
+        file_content = general.get_candidate_file(
+            self._pr_data.base_commit, filename, self._config.cloned_repo_dir
         )
 
         if file_content:
@@ -115,114 +163,103 @@ class TestGenerator:
             logger.marker(f"File {filename} does not exist in base commit")  # type: ignore[attr-defined]
             new_file_content = self._cst_builder._create_test_block(new_test, imports)
 
-        is_pass_2_fail = self._run_test_pre_and_post_pr(
-            file_content, new_file_content, filename
+        test_passed, stdout = self._run_test(
+            filename, file_content, new_file_content, [test_to_run], True
         )
 
-        if is_pass_2_fail:
-            logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
-            self._handle_commenting(filename)
-            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
-            return True
-        else:
-            logger.info("No Fail-to-Pass test generated")  # type: ignore[attr-defined]
-            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
-            return False
-
-    def _run_test_pre_and_post_pr(
-        self, old_file_content: str, new_file_content: str, filename: str
-    ) -> bool:
-        assert self._generation_dir is not None
-        model_test_patch = (
-            git_diff.unified_diff(
-                old_file_content,
-                new_file_content,
-                fromfile=filename,
-                tofile=filename,
-            )
-            + "\n\n"
-        )
-        Path(Path.cwd(), "model_test_patch.diff").write_text(
-            model_test_patch, encoding="utf-8"
-        )
-
-        test_file_diff = PullRequestFileDiff(
-            filename,
-            old_file_content,
-            new_file_content,
-        )
-
-        test_to_run = self._cst_builder.extract_changed_tests(test_file_diff)
-
-        test_passed_before = False
-        stdout_before = "Empty stdout because file did not exist before"
-        if old_file_content:
-            logger.marker("Running test in pre-PR codebase...")  # type: ignore[attr-defined]
-            test_passed_before, stdout_before = (
-                self._docker_service.run_test_in_container(
-                    model_test_patch, test_to_run
-                )
-            )
-        (self._generation_dir / "before.txt").write_text(
-            stdout_before, encoding="utf-8"
-        )
+        (self._generation_dir / "before.txt").write_text(stdout, encoding="utf-8")
         new_test_file = f"#{filename}\n{new_file_content}"
 
         (self._generation_dir / "new_test_file_content.rs").write_text(
             new_test_file, encoding="utf-8"
         )
+        return test_passed
 
-        if test_passed_before:
-            logger.warning("No Fail-to-Pass test generated")
-            logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
-            return False
+    def run_test_post_pr(
+        self, filename: str, new_test: str, imports: list[str], test_to_run: str
+    ) -> bool:
+        if not self._config.cloned_repo_dir:
+            raise DataMissingError(
+                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+            )
+        if not self._generation_dir:
+            raise DataMissingError(
+                "generation_dir", "None", "Generation dir should not be None"
+            )
+        # Try to get the direct file content from the head commit instead of checking out the commit
+        # This is to avoid issues where PRs or such are from forked repos and the commit does not exist in the main repo            
+        logger.info("Getting file content from head commit rather than checking out commit...")
+        pr_file_diff = self._pr_diff_ctx.get_specific_file_diff(filename)
+        file_content = pr_file_diff.after if pr_file_diff else ""
+        # logger.warning("An error occurred while fetching the file content from head commit")
 
-        logger.marker("Running test in post-PR codebase...")  # type: ignore[attr-defined]
-        Path(Path.cwd(), "golden_code_patch.diff").write_text(
-            self._pr_diff_ctx.golden_code_patch or "", encoding="utf-8"
-        )
-        golden_code_patch = ""
-        # Only include golden code patch if the file existed before
-        if old_file_content:
-            golden_code_patch = self._pr_diff_ctx.golden_code_patch
+        # file_content = general.get_candidate_file(
+        #     self._pr_data.head_commit, filename, self._config.cloned_repo_dir
+        # )
+
+        if file_content:
+            logger.marker(f"File {filename} exists in head commit")  # type: ignore[attr-defined]
+            new_file_content = self._cst_builder.append_test(
+                file_content, new_test, imports
+            )
         else:
+            logger.critical(f"File {filename} does not exist in head commit")  # type: ignore[attr-defined]
+            raise ExecutionError(
+                f"File {filename} should exist in head commit but does not"
+            )
+
+        test_passed, stdout = self._run_test(
+            filename, file_content, new_file_content, [test_to_run], False
+        )
+
+        (self._generation_dir / "after.txt").write_text(stdout, encoding="utf-8")
+        return test_passed
+
+    def _run_test(
+        self,
+        filename: str,
+        old_file_content: str,
+        new_file_content: str,
+        test_to_run: list[str],
+        is_pre_pr: bool,
+    ) -> tuple[bool, str]:
+        if is_pre_pr:
+            model_test_patch = (
+                git_diff.unified_diff(
+                    old_file_content,
+                    new_file_content,
+                    fromfile=filename,
+                    tofile=filename,
+                )
+                + "\n\n"
+            )
+            if old_file_content:
+                logger.marker("Running test in pre-PR codebase...")  # type: ignore[attr-defined]
+                return self._docker_service.run_test_in_container(
+                    model_test_patch, test_to_run, False
+                )
+            else:
+                logger.marker("File did not exist in pre-PR codebase, cannot run test...")  # type: ignore[attr-defined]
+                return (
+                    False,
+                    "Empty stdout because file did not exist in pre-PR codebase",
+                )
+
+        elif not is_pre_pr and old_file_content:
+            logger.marker("Running test in post-PR codebase...")  # type: ignore[attr-defined]
             # The golden code patch must be equal to all other files the test was not generated for
             # For the file the test was generated for, we need to modify the patch to
-            golden_code_patch = self._pr_diff_ctx.get_updated_golden_code_patch(
+            # include the new test as well
+            golden_code_patch: str = self._pr_diff_ctx.get_updated_golden_code_patch(
                 filename, new_file_content
             )
-
-        try:
-            test_passed_after, stdout_after = (
-                self._docker_service.run_test_in_container(
-                    model_test_patch,
-                    test_to_run,
-                    golden_code_patch=golden_code_patch,
-                )
+            return self._docker_service.run_test_in_container(
+                golden_code_patch, test_to_run, True
             )
-            (self._generation_dir / "after.txt").write_text(
-                stdout_after, encoding="utf-8"
+        else:
+            raise ExecutionError(
+                "Cannot run test in post-PR codebase without old file content"
             )
-        except (
-            GoldenCodePatchApplicationError
-        ):  # If only the golden code patch could not be applied, use the new file content to create an updated patch
-            logger.info(
-                "Retrying with rebasing golden code patch for newly added file..."
-            )
-            updated_golden_code_patch = self._pr_diff_ctx.get_updated_golden_code_patch(
-                filename, new_file_content
-            )
-            test_passed_after, stdout_after = (
-                self._docker_service.run_test_in_container(
-                    model_test_patch,
-                    test_to_run,
-                    updated_golden_code_patch,
-                )
-            )
-            (self._generation_dir / "after.txt").write_text(
-                stdout_after, encoding="utf-8"
-            )
-        return test_passed_after
 
     def _handle_commenting(
         self, filename: str, no_test_gen_reason: str | None = None

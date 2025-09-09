@@ -79,7 +79,7 @@ class BotRunner:
         self._config.setup_output_dir(curr_attempt, model)
 
         # Prepare environment
-        self.prepare_environment(curr_attempt, model)
+        self.prepare_environment()
         if self._pipeline_inputs is None:
             raise DataMissingError(
                 "pipeline_inputs", "None", "Pipeline inputs not prepared"
@@ -152,14 +152,13 @@ class BotRunner:
         finally:
             self._record_result(curr_attempt, model)
 
-    def prepare_environment(self, curr_attempt: int, model: LLM) -> None:
+    def prepare_environment(self) -> None:
         """Prepares all services and data used in each attempt"""
 
         if self._environment_prepared:
             self._logger.info(
                 "Environment already prepared, skipping preparation phase..."
             )
-            # self._create_model_attempt_dir(curr_attempt, model)
             return
 
         self._setup_logging()
