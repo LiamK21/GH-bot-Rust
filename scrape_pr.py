@@ -144,10 +144,12 @@ def _get_github_issue(number: int, repo: Repo) -> str | None:
     response = requests.get(url, headers=HEADERS)
     if response.status_code == 200:
         issue_data = response.json()
-        if not "pull_request" in issue_data:
-            return "\n".join(
-                value for value in (issue_data["title"], issue_data["body"]) if value
-            )
+        if "pull_request" in issue_data:
+            print(f"[!] Issue #{number} is a pull request, skipping...")
+            return None
+        return "\n".join(
+            value for value in (issue_data["title"], issue_data["body"]) if value
+        )
 
     return None
 
