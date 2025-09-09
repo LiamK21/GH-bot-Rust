@@ -126,9 +126,6 @@ class CSTBuilder:
             mod_test_item: Node | None = self._get_mod_test_node(tree.root_node)
 
             if not mod_test_item:
-                print(
-                    "No 'mod tests' module found, creating one at the end of the file."
-                )
                 test_block = self._create_test_block(new_test, imports)
                 return "\n".join([file_content, test_block])
 
