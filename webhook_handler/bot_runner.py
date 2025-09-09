@@ -79,40 +79,40 @@ class BotRunner:
         self._config.setup_output_dir(curr_attempt, model)
 
         # Prepare environment
-        self.prepare_environment()
-        if self._pipeline_inputs is None:
-            raise DataMissingError(
-                "pipeline_inputs", "None", "Pipeline inputs not prepared"
-            )
-
-        if self._llm_handler is None:
-            raise DataMissingError("llm_handler", "None", "LLM Handler not prepared")
-
-        if self._cst_builder is None:
-            raise DataMissingError("cst_builder", "None", "CST Builder not prepared")
-
-        if self._docker_service is None:
-            raise DataMissingError(
-                "docker_service", "None", "Docker Service not prepared"
-            )
-
-        if self._config.output_dir is None:
-            raise DataMissingError("output_dir", "None", "Output directory not set")
-
-        generator = TestGenerator(
-            self._config,
-            self._pipeline_inputs,
-            # self._mock_response,
-            self._post_comment,
-            self._gh_service,
-            self._cst_builder,
-            self._docker_service,
-            self._llm_handler,
-            i_attempt=curr_attempt,
-            model=model,
-        )
-
         try:
+            self.prepare_environment()
+            if self._pipeline_inputs is None:
+                raise DataMissingError(
+                    "pipeline_inputs", "None", "Pipeline inputs not prepared"
+                )
+
+            if self._llm_handler is None:
+                raise DataMissingError("llm_handler", "None", "LLM Handler not prepared")
+
+            if self._cst_builder is None:
+                raise DataMissingError("cst_builder", "None", "CST Builder not prepared")
+
+            if self._docker_service is None:
+                raise DataMissingError(
+                    "docker_service", "None", "Docker Service not prepared"
+                )
+
+            if self._config.output_dir is None:
+                raise DataMissingError("output_dir", "None", "Output directory not set")
+
+            generator = TestGenerator(
+                self._config,
+                self._pipeline_inputs,
+                # self._mock_response,
+                self._post_comment,
+                self._gh_service,
+                self._cst_builder,
+                self._docker_service,
+                self._llm_handler,
+                i_attempt=curr_attempt,
+                model=model,
+            )
+
             result = generator.generate()
             self._logger.success(f"Attempt %d with model %s finished successfully" % (curr_attempt + 1, model))  # type: ignore[attr-defined]
             if result is True:
