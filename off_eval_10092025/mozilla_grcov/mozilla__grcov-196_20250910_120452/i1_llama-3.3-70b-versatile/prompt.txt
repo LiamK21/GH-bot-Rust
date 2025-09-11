@@ -1,0 +1,231 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add option to rewrite partial paths into complete paths relative to source directory
+When collecting Java code coverage, we get filenames that are relative to the Java package root, not the source directory. This means we need functionality for the following:
+
+On startup, if the argument `--rewrite-partial-relative-paths` has been passed, then:
+- walk the source directory and record all file paths found
+- note the longest path (in number of segments), let this be `N`
+- initialize hash maps `map[1]` to `map[N]`
+- for all paths:
+  - for all path suffixes:
+    - X is the number of segments in the suffix
+    - add the mapping `suffix -> path` to `map[X]`
+
+Then, for each file path:
+
+- for `i` from `N` to `1`:
+  - if the path is in `map[i]`, then rewrite it to `map[i][path]` and continue to next file
+
+All paths should be relative to the source directory. Where should this rewriting go? Is the end of [the rewrite_paths function](https://github.com/mozilla/grcov/blob/376ab00c79682a9138f54d7756e503babf140af3/src/path_rewriting.rs#L147) the place to do this?
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -1,9 +1,11 @@
+ use globset::{Glob, GlobSetBuilder};
+ use serde_json::Value;
++use std::collections::{hash_map, HashMap};
+ use std::fs;
+ use std::io;
+ use std::mem;
+ use std::path::{Path, PathBuf};
++use walkdir::{DirEntry, WalkDir};
+ 
+ use defs::*;
+ use filter::*;
+@@ -114,6 +116,40 @@ fn get_abs_path(source_dir: &Option<PathBuf>, rel_path: PathBuf, cache: &mut Opt
+     (abs_path, rel_path)
+ }
+ 
++fn map_partial_path(file_to_paths: &HashMap<String,Vec<PathBuf>>, path: PathBuf) -> PathBuf {
++    let options = file_to_paths.get(path.file_name().unwrap().to_str().unwrap());
++
++    if options.is_none() {
++        return path;
++    }
++
++    let options = options.unwrap();
++
++    if options.len() == 1 {
++        return options[0].clone();
++    }
++
++    let mut result = None;
++    for option in options {
++        if option.ends_with(&path) {
++            assert!(result.is_none(), "Only one file in the repository should end with {}", path.display());
++            result = Some(option)
++        }
++    }
++
++    match result {
++        Some(result) => result.clone(),
++        None => path
++    }
++}
++
++fn is_hidden(entry: &DirEntry) -> bool {
++    entry.file_name()
++         .to_str()
++         .map(|s| s.starts_with("."))
++         .unwrap_or(false)
++}
++
+ pub fn rewrite_paths(
+     result_map: CovResultMap,
+     path_mapping: Option<Value>,
+@@ -133,6 +169,32 @@ pub fn rewrite_paths(
+         assert!(p.is_absolute());
+     }
+ 
++    // Traverse source dir and store all paths, reversed.
++    let mut file_to_paths: HashMap<String,Vec<PathBuf>> = HashMap::new();
++    if let Some(ref source_dir) = source_dir {
++        for entry in WalkDir::new(&source_dir)
++                             .into_iter()
++                             .filter_entry(|e| !is_hidden(e)) {
++            let entry = entry.unwrap_or_else(|_| panic!("Failed to open directory '{}'.", source_dir.display()));
++
++            let full_path = entry.path();
++            if !full_path.is_file() {
++                continue;
++            }
++
++            let name = entry.file_name().to_str().unwrap().to_string();
++
++            let path = full_path.strip_prefix(&source_dir).unwrap().to_path_buf();
++
++            match file_to_paths.entry(name) {
++                hash_map::Entry::Occupied(f) => f.into_mut().push(path),
++                hash_map::Entry::Vacant(v) => {
++                    v.insert(vec![path]);
++                }
++            };
++        }
++    }
++
+     let mut cache: Option<PathBuf> = None;
+ 
+     Box::new(result_map.into_iter().filter_map(move |(path, result)| {
+@@ -144,6 +206,9 @@ pub fn rewrite_paths(
+         // Remove prefix from the path.
+         let rel_path = remove_prefix(&prefix_dir, rel_path);
+ 
++        // Try mapping a partial path to a full path.
++        let rel_path = map_partial_path(&file_to_paths, rel_path);
++
+         // Get absolute path to the source file.
+         let (abs_path, rel_path) = get_abs_path(&source_dir, rel_path, &mut cache);
+ 
+@@ -583,6 +648,56 @@ mod tests {
+         assert_eq!(count, 2);
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn test_rewrite_paths_rewrite_path_using_absolute_source_directory_and_partial_path() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("class/main.cpp".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            Some(canonicalize_path(".").unwrap()),
++            None,
++            true,
++            Vec::new(),
++            None,
++        );
++        let mut count = 0;
++        for (abs_path, rel_path, result) in results {
++            count += 1;
++            assert!(abs_path.is_absolute());
++            assert!(abs_path.ends_with("tests/class/main.cpp"));
++            assert_eq!(rel_path, PathBuf::from("tests/class/main.cpp"));
++            assert_eq!(result, empty_result!());
++        }
++        assert_eq!(count, 1);
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn test_rewrite_paths_rewrite_path_using_absolute_source_directory_and_partial_path() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("class\\main.cpp".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            Some(canonicalize_path(".").unwrap()),
++            None,
++            true,
++            Vec::new(),
++            None,
++        );
++        let mut count = 0;
++        for (abs_path, rel_path, result) in results {
++            count += 1;
++            assert!(abs_path.is_absolute());
++            assert!(abs_path.ends_with("tests\\class\\main.cpp"));
++            assert_eq!(rel_path, PathBuf::from("tests\\class\\main.cpp"));
++            assert_eq!(result, empty_result!());
++        }
++        assert_eq!(count, 1);
++    }
++
+     #[cfg(unix)]
+     #[test]
+     fn test_rewrite_paths_rewrite_path_and_remove_prefix() {
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn get_abs_path(source_dir: &Option<PathBuf>, rel_path: PathBuf, cache: &mut Option<PathBuf>) -> (PathBuf, PathBuf)
+
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<PathBuf>,
+prefix_dir: Option<PathBuf>,
+ignore_not_existing: bool,
+to_ignore_dirs: Vec<String>,
+filter_option: Option<bool>) -> CovResultIter
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

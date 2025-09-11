@@ -1,0 +1,27 @@
+#src/covdir.rs
+#[cfg(test)]
+mod tests {
+
+
+#[test]
+fn test_cdstats_calculations() {
+    let mut root = CDDirStats::new("root".to_string());
+
+    // Add a file with 10 lines, 5 covered
+    let coverage = (0..10).map(|i| (i as u32, if i < 5 { 1 } else { 0 })).collect::<BTreeMap<_, _>>();
+    let file1 = CDFileStats::new("file1.txt".to_string(), coverage);
+    root.files.push(file1);
+
+    // Add another file with 8 lines, 7 covered
+    let coverage = (0..8).map(|i| (i as u32, if i < 7 { 1 } else { 0 })).collect::<BTreeMap<_, _>>();
+    let file2 = CDFileStats::new("file2.txt".to_string(), coverage);
+    root.files.push(file2);
+
+    root.set_stats();
+
+    assert_eq!(root.stats.total, 18);
+    assert_eq!(root.stats.covered, 12);
+    assert_eq!(root.stats.missed, 6);
+    assert_eq!(root.stats.percent, 66.666);
+}
+}
