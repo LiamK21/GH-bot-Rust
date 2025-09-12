@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-type Repo = Literal["grcov", "rust-code-analysis", "glean"]
+type Repo = Literal["grcov", "rust-code-analysis", "glean", "neqo"]
 
 class FileType(StrEnum):
     TEST = "test"
@@ -30,8 +30,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 API_URL = "https://api.github.com/repos"
 OWNER = "mozilla"
-HEADERS = {
-    "Accept": "application/vnd.github.v3+json",
+GITHUB_HEADERS = {
+    "Accept": "application/json",
     "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
 }
 
@@ -47,7 +47,7 @@ def _fetch_github_data(url: str) -> dict:
         dict: Data.
     """
 
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=GITHUB_HEADERS)
     if response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
         print("[*] Sleeping...")
         reset_time = int(response.headers["X-RateLimit-Reset"])
@@ -205,7 +205,7 @@ def _get_github_issue(number: int, repo: Repo) -> str | None:
     """
 
     url = f"{API_URL}/{OWNER}/{repo}/issues/{number}"
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=GITHUB_HEADERS)
     if response.status_code == 200:
         issue_data = response.json()
         if not "pull_request" in issue_data:
@@ -377,12 +377,12 @@ def _validate_passed_args(args: list[str]) -> bool:
         print("Available repositories: grcov, rust-code-analysis, glean")
         sys.exit(1)
    
-    valid_repos = ["grcov", "rust-code-analysis", "glean"]
+    valid_repos = ["grcov", "rust-code-analysis", "glean", "neqo"]
     for arg in args:
         if arg not in valid_repos:
             print(f"[!] Invalid repository: {arg}")
             print("Usage: python scrape_pr.py [repository]")
-            print("Available repositories: grcov, rust-code-analysis, glean")
+            print("Available repositories: grcov, rust-code-analysis, glean, neqo")
             sys.exit(1)
     return True
     
@@ -407,6 +407,8 @@ if __name__ == "__main__":
         repos.append("rust-code-analysis")
     if "glean" in cli_args:
         repos.append("glean")
+    if "neqo" in cli_args:
+        repos.append("neqo")
     
     
     for repo in repos:
