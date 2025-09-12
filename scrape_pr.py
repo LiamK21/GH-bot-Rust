@@ -373,15 +373,15 @@ def _process_pr(curr_pr: dict, repo: Repo) -> bool | str:
 
 def _validate_passed_args(args: list[str]) -> bool:
     if len(args) == 0:
-        print("Usage: python scrape_pr.py [repository]")
-        print("Available repositories: grcov, rust-code-analysis, glean")
+        print("Usage: python scrape_pr.py [repository, repository...]")
+        print("Available repositories: grcov, rust-code-analysis, glean, neqo")
         sys.exit(1)
    
     valid_repos = ["grcov", "rust-code-analysis", "glean", "neqo"]
     for arg in args:
         if arg not in valid_repos:
             print(f"[!] Invalid repository: {arg}")
-            print("Usage: python scrape_pr.py [repository]")
+            print("Usage: python scrape_pr.py [repository, repository...]")
             print("Available repositories: grcov, rust-code-analysis, glean, neqo")
             sys.exit(1)
     return True
@@ -431,7 +431,7 @@ if __name__ == "__main__":
             page += 1
 
         print(f"[+] Found {curr_valid_payloads} valid {repo} payloads")
-        print(f"[+] Found {curr_valid_payloads_amp} valid {repo} payloads")
+        print(f"[+] Found {curr_valid_payloads_amp} valid {repo} payloads with tests")
         valid_payloads += curr_valid_payloads
         valid_payloads_amp += curr_valid_payloads_amp
     
