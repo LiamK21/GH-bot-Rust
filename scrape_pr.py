@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import time
 from enum import StrEnum
 from pathlib import Path
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-type Repo = Literal["grcov", "rust-code-analysis"]
+type Repo = Literal["grcov", "rust-code-analysis", "glean"]
 
 class FileType(StrEnum):
     TEST = "test"
@@ -53,6 +54,27 @@ def _fetch_github_data(url: str) -> dict:
         wait_time = reset_time - int(time.time()) + 1
         time.sleep(max(wait_time, 1))
         return _fetch_github_data(url)
+    response.raise_for_status()
+    return response.json()
+
+def _fetch_bugzilla_data(bug_id: int) -> dict:
+    """
+    Fetches data from Bugzilla API.
+
+    Parameters:
+        bug_id (str): Bugzilla id.
+
+    Returns:
+        dict: Data.
+    """
+    url = f"https://bugzilla.mozilla.org/rest/bug/{bug_id}"
+    response = requests.get(url)
+    if response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
+        print("[*] Sleeping...")
+        reset_time = int(response.headers["X-RateLimit-Reset"])
+        wait_time = reset_time - int(time.time()) + 1
+        time.sleep(max(wait_time, 1))
+        return _fetch_bugzilla_data(bug_id)
     response.raise_for_status()
     return response.json()
 
@@ -101,13 +123,34 @@ def _get_linked_data(pr_title: str, pr_description: str, repo: Repo) -> str:
     Returns:
         str: The linked issue title and description
     """
+    issue_description = f"{pr_title} {pr_description}"
+    # Glean often links to bugs in Bugzilla, not GitHub issues
+    if repo == "glean":
+        bugzilla_url_pattern = r"\bhttps://bugzilla\.mozilla\.org/show_bug\.cgi\?id=(\d+)\b"
+        bugzilla_bug_id_pattern = r"\bbug\s+(\d+)\b"
+        bugzilla_url_matches: list[str] = re.findall(
+            bugzilla_url_pattern, issue_description, re.IGNORECASE
+        )
+        bugzilla__bug_id_matches: list[str] = re.findall(
+            bugzilla_bug_id_pattern, issue_description, re.IGNORECASE
+        )
+        all_matches = bugzilla_url_matches + bugzilla__bug_id_matches
+        
+        if all_matches:
+            for bug_id in all_matches:
+                bug_id = int(bug_id)
+                if not bug_id:
+                    continue
+                linked_issue_description = _get_bugzilla_issue(bug_id)
+                if linked_issue_description:
+                    return linked_issue_description
+                
     issue_pattern = r"#(\d+)"
     url_pattern = rf"\bhttps://github\.com/mozilla/{re.escape(repo)}/issues/(\d+)\b"
         
     # issue_pattern = (
     #     r"\b(?:Closes|Fixes|Resolves)\s+#(\d+)\b|\(?\b(?:bug|issue)\b\s+(\d+)\)?"
     # )
-    issue_description = f"{pr_title} {pr_description}"
     issue_matches: list[str] = re.findall(
             issue_pattern, issue_description, re.IGNORECASE
         )
@@ -128,6 +171,27 @@ def _get_linked_data(pr_title: str, pr_description: str, repo: Repo) -> str:
 
     return ""
 
+
+def _get_bugzilla_issue(number: int) -> str | None:
+    """
+    Fetches a Bugzilla issue.
+
+    Parameters:
+        number (int): The number of the issue
+
+    Returns:
+        str | None: The Bugzilla issue title and description
+    """
+    bug_data = _fetch_bugzilla_data(number)
+    if "bugs" in bug_data and len(bug_data["bugs"]) > 0:
+        bug: dict = bug_data["bugs"][0]
+        component: str = bug.get("component", "")
+        if not "glean" in component.lower():
+            return None
+        return "\n".join(
+            value for value in (bug["summary"], bug.get("description", "")) if value
+        )
+    return None
 
 def _get_github_issue(number: int, repo: Repo) -> str | None:
     """
@@ -240,7 +304,7 @@ def _save_pr_amp(payload, repo: Repo) -> None:
         print(f"[!] PR #{pr_number} at {path} already exists\n")
 
 
-def _process_pr(curr_pr: dict, repo: Repo) -> bool:
+def _process_pr(curr_pr: dict, repo: Repo) -> bool | str:
     """
     Processes PR fetched from the GitHub PR list.
 
@@ -250,13 +314,6 @@ def _process_pr(curr_pr: dict, repo: Repo) -> bool:
     Returns:
         bool: True if PR fulfills requirements, False otherwise.
     """
-    if repo == "grcov":
-        global valid_grcov_payloads
-        global valid_grcov_payloads_amp
-    else:
-        global valid_rust_code_analysis_payloads
-        global valid_rust_code_analysis_payloads_amp
-
     pr_number = curr_pr["number"]
     print(f"[*] Processing PR #{pr_number}...")
 
@@ -305,48 +362,76 @@ def _process_pr(curr_pr: dict, repo: Repo) -> bool:
     # Requirement #4: PR must modify at least one .rs file
     if "src" in file_types:
         if "test" in file_types:
-            valid_grcov_payloads_amp += 1 if repo == "grcov" else 0
-            valid_rust_code_analysis_payloads_amp += 1 if repo == "rust-code-analysis" else 0
             _save_pr_amp(current_payload, repo)
+            return "amp"
         else:
-            valid_grcov_payloads_amp += 1 if repo == "grcov" else 0
-            valid_rust_code_analysis_payloads_amp += 1 if repo == "rust-code-analysis" else 0
             _save_pr(current_payload, repo)
-        return True
+            return "src"
     else:
         print(f"[!] No .rs changes in source code in PR #{pr_number}\n")
         return False
 
+def _validate_passed_args(args: list[str]) -> bool:
+    if len(args) == 0:
+        print("Usage: python scrape_pr.py [repository]")
+        print("Available repositories: grcov, rust-code-analysis, glean")
+        sys.exit(1)
+   
+    valid_repos = ["grcov", "rust-code-analysis", "glean"]
+    for arg in args:
+        if arg not in valid_repos:
+            print(f"[!] Invalid repository: {arg}")
+            print("Usage: python scrape_pr.py [repository]")
+            print("Available repositories: grcov, rust-code-analysis, glean")
+            sys.exit(1)
+    return True
+    
+    
+
 
 ################## Main Logic ###################
-#valid_payloads = 0
-valid_grcov_payloads = 0
-valid_rust_code_analysis_payloads = 0
-#valid_payloads_amp = 0
-valid_grcov_payloads_amp = 0
-valid_rust_code_analysis_payloads_amp = 0
+valid_payloads = 0
+valid_payloads_amp = 0
 page = 1
 
 
 if __name__ == "__main__":
-    while (valid_grcov_payloads + valid_rust_code_analysis_payloads) < SCRAPE_TARGET:
-        pr_list_grcov = _fetch_pr_list(page, "grcov")
-        pr_list_rust_code_analysis = _fetch_pr_list(page, "rust-code-analysis")
-        if not pr_list_grcov and not pr_list_rust_code_analysis:
-            print("[*] No PRs to process")
-            break
+    repos: list[Repo] = []
 
-        for pr in pr_list_grcov:
-            if _process_pr(pr, "grcov") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
+    cli_args = sys.argv[1:]
+    _validate_passed_args(cli_args)
+    
+    if "grcov" in cli_args:
+        repos.append("grcov")
+    if "rust-code-analysis" in cli_args:
+        repos.append("rust-code-analysis")
+    if "glean" in cli_args:
+        repos.append("glean")
+    
+    
+    for repo in repos:
+        curr_valid_payloads = 0
+        curr_valid_payloads_amp = 0
+        print(f"[*] Scraping PRs from {repo}...")
+        while (valid_payloads) < SCRAPE_TARGET:
+            pr_list = _fetch_pr_list(page, repo)
+            if not pr_list:
+                print("[*] No PRs to process")
                 break
-        print("Processing rust-code-analysis PRs...")
-        for pr in pr_list_rust_code_analysis:
-            if _process_pr(pr, "rust-code-analysis") and (valid_grcov_payloads + valid_rust_code_analysis_payloads) >= SCRAPE_TARGET:
-                break
+            
+            for pr in pr_list:
+                res = _process_pr(pr, repo)
+                if res and (valid_payloads) >= SCRAPE_TARGET:
+                    break
+                curr_valid_payloads += 1 if res == "src" else 0
+                curr_valid_payloads_amp += 1 if res == "amp" else 0
+                        
+            page += 1
 
-        page += 1
-
-    print(f"[+] Found {valid_grcov_payloads} valid grcov payloads")
-    print(f"[+] Found {valid_rust_code_analysis_payloads} valid rust-code-analysis payloads")
-    print(f"[+] Found {valid_grcov_payloads_amp} valid grcov payloads with integration test files\n")
-    print(f"[+] Found {valid_rust_code_analysis_payloads_amp} valid rust-code-analysis payloads with integration test files\n")
+        print(f"[+] Found {curr_valid_payloads} valid {repo} payloads")
+        print(f"[+] Found {curr_valid_payloads_amp} valid {repo} payloads")
+        valid_payloads += curr_valid_payloads
+        valid_payloads_amp += curr_valid_payloads_amp
+    
+    print(f"[+] Found {valid_payloads} valid total payloads")
+    print(f"[+] Found {valid_payloads_amp} valid total payloads with tests")
