@@ -38,6 +38,7 @@ BUGZILLA_GET_BUG_URL = "https://bugzilla.mozilla.org/rest/bug"
 BUGZILLA_BUGS: list[int] = []
 BUGZILLA_BUGS_DICT = dict() 
 BUGZILLA_BUGS_REQUIRED = 50
+BUGZILLA_PR = {}
 BUGZILLA_HEADERS = {
     "Accept": "application/json",
 }
@@ -147,8 +148,8 @@ def _get_linked_bugzilla_data(pr_description: str, is_pre_processing: bool) -> s
             else:
                 # retrieve from already fetched bugs
                 linked_issue_description = BUGZILLA_BUGS_DICT.get(bug_id)
-                del(BUGZILLA_BUGS_DICT[bug_id])
                 if linked_issue_description:
+                    del(BUGZILLA_BUGS_DICT[bug_id])
                     return linked_issue_description
     return ""
 
@@ -167,9 +168,9 @@ def _get_linked_data(pr_title: str, pr_description: str, repo: Repo, is_pre_proc
     issue_description = f"{pr_title} {pr_description}"
     # Glean often links to bugs in Bugzilla, not GitHub issues
     if repo == "glean":
-        val = _get_linked_bugzilla_data(issue_description, is_pre_processing)
-        if val:
-            return val
+        linked_issue_description = _get_linked_bugzilla_data(issue_description, is_pre_processing)
+        if linked_issue_description:
+            return linked_issue_description
                 
     issue_pattern = r"#(\d+)"
     url_pattern = rf"\bhttps://github\.com/mozilla/{re.escape(repo)}/issues/(\d+)\b"
@@ -351,7 +352,8 @@ def pre_process_glean_prs(pr_list: dict):
         if res == "BUGZILLA":
             print(f"[*] linked issue belongs to Bugzilla")
             cast(list, pr_list).remove(pr)
-    
+            BUGZILLA_PR[pr_number] = pr
+
 def process_pr(curr_pr: dict, repo: Repo) -> bool | str:
     """
     Processes PR fetched from the GitHub PR list.
@@ -487,19 +489,23 @@ if __name__ == "__main__":
             
             
             for pr in pr_list:
-                if repo == "glean":
-                    res: str | bool = False
-                    # Call different starting function for Glean to batch fetch Bugzilla bugs
-                    pass
-                else:
-                    res = process_pr(pr, repo)
-                    
+                res = process_pr(pr, repo)
                 if res and (valid_payloads) >= SCRAPE_TARGET:
                     break
                 curr_valid_payloads += 1 if res == "src" else 0
                 curr_valid_payloads_amp += 1 if res == "amp" else 0
                         
             page += 1
+            break
+        
+        if repo == "glean":
+            for pr_number, pr in BUGZILLA_PR.items():
+                res = process_pr(pr, repo)
+                if res and (valid_payloads) >= SCRAPE_TARGET:
+                    break
+                curr_valid_payloads += 1 if res == "src" else 0
+                curr_valid_payloads_amp += 1 if res == "amp" else 0
+        
 
         print(f"[+] Found {curr_valid_payloads} valid {repo} payloads")
         print(f"[+] Found {curr_valid_payloads_amp} valid {repo} payloads with tests")
