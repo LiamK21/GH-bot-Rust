@@ -1,0 +1,97 @@
+#neqo-crypto/src/err.rs
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#![allow(dead_code)]
+
+include!(concat!(env!("OUT_DIR"), "/nspr_error.rs"));
+mod codes {
+    #![allow(non_snake_case)]
+    include!(concat!(env!("OUT_DIR"), "/nss_secerr.rs"));
+    include!(concat!(env!("OUT_DIR"), "/nss_sslerr.rs"));
+    include!(concat!(env!("OUT_DIR"), "/mozpkix.rs"));
+}
+pub use codes::mozilla_pkix_ErrorCode as mozpkix;
+pub use codes::SECErrorCodes as sec;
+pub use codes::SSLErrorCodes as ssl;
+pub mod nspr {
+    include!(concat!(env!("OUT_DIR"), "/nspr_err.rs"));
+}
+
+pub type Res<T> = Result<T, Error>;
+
+#[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq)]
+#[allow(clippy::pub_enum_variant_names)]
+pub enum Error {
+    AeadInitFailure,
+    AeadError,
+    CertificateLoading,
+    CreateSslSocket,
+    HkdfError,
+    InternalError,
+    IntegerOverflow,
+    InvalidEpoch,
+    MixedHandshakeMethod,
+    NoDataAvailable,
+    NssError {
+        name: String,
+        code: PRErrorCode,
+        desc: String,
+    },
+    OverrunError,
+    TimeTravelError,
+    UnsupportedCipher,
+    UnsupportedVersion,
+}
+
+impl std::error::Error for Error {
+    fn cause(&self) -> Option<&dyn std::error::Error> {
+        None
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Error: {:?}", self)
+    }
+}
+
+// TryFromIntError is only ever used in time.rs for time conversion.
+impl From<std::num::TryFromIntError> for Error {
+    fn from(_: std::num::TryFromIntError) -> Self {
+        Error::TimeTravelError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::err::{nspr, sec, ssl};
+    use test_fixture::fixture_init;
+
+    use crate::err::{secstatus_to_res, Error, is_blocked, PRErrorCode, PR_SetError};
+    use crate::ssl::{SECFailure, SECSuccess};
+    use std::ffi::NulError;
+
+    #[test]
+    fn error_code() {
+        fixture_init();
+        assert_eq!(15 - 0x3000, ssl::SSL_ERROR_BAD_MAC_READ);
+        assert_eq!(166 - 0x2000, sec::SEC_ERROR_LIBPKIX_INTERNAL);
+        assert_eq!(-5998, nspr::PR_WOULD_BLOCK_ERROR);
+    }
+
+    #[test]
+    fn test_secstatus_to_res() {
+      let _ = PR_SetError(PRErrorCode::PR_WOULD_BLOCK_ERROR as i32, 0);
+      let res = secstatus_to_res(SECFailure);
+      assert!(res.is_err());
+      assert!(is_blocked(&res));
+    }
+}

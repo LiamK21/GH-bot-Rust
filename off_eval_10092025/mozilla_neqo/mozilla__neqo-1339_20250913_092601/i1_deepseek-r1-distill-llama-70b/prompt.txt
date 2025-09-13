@@ -1,0 +1,129 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Don't grease VN with the version from the client Initial
+If the client sends 0x?a?a?a?a, we should not include that version in the VN packet.  A client is required to ignore a VN where the server includes the version they attempted, which applies here too.
+
+The easiest way to fix this is to pass the client packet version into PacketBuilder::version_negotiation and ensure that we don't repeat that when greasing (we can just add 0x10 to the version to avoid a collision).  We should include a test for this, which will be probabilistic, but at 2<sup>-16</sup> odds, we will get test failures often enough if we run the test a few hundred times.
+
+The impact of this is minor: the client should ignore the VN packet and continue sending its Initial.  We probably won't make the same mistake multiple times in a row, but it will add unnecessary latency.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/packet/mod.rs b/neqo-transport/src/packet/mod.rs
+--- a/neqo-transport/src/packet/mod.rs
++++ b/neqo-transport/src/packet/mod.rs
+@@ -437,11 +437,16 @@ impl PacketBuilder {
+     }
+ 
+     /// Make a Version Negotiation packet.
+-    pub fn version_negotiation(dcid: &[u8], scid: &[u8], versions: &[Version]) -> Vec<u8> {
++    pub fn version_negotiation(
++        dcid: &[u8],
++        scid: &[u8],
++        client_version: u32,
++        versions: &[Version],
++    ) -> Vec<u8> {
+         let mut encoder = Encoder::default();
+-        let mut grease = random(5);
++        let mut grease = random(4);
+         // This will not include the "QUIC bit" sometimes.  Intentionally.
+-        encoder.encode_byte(PACKET_BIT_LONG | (grease[4] & 0x7f));
++        encoder.encode_byte(PACKET_BIT_LONG | (grease[3] & 0x7f));
+         encoder.encode(&[0; 4]); // Zero version == VN.
+         encoder.encode_vec(1, dcid);
+         encoder.encode_vec(1, scid);
+@@ -450,9 +455,13 @@ impl PacketBuilder {
+             encoder.encode_uint(4, v.as_u32());
+         }
+         // Add a greased version, using the randomness already generated.
+-        for g in &mut grease[..4] {
++        for g in &mut grease[..3] {
+             *g = *g & 0xf0 | 0x0a;
+         }
++
++        // Ensure our greased version does not collide with the client version
++        // by making the last byte differ from the client initial.
++        grease[3] = (client_version.wrapping_add(0x10) & 0xf0) as u8 | 0x0a;
+         encoder.encode(&grease[..4]);
+ 
+         Vec::from(encoder)
+@@ -1347,7 +1356,8 @@ mod tests {
+     #[test]
+     fn build_vn() {
+         fixture_init();
+-        let mut vn = PacketBuilder::version_negotiation(SERVER_CID, CLIENT_CID, &Version::all());
++        let mut vn =
++            PacketBuilder::version_negotiation(SERVER_CID, CLIENT_CID, 0x0a0a0a0a, &Version::all());
+         // Erase randomness from greasing...
+         assert_eq!(vn.len(), SAMPLE_VN.len());
+         vn[0] &= 0x80;
+@@ -1357,6 +1367,14 @@ mod tests {
+         assert_eq!(&vn, &SAMPLE_VN);
+     }
+ 
++    #[test]
++    fn vn_do_not_repeat_client_grease() {
++        fixture_init();
++        let vn =
++            PacketBuilder::version_negotiation(SERVER_CID, CLIENT_CID, 0x0a0a0a0a, &Version::all());
++        assert_ne!(&vn[SAMPLE_VN.len() - 4..], &[0x0a, 0x0a, 0x0a, 0x0a]);
++    }
++
+     #[test]
+     fn parse_vn() {
+         let (packet, remainder) =
+
+diff --git a/neqo-transport/src/server.rs b/neqo-transport/src/server.rs
+--- a/neqo-transport/src/server.rs
++++ b/neqo-transport/src/server.rs
+@@ -573,6 +573,7 @@ impl Server {
+             let vn = PacketBuilder::version_negotiation(
+                 packet.scid(),
+                 packet.dcid(),
++                packet.version().unwrap().as_u32(),
+                 self.conn_params.get_versions().all(),
+             );
+             return Some(Datagram::new(dgram.destination(), dgram.source(), vn));
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

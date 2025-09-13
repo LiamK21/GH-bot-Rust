@@ -1,0 +1,49 @@
+#[test]
+fn test_server_sends_large_response() {
+    let mut args = Args::default();
+    args.max_table_size_encoder = 100;
+    args.max_table_size_decoder = 100;
+
+    let server = SimpleServer::new(&args, AntiReplay::default(), Rc::new(RefCell::new(RandomConnectionIdGenerator::default())));
+
+    let (mut sender, mut receiver) = mpsc::channel(1);
+
+    let handle = std::thread::spawn(move || {
+        let mut poll = Poll::new().unwrap();
+        let mut timer = Builder::default().build().unwrap();
+
+        poll.register(&mut UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap(), Token(0), Ready::all(), PollOpt::edge().unwrap()).unwrap();
+
+        let mut events = Events::with_capacity(1024);
+
+        while let Some(event) = server.next_event() {
+            match event {
+                Http3ServerEvent::Headers { mut stream, headers, fin } => {
+                    let response = ResponseData::from(vec![b'a'; 100000]);
+                    response.send(&mut stream);
+                    if response.done() {
+                        stream.stream_close_send().unwrap();
+                    } else {
+                        server.remaining_data.insert(stream.stream_id(), response);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let client = AsyncSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = client.local_addr().unwrap();
+
+    client.connect(addr).unwrap();
+
+    let mut data = Vec::new();
+    while receiver.try_recv().is_ok() {
+        data.extend(receiver.try_recv().unwrap());
+    }
+
+    let expected = b"Hello World".to_vec();
+    assert_eq!(data, expected);
+
+    handle.join().unwrap();
+}

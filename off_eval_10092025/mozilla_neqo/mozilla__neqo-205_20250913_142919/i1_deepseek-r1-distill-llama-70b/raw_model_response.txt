@@ -1,0 +1,135 @@
+<think>
+Okay, I need to figure out whether a unit test is needed for the given patch. Let me start by understanding the issue and the changes made.
+
+The issue is about reading data frames after a stream has been unblocked. Previously, the code only read header frames after unblocking, waiting for new packets to read data frames. This could cause issues if no new packets arrive. The patch modifies the code to start reading data frames immediately after unblocking.
+
+Looking at the patch, several functions are changed. The `read_stream_client` and `read_stream_server` functions in `connection.rs` have their parameters removed, and their implementations now directly call `receive` instead of conditionally calling `unblock` or `receive`. 
+
+In `transaction_client.rs`, the `unblock` method is removed, and the `recv_frame_header` method is updated to handle blocked states by attempting to decode headers. Similarly, in `transaction_server.rs`, the `unblock` method is removed, and the `recv_frame_header` method is adjusted to handle blocked decoding.
+
+These changes suggest that the patch ensures that both headers and data frames are read when a stream is unblocked, which should fix the issue where data frames weren't being read without new packets.
+
+Now, considering whether a test is needed. Since the behavior has changed, a test is necessary to verify that after the patch, data frames are indeed read when the stream is unblocked, without requiring new packets.
+
+The test should simulate a scenario where a stream is unblocked and then check if both header and data frames are processed correctly. The test should fail before the patch because data frames wouldn't be read, and pass after the patch because they would.
+
+I'll structure the test to create a request, send a response with headers and data, and then unblock the stream. After processing, I'll check if both header and data events are received.
+
+I'll need to import necessary modules and use the `connect_and_receive_control_stream` function to set up the connection. The test will send headers and data, then process the connection to see if the events are triggered as expected.
+
+So, the test will look for `HeaderReady` and `DataReadable` events after unblocking. If both are received, the test passes; otherwise, it fails.
+
+I'll name the test `test_read_frames_header_blocked` to reflect the scenario. It will initialize the connection, send the response, and check for the expected events after processing.
+</think>
+
+<Filename>neqo-http3/src/connection.rs</Filename>
+<imports>
+use super::connect_and_receive_control_stream;
+use super::QPackEncoder;
+use neqo_common::{Connection, Error, Http3Event, Http3State};
+use neqo_transports::Connection as TransportConnection;
+</imports>
+<Rust>
+#[test]
+fn test_read_frames_header_blocked() {
+    let (mut hconn, mut neqo_trans_conn, _, mut encoder) =
+        connect_and_receive_control_stream(true);
+    let request_stream_id = hconn
+        .fetch(
+            "GET",
+            "https",
+            "something.com",
+            "/",
+            &Vec::<(String, String)>::new(),
+        )
+        .unwrap();
+    assert_eq!(request_stream_id, 0);
+    let _ = hconn.stream_close_send(request_stream_id);
+    let out = hconn.process(None, now());
+    neqo_trans_conn.process(out.dgram(), now());
+
+    encoder.set_max_capacity(100).unwrap();
+    encoder.set_max_blocked_streams(100).unwrap();
+
+    // find the new request/response stream and send frame v on it.
+    let events = neqo_trans_conn.events();
+    for e in events {
+        match e {
+            ConnectionEvent::NewStream {
+                stream_id,
+                stream_type,
+            } => {
+                assert_eq!(stream_id, request_stream_id);
+                assert_eq!(stream_type, StreamType::BiDi);
+            }
+            ConnectionEvent::RecvStreamReadable { stream_id } => {
+                assert_eq!(stream_id, request_stream_id);
+                let mut buf = [0u8; 100];
+                let (amount, fin) = neqo_trans_conn.stream_recv(stream_id, &mut buf).unwrap();
+                assert_eq!(fin, true);
+                assert_eq!(amount, 18);
+                assert_eq!(
+                    buf[..18],
+                    [
+                        0x01, 0x10, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x89, 0x41, 0xe9, 0x2a, 0x67,
+                        0x35, 0x53, 0x2e, 0x43, 0xd3, 0xc1
+                    ]
+                );
+
+                let headers = vec![
+                    (String::from(":status"), String::from("200")),
+                    (String::from("my-header"), String::from("my-header")),
+                    (String::from("content-length"), String::from("3")),
+                ];
+                let encoded_headers = encoder.encode_header_block(&headers, stream_id);
+                let hframe = HFrame::Headers {
+                    len: encoded_headers.len() as u64,
+                };
+                let mut d = Encoder::default();
+                hframe.encode(&mut d);
+                d.encode(&encoded_headers);
+                let d_frame = HFrame::Data { len: 3 };
+                d_frame.encode(&mut d);
+                d.encode(&[0x61, 0x62, 0x63]);
+                let _ = neqo_trans_conn.stream_send(stream_id, &d[..]);
+                neqo_trans_conn.stream_close_send(stream_id).unwrap();
+            }
+            _ => {}
+        }
+    }
+    // Send response before sending encoder instructions.
+    let out = neqo_trans_conn.process(None, now());
+    let _out = hconn.process(out.dgram(), now());
+
+    let header_ready_event = |e| matches!(e, Http3Event::HeaderReady { .. });
+    assert!(!hconn.events().any(header_ready_event));
+
+    // Send encoder instructions to unblock the stream.
+    encoder.send(&mut neqo_trans_conn).unwrap();
+
+    let out = neqo_trans_conn.process(None, now());
+    let _out = hconn.process(out.dgram(), now());
+    let _out = hconn.process(None, now());
+
+    let mut recv_header = false;
+    let mut recv_data = false;
+    // Now the stream is unblocked and both headers and data will be consumed.
+    let events = hconn.events();
+    for e in events {
+        match e {
+            Http3Event::HeaderReady { stream_id } => {
+                assert_eq!(stream_id, request_stream_id);
+                recv_header = true;
+            }
+            Http3Event::DataReadable { stream_id } => {
+                recv_data = true;
+                assert_eq!(stream_id, request_stream_id);
+            }
+            x => {
+                eprintln!("event {:?}", x);
+                panic!()
+            }
+        }
+    }
+    assert!(recv_header && recv_data);
+}</Rust>

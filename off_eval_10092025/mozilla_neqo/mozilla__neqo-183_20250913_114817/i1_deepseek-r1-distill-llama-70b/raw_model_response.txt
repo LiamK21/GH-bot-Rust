@@ -1,0 +1,71 @@
+<think>
+Okay, I need to figure out how to write a regression test for the patch provided. The issue was that SendStreamWritable events were being posted even when flow control didn't allow sending more data. The patch modifies the code to correctly handle this by considering both stream credit and connection credit.
+
+First, I should understand what the patch changes. It looks like the `stream_avail_send_space` function was modified to only consider the send stream's available space, not the connection's flow credit. Also, the `handle_max_data` function was added to properly check if the connection was blocked and then unblock the streams if credit increases.
+
+The test needs to verify that before the patch, SendStreamWritable events were incorrectly sent when they shouldn't have been, and after the patch, they are only sent when appropriate.
+
+I'll start by setting up a test scenario where the connection has limited credit. Then, I'll create a stream and check if the events are generated correctly when credits are increased.
+
+In the test, I'll:
+
+1. Initialize a client and server connection.
+2. Create a unidirectional stream and check the initial available send space.
+3. Send some data and observe the events.
+4. Modify the stream's max data and check if the events are generated only when the stream becomes unblocked.
+5. Increase the max data again and ensure that events are not generated if the stream is still blocked by connection credit.
+6. Finally, increase the connection's max data and check if the event is generated as the stream becomes unblocked.
+
+I need to make sure that each step correctly tests the conditions before and after the patch. The test should fail before the patch because events would be generated even when blocked, and pass after the patch because events are only generated when unblocked.
+
+I'll structure the test with these steps, using assertions to check the number and type of events after each action. This will ensure that the patch correctly resolves the issue.
+</think>
+
+<Filename> neqo-transport/src/connection.rs </Filename>
+<imports>
+use super::default_client;
+use super::default_server;
+use super::connect;
+use super::StreamType;
+use neqo_common::matches;
+use std::collections::BTreeSet;
+</imports>
+<Rust>
+#[test]
+fn test_send_stream_writable_event_after_max_data() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect(&mut client, &mut server);
+
+    let stream_id = client.stream_create(StreamType::UniDi).unwrap();
+    assert_eq!(stream_id, 2);
+    assert_eq!(
+        client.stream_avail_send_space(stream_id).unwrap(),
+        16383 // LOCAL_MAX_DATA in test config
+    );
+
+    // Initial send should succeed but not generate any events because credit is available
+    let evts = client.events().collect::<BTreeSet<_>>();
+    assert!(evts.is_empty());
+
+    // Send data and check events
+    client.stream_send(stream_id, &[b'a'; 4096]).unwrap();
+    let evts = client.events().collect::<BTreeSet<_>>();
+    assert!(evts.is_empty());
+
+    // Mark data as sent and acked
+    let mut ss = client.send_streams.get_mut(stream_id.into()).unwrap();
+    ss.mark_as_sent(0, 4096, false);
+    ss.mark_as_acked(0, 4096, false);
+
+    // No event because still limited by conn max data
+    let evts = client.events().collect::<BTreeSet<_>>();
+    assert!(evts.is_empty());
+
+    // Increase max data and check event
+    client.handle_max_data(100000);
+    let evts = client.events().collect::<BTreeSet<_>>();
+    assert_eq!(evts.len(), 1);
+    assert!(matches!(evts.into_iter().next().unwrap(), ConnectionEvent::SendStreamWritable(_)));
+}
+</Rust>

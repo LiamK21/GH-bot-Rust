@@ -1,0 +1,645 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Cut down on event-related borrow()ing in the code
+We signal events in many places and since the Event struct is refcounted this requires a `borrow()` or `borrow_mut()` each time. Instead, we can make the list WITHIN the Event struct refcounted, so the ugliness will move within Event's methods.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-http3/src/connection.rs b/neqo-http3/src/connection.rs
+--- a/neqo-http3/src/connection.rs
++++ b/neqo-http3/src/connection.rs
+@@ -176,7 +176,7 @@ pub struct Http3Connection {
+     streams_are_readable: BTreeSet<u64>,
+     streams_have_data_to_send: BTreeSet<u64>,
+     // Client only
+-    events: Rc<RefCell<Http3Events>>,
++    events: Http3Events,
+     request_streams_client: HashMap<u64, RequestStreamClient>,
+     // Server only
+     #[allow(clippy::type_complexity)]
+@@ -221,7 +221,7 @@ impl Http3Connection {
+             settings_received: false,
+             streams_are_readable: BTreeSet::new(),
+             streams_have_data_to_send: BTreeSet::new(),
+-            events: Rc::new(RefCell::new(Http3Events::default())),
++            events: Http3Events::default(),
+             handler,
+         }
+     }
+@@ -290,14 +290,14 @@ impl Http3Connection {
+             Http3State::Initializing => {
+                 if self.conn.state().clone() == State::Connected {
+                     self.state = Http3State::Connected;
+-                    self.events.borrow_mut().connected();
++                    self.events.connected();
+                     let res = self.initialize_http3_connection();
+                     self.check_result(now, res);
+                 }
+             }
+             Http3State::Connected => {
+                 if let State::Closing { error, .. } = self.conn.state().clone() {
+-                    self.events.borrow_mut().connection_closing();
++                    self.events.connection_closing();
+                     self.state = Http3State::Closing(error.into());
+                 }
+             }
+@@ -541,7 +541,7 @@ impl Http3Connection {
+     }
+ 
+     fn handle_stream_reset(&mut self, stream_id: u64, app_err: AppError) -> Res<()> {
+-        self.events.borrow_mut().reset(stream_id, app_err);
++        self.events.reset(stream_id, app_err);
+         Ok(())
+     }
+ 
+@@ -555,13 +555,13 @@ impl Http3Connection {
+ 
+     fn handle_stream_creatable(&mut self, stream_type: StreamType) -> Res<()> {
+         if stream_type == StreamType::BiDi {
+-            self.events.borrow_mut().new_requests_creatable();
++            self.events.new_requests_creatable();
+         }
+         Ok(())
+     }
+ 
+     fn handle_connection_closed(&mut self, error_code: CloseError) -> Res<()> {
+-        self.events.borrow_mut().connection_closed(error_code);
++        self.events.connection_closed(error_code);
+         self.state = Http3State::Closed(error_code);
+         Ok(())
+     }
+@@ -830,11 +830,7 @@ impl Http3Connection {
+                 .iter()
+                 .filter(|(id, _)| **id >= goaway_stream_id)
+                 .map(|(id, _)| *id)
+-                .for_each(|id| {
+-                    self.events
+-                        .borrow_mut()
+-                        .reset(id, Error::RequestRejected.code())
+-                });
++                .for_each(|id| self.events.reset(id, Error::RequestRejected.code()));
+ 
+             // Actually remove (i.e. don't retain) these streams
+             self.request_streams_client
+@@ -844,8 +840,7 @@ impl Http3Connection {
+             // filtered events and then swapping with the original set.
+             let updated_events = self
+                 .events
+-                .borrow()
+-                .events
++                .events()
+                 .iter()
+                 .filter(|evt| match evt {
+                     Http3Event::HeaderReady { stream_id }
+@@ -860,9 +855,9 @@ impl Http3Connection {
+                 })
+                 .cloned()
+                 .collect::<BTreeSet<_>>();
+-            mem::replace(&mut self.events.borrow_mut().events, updated_events);
++            self.events.replace(updated_events);
+ 
+-            self.events.borrow_mut().goaway_received();
++            self.events.goaway_received();
+             if self.state == Http3State::Connected {
+                 self.state = Http3State::GoingAway;
+             }
+@@ -944,7 +939,7 @@ impl Http3Connection {
+ 
+     pub fn events(&mut self) -> Vec<Http3Event> {
+         // Turn it into a vec for simplicity's sake
+-        self.events.borrow_mut().events().into_iter().collect()
++        self.events.events().into_iter().collect()
+     }
+ 
+     // SERVER SIDE ONLY FUNCTIONS
+@@ -987,52 +982,59 @@ pub enum Http3Event {
+     },
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, Clone)]
+ pub struct Http3Events {
+-    events: BTreeSet<Http3Event>,
++    events: Rc<RefCell<BTreeSet<Http3Event>>>,
+ }
+ 
+ impl Http3Events {
+-    pub fn header_ready(&mut self, stream_id: u64) {
+-        self.events.insert(Http3Event::HeaderReady { stream_id });
++    pub fn header_ready(&self, stream_id: u64) {
++        self.insert(Http3Event::HeaderReady { stream_id });
++    }
++
++    pub fn data_readable(&self, stream_id: u64) {
++        self.insert(Http3Event::DataReadable { stream_id });
++    }
++
++    pub fn reset(&self, stream_id: u64, error: AppError) {
++        self.insert(Http3Event::Reset { stream_id, error });
+     }
+ 
+-    pub fn data_readable(&mut self, stream_id: u64) {
+-        self.events.insert(Http3Event::DataReadable { stream_id });
++    pub fn new_push_stream(&self, stream_id: u64) {
++        self.insert(Http3Event::NewPushStream { stream_id });
+     }
+ 
+-    pub fn reset(&mut self, stream_id: u64, error: AppError) {
+-        self.events.insert(Http3Event::Reset { stream_id, error });
++    pub fn new_requests_creatable(&self) {
++        self.insert(Http3Event::RequestsCreatable);
+     }
+ 
+-    pub fn new_push_stream(&mut self, stream_id: u64) {
+-        self.events.insert(Http3Event::NewPushStream { stream_id });
++    pub fn connected(&self) {
++        self.insert(Http3Event::ConnectionConnected);
+     }
+ 
+-    pub fn new_requests_creatable(&mut self) {
+-        self.events.insert(Http3Event::RequestsCreatable);
++    pub fn goaway_received(&self) {
++        self.insert(Http3Event::GoawayReceived);
+     }
+ 
+-    pub fn connected(&mut self) {
+-        self.events.insert(Http3Event::ConnectionConnected);
++    pub fn connection_closing(&self) {
++        self.insert(Http3Event::ConnectionClosing);
+     }
+ 
+-    pub fn goaway_received(&mut self) {
+-        self.events.insert(Http3Event::GoawayReceived);
++    pub fn connection_closed(&self, error_code: CloseError) {
++        self.events.borrow_mut().clear();
++        self.insert(Http3Event::ConnectionClosed { error_code });
+     }
+ 
+-    pub fn connection_closing(&mut self) {
+-        self.events.insert(Http3Event::ConnectionClosing);
++    pub fn events(&self) -> BTreeSet<Http3Event> {
++        self.replace(BTreeSet::new())
+     }
+ 
+-    pub fn connection_closed(&mut self, error_code: CloseError) {
+-        self.events.clear();
+-        self.events
+-            .insert(Http3Event::ConnectionClosed { error_code });
++    pub fn replace(&self, new_events: BTreeSet<Http3Event>) -> BTreeSet<Http3Event> {
++        self.events.replace(new_events)
+     }
+ 
+-    pub fn events(&mut self) -> BTreeSet<Http3Event> {
+-        mem::replace(&mut self.events, BTreeSet::new())
++    fn insert(&self, event: Http3Event) {
++        self.events.borrow_mut().insert(event);
+     }
+ }
+
+diff --git a/neqo-http3/src/request_stream_client.rs b/neqo-http3/src/request_stream_client.rs
+--- a/neqo-http3/src/request_stream_client.rs
++++ b/neqo-http3/src/request_stream_client.rs
+@@ -14,9 +14,7 @@ use neqo_qpack::encoder::QPackEncoder;
+ use neqo_transport::Connection;
+ 
+ use crate::{Error, Res};
+-use std::cell::RefCell;
+ use std::mem;
+-use std::rc::Rc;
+ 
+ #[derive(Debug)]
+ struct Request {
+@@ -128,7 +126,7 @@ pub struct RequestStreamClient {
+     request: Request,
+     response: Response,
+     frame_reader: HFrameReader,
+-    conn_events: Rc<RefCell<Http3Events>>,
++    conn_events: Http3Events,
+ }
+ 
+ impl RequestStreamClient {
+@@ -139,7 +137,7 @@ impl RequestStreamClient {
+         host: &str,
+         path: &str,
+         headers: &[(String, String)],
+-        conn_events: Rc<RefCell<Http3Events>>,
++        conn_events: Http3Events,
+     ) -> RequestStreamClient {
+         qinfo!("Create a request stream_id={}", stream_id);
+         RequestStreamClient {
+@@ -249,7 +247,7 @@ impl RequestStreamClient {
+                         mem::swap(&mut tmp, buf);
+                         self.state = RequestStreamClientState::BlockedDecodingHeaders { buf: tmp };
+                     } else {
+-                        self.conn_events.borrow_mut().header_ready(self.stream_id);
++                        self.conn_events.header_ready(self.stream_id);
+                         self.state = RequestStreamClientState::WaitingForData;
+                     }
+                 }
+@@ -258,7 +256,7 @@ impl RequestStreamClient {
+                     self.recv_frame(conn)?;
+                     if self.state == RequestStreamClientState::ClosePending {
+                         // Received 0 byte fin? Client must see this.
+-                        self.conn_events.borrow_mut().data_readable(self.stream_id);
++                        self.conn_events.data_readable(self.stream_id);
+                     }
+                     if !self.frame_reader.done() {
+                         break Ok(());
+@@ -275,7 +273,7 @@ impl RequestStreamClient {
+                     };
+                 }
+                 RequestStreamClientState::ReadingData { .. } => {
+-                    self.conn_events.borrow_mut().data_readable(self.stream_id);
++                    self.conn_events.data_readable(self.stream_id);
+                     break Ok(());
+                 }
+                 //                RequestStreamClientState::ReadingTrailers => break Ok(()),
+@@ -321,7 +319,7 @@ impl RequestStreamClient {
+     pub fn unblock(&mut self, decoder: &mut QPackDecoder) -> Res<()> {
+         if let RequestStreamClientState::BlockedDecodingHeaders { ref mut buf } = self.state {
+             self.response.headers = decoder.decode_header_block(buf, self.stream_id)?;
+-            self.conn_events.borrow_mut().header_ready(self.stream_id);
++            self.conn_events.header_ready(self.stream_id);
+             self.state = RequestStreamClientState::WaitingForData;
+             if self.response.headers.is_none() {
+                 panic!("We must not be blocked again!");
+
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -170,7 +170,7 @@ pub struct Connection {
+     pub(crate) flow_mgr: Rc<RefCell<FlowMgr>>,
+     loss_recovery: LossRecovery,
+     loss_recovery_state: LossRecoveryState,
+-    events: Rc<RefCell<ConnectionEvents>>,
++    events: ConnectionEvents,
+     token: Option<Vec<u8>>,
+     send_vn: Option<(PacketHdr, SocketAddr, SocketAddr)>,
+     send_retry: Option<PacketType>, // This will be PacketType::Retry.
+@@ -280,7 +280,7 @@ impl Connection {
+             flow_mgr: Rc::new(RefCell::new(FlowMgr::default())),
+             loss_recovery: LossRecovery::new(),
+             loss_recovery_state: LossRecoveryState::default(),
+-            events: Rc::new(RefCell::new(ConnectionEvents::default())),
++            events: ConnectionEvents::default(),
+             token: None,
+             send_vn: None,
+             send_retry: None,
+@@ -1024,7 +1024,6 @@ impl Connection {
+                 application_error_code,
+             } => {
+                 self.events
+-                    .borrow_mut()
+                     .send_stream_stop_sending(stream_id.into(), application_error_code);
+                 if let (Some(ss), _) = self.obtain_stream(stream_id.into())? {
+                     ss.reset(application_error_code);
+@@ -1081,7 +1080,7 @@ impl Connection {
+ 
+                 if maximum_streams > *peer_max {
+                     *peer_max = maximum_streams;
+-                    self.events.borrow_mut().send_stream_creatable(stream_type);
++                    self.events.send_stream_creatable(stream_type);
+                 }
+             }
+             Frame::DataBlocked { data_limit } => {
+@@ -1144,7 +1143,6 @@ impl Connection {
+                        frame_type,
+                        reason_phrase);
+                 self.events
+-                    .borrow_mut()
+                     .connection_closed(error_code, frame_type, &reason_phrase);
+                 self.set_state(State::Closed(error_code.into()));
+             }
+@@ -1237,7 +1235,7 @@ impl Connection {
+         }
+         self.send_streams.clear();
+         self.recv_streams.clear();
+-        self.events.borrow_mut().client_0rtt_rejected();
++        self.events.client_0rtt_rejected();
+     }
+ 
+     fn set_state(&mut self, state: State) {
+@@ -1372,9 +1370,7 @@ impl Connection {
+                     );
+ 
+                     if next_stream_id.is_uni() {
+-                        self.events
+-                            .borrow_mut()
+-                            .new_stream(next_stream_id, StreamType::UniDi);
++                        self.events.new_stream(next_stream_id, StreamType::UniDi);
+                     } else {
+                         let send_initial_max_stream_data = self
+                             .tps
+@@ -1390,9 +1386,7 @@ impl Connection {
+                                 self.events.clone(),
+                             ),
+                         );
+-                        self.events
+-                            .borrow_mut()
+-                            .new_stream(next_stream_id, StreamType::BiDi);
++                        self.events.new_stream(next_stream_id, StreamType::BiDi);
+                     }
+ 
+                     *next_stream_idx += 1;
+@@ -1567,7 +1561,7 @@ impl Connection {
+ 
+     /// Get events that indicate state changes on the connection.
+     pub fn events(&mut self) -> impl Iterator<Item = ConnectionEvent> {
+-        self.events.borrow_mut().events().into_iter()
++        self.events.events().into_iter()
+     }
+ 
+     fn check_loss_detection_timeout(&mut self, now: Instant) {
+
+diff --git a/neqo-transport/src/events.rs b/neqo-transport/src/events.rs
+--- a/neqo-transport/src/events.rs
++++ b/neqo-transport/src/events.rs
+@@ -6,8 +6,9 @@
+ 
+ // Collecting a list of events relevant to whoever is using the Connection.
+ 
++use std::cell::RefCell;
+ use std::collections::BTreeSet;
+-use std::mem;
++use std::rc::Rc;
+ 
+ use crate::frame::{CloseError, StreamType};
+ use crate::stream_id::StreamId;
+@@ -44,75 +45,73 @@ pub enum ConnectionEvent {
+     ZeroRttRejected,
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, Clone)]
+ pub struct ConnectionEvents {
+-    events: BTreeSet<ConnectionEvent>,
++    events: Rc<RefCell<BTreeSet<ConnectionEvent>>>,
+ }
+ 
+ impl ConnectionEvents {
+-    pub fn new_stream(&mut self, stream_id: StreamId, stream_type: StreamType) {
+-        self.events.insert(ConnectionEvent::NewStream {
++    pub fn new_stream(&self, stream_id: StreamId, stream_type: StreamType) {
++        self.insert(ConnectionEvent::NewStream {
+             stream_id: stream_id.as_u64(),
+             stream_type,
+         });
+     }
+ 
+-    pub fn send_stream_writable(&mut self, stream_id: StreamId) {
+-        self.events.insert(ConnectionEvent::SendStreamWritable {
++    pub fn send_stream_writable(&self, stream_id: StreamId) {
++        self.insert(ConnectionEvent::SendStreamWritable {
+             stream_id: stream_id.as_u64(),
+         });
+     }
+ 
+-    pub fn recv_stream_readable(&mut self, stream_id: StreamId) {
+-        self.events.insert(ConnectionEvent::RecvStreamReadable {
++    pub fn recv_stream_readable(&self, stream_id: StreamId) {
++        self.insert(ConnectionEvent::RecvStreamReadable {
+             stream_id: stream_id.as_u64(),
+         });
+     }
+ 
+-    pub fn recv_stream_reset(&mut self, stream_id: StreamId, app_error: AppError) {
+-        self.events.insert(ConnectionEvent::RecvStreamReset {
++    pub fn recv_stream_reset(&self, stream_id: StreamId, app_error: AppError) {
++        self.insert(ConnectionEvent::RecvStreamReset {
+             stream_id: stream_id.as_u64(),
+             app_error,
+         });
+     }
+ 
+-    pub fn send_stream_stop_sending(&mut self, stream_id: StreamId, app_error: AppError) {
+-        self.events.insert(ConnectionEvent::SendStreamStopSending {
++    pub fn send_stream_stop_sending(&self, stream_id: StreamId, app_error: AppError) {
++        self.insert(ConnectionEvent::SendStreamStopSending {
+             stream_id: stream_id.as_u64(),
+             app_error,
+         });
+     }
+ 
+-    pub fn send_stream_complete(&mut self, stream_id: StreamId) {
+-        self.events.insert(ConnectionEvent::SendStreamComplete {
++    pub fn send_stream_complete(&self, stream_id: StreamId) {
++        self.insert(ConnectionEvent::SendStreamComplete {
+             stream_id: stream_id.as_u64(),
+         });
+     }
+ 
+-    pub fn send_stream_creatable(&mut self, stream_type: StreamType) {
+-        self.events
+-            .insert(ConnectionEvent::SendStreamCreatable { stream_type });
++    pub fn send_stream_creatable(&self, stream_type: StreamType) {
++        self.insert(ConnectionEvent::SendStreamCreatable { stream_type });
+     }
+ 
+-    pub fn connection_closed(
+-        &mut self,
+-        error_code: CloseError,
+-        frame_type: u64,
+-        reason_phrase: &str,
+-    ) {
+-        self.events.insert(ConnectionEvent::ConnectionClosed {
++    pub fn connection_closed(&self, error_code: CloseError, frame_type: u64, reason_phrase: &str) {
++        self.insert(ConnectionEvent::ConnectionClosed {
+             error_code,
+             frame_type,
+             reason_phrase: reason_phrase.to_owned(),
+         });
+     }
+ 
+-    pub fn client_0rtt_rejected(&mut self) {
+-        self.events.clear();
+-        self.events.insert(ConnectionEvent::ZeroRttRejected);
++    pub fn client_0rtt_rejected(&self) {
++        self.events.borrow_mut().clear();
++        self.insert(ConnectionEvent::ZeroRttRejected);
++    }
++
++    pub fn events(&self) -> BTreeSet<ConnectionEvent> {
++        self.events.replace(BTreeSet::new())
+     }
+ 
+-    pub fn events(&mut self) -> BTreeSet<ConnectionEvent> {
+-        mem::replace(&mut self.events, BTreeSet::new())
++    fn insert(&self, event: ConnectionEvent) {
++        self.events.borrow_mut().insert(event);
+     }
+ }
+
+diff --git a/neqo-transport/src/recv_stream.rs b/neqo-transport/src/recv_stream.rs
+--- a/neqo-transport/src/recv_stream.rs
++++ b/neqo-transport/src/recv_stream.rs
+@@ -340,7 +340,7 @@ pub struct RecvStream {
+     stream_id: StreamId,
+     state: RecvStreamState,
+     flow_mgr: Rc<RefCell<FlowMgr>>,
+-    conn_events: Rc<RefCell<ConnectionEvents>>,
++    conn_events: ConnectionEvents,
+ }
+ 
+ impl RecvStream {
+@@ -348,7 +348,7 @@ impl RecvStream {
+         stream_id: StreamId,
+         max_stream_data: u64,
+         flow_mgr: Rc<RefCell<FlowMgr>>,
+-        conn_events: Rc<RefCell<ConnectionEvents>>,
++        conn_events: ConnectionEvents,
+     ) -> RecvStream {
+         RecvStream {
+             stream_id,
+@@ -419,9 +419,7 @@ impl RecvStream {
+         }
+ 
+         if self.data_ready() || self.needs_to_inform_app_about_fin() {
+-            self.conn_events
+-                .borrow_mut()
+-                .recv_stream_readable(self.stream_id)
++            self.conn_events.recv_stream_readable(self.stream_id)
+         }
+ 
+         Ok(())
+@@ -431,7 +429,6 @@ impl RecvStream {
+         match self.state {
+             RecvStreamState::Recv { .. } | RecvStreamState::SizeKnown { .. } => {
+                 self.conn_events
+-                    .borrow_mut()
+                     .recv_stream_reset(self.stream_id, application_error_code);
+                 self.state.transition(RecvStreamState::ResetRecvd);
+             }
+@@ -527,7 +524,7 @@ mod tests {
+     #[test]
+     fn test_stream_rx() {
+         let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
+-        let conn_events = Rc::new(RefCell::new(ConnectionEvents::default()));
++        let conn_events = ConnectionEvents::default();
+ 
+         let mut s = RecvStream::new(567.into(), 1024, flow_mgr.clone(), conn_events.clone());
+ 
+@@ -579,7 +576,7 @@ mod tests {
+     #[test]
+     fn test_stream_rx_dedupe() {
+         let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
+-        let conn_events = Rc::new(RefCell::new(ConnectionEvents::default()));
++        let conn_events = ConnectionEvents::default();
+ 
+         let mut s = RecvStream::new(3.into(), 1024, flow_mgr.clone(), conn_events.clone());
+ 
+@@ -668,7 +665,7 @@ mod tests {
+     #[test]
+     fn test_stream_flowc_update() {
+         let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
+-        let conn_events = Rc::new(RefCell::new(ConnectionEvents::default()));
++        let conn_events = ConnectionEvents::default();
+ 
+         let frame1 = vec![0; RX_STREAM_DATA_WINDOW as usize];
+ 
+@@ -704,7 +701,7 @@ mod tests {
+     #[test]
+     fn test_stream_max_stream_data() {
+         let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
+-        let conn_events = Rc::new(RefCell::new(ConnectionEvents::default()));
++        let conn_events = ConnectionEvents::default();
+ 
+         let frame1 = vec![0; RX_STREAM_DATA_WINDOW as usize];
+
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -434,7 +434,7 @@ pub struct SendStream {
+     max_stream_data: u64,
+     state: SendStreamState,
+     flow_mgr: Rc<RefCell<FlowMgr>>,
+-    conn_events: Rc<RefCell<ConnectionEvents>>,
++    conn_events: ConnectionEvents,
+ }
+ 
+ impl SendStream {
+@@ -442,10 +442,10 @@ impl SendStream {
+         stream_id: StreamId,
+         max_stream_data: u64,
+         flow_mgr: Rc<RefCell<FlowMgr>>,
+-        conn_events: Rc<RefCell<ConnectionEvents>>,
++        conn_events: ConnectionEvents,
+     ) -> SendStream {
+         if max_stream_data > 0 {
+-            conn_events.borrow_mut().send_stream_writable(stream_id);
++            conn_events.send_stream_writable(stream_id);
+         }
+         SendStream {
+             stream_id,
+@@ -511,9 +511,7 @@ impl SendStream {
+             SendStreamState::Send { ref mut send_buf } => {
+                 send_buf.mark_as_acked(offset, len);
+                 if send_buf.buffered() < TX_STREAM_BUFFER {
+-                    self.conn_events
+-                        .borrow_mut()
+-                        .send_stream_writable(self.stream_id)
++                    self.conn_events.send_stream_writable(self.stream_id)
+                 }
+             }
+             SendStreamState::DataSent {
+@@ -523,9 +521,7 @@ impl SendStream {
+             } => {
+                 send_buf.mark_as_acked(offset, len);
+                 if fin && send_buf.buffered() == 0 {
+-                    self.conn_events
+-                        .borrow_mut()
+-                        .send_stream_complete(self.stream_id);
++                    self.conn_events.send_stream_complete(self.stream_id);
+                     self.state
+                         .transition(SendStreamState::DataRecvd { final_size });
+                 }
+@@ -876,7 +872,7 @@ mod tests {
+     fn test_stream_tx() {
+         let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
+         flow_mgr.borrow_mut().conn_increase_max_credit(4096);
+-        let conn_events = Rc::new(RefCell::new(ConnectionEvents::default()));
++        let conn_events = ConnectionEvents::default();
+ 
+         let mut s = SendStream::new(4.into(), 1024, flow_mgr.clone(), conn_events.clone());
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

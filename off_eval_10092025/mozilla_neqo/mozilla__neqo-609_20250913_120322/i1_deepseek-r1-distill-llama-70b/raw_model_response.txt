@@ -1,0 +1,79 @@
+<think>
+Okay, so I'm trying to figure out how to write a regression test for the issue where the callback time becomes 0ms after the PTO timer expires. From the patch, I can see that some changes were made in the connection.rs and recovery.rs files. The main issue seems to be that after the PTO timer fires, the client enters a busy wait, which isn't efficient.
+
+First, I need to understand what the patch does. It looks like the patch modifies the behavior when the PTO is active. Instead of returning Ok(None) when there are no more PTO packets to send, it now sends ACK frames only. Also, in the test fixtures, the AT_LEAST_PTO constant is introduced to represent a duration of at least one second, which is used in multiple test cases.
+
+The user is asking if a unit test is needed. Since the patch changes the behavior of the connection handling after PTO, a test is necessary to ensure that the callback time doesn't stay at 0ms and that the client correctly handles sending ACKs after PTO.
+
+Looking at the existing tests in the patch, I see that they added a new test called ack_after_pto. But I need to create a new test that specifically targets the scenario where the client is in PTO and then receives a packet, ensuring it sends an ACK without getting stuck in a busy wait.
+
+So, my test should simulate the following steps:
+1. Set up a client and server connection.
+2. Force the client into an idle state so that it doesn't send any data, triggering PTO.
+3. Wait for the PTO timer to expire, which should cause the client to send PTO packets.
+4. After the PTO, send a packet from the server to the client.
+5. Check that the client responds with an ACK frame and doesn't enter a busy wait (i.e., the callback time is handled correctly).
+
+I need to make sure that the test fails before the patch because without the fix, the client would busy wait, but after the patch, it should send the ACK correctly.
+
+I should structure the test by initializing the client and server, advancing time to trigger PTO, then sending a packet and checking the response. I'll need to use the test_fixture functions like connect_force_idle, send_something, and process_input.
+
+I also need to import the necessary modules and functions, like default_client, default_server, connect_force_idle, send_something, and test_process_input.
+
+Putting it all together, the test will ensure that after the PTO, when the client receives a packet, it sends an ACK without issues, thus resolving the 0ms callback problem.
+</think>
+
+The test will verify that after a PTO, the client correctly sends ACK frames without busy waiting.
+
+<Filename> neqo-transport/src/connection.rs </Filename>
+<imports>
+use super::default_client;
+use super::default_server;
+use super::connect_force_idle;
+use super::send_something;
+use super::test_process_input;
+use super::now;
+use super::AT_LEAST_PTO;
+use super::PTO_PACKET_COUNT;
+use neqo_common::Frame;
+use neqo_common::PNSpace;
+use std::time::Instant;
+</imports>
+<Rust>
+#[test]
+fn test_ack_after_pto() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+
+    let mut now = now();
+
+    // Client sends data and enters PTO
+    let _ = send_something(&mut client, now);
+
+    // Wait for PTO
+    now += AT_LEAST_PTO;
+
+    // Drain PTO packets
+    for _ in 0..PTO_PACKET_COUNT {
+        let dgram = client.process(None, now).dgram();
+        assert!(dgram.is_some());
+    }
+    assert!(client.process(None, now).dgram().is_none());
+
+    // Server sends a packet that needs ACK
+    let _ = send_something(&mut server, now);
+    let dgram = send_something(&mut server, now);
+
+    // Client should send ACK
+    let ack = client.process(Some(dgram), now).dgram();
+    assert!(ack.is_some());
+
+    // Verify ACK frames
+    let frames = server.test_process_input(ack.unwrap(), now);
+    assert_eq!(frames.len(), 1);
+    for (frame, space) in frames {
+        assert_eq!(space, PNSpace::ApplicationData);
+        assert!(matches!(frame, Frame::Ack { .. }));
+    }
+}</Rust>

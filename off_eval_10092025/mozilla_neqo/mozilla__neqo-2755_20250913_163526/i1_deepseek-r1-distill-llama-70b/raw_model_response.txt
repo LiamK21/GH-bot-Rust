@@ -1,0 +1,133 @@
+<think>
+Okay, I need to figure out how to write a regression test for the issue where `send_ignore_emsgsize` fails on BSD systems, specifically FreeBSD. The user provided a patch, and I need to determine if a unit test is necessary. 
+
+First, I'll look at the issue details. The test `send_ignore_emsgsize` is failing because when trying to send a datagram of size 65536, it's resulting in an OS error 40, which is "Message too long". The test expects that this error is ignored, allowing subsequent sends to work. However, after sending the oversized datagram, when a normal one is sent, it's resulting in "Resource temporarily unavailable" (error 35), which suggests the socket might be in a bad state.
+
+Now, looking at the patch provided. The changes are in `neqo-udp/src/lib.rs`. The patch adds a comment about sending an oversized datagram and expecting `EMSGSIZE` to be ignored. It also adds a line where the receiver's socket is set to non-blocking mode: `receiver.inner.set_nonblocking(false)?;`. 
+
+Wait, actually, the patch is modifying the test code. It seems like the test was trying to send an oversized datagram and then a normal one. The problem was that after the oversized send, the normal send failed. The patch makes the receiver's socket blocking, which might help in receiving the data properly.
+
+So, the original test was failing because after sending the oversized datagram, the sender's socket might be in a state that causes the next send to fail. The patch is adjusting the receiver's behavior to block until data is received, which might prevent the error.
+
+Now, the question is whether a unit test is needed. Since the issue is about a test failing, and the patch is modifying the test, perhaps the test itself was flawed. The patch is fixing the test to correctly handle the scenario, ensuring that after ignoring the `EMSGSIZE` error, the socket remains usable.
+
+But wait, the user is asking if a unit test is needed. The issue is that the test is failing on BSD systems. The patch is modifying the test to set the receiver to blocking mode, which might fix the test. So, perhaps the test was incorrectly written before, and the patch is correcting it.
+
+In this case, the test was part of the problem. So, the patch is fixing the test. Therefore, the test after the patch should pass, and before the patch, it would fail.
+
+So, to verify that the patch resolves the issue, we need a test that checks if sending an oversized datagram doesn't affect subsequent sends. The test should simulate the scenario, send a large datagram, ignore the error, and then successfully send a normal one.
+
+The test should be self-contained. It should create a sender and receiver socket, attempt to send an oversized datagram, expecting an `EMSGSIZE` error, then send a normal datagram and ensure it's received correctly.
+
+I should write a test that does the following:
+
+1. Create a sender and receiver UDP sockets.
+2. Send an oversized datagram from sender to receiver, expecting it to fail with `EMSGSIZE`.
+3. Send a normal-sized datagram.
+4. Ensure the receiver can receive the normal datagram without issues.
+
+In Rust, I'll structure the test using `#[test]` attribute. I'll need to use `std::net::UdpSocket` for both sender and receiver. 
+
+Wait, but the code uses `neqo-udp::Socket`, which is a custom type. So, in the test, I'll need to create instances of `Socket` for both sender and receiver.
+
+The test will:
+
+- Initialize sender and receiver sockets.
+- Attempt to send an oversized datagram, expecting it to fail with `EMSGSIZE`.
+- Then send a normal datagram.
+- Ensure the receiver can receive it.
+
+But in the original test, the issue was that after sending the oversized datagram, the next send failed. So, the test should check that after the oversized send (which is ignored), the normal send works.
+
+In the patch, the receiver is set to blocking mode. So, in the test, after sending the normal datagram, the receiver should block until it receives the data.
+
+Now, considering the code structure, the test will:
+
+- Create sender and receiver `Socket`s.
+- Prepare an oversized datagram and send it, expecting an error.
+- Prepare a normal datagram and send it.
+- Have the receiver set to blocking and receive the data.
+- Assert that the received data matches the sent.
+
+I'll need to handle possible errors when sending and receiving, using `?` for propagation.
+
+So, putting it all together, the test will look something like:
+
+- Initialize sender and receiver.
+- Send oversized, expect error.
+- Send normal.
+- Receive and assert.
+
+I should also make sure that the test is self-contained, with all necessary imports inside an `<imports>` block.
+
+Wait, the user's instructions say that the test must be exactly one `#[test]` block, not inside a `mod tests`. So, I'll write the test function directly.
+
+I'll need to import `Socket`, `Datagram`, `RecvBuf`, and other necessary items from `neqo-udp`.
+
+So, the imports will include:
+
+- `use super::Socket;`
+- `use super::Datagram;`
+- `use super::RecvBuf;`
+
+And other standard imports like `std::net::UdpSocket` and `std::time::Duration`.
+
+Wait, in the provided code, the `Socket` is created with `UdpSocket::bind`, so I'll need to use `std::net::UdpSocket` as well.
+
+Putting it all together, the test function will create the sockets, send the oversized datagram, handle the error, send the normal one, and then receive it.
+
+I think that's the plan. Now, I'll write the Rust code accordingly, ensuring that it's self-contained and follows the user's instructions.
+</think>
+
+<Filename> neqo-udp/src/lib.rs </Filename>
+<imports> 
+use super::Socket;
+use super::Datagram;
+use super::RecvBuf;
+use std::net::UdpSocket;
+use std::time::Duration;
+</imports>
+<Rust>
+#[test]
+fn test_send_ignore_emsgsize() -> std::io::Result<()> {
+    let sender = Socket::new(UdpSocket::bind("127.0.0.1:0")?);
+    let receiver = Socket::new(UdpSocket::bind("127.0.0.1:0")?);
+    let receiver_addr: std::net::SocketAddr = receiver.inner.local_addr()?;
+
+    // Send an oversized datagram and expect it to fail with EMSGSIZE
+    let oversized_datagram = Datagram::new(
+        sender.inner.local_addr()?,
+        receiver_addr,
+    )?;
+    // Grow the buffer to a size that exceeds the MTU
+    let mut buf = vec![0u8; 65536];
+    let len = "Hello World!".len();
+    buf[..len].copy_from_slice(b"Hello World!");
+    oversized_datagram.buffer = buf;
+
+    assert!(sender.send(&oversized_datagram).is_err(), 
+        "Expected send to fail with EMSGSIZE");
+
+    // Send a normal datagram
+    let normal_datagram = Datagram::new(
+        sender.inner.local_addr()?,
+        receiver_addr,
+    )?;
+    let buf = b"Hello World!";
+    normal_datagram.buffer = buf.to_vec();
+    sender.send(&normal_datagram)?;
+
+    // Set receiver to blocking mode
+    receiver.inner.set_nonblocking(false)?;
+
+    let mut recv_buf = RecvBuf::new();
+    let received_datagram = receiver.recv(receiver_addr, &mut recv_buf)?;
+
+    assert_eq!(
+        received_datagram.next().unwrap().as_ref(),
+        b"Hello World!"
+    );
+
+    Ok(())
+}
+</Rust>

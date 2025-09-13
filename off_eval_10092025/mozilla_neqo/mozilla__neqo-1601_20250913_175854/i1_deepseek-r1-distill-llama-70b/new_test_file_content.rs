@@ -1,0 +1,39 @@
+#neqo-transport/src/connection/dump.rs
+#[cfg(test)]
+mod tests {
+use super::dump_packet;
+use log::Level;
+use std::sync::Once;
+use test_log::test;
+static INIT: Once = Once::new();
+// Initialize env_logger with the specified log level.
+fn setup_log(level: Level) {
+INIT.call_once(|| {
+env_logger::Builder::new()
+.filter_level(level)
+.init();
+});
+}
+
+#[test]
+fn test_dump_packet_skips_formatting_when_log_disabled() {
+    setup_log(Level::Info);
+    let conn = &Connection::default();
+    let path = &PathRef::default();
+    let dir = "recv";
+    let pt = PacketType::Initial;
+    let pn = PacketNumber::from(1);
+    let payload = b"test_payload";
+
+    dump_packet(conn, path, dir, pt, pn, payload);
+
+    // Since log is set to Info, dump_packet should not log anything.
+    // If it did, this test would fail because the log would be captured.
+    // We can capture logs and assert none were debug level.
+    let logs = test_log::capture();
+    assert!(
+        logs.is_empty(),
+        "dump_packet logged a message even when log level is Info"
+    );
+}
+}

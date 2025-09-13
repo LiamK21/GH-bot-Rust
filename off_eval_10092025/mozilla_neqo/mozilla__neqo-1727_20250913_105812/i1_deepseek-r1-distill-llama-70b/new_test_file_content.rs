@@ -1,0 +1,18 @@
+#neqo-bin/src/bin/client/http3.rs
+#[cfg(test)]
+mod tests {
+use super::Args;
+use neqo_transport::Connection;
+
+#[test]
+fn test_create_http3_client() {
+    let mut args = Args::parse();
+    let local_addr = "0.0.0.0:0".parse().unwrap();
+    let remote_addr = "example.com:443".parse().unwrap();
+    let hostname = "example.com";
+    let resumption_token = None;
+
+    let client = create_client(&mut args, local_addr, remote_addr, hostname, resumption_token);
+    assert!(client.is_ok());
+}
+}

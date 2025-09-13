@@ -1,0 +1,154 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Sending DATA_BLOCKED in every packet
+It seems like we are sending these frames a little too aggressively.
+
+```
+0s 24ms DEBUG [Client 0x7f97f8fd10b0] pn=9 type=Short
+  TX -> DataBlocked { data_limit: 65536 }
+  TX -> Stream { stream_id: 2, offset: 10431, len: >>1303 fin: false }
+0s 25ms DEBUG [LossRecovery] packet ap-9 sent
+0s 25ms DEBUG [CongCtrl 12033/16119 ssthresh 18446744073709551615 Pacer 2674/1337] Pkt Sent len 1337, bif 12033, cwnd 16119
+0s 25ms TRACE [LossRecovery] timeout Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 25ms TRACE detect lost ap: now=Instant { tv_sec: 10619, tv_nsec: 618406899 } delay=20ms deadline=Instant { tv_sec: 10619, tv_nsec: 598406899 }
+0s 25ms DEBUG [LossRecovery] get send profile Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 25ms DEBUG [Client 0x7f97f8fd10b0] pn=10 type=Short
+  TX -> DataBlocked { data_limit: 65536 }
+  TX -> Stream { stream_id: 2, offset: 11734, len: >>1303 fin: false }
+0s 26ms DEBUG [LossRecovery] packet ap-10 sent
+0s 26ms DEBUG [CongCtrl 13370/16119 ssthresh 18446744073709551615 Pacer 2674/1337] Pkt Sent len 1337, bif 13370, cwnd 16119
+0s 26ms TRACE [LossRecovery] timeout Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 26ms TRACE detect lost ap: now=Instant { tv_sec: 10619, tv_nsec: 618406899 } delay=20ms deadline=Instant { tv_sec: 10619, tv_nsec: 598406899 }
+0s 26ms DEBUG [LossRecovery] get send profile Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 26ms DEBUG [Client 0x7f97f8fd10b0] pn=11 type=Short
+  TX -> DataBlocked { data_limit: 65536 }
+  TX -> Stream { stream_id: 2, offset: 13037, len: >>1303 fin: false }
+0s 27ms DEBUG [LossRecovery] packet ap-11 sent
+0s 27ms DEBUG [CongCtrl 14707/16119 ssthresh 18446744073709551615 Pacer 2674/1337] Pkt Sent len 1337, bif 14707, cwnd 16119
+0s 27ms TRACE [LossRecovery] timeout Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 27ms TRACE detect lost ap: now=Instant { tv_sec: 10619, tv_nsec: 618406899 } delay=20ms deadline=Instant { tv_sec: 10619, tv_nsec: 598406899 }
+0s 27ms DEBUG [LossRecovery] get send profile Instant { tv_sec: 10619, tv_nsec: 618406899 }
+0s 27ms DEBUG [Client 0x7f97f8fd10b0] pn=12 type=Short
+  TX -> DataBlocked { data_limit: 65536 }
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -512,14 +512,7 @@ impl SendStream {
+     pub fn mark_as_sent(&mut self, offset: u64, len: usize, fin: bool) {
+         if let Some(buf) = self.state.tx_buf_mut() {
+             buf.mark_as_sent(offset, len);
+-            if offset + len as u64 == self.max_stream_data {
+-                self.flow_mgr
+-                    .borrow_mut()
+-                    .stream_data_blocked(self.stream_id, self.max_stream_data);
+-            }
+-            if self.flow_mgr.borrow().conn_credit_avail() == 0 {
+-                self.flow_mgr.borrow_mut().data_blocked();
+-            }
++            self.send_blocked_if_space_needed(0);
+         };
+ 
+         if fin {
+@@ -628,14 +621,14 @@ impl SendStream {
+         self.send_internal(buf, true)
+     }
+ 
+-    fn send_blocked(&mut self, len: u64) {
+-        if self.credit_avail() < len {
++    fn send_blocked_if_space_needed(&mut self, needed_space: u64) {
++        if self.credit_avail() <= needed_space {
+             self.flow_mgr
+                 .borrow_mut()
+                 .stream_data_blocked(self.stream_id, self.max_stream_data);
+         }
+ 
+-        if self.flow_mgr.borrow().conn_credit_avail() < len {
++        if self.flow_mgr.borrow().conn_credit_avail() <= needed_space {
+             self.flow_mgr.borrow_mut().data_blocked();
+         }
+     }
+@@ -659,8 +652,8 @@ impl SendStream {
+         let buf = if buf.is_empty() || (self.avail() == 0) {
+             return Ok(0);
+         } else if self.avail() < buf.len() {
+-            self.send_blocked(buf.len() as u64);
+             if atomic {
++                self.send_blocked_if_space_needed(buf.len() as u64);
+                 return Ok(0);
+             } else {
+                 &buf[..self.avail()]
+@@ -1371,7 +1364,12 @@ mod tests {
+ 
+         // assert non-atomic write works
+         assert_eq!(s.send(b"abc").unwrap(), 2);
+-        // assert that STREAM_DATA_BLOCKED is sent.
++        assert_eq!(s.next_bytes(), Some((0, &b"ab"[..])));
++        // STREAM_DATA_BLOCKED is not sent yet.
++        assert!(flow_mgr.borrow_mut().next().is_none());
++
++        // STREAM_DATA_BLOCKED is queued once bytes using all credit are sent.
++        s.mark_as_sent(0, 2, false);
+         assert_eq!(
+             flow_mgr.borrow_mut().next().unwrap(),
+             Frame::StreamDataBlocked {
+@@ -1393,7 +1391,12 @@ mod tests {
+ 
+         // assert non-atomic write works
+         assert_eq!(s.send(b"abcd").unwrap(), 3);
+-        // assert that STREAM_DATA_BLOCKED is sent.
++        assert_eq!(s.next_bytes(), Some((2, &b"abc"[..])));
++        // DATA_BLOCKED is not sent yet.
++        assert!(flow_mgr.borrow_mut().next().is_none());
++
++        // DATA_BLOCKED is queued once bytes using all credit are sent.
++        s.mark_as_sent(2, 3, false);
+         assert_eq!(
+             flow_mgr.borrow_mut().next().unwrap(),
+             Frame::DataBlocked { data_limit: 0x5 }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

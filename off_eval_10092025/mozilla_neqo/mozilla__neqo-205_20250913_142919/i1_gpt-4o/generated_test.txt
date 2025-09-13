@@ -1,0 +1,92 @@
+#[test]
+fn test_read_frames_after_unblock() {
+    let (mut hconn, mut neqo_trans_conn, _, mut encoder) = connect_and_receive_control_stream(true);
+    let request_stream_id = hconn
+        .fetch("GET", "https", "something.com", "/", &Vec::<(String, String)>::new())
+        .unwrap();
+    assert_eq!(request_stream_id, 0);
+    let _ = hconn.stream_close_send(request_stream_id);
+    let out = hconn.process(None, now());
+    neqo_trans_conn.process(out.dgram(), now());
+
+    encoder.set_max_capacity(100).unwrap();
+    encoder.set_max_blocked_streams(100).unwrap();
+
+    let events = neqo_trans_conn.events();
+    for e in events {
+        match e {
+            ConnectionEvent::NewStream {
+                stream_id,
+                stream_type,
+            } => {
+                assert_eq!(stream_id, request_stream_id);
+                assert_eq!(stream_type, StreamType::BiDi);
+            }
+            ConnectionEvent::RecvStreamReadable { stream_id } => {
+                assert_eq!(stream_id, request_stream_id);
+                let mut buf = [0u8; 100];
+                let (amount, fin) = neqo_trans_conn.stream_recv(stream_id, &mut buf).unwrap();
+                assert_eq!(fin, true);
+                assert_eq!(amount, 18);
+                assert_eq!(
+                    buf[..18],
+                    [
+                        0x01, 0x10, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x89, 0x41, 0xe9, 0x2a, 0x67,
+                        0x35, 0x53, 0x2e, 0x43, 0xd3, 0xc1
+                    ]
+                );
+
+                let headers = vec![
+                    (String::from(":status"), String::from("200")),
+                    (String::from("my-header"), String::from("my-header")),
+                    (String::from("content-length"), String::from("3")),
+                ];
+                let encoded_headers = encoder.encode_header_block(&headers, stream_id);
+                let hframe = HFrame::Headers {
+                    len: encoded_headers.len() as u64,
+                };
+                let mut d = Encoder::default();
+                hframe.encode(&mut d);
+                d.encode(&encoded_headers);
+                let d_frame = HFrame::Data { len: 3 };
+                d_frame.encode(&mut d);
+                d.encode(&[0x61, 0x62, 0x63]);
+                let _ = neqo_trans_conn.stream_send(stream_id, &d[..]);
+                neqo_trans_conn.stream_close_send(stream_id).unwrap();
+            }
+            _ => {}
+        }
+    }
+    let out = neqo_trans_conn.process(None, now());
+    let _out = hconn.process(out.dgram(), now());
+
+    let header_ready_event = |e| matches!(e, Http3Event::HeaderReady { .. });
+    assert!(!hconn.events().any(header_ready_event));
+
+    encoder.send(&mut neqo_trans_conn).unwrap();
+
+    let out = neqo_trans_conn.process(None, now());
+    let _out = hconn.process(out.dgram(), now());
+    let _out = hconn.process(None, now());
+
+    let mut recv_header = false;
+    let mut recv_data = false;
+    let events = hconn.events();
+    for e in events {
+        match e {
+            Http3Event::HeaderReady { stream_id } => {
+                assert_eq!(stream_id, request_stream_id);
+                recv_header = true;
+            }
+            Http3Event::DataReadable { stream_id } => {
+                recv_data = true;
+                assert_eq!(stream_id, request_stream_id);
+            }
+            x => {
+                eprintln!("event {:?}", x);
+                panic!()
+            }
+        }
+    }
+    assert!(recv_header && recv_data);
+}

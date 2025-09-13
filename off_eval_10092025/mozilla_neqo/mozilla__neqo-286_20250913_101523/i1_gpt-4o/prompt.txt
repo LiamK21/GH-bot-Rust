@@ -1,0 +1,395 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Calculation for available CRYPTO/STREAM space
+CRYPTO and STREAM frames try to work out how much space they have in the frame.  But this calculation underplays the available space, particularly when there around ~64 bytes remaining in the packet.
+
+This calculation should be moved to a function on Frame.  A function called `Frame::truncate(remaining)` can self-modify to ensure that the frame uses the available space properly.     A stream frame that is being truncated can write all the way to the end of the packet and the length field dropped.  In that case, care is required to ensure that it always uses up all the remaining space, we don't want other frames sneaking in should not if the whole packet isn't used up).  It should be enough to only do that optimization if there are more than `len(encoded(len))` bytes trimmed off.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -1343,6 +1343,7 @@ impl Connection {
+                 stream_id,
+                 offset,
+                 data,
++                ..
+             } => {
+                 if let (_, Some(rs)) = self.obtain_stream(stream_id.into())? {
+                     rs.inbound_stream_frame(fin, offset, data)?;
+
+diff --git a/neqo-transport/src/crypto.rs b/neqo-transport/src/crypto.rs
+--- a/neqo-transport/src/crypto.rs
++++ b/neqo-transport/src/crypto.rs
+@@ -5,7 +5,6 @@
+ // except according to those terms.
+ 
+ use std::cell::RefCell;
+-use std::cmp::min;
+ use std::rc::Rc;
+ 
+ use neqo_common::{hex, qdebug, qinfo, qtrace};
+@@ -17,7 +16,7 @@ use neqo_crypto::{
+ };
+ 
+ use crate::connection::Role;
+-use crate::frame::{crypto_frame_hdr_len, Frame, TxMode};
++use crate::frame::{Frame, TxMode};
+ use crate::packet::{CryptoCtx, PacketNumber};
+ use crate::recovery::RecoveryToken;
+ use crate::recv_stream::RxStreamOrderer;
+@@ -167,12 +166,7 @@ impl Crypto {
+     ) -> Option<(Frame, Option<RecoveryToken>)> {
+         let tx_stream = &mut self.streams[epoch as usize].tx;
+         if let Some((offset, data)) = tx_stream.next_bytes(mode) {
+-            let frame_hdr_len = crypto_frame_hdr_len(offset, remaining);
+-            let length = min(data.len(), remaining - frame_hdr_len);
+-            let frame = Frame::Crypto {
+-                offset,
+-                data: data[..length].to_vec(),
+-            };
++            let (frame, length) = Frame::new_crypto(offset, data, remaining);
+             tx_stream.mark_as_sent(offset, length);
+ 
+             qdebug!(
+
+diff --git a/neqo-transport/src/frame.rs b/neqo-transport/src/frame.rs
+--- a/neqo-transport/src/frame.rs
++++ b/neqo-transport/src/frame.rs
+@@ -12,6 +12,9 @@ use crate::stream_id::StreamIndex;
+ use crate::{AppError, TransportError};
+ use crate::{ConnectionError, Error, Res};
+ 
++use std::cmp::min;
++use std::convert::TryFrom;
++
+ #[allow(clippy::module_name_repetitions)]
+ pub type FrameType = u64;
+ 
+@@ -142,6 +145,7 @@ pub enum Frame {
+         stream_id: u64,
+         offset: u64,
+         data: Vec<u8>,
++        fill: bool,
+     },
+     MaxData {
+         maximum_data: u64,
+@@ -197,7 +201,9 @@ impl Frame {
+             Frame::StopSending { .. } => FRAME_TYPE_STOP_SENDING,
+             Frame::Crypto { .. } => FRAME_TYPE_CRYPTO,
+             Frame::NewToken { .. } => FRAME_TYPE_NEW_TOKEN,
+-            Frame::Stream { fin, offset, .. } => {
++            Frame::Stream {
++                fin, offset, fill, ..
++            } => {
+                 let mut t = FRAME_TYPE_STREAM;
+                 if *fin {
+                     t |= STREAM_FRAME_BIT_FIN;
+@@ -205,7 +211,9 @@ impl Frame {
+                 if *offset > 0 {
+                     t |= STREAM_FRAME_BIT_OFF;
+                 }
+-                t |= STREAM_FRAME_BIT_LEN;
++                if !*fill {
++                    t |= STREAM_FRAME_BIT_LEN;
++                }
+                 t
+             }
+             Frame::MaxData { .. } => FRAME_TYPE_MAX_DATA,
+@@ -228,6 +236,68 @@ impl Frame {
+         }
+     }
+ 
++    /// Create a CRYPTO frame that fits the available space and its length.
++    pub fn new_crypto(offset: u64, data: &[u8], space: usize) -> (Frame, usize) {
++        // Subtract the frame type and offset from available space.
++        let mut remaining = space - 1 - Encoder::varint_len(offset);
++        // Then subtract space for the length field.
++        let data_len = min(remaining - 1, data.len());
++        remaining -= Encoder::varint_len(u64::try_from(data_len).unwrap());
++        remaining = min(data.len(), remaining);
++        (
++            Frame::Crypto {
++                offset,
++                data: data[..remaining].to_vec(),
++            },
++            remaining,
++        )
++    }
++
++    /// Create a STREAM frame that fits the available space.
++    /// Return a tuple of a frame and the amount of data it carries.
++    pub fn new_stream(
++        stream_id: u64,
++        offset: u64,
++        data: &[u8],
++        fin: bool,
++        space: usize,
++    ) -> (Frame, usize) {
++        let mut remaining = space - 1 - Encoder::varint_len(stream_id);
++        if offset > 0 {
++            remaining -= Encoder::varint_len(offset);
++        }
++        let (fin, fill) = if data.len() > remaining {
++            // More data than fits, fill the packet and negate |fin|.
++            (false, true)
++        } else if data.len() == remaining {
++            // Exact fit, fill the packet, keep |fin|.
++            (fin, true)
++        } else {
++            // Too small, so include a length.
++            let data_len = min(remaining - 1, data.len());
++            remaining -= Encoder::varint_len(u64::try_from(data_len).unwrap());
++            remaining = min(data.len(), remaining);
++            // In case the added length causes this to spill over, check |fin| again.
++            (fin && remaining == data.len(), false)
++        };
++        qdebug!(
++            "Frame::new_stream fill {} fin {} data {}",
++            fill,
++            fin,
++            remaining
++        );
++        (
++            Frame::Stream {
++                stream_id,
++                offset,
++                data: data[..remaining].to_vec(),
++                fin,
++                fill,
++            },
++            remaining,
++        )
++    }
++
+     pub fn marshal(&self, enc: &mut Encoder) {
+         enc.encode_varint(self.get_type());
+ 
+@@ -275,13 +345,18 @@ impl Frame {
+                 stream_id,
+                 offset,
+                 data,
++                fill,
+                 ..
+             } => {
+                 enc.encode_varint(*stream_id);
+                 if *offset > 0 {
+                     enc.encode_varint(*offset);
+                 }
+-                enc.encode_vvec(&data);
++                if *fill {
++                    enc.encode(&data);
++                } else {
++                    enc.encode_vvec(&data);
++                }
+             }
+             Frame::MaxData { maximum_data } => {
+                 enc.encode_varint(*maximum_data);
+@@ -401,12 +476,14 @@ impl Frame {
+             Frame::Stream {
+                 stream_id,
+                 offset,
++                fill,
+                 data,
+                 fin,
+             } => Some(format!(
+-                "Stream {{ stream_id: {}, offset: {}, len: {} fin: {} }}",
++                "Stream {{ stream_id: {}, offset: {}, len: {}{} fin: {} }}",
+                 stream_id,
+                 offset,
++                if *fill { ">>" } else { "" },
+                 data.len(),
+                 fin,
+             )),
+@@ -416,13 +493,6 @@ impl Frame {
+     }
+ }
+ 
+-/// Calculate the crypto frame header size so we know how much data we can fit
+-pub fn crypto_frame_hdr_len(offset: u64, remaining: usize) -> usize {
+-    let mut hdr_len = 1; // for frame type
+-    hdr_len += Encoder::varint_len(offset);
+-    hdr_len + Encoder::varint_len(remaining as u64)
+-}
+-
+ #[allow(clippy::module_name_repetitions)]
+ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+     macro_rules! d {
+@@ -505,7 +575,8 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+                 dv!(dec)
+             };
+             qdebug!("STREAM {}", t);
+-            let data = if (t & STREAM_FRAME_BIT_LEN) == 0 {
++            let fill = (t & STREAM_FRAME_BIT_LEN) == 0;
++            let data = if fill {
+                 qdebug!("STREAM frame extends to the end of the packet");
+                 dec.decode_remainder()
+             } else {
+@@ -517,6 +588,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+                 stream_id: s,
+                 offset: o,
+                 data: data.to_vec(), // TODO(mt) unnecessary copy.
++                fill,
+             })
+         }
+         FRAME_TYPE_MAX_DATA => Ok(Frame::MaxData {
+@@ -685,30 +757,35 @@ mod tests {
+     #[test]
+     fn test_stream() {
+         // First, just set the length bit.
+-        let mut f = Frame::Stream {
++        let f = Frame::Stream {
+             fin: false,
+             stream_id: 5,
+             offset: 0,
+             data: vec![1, 2, 3],
++            fill: false,
+         };
+ 
+         enc_dec(&f, "0a0503010203");
+ 
+-        // Now verify that we can parse without the length
+-        // bit, because we never generate this.
+-        let enc = Encoder::from_hex("0805010203");
+-        let mut dec = enc.as_decoder();
+-        let f2 = decode_frame(&mut dec).unwrap();
+-        assert_eq!(f, f2);
+-
+         // Now with offset != 0 and FIN
+-        f = Frame::Stream {
++        let f = Frame::Stream {
+             fin: true,
+             stream_id: 5,
+             offset: 1,
+             data: vec![1, 2, 3],
++            fill: false,
+         };
+         enc_dec(&f, "0f050103010203");
++
++        // Now to fill the packet.
++        let f = Frame::Stream {
++            fin: true,
++            stream_id: 5,
++            offset: 0,
++            data: vec![1, 2, 3],
++            fill: true,
++        };
++        enc_dec(&f, "0905010203");
+     }
+ 
+     #[test]
+
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -16,7 +16,7 @@ use std::rc::Rc;
+ use slice_deque::SliceDeque;
+ use smallvec::SmallVec;
+ 
+-use neqo_common::{matches, qdebug, qerror, qinfo, qtrace, qwarn, Encoder};
++use neqo_common::{matches, qdebug, qerror, qinfo, qtrace, qwarn};
+ 
+ use crate::events::ConnectionEvents;
+ use crate::flow_mgr::FlowMgr;
+@@ -767,30 +767,22 @@ impl SendStreams {
+         }
+ 
+         for (stream_id, stream) in self {
+-            let fin = stream.final_size();
++            let complete = stream.final_size().is_some();
+             if let Some((offset, data)) = stream.next_bytes(mode) {
++                let (frame, length) =
++                    Frame::new_stream(stream_id.as_u64(), offset, data, complete, remaining);
+                 qdebug!(
+-                    "Stream {} sending bytes {}-{}, epoch {}, mode {:?}, remaining {}",
++                    "Stream {} sending bytes {}-{}, epoch {}, mode {:?}",
+                     stream_id.as_u64(),
+                     offset,
+-                    offset + data.len() as u64,
++                    offset + length as u64,
+                     epoch,
+                     mode,
+-                    remaining
+                 );
+-                let frame_hdr_len = stream_frame_hdr_len(*stream_id, offset, remaining);
+-                let length = min(data.len(), remaining - frame_hdr_len);
+-                let fin = match fin {
+-                    None => false,
+-                    Some(fin) => fin == offset + length as u64,
+-                };
+-                let frame = Frame::Stream {
+-                    fin,
+-                    stream_id: stream_id.as_u64(),
+-                    offset,
+-                    data: data[..length].to_vec(),
+-                };
++                let fin = complete && length == data.len();
++                debug_assert!(!fin || matches!(frame, Frame::Stream{fin: true, .. }));
+                 stream.mark_as_sent(offset, length, fin);
++
+                 return Some((
+                     frame,
+                     Some(RecoveryToken::Stream(StreamRecoveryToken {
+@@ -815,18 +807,6 @@ impl<'a> IntoIterator for &'a mut SendStreams {
+     }
+ }
+ 
+-/// Calculate the frame header size so we know how much data we can fit
+-fn stream_frame_hdr_len(stream_id: StreamId, offset: u64, remaining: usize) -> usize {
+-    let mut hdr_len = 1; // for frame type
+-    hdr_len += Encoder::varint_len(stream_id.as_u64());
+-    if offset > 0 {
+-        hdr_len += Encoder::varint_len(offset);
+-    }
+-
+-    // We always include a length field.
+-    hdr_len + Encoder::varint_len(remaining as u64)
+-}
+-
+ #[derive(Debug, Clone)]
+ pub struct StreamRecoveryToken {
+     pub(crate) id: StreamId,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn decode_frame(dec: &mut Decoder) -> Res<Frame>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

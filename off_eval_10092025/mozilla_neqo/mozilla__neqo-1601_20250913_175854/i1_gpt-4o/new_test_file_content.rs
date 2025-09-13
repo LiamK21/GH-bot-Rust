@@ -1,0 +1,33 @@
+#neqo-transport/src/connection/dump.rs
+#[cfg(test)]
+mod tests {
+use super::dump_packet;
+use crate::connection::Connection;
+use crate::packet::{PacketNumber, PacketType};
+use crate::path::PathRef;
+use neqo_common::log;
+use std::sync::Once;
+
+#[test]
+fn test_dump_packet_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = env_logger::builder().is_test(true).try_init();
+    });
+
+    let conn = Connection::new_client("example.com", &Default::default(), &Default::default(), &Default::default()).unwrap();
+    let path = PathRef::default();
+    let dir = "->";
+    let pt = PacketType::Short;
+    let pn = PacketNumber::new(1);
+    let payload = &[0u8; 10];
+
+    log::set_max_level(log::LevelFilter::Info);
+    dump_packet(&conn, &path, dir, pt, pn, payload);
+    // No output expected as log level is Info
+
+    log::set_max_level(log::LevelFilter::Debug);
+    dump_packet(&conn, &path, dir, pt, pn, payload);
+    // Output expected as log level is Debug
+}
+}

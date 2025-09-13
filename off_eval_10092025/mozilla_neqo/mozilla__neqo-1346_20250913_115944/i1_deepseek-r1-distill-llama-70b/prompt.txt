@@ -1,0 +1,348 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Send arbitrary amounts of data as a server
+We currently only send data up to the flow control limit of the client (which is probably the lesser of their initial flow control windows for session and stream).  This isn't great.
+
+(HTTP/3 server in neqo-server, that is.)
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-server/src/main.rs b/neqo-server/src/main.rs
+--- a/neqo-server/src/main.rs
++++ b/neqo-server/src/main.rs
+@@ -8,7 +8,8 @@
+ #![warn(clippy::use_self)]
+ 
+ use std::cell::RefCell;
+-use std::collections::HashSet;
++use std::cmp::min;
++use std::collections::{HashMap, HashSet};
+ use std::convert::TryFrom;
+ use std::fmt::{self, Display};
+ use std::fs::OpenOptions;
+@@ -25,14 +26,17 @@ use std::time::{Duration, Instant};
+ use mio::net::UdpSocket;
+ use mio::{Events, Poll, PollOpt, Ready, Token};
+ use mio_extras::timer::{Builder, Timeout, Timer};
++use neqo_transport::ConnectionIdGenerator;
+ use structopt::StructOpt;
+ 
+-use neqo_common::{hex, qdebug, qinfo, Datagram, Header};
++use neqo_common::{hex, qdebug, qinfo, qwarn, Datagram, Header};
+ use neqo_crypto::{
+     constants::{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256},
+     generate_ech_keys, init_db, random, AntiReplay, Cipher,
+ };
+-use neqo_http3::{Error, Http3Parameters, Http3Server, Http3ServerEvent};
++use neqo_http3::{
++    Error, Http3OrWebTransportStream, Http3Parameters, Http3Server, Http3ServerEvent, StreamId,
++};
+ use neqo_transport::{
+     server::ValidateAddress, tparams::PreferredAddress, CongestionControlAlgorithm,
+     ConnectionParameters, Output, RandomConnectionIdGenerator, StreamType, Version,
+@@ -337,13 +341,118 @@ trait HttpServer: Display {
+     fn enable_ech(&mut self) -> &[u8];
+ }
+ 
+-impl HttpServer for Http3Server {
++struct ResponseData {
++    data: Vec<u8>,
++    offset: usize,
++    remaining: usize,
++}
++
++impl From<&[u8]> for ResponseData {
++    fn from(data: &[u8]) -> Self {
++        Self::from(data.to_vec())
++    }
++}
++
++impl From<Vec<u8>> for ResponseData {
++    fn from(data: Vec<u8>) -> Self {
++        let remaining = data.len();
++        Self {
++            data,
++            offset: 0,
++            remaining,
++        }
++    }
++}
++
++impl ResponseData {
++    fn repeat(buf: &[u8], total: usize) -> Self {
++        Self {
++            data: buf.to_owned(),
++            offset: 0,
++            remaining: total,
++        }
++    }
++
++    fn send(&mut self, stream: &mut Http3OrWebTransportStream) {
++        while self.remaining > 0 {
++            let end = min(self.data.len(), self.offset + self.remaining);
++            let slice = &self.data[self.offset..end];
++            match stream.send_data(slice) {
++                Ok(0) => {
++                    return;
++                }
++                Ok(sent) => {
++                    self.remaining -= sent;
++                    self.offset = (self.offset + sent) % self.data.len();
++                }
++                Err(e) => {
++                    qwarn!("Error writing to stream {}: {:?}", stream, e);
++                    return;
++                }
++            }
++        }
++    }
++
++    fn done(&self) -> bool {
++        self.remaining == 0
++    }
++}
++
++struct SimpleServer {
++    server: Http3Server,
++    /// Progress writing to each stream.
++    remaining_data: HashMap<StreamId, ResponseData>,
++}
++
++impl SimpleServer {
++    const MESSAGE: &'static [u8] = b"I am the very model of a modern Major-General,\n\
++        I've information vegetable, animal, and mineral,\n\
++        I know the kings of England, and I quote the fights historical\n\
++        From Marathon to Waterloo, in order categorical;\n\
++        I'm very well acquainted, too, with matters mathematical,\n\
++        I understand equations, both the simple and quadratical,\n\
++        About binomial theorem, I'm teeming with a lot o' news,\n\
++        With many cheerful facts about the square of the hypotenuse.\n";
++
++    pub fn new(
++        args: &Args,
++        anti_replay: AntiReplay,
++        cid_mgr: Rc<RefCell<dyn ConnectionIdGenerator>>,
++    ) -> Self {
++        let server = Http3Server::new(
++            args.now(),
++            &[args.key.clone()],
++            &[args.alpn.clone()],
++            anti_replay,
++            cid_mgr,
++            Http3Parameters::default()
++                .connection_parameters(args.quic_parameters.get())
++                .max_table_size_encoder(args.max_table_size_encoder)
++                .max_table_size_decoder(args.max_table_size_decoder)
++                .max_blocked_streams(args.max_blocked_streams),
++            None,
++        )
++        .expect("We cannot make a server!");
++        Self {
++            server,
++            remaining_data: HashMap::new(),
++        }
++    }
++}
++
++impl Display for SimpleServer {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        self.server.fmt(f)
++    }
++}
++
++impl HttpServer for SimpleServer {
+     fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output {
+-        self.process(dgram, now)
++        self.server.process(dgram, now)
+     }
+ 
+     fn process_events(&mut self, args: &Args, _now: Instant) {
+-        while let Some(event) = self.next_event() {
++        while let Some(event) = self.server.next_event() {
+             match event {
+                 Http3ServerEvent::Headers {
+                     mut stream,
+@@ -352,37 +461,51 @@ impl HttpServer for Http3Server {
+                 } => {
+                     println!("Headers (request={} fin={}): {:?}", stream, fin, headers);
+ 
+-                    let default_ret = b"Hello World".to_vec();
+-
+-                    let response = headers.iter().find(|&h| h.name() == ":path").and_then(|h| {
+-                        if args.qns_test.is_some() {
+-                            qns_read_response(h.value())
+-                        } else {
+-                            match h.value().trim_matches(|p| p == '/').parse::<usize>() {
+-                                Ok(v) => Some(vec![b'a'; v]),
+-                                Err(_) => Some(default_ret),
++                    let mut response =
++                        if let Some(path) = headers.iter().find(|&h| h.name() == ":path") {
++                            if args.qns_test.is_some() {
++                                if let Some(data) = qns_read_response(path.value()) {
++                                    ResponseData::from(data)
++                                } else {
++                                    ResponseData::from(Self::MESSAGE)
++                                }
++                            } else if let Ok(count) =
++                                path.value().trim_matches(|p| p == '/').parse::<usize>()
++                            {
++                                ResponseData::repeat(Self::MESSAGE, count)
++                            } else {
++                                ResponseData::from(Self::MESSAGE)
+                             }
+-                        }
+-                    });
+-
+-                    if response.is_none() {
+-                        stream
+-                            .cancel_fetch(Error::HttpRequestIncomplete.code())
+-                            .unwrap();
+-                        continue;
+-                    }
+-
+-                    let response = response.unwrap();
++                        } else {
++                            stream
++                                .cancel_fetch(Error::HttpRequestIncomplete.code())
++                                .unwrap();
++                            continue;
++                        };
+ 
+                     stream
+                         .send_headers(&[
+                             Header::new(":status", "200"),
+-                            Header::new("content-length", response.len()),
++                            Header::new("content-length", response.remaining),
+                         ])
+                         .unwrap();
+-                    stream.send_data(&response).unwrap();
+-                    stream.stream_close_send().unwrap();
++                    response.send(&mut stream);
++                    if response.done() {
++                        stream.stream_close_send().unwrap();
++                    } else {
++                        self.remaining_data.insert(stream.stream_id(), response);
++                    }
++                }
++                Http3ServerEvent::DataWritable { mut stream } => {
++                    if let Some(remaining) = self.remaining_data.get_mut(&stream.stream_id()) {
++                        remaining.send(&mut stream);
++                        if remaining.done() {
++                            self.remaining_data.remove(&stream.stream_id());
++                            stream.stream_close_send().unwrap();
++                        }
++                    }
+                 }
++
+                 Http3ServerEvent::Data { stream, data, fin } => {
+                     println!("Data (request={} fin={}): {:?}", stream, fin, data);
+                 }
+@@ -392,21 +515,23 @@ impl HttpServer for Http3Server {
+     }
+ 
+     fn set_qlog_dir(&mut self, dir: Option<PathBuf>) {
+-        Self::set_qlog_dir(self, dir)
++        self.server.set_qlog_dir(dir)
+     }
+ 
+     fn validate_address(&mut self, v: ValidateAddress) {
+-        self.set_validation(v);
++        self.server.set_validation(v);
+     }
+ 
+     fn set_ciphers(&mut self, ciphers: &[Cipher]) {
+-        Self::set_ciphers(self, ciphers);
++        self.server.set_ciphers(ciphers);
+     }
+ 
+     fn enable_ech(&mut self) -> &[u8] {
+         let (sk, pk) = generate_ech_keys().expect("should create ECH keys");
+-        Self::enable_ech(self, random(1)[0], "public.example", &sk, &pk).unwrap();
+-        self.ech_config()
++        self.server
++            .enable_ech(random(1)[0], "public.example", &sk, &pk)
++            .unwrap();
++        self.server.ech_config()
+     }
+ }
+ 
+@@ -537,22 +662,7 @@ impl ServersRunner {
+                 .expect("We cannot make a server!"),
+             )
+         } else {
+-            Box::new(
+-                Http3Server::new(
+-                    args.now(),
+-                    &[args.key.clone()],
+-                    &[args.alpn.clone()],
+-                    anti_replay,
+-                    cid_mgr,
+-                    Http3Parameters::default()
+-                        .connection_parameters(args.quic_parameters.get())
+-                        .max_table_size_encoder(args.max_table_size_encoder)
+-                        .max_table_size_decoder(args.max_table_size_decoder)
+-                        .max_blocked_streams(args.max_blocked_streams),
+-                    None,
+-                )
+-                .expect("We cannot make a server!"),
+-            )
++            Box::new(SimpleServer::new(args, anti_replay, cid_mgr))
+         };
+         svr.set_ciphers(&args.get_ciphers());
+         svr.set_qlog_dir(args.qlog_dir.clone());
+
+diff --git a/neqo-transport/src/cc/classic_cc.rs b/neqo-transport/src/cc/classic_cc.rs
+--- a/neqo-transport/src/cc/classic_cc.rs
++++ b/neqo-transport/src/cc/classic_cc.rs
+@@ -152,7 +152,7 @@ impl<T: WindowAdjustment> CongestionControl for ClassicCongestionControl<T> {
+         let is_app_limited = self.app_limited();
+         qtrace!(
+             [self],
+-            "app limited={}, bytes_in_flight:{}, cwnd: {}, state: {:?} pacing_burst_size: {}",
++            "limited={}, bytes_in_flight={}, cwnd={}, state={:?} pacing_burst_size={}",
+             is_app_limited,
+             self.bytes_in_flight,
+             self.congestion_window,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

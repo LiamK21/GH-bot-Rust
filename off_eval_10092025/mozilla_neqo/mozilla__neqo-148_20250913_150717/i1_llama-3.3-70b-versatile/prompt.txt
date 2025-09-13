@@ -1,0 +1,1316 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Potentially unsafe uses of unsafe
+(I'm super excited to see QUIC for Firefox built in rust!)
+
+I did a quick review of the uses of `unsafe` and a few potential issues jumped out at me.
+
+https://github.com/mozilla/neqo/blob/5e5249a056ba397919135b83f43d3763a5c8e00d/neqo-crypto/src/aead.rs#L79-L86
+
+If `p.len()` larger than can fit in `u32`, you'll wrap around and produce an incorrect result. I don't think this can happen in reality, but using something like `try_into()` to propagate an error in that case would be safer.
+
+https://github.com/mozilla/neqo/blob/5e5249a056ba397919135b83f43d3763a5c8e00d/neqo-crypto/src/agent.rs#L680-L684
+
+I believe this produces a use-after-free issue. `CString::new` returns a `Result<CString, SomeError>`. Calling `unwrap()` gives you a `CString`, and then `as_ptr()` gets you the raw `* const c_char`. However, because `as_ptr()` returns a raw pointer, it doesn't participate in the lifetime, and thus nothing is keeping the `CString` alive. This issue is described here: https://doc.rust-lang.org/stable/std/ffi/struct.CString.html#method.as_ptr
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-crypto/src/aead.rs b/neqo-crypto/src/aead.rs
+--- a/neqo-crypto/src/aead.rs
++++ b/neqo-crypto/src/aead.rs
+@@ -7,14 +7,12 @@
+ #![allow(clippy::too_many_arguments)]
+ 
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+ use crate::err::{Error, Res};
+ use crate::p11::{PK11SymKey, SymKey};
+-use crate::result;
+ use crate::ssl;
+ use crate::ssl::{PRUint16, PRUint64, PRUint8, SSLAeadContext};
+ 
+-use std::convert::TryInto;
++use std::convert::{TryFrom, TryInto};
+ use std::fmt;
+ use std::ops::{Deref, DerefMut};
+ use std::os::raw::{c_char, c_uint};
+@@ -77,15 +75,14 @@ impl Aead {
+         let prefix_str = prefix.into();
+         let p = prefix_str.as_bytes();
+         let mut ctx: *mut ssl::SSLAeadContext = null_mut();
+-        let rv = SSL_MakeAead(
++        SSL_MakeAead(
+             version,
+             cipher,
+             secret,
+             p.as_ptr() as *const i8,
+-            p.len().try_into()?,
++            c_uint::try_from(p.len())?,
+             &mut ctx,
+-        );
+-        result::result(rv)?;
++        )?;
+         match NonNull::new(ctx) {
+             Some(ctx_ptr) => Ok(Self {
+                 ctx: AeadContext::new(ctx_ptr),
+@@ -102,21 +99,20 @@ impl Aead {
+         output: &'a mut [u8],
+     ) -> Res<&'a [u8]> {
+         let mut l: c_uint = 0;
+-        let rv = unsafe {
++        unsafe {
+             SSL_AeadEncrypt(
+                 *self.ctx.deref(),
+                 count,
+                 aad.as_ptr(),
+-                to_c_uint(aad.len())?,
++                c_uint::try_from(aad.len())?,
+                 input.as_ptr(),
+-                to_c_uint(input.len())?,
++                c_uint::try_from(input.len())?,
+                 output.as_mut_ptr(),
+                 &mut l,
+-                to_c_uint(output.len())?,
++                c_uint::try_from(output.len())?,
+             )
+-        };
+-        result::result(rv)?;
+-        Ok(&output[0..l as usize])
++        }?;
++        Ok(&output[0..(l.try_into().unwrap())])
+     }
+ 
+     pub fn decrypt<'a>(
+@@ -127,21 +123,20 @@ impl Aead {
+         output: &'a mut [u8],
+     ) -> Res<&'a [u8]> {
+         let mut l: c_uint = 0;
+-        let rv = unsafe {
++        unsafe {
+             SSL_AeadDecrypt(
+                 *self.ctx.deref(),
+                 count,
+                 aad.as_ptr(),
+-                to_c_uint(aad.len())?,
++                c_uint::try_from(aad.len())?,
+                 input.as_ptr(),
+-                to_c_uint(input.len())?,
++                c_uint::try_from(input.len())?,
+                 output.as_mut_ptr(),
+                 &mut l,
+-                to_c_uint(output.len())?,
++                c_uint::try_from(output.len())?,
+             )
+-        };
+-        result::result(rv)?;
+-        Ok(&output[0..l as usize])
++        }?;
++        Ok(&output[0..(l.try_into().unwrap())])
+     }
+ }
+
+diff --git a/neqo-crypto/src/agent.rs b/neqo-crypto/src/agent.rs
+--- a/neqo-crypto/src/agent.rs
++++ b/neqo-crypto/src/agent.rs
+@@ -10,13 +10,11 @@ use crate::assert_initialized;
+ use crate::auth::AuthenticationStatus;
+ pub use crate::cert::CertificateInfo;
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+-use crate::err::{Error, PRErrorCode, Res};
++use crate::err::{is_blocked, secstatus_to_res, Error, PRErrorCode, Res};
+ use crate::ext::{ExtensionHandler, ExtensionTracker};
+ use crate::p11;
+ use crate::prio;
+ use crate::replay::AntiReplay;
+-use crate::result;
+ use crate::secrets::SecretHolder;
+ use crate::ssl::{self, PRBool};
+ use crate::time::{PRTime, Time};
+@@ -55,16 +53,15 @@ fn get_alpn(fd: *mut ssl::PRFileDesc, pre: bool) -> Res<Option<String>> {
+     let mut alpn_state = ssl::SSLNextProtoState::SSL_NEXT_PROTO_NO_SUPPORT;
+     let mut chosen = vec![0_u8; 255];
+     let mut chosen_len: c_uint = 0;
+-    let rv = unsafe {
++    secstatus_to_res(unsafe {
+         ssl::SSL_GetNextProto(
+             fd,
+             &mut alpn_state,
+             chosen.as_mut_ptr(),
+             &mut chosen_len,
+-            to_c_uint(chosen.len())?,
++            c_uint::try_from(chosen.len())?,
+         )
+-    };
+-    result::result(rv)?;
++    })?;
+ 
+     let alpn = match (pre, alpn_state) {
+         (true, ssl::SSLNextProtoState::SSL_NEXT_PROTO_EARLY_VALUE)
+@@ -101,14 +98,13 @@ macro_rules! preinfo_arg {
+ impl SecretAgentPreInfo {
+     fn new(fd: *mut ssl::PRFileDesc) -> Res<Self> {
+         let mut info: ssl::SSLPreliminaryChannelInfo = unsafe { mem::uninitialized() };
+-        let rv = unsafe {
++        secstatus_to_res(unsafe {
+             ssl::SSL_GetPreliminaryChannelInfo(
+                 fd,
+                 &mut info,
+-                mem::size_of::<ssl::SSLPreliminaryChannelInfo>().try_into()?,
++                c_uint::try_from(mem::size_of::<ssl::SSLPreliminaryChannelInfo>())?,
+             )
+-        };
+-        result::result(rv)?;
++        })?;
+ 
+         Ok(Self {
+             info,
+@@ -152,22 +148,21 @@ pub struct SecretAgentInfo {
+ impl SecretAgentInfo {
+     fn new(fd: *mut ssl::PRFileDesc) -> Res<Self> {
+         let mut info: ssl::SSLChannelInfo = unsafe { mem::uninitialized() };
+-        let rv = unsafe {
++        secstatus_to_res(unsafe {
+             ssl::SSL_GetChannelInfo(
+                 fd,
+                 &mut info,
+-                mem::size_of::<ssl::SSLChannelInfo>().try_into()?,
++                c_uint::try_from(mem::size_of::<ssl::SSLChannelInfo>())?,
+             )
+-        };
+-        result::result(rv)?;
++        })?;
+         Ok(Self {
+             version: info.protocolVersion as Version,
+             cipher: info.cipherSuite as Cipher,
+-            group: info.keaGroup.try_into()?,
++            group: Group::try_from(info.keaGroup)?,
+             resumed: info.resumed != 0,
+             early_data: info.earlyDataAccepted != 0,
+             alpn: get_alpn(fd, false)?,
+-            signature_scheme: info.signatureScheme.try_into()?,
++            signature_scheme: SignatureScheme::try_from(info.signatureScheme)?,
+         })
+     }
+ 
+@@ -249,7 +244,7 @@ impl SecretAgent {
+     // ssl::SSL_* APIs only need an opaque type.
+     fn create_fd(&mut self) -> Res<()> {
+         assert_initialized();
+-        let label = CString::new("sslwrapper").expect("cstring failed");
++        let label = CString::new("sslwrapper")?;
+         let id = unsafe { prio::PR_GetUniqueIdentity(label.as_ptr()) };
+ 
+         let base_fd = unsafe { prio::PR_CreateIOLayerStub(id, METHODS) };
+@@ -307,36 +302,33 @@ impl SecretAgent {
+ 
+     // Ready this for connecting.
+     fn ready(&mut self, is_server: bool) -> Res<()> {
+-        let mut rv = unsafe {
++        secstatus_to_res(unsafe {
+             ssl::SSL_AuthCertificateHook(
+                 self.fd,
+                 Some(Self::auth_complete_hook),
+                 &mut *self.auth_required as *mut bool as *mut c_void,
+             )
+-        };
+-        result::result(rv)?;
++        })?;
+ 
+-        rv = unsafe {
++        secstatus_to_res(unsafe {
+             ssl::SSL_AlertSentCallback(
+                 self.fd,
+                 Some(Self::alert_sent_cb),
+                 &mut *self.alert as *mut Option<Alert> as *mut c_void,
+             )
+-        };
+-        result::result(rv)?;
++        })?;
+ 
+         // TODO(mt) move to time.rs so we can remove PRTime definition from nss_ssl bindings.
+-        rv = unsafe {
++        unsafe {
+             ssl::SSL_SetTimeFunc(
+                 self.fd,
+                 Some(Self::time_func),
+                 &mut *self.now as *mut PRTime as *mut c_void,
+             )
+-        };
+-        result::result(rv)?;
++        }?;
+ 
+         self.configure()?;
+-        result::result(unsafe { ssl::SSL_ResetHandshake(self.fd, is_server as ssl::PRBool) })
++        secstatus_to_res(unsafe { ssl::SSL_ResetHandshake(self.fd, is_server as ssl::PRBool) })
+     }
+ 
+     /// Default configuration.
+@@ -353,7 +345,7 @@ impl SecretAgent {
+             min: min as ssl::PRUint16,
+             max: max as ssl::PRUint16,
+         };
+-        result::result(unsafe { ssl::SSL_VersionRangeSet(self.fd, &range) })
++        secstatus_to_res(unsafe { ssl::SSL_VersionRangeSet(self.fd, &range) })
+     }
+ 
+     pub fn enable_ciphers(&mut self, ciphers: &[Cipher]) -> Res<()> {
+@@ -361,14 +353,15 @@ impl SecretAgent {
+         let cipher_count = unsafe { ssl::SSL_GetNumImplementedCiphers() } as usize;
+         for i in 0..cipher_count {
+             let p = all_ciphers.wrapping_add(i);
+-            let rv =
+-                unsafe { ssl::SSL_CipherPrefSet(self.fd, i32::from(*p), false as ssl::PRBool) };
+-            result::result(rv)?;
++            secstatus_to_res(unsafe {
++                ssl::SSL_CipherPrefSet(self.fd, i32::from(*p), false as ssl::PRBool)
++            })?;
+         }
+ 
+         for c in ciphers {
+-            let rv = unsafe { ssl::SSL_CipherPrefSet(self.fd, i32::from(*c), true as ssl::PRBool) };
+-            result::result(rv)?;
++            secstatus_to_res(unsafe {
++                ssl::SSL_CipherPrefSet(self.fd, i32::from(*c), true as ssl::PRBool)
++            })?;
+         }
+         Ok(())
+     }
+@@ -381,13 +374,16 @@ impl SecretAgent {
+             .collect();
+ 
+         let ptr = group_vec.as_slice().as_ptr();
+-        let rv = unsafe { ssl::SSL_NamedGroupConfig(self.fd, ptr, to_c_uint(group_vec.len())?) };
+-        result::result(rv)
++        secstatus_to_res(unsafe {
++            ssl::SSL_NamedGroupConfig(self.fd, ptr, c_uint::try_from(group_vec.len())?)
++        })
+     }
+ 
+     /// Set TLS options.
+     pub fn set_option(&mut self, opt: ssl::Opt, value: bool) -> Res<()> {
+-        result::result(unsafe { ssl::SSL_OptionSet(self.fd, opt.as_int(), opt.map_enabled(value)) })
++        secstatus_to_res(unsafe {
++            ssl::SSL_OptionSet(self.fd, opt.as_int(), opt.map_enabled(value))
++        })
+     }
+ 
+     /// Enable 0-RTT.
+@@ -417,7 +413,7 @@ impl SecretAgent {
+         // Prepare to encode.
+         let mut encoded = Vec::with_capacity(encoded_len);
+         let mut add = |v: &str| {
+-            if let Ok(s) = v.len().try_into() {
++            if let Ok(s) = u8::try_from(v.len()) {
+                 encoded.push(s);
+                 encoded.extend_from_slice(v.as_bytes());
+             }
+@@ -435,14 +431,13 @@ impl SecretAgent {
+         assert_eq!(encoded_len, encoded.len());
+ 
+         // Now give the result to NSS.
+-        let rv = unsafe {
++        secstatus_to_res(unsafe {
+             ssl::SSL_SetNextProtoNego(
+                 self.fd,
+                 encoded.as_slice().as_ptr(),
+-                to_c_uint(encoded.len())?,
++                c_uint::try_from(encoded.len())?,
+             )
+-        };
+-        result::result(rv)
++        })
+     }
+ 
+     /// Install an extension handler.
+@@ -520,15 +515,15 @@ impl SecretAgent {
+         res
+     }
+ 
+-    fn update_state(&mut self, rv: ssl::SECStatus) -> Res<()> {
+-        let blocked = self.capture_error(result::result_or_blocked(rv))?;
+-        self.state = if blocked {
++    fn update_state(&mut self, res: Res<()>) -> Res<()> {
++        self.state = if is_blocked(&res) {
+             if *self.auth_required {
+                 HandshakeState::AuthenticationPending
+             } else {
+                 HandshakeState::InProgress
+             }
+         } else {
++            self.capture_error(res)?;
+             let info = self.capture_error(SecretAgentInfo::new(self.fd))?;
+             HandshakeState::Complete(info)
+         };
+@@ -536,11 +531,6 @@ impl SecretAgent {
+         Ok(())
+     }
+ 
+-    fn set_failed(&mut self) -> Error {
+-        self.capture_error(result::result(ssl::SECFailure))
+-            .unwrap_err()
+-    }
+-
+     // Drive the TLS handshake, taking bytes from @input and putting
+     // any bytes necessary into @output.
+     // This takes the current time as @now.
+@@ -565,7 +555,7 @@ impl SecretAgent {
+         // Take before updating state so that we leave the output buffer empty
+         // even if there is an error.
+         let output = self.io.take_output();
+-        self.update_state(rv)?;
++        self.update_state(secstatus_to_res(rv))?;
+         Ok(output)
+     }
+ 
+@@ -578,10 +568,7 @@ impl SecretAgent {
+         let records_ptr = &mut *records as *mut RecordList as *mut c_void;
+         let rv =
+             unsafe { ssl::SSL_RecordLayerWriteCallback(self.fd, Some(ingest_record), records_ptr) };
+-        if rv != ssl::SECSuccess {
+-            return Err(self.set_failed());
+-        }
+-
++        self.capture_error(rv)?;
+         Ok(records)
+     }
+ 
+@@ -595,8 +582,7 @@ impl SecretAgent {
+ 
+         if self.no_eoed {
+             let mut read_epoch: u16 = 0;
+-            let rv = unsafe { ssl::SSL_GetCurrentEpoch(self.fd, &mut read_epoch, null_mut()) };
+-            result::result(rv)?;
++            unsafe { ssl::SSL_GetCurrentEpoch(self.fd, &mut read_epoch, null_mut()) }?;
+             if read_epoch == 1 {
+                 // It's waiting for EndOfEarlyData, so feed one in.
+                 // Note that this is the test that ensures that we only do this for the server.
+@@ -620,10 +606,11 @@ impl SecretAgent {
+ 
+         // Fire off any authentication we might need to complete.
+         if let HandshakeState::Authenticated(ref err) = self.state {
+-            let rv = unsafe { ssl::SSL_AuthCertificateComplete(self.fd, *err) };
+-            qdebug!([self] "SSL_AuthCertificateComplete: {:?}", rv);
++            let result =
++                secstatus_to_res(unsafe { ssl::SSL_AuthCertificateComplete(self.fd, *err) });
++            qdebug!([self] "SSL_AuthCertificateComplete: {:?}", result);
+             // This should return SECSuccess, so don't use update_state().
+-            self.capture_error(result::result(rv))?;
++            self.capture_error(result)?;
+         }
+ 
+         // Feed in any records.
+@@ -635,7 +622,7 @@ impl SecretAgent {
+         }
+ 
+         // Drive the handshake once more.
+-        let rv = unsafe { ssl::SSL_ForceHandshake(self.fd) };
++        let rv = secstatus_to_res(unsafe { ssl::SSL_ForceHandshake(self.fd) });
+         self.update_state(rv)?;
+ 
+         if self.no_eoed {
+@@ -677,11 +664,8 @@ pub struct Client {
+ impl Client {
+     pub fn new(server_name: &str) -> Res<Self> {
+         let mut agent = SecretAgent::new()?;
+-        let url = CString::new(server_name);
+-        if url.is_err() {
+-            return Err(Error::InternalError);
+-        }
+-        result::result(unsafe { ssl::SSL_SetURL(agent.fd, url.unwrap().as_ptr()) })?;
++        let url = CString::new(server_name)?;
++        secstatus_to_res(unsafe { ssl::SSL_SetURL(agent.fd, url.as_ptr()) })?;
+         agent.ready(false)?;
+         let mut client = Self {
+             agent,
+@@ -706,14 +690,13 @@ impl Client {
+     }
+ 
+     fn ready(&mut self) -> Res<()> {
+-        let rv = unsafe {
++        unsafe {
+             ssl::SSL_SetResumptionTokenCallback(
+                 self.fd,
+                 Some(Self::resumption_token_cb),
+                 &mut *self.resumption as *mut Option<Vec<u8>> as *mut c_void,
+             )
+-        };
+-        result::result(rv)
++        }
+     }
+ 
+     /// Return the resumption token.
+@@ -723,10 +706,13 @@ impl Client {
+ 
+     /// Enable resumption, using a token previously provided.
+     pub fn set_resumption_token(&mut self, token: &[u8]) -> Res<()> {
+-        let rv = unsafe {
+-            ssl::SSL_SetResumptionToken(self.agent.fd, token.as_ptr(), to_c_uint(token.len())?)
+-        };
+-        result::result(rv)
++        unsafe {
++            ssl::SSL_SetResumptionToken(
++                self.agent.fd,
++                token.as_ptr(),
++                c_uint::try_from(token.len())?,
++            )
++        }
+     }
+ }
+ 
+@@ -785,11 +771,7 @@ impl Server {
+         let mut agent = SecretAgent::new()?;
+ 
+         for n in certificates {
+-            let c = CString::new(n.as_ref());
+-            if c.is_err() {
+-                return Err(Error::CertificateLoading);
+-            }
+-            let c = c.unwrap();
++            let c = CString::new(n.as_ref())?;
+             let cert = match NonNull::new(unsafe {
+                 p11::PK11_FindCertFromNickname(c.as_ptr(), null_mut())
+             }) {
+@@ -802,7 +784,7 @@ impl Server {
+                 None => return Err(Error::CertificateLoading),
+                 Some(ptr) => p11::PrivateKey::new(ptr),
+             };
+-            result::result(unsafe {
++            secstatus_to_res(unsafe {
+                 ssl::SSL_ConfigServerCert(agent.fd, *cert.deref(), *key.deref(), null(), 0)
+             })?;
+         }
+@@ -846,7 +828,7 @@ impl Server {
+                 assert!(tok.len() <= usize::try_from(retry_token_max).unwrap());
+                 let slc = std::slice::from_raw_parts_mut(retry_token, tok.len());
+                 slc.copy_from_slice(&tok);
+-                *retry_token_len = to_c_uint(tok.len()).expect("token was way too big");
++                *retry_token_len = c_uint::try_from(tok.len()).expect("token was way too big");
+                 ssl::SSLHelloRetryRequestAction::ssl_hello_retry_request
+             }
+         }
+@@ -862,12 +844,10 @@ impl Server {
+     ) -> Res<()> {
+         let mut check_state = ZeroRttCheckState::new(self.agent.fd, checker);
+         let arg = &mut *check_state as *mut ZeroRttCheckState as *mut c_void;
+-        let mut rv = unsafe {
++        unsafe {
+             ssl::SSL_HelloRetryRequestCallback(self.agent.fd, Some(Self::hello_retry_cb), arg)
+-        };
+-        result::result(rv)?;
+-        rv = unsafe { ssl::SSL_SetMaxEarlyDataSize(self.agent.fd, max_early_data) };
+-        result::result(rv)?;
++        }?;
++        unsafe { ssl::SSL_SetMaxEarlyDataSize(self.agent.fd, max_early_data) }?;
+         self.zero_rtt_check = Some(check_state);
+         self.agent.enable_0rtt()?;
+         anti_replay.config_socket(self.fd)?;
+@@ -881,9 +861,9 @@ impl Server {
+         *self.agent.now = Time::from(now).try_into()?;
+         let records = self.setup_raw()?;
+ 
+-        let rv =
+-            unsafe { ssl::SSL_SendSessionTicket(self.fd, extra.as_ptr(), to_c_uint(extra.len())?) };
+-        result::result(rv)?;
++        unsafe {
++            ssl::SSL_SendSessionTicket(self.fd, extra.as_ptr(), c_uint::try_from(extra.len())?)
++        }?;
+ 
+         Ok(*records)
+     }
+
+diff --git a/neqo-crypto/src/agentio.rs b/neqo-crypto/src/agentio.rs
+--- a/neqo-crypto/src/agentio.rs
++++ b/neqo-crypto/src/agentio.rs
+@@ -5,10 +5,8 @@
+ // except according to those terms.
+ 
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+ use crate::err::{nspr, Error, PR_SetError, Res};
+ use crate::prio;
+-use crate::result;
+ use crate::ssl;
+ 
+ use neqo_common::{hex, qtrace};
+@@ -55,16 +53,15 @@ impl Record {
+     // Shoves this record into the socket, returns true if blocked.
+     fn write(self, fd: *mut ssl::PRFileDesc) -> Res<()> {
+         qtrace!("write {:?}", self);
+-        let rv = unsafe {
++        unsafe {
+             ssl::SSL_RecordLayerData(
+                 fd,
+                 self.epoch,
+                 self.ct,
+                 self.data.as_ptr(),
+-                to_c_uint(self.data.len())?,
++                c_uint::try_from(self.data.len())?,
+             )
+-        };
+-        result::result(rv)
++        }
+     }
+ }
+ 
+@@ -257,7 +254,7 @@ unsafe extern "C" fn agent_close(fd: PrFd) -> PrStatus {
+ 
+ unsafe extern "C" fn agent_read(mut fd: PrFd, buf: *mut c_void, amount: prio::PRInt32) -> PrStatus {
+     let io = AgentIo::borrow(&mut fd);
+-    if let Ok(a) = amount.try_into() {
++    if let Ok(a) = usize::try_from(amount) {
+         match io.input.read_input(buf as *mut u8, a) {
+             Ok(_) => PR_SUCCESS,
+             Err(_) => PR_FAILURE,
+@@ -275,10 +272,10 @@ unsafe extern "C" fn agent_recv(
+     _timeout: prio::PRIntervalTime,
+ ) -> prio::PRInt32 {
+     let io = AgentIo::borrow(&mut fd);
+-    if amount <= 0 || flags != 0 {
++    if flags != 0 {
+         return PR_FAILURE;
+     }
+-    if let Ok(a) = amount.try_into() {
++    if let Ok(a) = usize::try_from(amount) {
+         match io.input.read_input(buf as *mut u8, a) {
+             Ok(v) => prio::PRInt32::try_from(v).unwrap_or(PR_FAILURE),
+             Err(_) => PR_FAILURE,
+@@ -294,10 +291,7 @@ unsafe extern "C" fn agent_write(
+     amount: prio::PRInt32,
+ ) -> PrStatus {
+     let io = AgentIo::borrow(&mut fd);
+-    if amount <= 0 {
+-        return PR_FAILURE;
+-    }
+-    if let Ok(a) = amount.try_into() {
++    if let Ok(a) = usize::try_from(amount) {
+         io.save_output(buf as *const u8, a);
+         amount
+     } else {
+@@ -314,10 +308,10 @@ unsafe extern "C" fn agent_send(
+ ) -> prio::PRInt32 {
+     let io = AgentIo::borrow(&mut fd);
+ 
+-    if amount <= 0 || flags != 0 {
++    if flags != 0 {
+         return PR_FAILURE;
+     }
+-    if let Ok(a) = amount.try_into() {
++    if let Ok(a) = usize::try_from(amount) {
+         io.save_output(buf as *const u8, a);
+         amount
+     } else {
+
+diff --git a/neqo-crypto/src/cert.rs b/neqo-crypto/src/cert.rs
+--- a/neqo-crypto/src/cert.rs
++++ b/neqo-crypto/src/cert.rs
+@@ -4,16 +4,18 @@
+ // option. This file may not be copied, modified, or distributed
+ // except according to those terms.
+ 
++use crate::err::secstatus_to_res;
+ use crate::p11::{
+     CERTCertList, CERTCertListNode, CERT_GetCertificateDer, CertList, PRCList, SECItem,
+     SECItemArray, SECItemType,
+ };
+-use crate::result;
+ use crate::ssl::{
+     PRFileDesc, SSL_PeerCertificateChain, SSL_PeerSignedCertTimestamps,
+     SSL_PeerStapledOCSPResponses,
+ };
+-use std::convert::TryInto;
++use neqo_common::qerror;
++
++use std::convert::TryFrom;
+ use std::ptr::{null_mut, NonNull};
+ 
+ use std::slice;
+@@ -45,15 +47,15 @@ fn stapled_ocsp_responses(fd: *mut PRFileDesc) -> Option<Vec<Vec<u8>>> {
+     match NonNull::new(ocsp_nss as *mut SECItemArray) {
+         Some(ocsp_ptr) => {
+             let mut ocsp_helper: Vec<Vec<u8>> = Vec::new();
+-            let len = unsafe { ocsp_ptr.as_ref().len };
+-            for inx in 0..len {
+-                let item_nss = if let Ok(i) = inx.try_into() {
+-                    unsafe { ocsp_ptr.as_ref().items.offset(i) as *const SECItem }
+-                } else {
+-                    return None;
+-                };
+-                let item =
+-                    unsafe { slice::from_raw_parts((*item_nss).data, (*item_nss).len as usize) };
++            let len = if let Ok(l) = isize::try_from(unsafe { ocsp_ptr.as_ref().len }) {
++                l
++            } else {
++                qerror!([format!("{:p}", fd)], "Received illegal OSCP length");
++                return None;
++            };
++            for idx in 0..len {
++                let itemp = unsafe { ocsp_ptr.as_ref().items.offset(idx) as *const SECItem };
++                let item = unsafe { slice::from_raw_parts((*itemp).data, (*itemp).len as usize) };
+                 ocsp_helper.push(item.to_owned());
+             }
+             Some(ocsp_helper)
+@@ -107,10 +109,8 @@ impl<'a> Iterator for &'a mut CertificateInfo {
+             len: 0,
+         };
+         let cert = unsafe { *self.cursor }.cert;
+-        let rv = unsafe { CERT_GetCertificateDer(cert, &mut item) };
+-        if result::result(rv).is_err() {
+-            panic!("Error getting DER from certificate");
+-        }
++        secstatus_to_res(unsafe { CERT_GetCertificateDer(cert, &mut item) })
++            .expect("getting DER from certificate should work");
+         Some(unsafe { std::slice::from_raw_parts(item.data, item.len as usize) })
+     }
+ }
+
+diff --git a/neqo-crypto/src/convert.rs b/neqo-crypto/src/convert.rs
+--- a/neqo-crypto/src/convert.rs
++++ b/neqo-crypto/src/convert.rs
+@@ -1,17 +0,0 @@
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-use crate::err::{Error, Res};
+-
+-use std::convert::TryInto;
+-use std::os::raw::c_uint;
+-
+-pub fn to_c_uint<T: TryInto<c_uint>>(v: T) -> Res<c_uint> {
+-    match v.try_into() {
+-        Ok(x) => Ok(x),
+-        _ => Err(Error::IntegerOverflow),
+-    }
+-}
+
+diff --git a/neqo-crypto/src/err.rs b/neqo-crypto/src/err.rs
+--- a/neqo-crypto/src/err.rs
++++ b/neqo-crypto/src/err.rs
+@@ -6,6 +6,8 @@
+ 
+ #![allow(dead_code)]
+ 
++use crate::ssl::{SECStatus, SECSuccess};
++
+ include!(concat!(env!("OUT_DIR"), "/nspr_error.rs"));
+ mod codes {
+     #![allow(non_snake_case)]
+@@ -62,23 +64,126 @@ impl std::fmt::Display for Error {
+     }
+ }
+ 
+-// TryFromIntError is only ever used in time.rs for time conversion.
+ impl From<std::num::TryFromIntError> for Error {
+     fn from(_: std::num::TryFromIntError) -> Self {
+-        Error::TimeTravelError
++        Error::IntegerOverflow
++    }
++}
++impl From<std::ffi::NulError> for Error {
++    fn from(_: std::ffi::NulError) -> Self {
++        Error::InternalError
++    }
++}
++
++use std::ffi::CStr;
++
++fn wrap_str_fn<F>(f: F, dflt: &str) -> String
++where
++    F: FnOnce() -> *const i8,
++{
++    unsafe {
++        let p = f();
++        if p.is_null() {
++            return dflt.to_string();
++        }
++        CStr::from_ptr(p).to_string_lossy().into_owned()
++    }
++}
++
++pub fn secstatus_to_res(rv: SECStatus) -> Res<()> {
++    if rv == SECSuccess {
++        return Ok(());
++    }
++
++    let code = unsafe { PR_GetError() };
++    let name = wrap_str_fn(|| unsafe { PR_ErrorToName(code) }, "UNKNOWN_ERROR");
++    let desc = wrap_str_fn(
++        || unsafe { PR_ErrorToString(code, PR_LANGUAGE_I_DEFAULT) },
++        "...",
++    );
++    Err(Error::NssError { name, code, desc })
++}
++
++pub fn is_blocked(result: &Res<()>) -> bool {
++    match result {
++        Err(Error::NssError { code, .. }) => *code == nspr::PR_WOULD_BLOCK_ERROR,
++        _ => false,
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use crate::err::{nspr, sec, ssl};
++    use crate::err::{self, is_blocked, secstatus_to_res, Error, PRErrorCode, PR_SetError};
++    use crate::ssl::{SECFailure, SECSuccess};
+     use test_fixture::fixture_init;
+ 
++    fn set_error_code(code: PRErrorCode) {
++        // This code doesn't work without initializing NSS first.
++        fixture_init();
++        unsafe { PR_SetError(code, 0) };
++    }
++
+     #[test]
+     fn error_code() {
+         fixture_init();
+-        assert_eq!(15 - 0x3000, ssl::SSL_ERROR_BAD_MAC_READ);
+-        assert_eq!(166 - 0x2000, sec::SEC_ERROR_LIBPKIX_INTERNAL);
+-        assert_eq!(-5998, nspr::PR_WOULD_BLOCK_ERROR);
++        assert_eq!(15 - 0x3000, err::ssl::SSL_ERROR_BAD_MAC_READ);
++        assert_eq!(166 - 0x2000, err::sec::SEC_ERROR_LIBPKIX_INTERNAL);
++        assert_eq!(-5998, err::nspr::PR_WOULD_BLOCK_ERROR);
++    }
++
++    #[test]
++    fn is_ok() {
++        assert!(secstatus_to_res(SECSuccess).is_ok());
++    }
++
++    #[test]
++    fn is_err() {
++        set_error_code(err::ssl::SSL_ERROR_BAD_MAC_READ);
++        let r = secstatus_to_res(SECFailure);
++        assert!(r.is_err());
++        match r.unwrap_err() {
++            Error::NssError { name, code, desc } => {
++                assert_eq!(name, "SSL_ERROR_BAD_MAC_READ");
++                assert_eq!(code, -12273);
++                assert_eq!(
++                    desc,
++                    "SSL received a record with an incorrect Message Authentication Code."
++                );
++            }
++            _ => unreachable!(),
++        }
+     }
++
++    #[test]
++    fn is_err_zero_code() {
++        set_error_code(0);
++        let r = secstatus_to_res(SECFailure);
++        assert!(r.is_err());
++        match r.unwrap_err() {
++            Error::NssError { name, code, .. } => {
++                assert_eq!(name, "UNKNOWN_ERROR");
++                assert_eq!(code, 0);
++                // Note that we don't test |desc| here because that comes from
++                // strerror(0), which is platform-dependent.
++            }
++            _ => unreachable!(),
++        }
++    }
++
++    #[test]
++    fn blocked() {
++        set_error_code(err::nspr::PR_WOULD_BLOCK_ERROR);
++        let r = secstatus_to_res(SECFailure);
++        assert!(r.is_err());
++        assert!(is_blocked(&r));
++        match r.unwrap_err() {
++            Error::NssError { name, code, desc } => {
++                assert_eq!(name, "PR_WOULD_BLOCK_ERROR");
++                assert_eq!(code, -5998);
++                assert_eq!(desc, "The operation would have blocked");
++            }
++            _ => panic!("bad error type"),
++        }
++    }
++
+ }
+
+diff --git a/neqo-crypto/src/exp.rs b/neqo-crypto/src/exp.rs
+--- a/neqo-crypto/src/exp.rs
++++ b/neqo-crypto/src/exp.rs
+@@ -8,15 +8,16 @@ macro_rules! experimental_api {
+     ( $n:ident ( $( $a:ident : $t:ty ),* $(,)? ) ) => {
+         #[allow(non_snake_case)]
+         #[allow(clippy::too_many_arguments)]
+-        pub(crate) unsafe fn $n ( $( $a : $t ),* ) -> crate::ssl::SECStatus {
++        pub(crate) unsafe fn $n ( $( $a : $t ),* ) -> Result<(), crate::err::Error> {
+             const EXP_FUNCTION: &str = stringify!($n);
+-            let n = ::std::ffi::CString::new(EXP_FUNCTION).unwrap();
++            let n = ::std::ffi::CString::new(EXP_FUNCTION)?;
+             let f = crate::ssl::SSL_GetExperimentalAPI(n.as_ptr());
+             if f.is_null() {
+-                return crate::ssl::SECFailure;
++                return Err(crate::err::Error::InternalError);
+             }
+             let f: unsafe extern "C" fn( $( $t ),* ) -> crate::ssl::SECStatus = ::std::mem::transmute(f);
+-            f( $( $a ),* )
++            let rv = f( $( $a ),* );
++            crate::err::secstatus_to_res(rv)
+         }
+     };
+ }
+
+diff --git a/neqo-crypto/src/ext.rs b/neqo-crypto/src/ext.rs
+--- a/neqo-crypto/src/ext.rs
++++ b/neqo-crypto/src/ext.rs
+@@ -5,15 +5,14 @@
+ // except according to those terms.
+ 
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+ use crate::err::Res;
+-use crate::result;
+ use crate::ssl::{
+     PRBool, PRFileDesc, SECFailure, SECStatus, SECSuccess, SSLAlertDescription,
+     SSLExtensionHandler, SSLExtensionWriter, SSLHandshakeType,
+ };
+ 
+ use std::cell::RefCell;
++use std::convert::TryFrom;
+ use std::ops::DerefMut;
+ use std::os::raw::{c_uint, c_void};
+ use std::rc::Rc;
+@@ -84,7 +83,7 @@ impl ExtensionTracker {
+             // Cast is safe here because the message type is always part of the enum
+             match handler.write(message as HandshakeMessage, d) {
+                 ExtensionWriterResult::Write(sz) => {
+-                    *len = to_c_uint(sz).expect("integer overflow from extension writer");
++                    *len = c_uint::try_from(sz).expect("integer overflow from extension writer");
+                     1
+                 }
+                 ExtensionWriterResult::Skip => 0,
+@@ -131,15 +130,14 @@ impl ExtensionTracker {
+             handler: Box::new(Box::new(handler)),
+         };
+         let p = &mut *tracker.handler as *mut Box<Rc<RefCell<dyn ExtensionHandler>>> as *mut c_void;
+-        let rv = SSL_InstallExtensionHooks(
++        SSL_InstallExtensionHooks(
+             fd,
+             extension,
+             Some(Self::extension_writer),
+             p,
+             Some(Self::extension_handler),
+             p,
+-        );
+-        result::result(rv)?;
++        )?;
+         Ok(tracker)
+     }
+ }
+
+diff --git a/neqo-crypto/src/hkdf.rs b/neqo-crypto/src/hkdf.rs
+--- a/neqo-crypto/src/hkdf.rs
++++ b/neqo-crypto/src/hkdf.rs
+@@ -5,15 +5,14 @@
+ // except according to those terms.
+ 
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+ use crate::err::{Error, Res};
+ use crate::p11::{
+     PK11Origin, PK11SymKey, PK11_GetInternalSlot, PK11_ImportSymKey, SECItem, SECItemType, Slot,
+     SymKey, CKA_DERIVE, CKM_INVALID_MECHANISM, CKM_NSS_HKDF_SHA256, CKM_NSS_HKDF_SHA384,
+     CK_ATTRIBUTE_TYPE, CK_MECHANISM_TYPE,
+ };
+-use crate::result;
+ 
++use std::convert::TryFrom;
+ use std::os::raw::{c_char, c_uchar, c_uint};
+ use std::ptr::{null_mut, NonNull};
+ 
+@@ -51,7 +50,7 @@ pub fn import_key(version: Version, cipher: Cipher, buf: &[u8]) -> Res<SymKey> {
+     let mut item = SECItem {
+         type_: SECItemType::siBuffer,
+         data: buf.as_ptr() as *mut c_uchar,
+-        len: to_c_uint(buf.len())?,
++        len: c_uint::try_from(buf.len())?,
+     };
+     let slot_ptr = unsafe { PK11_GetInternalSlot() };
+     let slot = match NonNull::new(slot_ptr) {
+@@ -86,8 +85,7 @@ pub fn extract(
+         Some(s) => **s,
+         None => null_mut(),
+     };
+-    let rv = unsafe { SSL_HkdfExtract(version, cipher, salt_ptr, **ikm, &mut prk) };
+-    result::result(rv)?;
++    unsafe { SSL_HkdfExtract(version, cipher, salt_ptr, **ikm, &mut prk) }?;
+     match NonNull::new(prk) {
+         Some(p) => Ok(SymKey::new(p)),
+         None => Err(Error::InternalError),
+@@ -108,19 +106,18 @@ pub fn expand_label<S: Into<String>>(
+ 
+     // Note that this doesn't allow for passing null() for the handshake hash.
+     // A zero-length slice produces an identical result.
+-    let rv = unsafe {
++    unsafe {
+         SSL_HkdfExpandLabel(
+             version,
+             cipher,
+             **prk,
+             handshake_hash.as_ptr(),
+-            to_c_uint(handshake_hash.len())?,
++            c_uint::try_from(handshake_hash.len())?,
+             l.as_ptr() as *const c_char,
+-            to_c_uint(l.len())?,
++            c_uint::try_from(l.len())?,
+             &mut secret,
+         )
+-    };
+-    result::result(rv)?;
++    }?;
+     match NonNull::new(secret) {
+         Some(p) => Ok(SymKey::new(p)),
+         None => Err(Error::HkdfError),
+
+diff --git a/neqo-crypto/src/hp.rs b/neqo-crypto/src/hp.rs
+--- a/neqo-crypto/src/hp.rs
++++ b/neqo-crypto/src/hp.rs
+@@ -5,14 +5,13 @@
+ // except according to those terms.
+ 
+ use crate::constants::*;
+-use crate::convert::to_c_uint;
+-use crate::err::{Error, Res};
++use crate::err::{secstatus_to_res, Error, Res};
+ use crate::p11::{
+     PK11SymKey, PK11_Encrypt, PK11_GetBlockSize, PK11_GetMechanism, SECItem, SECItemType, SymKey,
+     CKM_AES_ECB, CKM_NSS_CHACHA20_CTR, CK_MECHANISM_TYPE,
+ };
+-use crate::result;
+ 
++use std::convert::TryFrom;
+ use std::fmt::{self, Debug};
+ use std::os::raw::{c_char, c_uint};
+ use std::ptr::{null, null_mut, NonNull};
+@@ -58,7 +57,7 @@ pub fn extract_hp<S: Into<String>>(
+ 
+     // Note that this doesn't allow for passing null() for the handshake hash.
+     // A zero-length slice produces an identical result.
+-    let rv = unsafe {
++    unsafe {
+         SSL_HkdfExpandLabelWithMech(
+             version,
+             cipher,
+@@ -66,13 +65,12 @@ pub fn extract_hp<S: Into<String>>(
+             null(),
+             0,
+             l.as_ptr() as *const c_char,
+-            to_c_uint(l.len())?,
++            c_uint::try_from(l.len())?,
+             mech,
+             key_size,
+             &mut secret,
+         )
+-    };
+-    result::result(rv)?;
++    }?;
+     match NonNull::new(secret) {
+         None => Err(Error::HkdfError),
+         Some(p) => Ok(HpKey(SymKey::new(p))),
+@@ -95,7 +93,7 @@ impl HpKey {
+         let mut item = SECItem {
+             type_: SECItemType::siBuffer,
+             data: sample.as_ptr() as *mut u8,
+-            len: to_c_uint(sample.len())?,
++            len: c_uint::try_from(sample.len())?,
+         };
+         let zero = vec![0_u8; block_size];
+         let (iv, inbuf) = match () {
+@@ -105,19 +103,18 @@ impl HpKey {
+             }
+             _ => unreachable!(),
+         };
+-        let rv = unsafe {
++        secstatus_to_res(unsafe {
+             PK11_Encrypt(
+                 k,
+                 mech,
+                 iv,
+                 output_slice.as_mut_ptr(),
+                 &mut output_len,
+-                to_c_uint(output.len())?,
++                c_uint::try_from(output.len())?,
+                 inbuf.as_ptr() as *const u8,
+-                to_c_uint(inbuf.len())?,
++                c_uint::try_from(inbuf.len())?,
+             )
+-        };
+-        result::result(rv)?;
++        })?;
+         assert_eq!(output_len as usize, block_size);
+         Ok(output)
+     }
+
+diff --git a/neqo-crypto/src/lib.rs b/neqo-crypto/src/lib.rs
+--- a/neqo-crypto/src/lib.rs
++++ b/neqo-crypto/src/lib.rs
+@@ -21,14 +21,12 @@ mod agentio;
+ mod auth;
+ mod cert;
+ pub mod constants;
+-mod convert;
+ mod err;
+ pub mod ext;
+ pub mod hkdf;
+ pub mod hp;
+ mod prio;
+ mod replay;
+-mod result;
+ mod secrets;
+ mod ssl;
+ mod time;
+@@ -57,8 +55,8 @@ mod nss {
+ }
+ 
+ // Need to map the types through.
+-fn result(code: nss::SECStatus) -> Res<()> {
+-    crate::result::result(code as crate::ssl::SECStatus)
++fn secstatus_to_res(code: nss::SECStatus) -> Res<()> {
++    crate::err::secstatus_to_res(code as crate::ssl::SECStatus)
+ }
+ 
+ enum NssLoaded {
+@@ -71,7 +69,7 @@ impl Drop for NssLoaded {
+     fn drop(&mut self) {
+         match self {
+             NssLoaded::NoDb | NssLoaded::Db(_) => unsafe {
+-                result(nss::NSS_Shutdown()).expect("NSS Shutdown failed")
++                secstatus_to_res(nss::NSS_Shutdown()).expect("NSS Shutdown failed")
+             },
+             _ => {}
+         }
+@@ -94,10 +92,8 @@ pub fn init() {
+                 return NssLoaded::External;
+             }
+ 
+-            let mut st = nss::NSS_NoDB_Init(null());
+-            result(st).expect("NSS_NoDB_Init failed");
+-            st = nss::NSS_SetDomesticPolicy();
+-            result(st).expect("NSS_SetDomesticPolicy failed");
++            secstatus_to_res(nss::NSS_NoDB_Init(null())).expect("NSS_NoDB_Init failed");
++            secstatus_to_res(nss::NSS_SetDomesticPolicy()).expect("NSS_SetDomesticPolicy failed");
+ 
+             NssLoaded::NoDb
+         });
+@@ -117,20 +113,23 @@ pub fn init_db<P: Into<PathBuf>>(dir: P) {
+             let pathstr = path.to_str().expect("path converts to string").to_string();
+             let dircstr = CString::new(pathstr).expect("new CString");
+             let empty = CString::new("").expect("new empty CString");
+-            let mut st = nss::NSS_Initialize(
++            secstatus_to_res(nss::NSS_Initialize(
+                 dircstr.as_ptr(),
+                 empty.as_ptr(),
+                 empty.as_ptr(),
+                 nss::SECMOD_DB.as_ptr() as *const i8,
+                 nss::NSS_INIT_READONLY,
+-            );
+-            result(st).expect("NSS_Initialize failed");
+-
+-            st = nss::NSS_SetDomesticPolicy();
+-            result(st).expect("NSS_SetDomesticPolicy failed");
+-
+-            st = ssl::SSL_ConfigServerSessionIDCache(1024, 0, 0, dircstr.as_ptr());
+-            result(st).expect("SSL_ConfigServerSessionIDCache failed");
++            ))
++            .expect("NSS_Initialize failed");
++
++            secstatus_to_res(nss::NSS_SetDomesticPolicy()).expect("NSS_SetDomesticPolicy failed");
++            secstatus_to_res(ssl::SSL_ConfigServerSessionIDCache(
++                1024,
++                0,
++                0,
++                dircstr.as_ptr(),
++            ))
++            .expect("SSL_ConfigServerSessionIDCache failed");
+ 
+             NssLoaded::Db(path.to_path_buf().into_boxed_path())
+         });
+
+diff --git a/neqo-crypto/src/p11.rs b/neqo-crypto/src/p11.rs
+--- a/neqo-crypto/src/p11.rs
++++ b/neqo-crypto/src/p11.rs
+@@ -9,8 +9,7 @@
+ #![allow(non_camel_case_types)]
+ #![allow(non_snake_case)]
+ 
+-use crate::err::{Error, Res};
+-use crate::result;
++use crate::err::{secstatus_to_res, Error, Res};
+ 
+ use std::ops::{Deref, DerefMut};
+ use std::ptr::NonNull;
+@@ -49,7 +48,7 @@ macro_rules! scoped_ptr {
+ 
+         impl Drop for $scoped {
+             fn drop(&mut self) {
+-                unsafe { $dtor(self.ptr) };
++                let _ = unsafe { $dtor(self.ptr) };
+             }
+         }
+     };
+@@ -64,8 +63,7 @@ scoped_ptr!(Slot, PK11SlotInfo, PK11_FreeSlot);
+ impl SymKey {
+     /// You really don't want to use this.
+     pub fn as_bytes<'a>(&'a self) -> Res<&'a [u8]> {
+-        let rv = unsafe { PK11_ExtractKeyValue(self.ptr) };
+-        result::result(rv)?;
++        secstatus_to_res(unsafe { PK11_ExtractKeyValue(self.ptr) })?;
+ 
+         let key_item = unsafe { PK11_GetKeyData(self.ptr) };
+         // This is accessing a value attached to the key, so we can treat this as a borrow.
+
+diff --git a/neqo-crypto/src/replay.rs b/neqo-crypto/src/replay.rs
+--- a/neqo-crypto/src/replay.rs
++++ b/neqo-crypto/src/replay.rs
+@@ -4,13 +4,11 @@
+ // option. This file may not be copied, modified, or distributed
+ // except according to those terms.
+ 
+-use crate::convert::to_c_uint;
+ use crate::err::{Error, Res};
+-use crate::result;
+ use crate::ssl::PRFileDesc;
+ use crate::time::{Interval, PRTime, Time};
+ 
+-use std::convert::TryInto;
++use std::convert::{TryFrom, TryInto};
+ use std::ops::{Deref, DerefMut};
+ use std::os::raw::c_uint;
+ use std::ptr::{null_mut, NonNull};
+@@ -53,16 +51,15 @@ impl AntiReplay {
+     /// See the documentation in NSS for advice on how to set these values.
+     pub fn new(now: Instant, window: Duration, k: usize, bits: usize) -> Res<Self> {
+         let mut ctx: *mut SSLAntiReplayContext = null_mut();
+-        let rv = unsafe {
++        unsafe {
+             SSL_CreateAntiReplayContext(
+                 Time::from(now).try_into()?,
+                 Interval::from(window).try_into()?,
+-                to_c_uint(k)?,
+-                to_c_uint(bits)?,
++                c_uint::try_from(k)?,
++                c_uint::try_from(bits)?,
+                 &mut ctx,
+             )
+-        };
+-        result::result(rv)?;
++        }?;
+ 
+         match NonNull::new(ctx) {
+             Some(ctx_nn) => Ok(Self {
+@@ -74,7 +71,6 @@ impl AntiReplay {
+ 
+     /// Configure the provided socket with this anti-replay context.
+     pub(crate) fn config_socket(&self, fd: *mut PRFileDesc) -> Res<()> {
+-        let rv = unsafe { SSL_SetAntiReplayContext(fd, *self.ctx) };
+-        result::result(rv)
++        unsafe { SSL_SetAntiReplayContext(fd, *self.ctx) }
+     }
+ }
+
+diff --git a/neqo-crypto/src/secrets.rs b/neqo-crypto/src/secrets.rs
+--- a/neqo-crypto/src/secrets.rs
++++ b/neqo-crypto/src/secrets.rs
+@@ -7,7 +7,6 @@
+ use crate::constants::*;
+ use crate::err::Res;
+ use crate::p11::{PK11SymKey, PK11_ReferenceSymKey, SymKey};
+-use crate::result;
+ use crate::ssl::{PRFileDesc, SSLSecretCallback, SSLSecretDirection};
+ 
+ use neqo_common::qdebug;
+@@ -117,9 +116,7 @@ impl SecretHolder {
+     /// of the connection, or bad things might happen.
+     pub fn register(&mut self, fd: *mut PRFileDesc) -> Res<()> {
+         let p = &*self.secrets as *const Secrets as *const c_void;
+-        let rv =
+-            unsafe { SSL_SecretCallback(fd, Some(Secrets::secret_available), p as *mut c_void) };
+-        result::result(rv)
++        unsafe { SSL_SecretCallback(fd, Some(Secrets::secret_available), p as *mut c_void) }
+     }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn get_alpn(fd: *mut ssl::PRFileDesc, pre: bool) -> Res<Option<String>>
+
+fn agent_close(fd: PrFd) -> PrStatus
+
+fn agent_write(
+mut fd: PrFd,
+buf: *const c_void,
+amount: prio::PRInt32) -> PrStatus
+
+fn agent_recv(
+mut fd: PrFd,
+buf: *mut c_void,
+amount: prio::PRInt32,
+flags: prio::PRIntn,
+_timeout: prio::PRIntervalTime) -> prio::PRInt32
+
+fn agent_send(
+mut fd: PrFd,
+buf: *const c_void,
+amount: prio::PRInt32,
+flags: prio::PRIntn,
+_timeout: prio::PRIntervalTime) -> prio::PRInt32
+
+fn stapled_ocsp_responses(fd: *mut PRFileDesc) -> Option<Vec<Vec<u8>>>
+
+pub fn stapled_ocsp_responses(&mut self) -> &Option<Vec<Vec<u8>>>
+
+pub fn extract(
+version: Version,
+cipher: Cipher,
+salt: Option<&SymKey>,
+ikm: &SymKey) -> Res<SymKey>
+
+pub fn import_key(version: Version, cipher: Cipher, buf: &[u8]) -> Res<SymKey>
+
+pub fn init() -> ()
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

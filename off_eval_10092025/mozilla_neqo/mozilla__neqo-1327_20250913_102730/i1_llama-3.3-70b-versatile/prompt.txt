@@ -1,0 +1,251 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+rust_decimal crate uses features that were unstable in rust 1.51
+1.51 is our current minimum supported version; we should pin our use of rust_decimal to 1.20.  Unfortunately, we pick this up via the sfv crate.  sfv 0.9.1 (our dependency) specifies rust_decimal ^1.20.0, which selects 1.21.0, which doesn't compile.
+
+We need to include it directly (which doesn't really guarantee that we get the right version, but seems to work).
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-crypto/src/agent.rs b/neqo-crypto/src/agent.rs
+--- a/neqo-crypto/src/agent.rs
++++ b/neqo-crypto/src/agent.rs
+@@ -87,8 +87,11 @@ fn get_alpn(fd: *mut ssl::PRFileDesc, pre: bool) -> Res<Option<String>> {
+ 
+     let alpn = match (pre, alpn_state) {
+         (true, ssl::SSLNextProtoState::SSL_NEXT_PROTO_EARLY_VALUE)
+-        | (false, ssl::SSLNextProtoState::SSL_NEXT_PROTO_NEGOTIATED)
+-        | (false, ssl::SSLNextProtoState::SSL_NEXT_PROTO_SELECTED) => {
++        | (
++            false,
++            ssl::SSLNextProtoState::SSL_NEXT_PROTO_NEGOTIATED
++            | ssl::SSLNextProtoState::SSL_NEXT_PROTO_SELECTED,
++        ) => {
+             chosen.truncate(usize::try_from(chosen_len)?);
+             Some(match String::from_utf8(chosen) {
+                 Ok(a) => a,
+
+diff --git a/neqo-crypto/src/err.rs b/neqo-crypto/src/err.rs
+--- a/neqo-crypto/src/err.rs
++++ b/neqo-crypto/src/err.rs
+@@ -29,7 +29,6 @@ pub mod nspr {
+ pub type Res<T> = Result<T, Error>;
+ 
+ #[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq)]
+-#[allow(renamed_and_removed_lints, clippy::pub_enum_variant_names)] // rust 1.54 will require a different approach
+ pub enum Error {
+     AeadInitFailure,
+     AeadError,
+
+diff --git a/neqo-crypto/src/p11.rs b/neqo-crypto/src/p11.rs
+--- a/neqo-crypto/src/p11.rs
++++ b/neqo-crypto/src/p11.rs
+@@ -19,7 +19,7 @@ use std::os::raw::{c_int, c_uint};
+ use std::ptr::null_mut;
+ 
+ #[allow(clippy::upper_case_acronyms)]
+-#[allow(unknown_lints, deref_nullptr)] // Until we require rust 1.53 or bindgen#1651 is fixed.
++#[allow(unknown_lints, deref_nullptr)] // Until bindgen#1651 is fixed.
+ #[allow(clippy::unreadable_literal)]
+ mod nss_p11 {
+     include!(concat!(env!("OUT_DIR"), "/nss_p11.rs"));
+
+diff --git a/neqo-crypto/src/prio.rs b/neqo-crypto/src/prio.rs
+--- a/neqo-crypto/src/prio.rs
++++ b/neqo-crypto/src/prio.rs
+@@ -5,7 +5,7 @@
+ // except according to those terms.
+ 
+ #![allow(clippy::upper_case_acronyms)]
+-#![allow(unknown_lints, deref_nullptr)] // Until we require rust 1.53 or bindgen#1651 is fixed.
++#![allow(unknown_lints, deref_nullptr)] // Until bindgen#1651 is fixed.
+ #![allow(
+     dead_code,
+     non_upper_case_globals,
+
+diff --git a/neqo-crypto/src/ssl.rs b/neqo-crypto/src/ssl.rs
+--- a/neqo-crypto/src/ssl.rs
++++ b/neqo-crypto/src/ssl.rs
+@@ -12,7 +12,7 @@
+     clippy::too_many_lines,
+     clippy::upper_case_acronyms
+ )]
+-#![allow(unknown_lints, deref_nullptr)] // Until we require rust 1.53 or bindgen#1651 is fixed.
++#![allow(unknown_lints, deref_nullptr)] // Until bindgen#1651 is fixed.
+ 
+ use crate::constants::Epoch;
+ use crate::err::{secstatus_to_res, Res};
+
+diff --git a/neqo-http3/src/connection.rs b/neqo-http3/src/connection.rs
+--- a/neqo-http3/src/connection.rs
++++ b/neqo-http3/src/connection.rs
+@@ -203,8 +203,8 @@ impl Http3Connection {
+         self.qpack_decoder.borrow_mut().send(conn)?;
+         match self.qpack_encoder.borrow_mut().send_encoder_updates(conn) {
+             Ok(())
+-            | Err(neqo_qpack::Error::EncoderStreamBlocked)
+-            | Err(neqo_qpack::Error::DynamicTableFull) => {}
++            | Err(neqo_qpack::Error::EncoderStreamBlocked | neqo_qpack::Error::DynamicTableFull) => {
++            }
+             Err(e) => return Err(Error::QpackError(e)),
+         }
+         Ok(())
+@@ -300,9 +300,9 @@ impl Http3Connection {
+                 }
+                 Ok(ReceiveOutput::ControlFrames(rest))
+             }
+-            ReceiveOutput::NewStream(NewStreamType::Push(_))
+-            | ReceiveOutput::NewStream(NewStreamType::Http)
+-            | ReceiveOutput::NewStream(NewStreamType::WebTransportStream(_)) => Ok(output),
++            ReceiveOutput::NewStream(
++                NewStreamType::Push(_) | NewStreamType::Http | NewStreamType::WebTransportStream(_),
++            ) => Ok(output),
+             ReceiveOutput::NewStream(_) => {
+                 unreachable!("NewStream should have been handled already")
+             }
+
+diff --git a/neqo-http3/src/lib.rs b/neqo-http3/src/lib.rs
+--- a/neqo-http3/src/lib.rs
++++ b/neqo-http3/src/lib.rs
+@@ -60,11 +60,6 @@ pub use stream_type_reader::NewStreamType;
+ type Res<T> = Result<T, Error>;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+-#[allow(
+-    renamed_and_removed_lints,
+-    clippy::pub_enum_variant_names,
+-    clippy::enum_variant_names
+-)]
+ pub enum Error {
+     HttpNoError,
+     HttpGeneralProtocol,
+@@ -153,8 +148,7 @@ impl Error {
+                 | Self::HttpId
+                 | Self::HttpSettings
+                 | Self::HttpMissingSettings
+-                | Self::QpackError(QpackError::EncoderStream)
+-                | Self::QpackError(QpackError::DecoderStream)
++                | Self::QpackError(QpackError::EncoderStream | QpackError::DecoderStream)
+         )
+     }
+ 
+@@ -168,10 +162,9 @@ impl Error {
+     #[must_use]
+     pub fn map_stream_send_errors(err: &Error) -> Self {
+         match err {
+-            Self::TransportError(TransportError::InvalidStreamId)
+-            | Self::TransportError(TransportError::FinalSizeError) => {
+-                Error::TransportStreamDoesNotExist
+-            }
++            Self::TransportError(
++                TransportError::InvalidStreamId | TransportError::FinalSizeError,
++            ) => Error::TransportStreamDoesNotExist,
+             Self::TransportError(TransportError::InvalidInput) => Error::InvalidInput,
+             _ => {
+                 debug_assert!(false, "Unexpected error");
+
+diff --git a/neqo-http3/src/server.rs b/neqo-http3/src/server.rs
+--- a/neqo-http3/src/server.rs
++++ b/neqo-http3/src/server.rs
+@@ -342,12 +342,7 @@ mod tests {
+ 
+     fn assert_closed(hconn: &mut Http3Server, expected: &Error) {
+         let err = ConnectionError::Application(expected.code());
+-        let closed = |e| {
+-            matches!(e,
+-            Http3ServerEvent::StateChange{ state: Http3State::Closing(e), .. }
+-            | Http3ServerEvent::StateChange{ state: Http3State::Closed(e), .. }
+-              if e == err)
+-        };
++        let closed = |e| matches!(e, Http3ServerEvent::StateChange{ state: Http3State::Closing(e) | Http3State::Closed(e), .. } if e == err);
+         assert!(hconn.events().any(closed));
+     }
+
+diff --git a/neqo-http3/src/stream_type_reader.rs b/neqo-http3/src/stream_type_reader.rs
+--- a/neqo-http3/src/stream_type_reader.rs
++++ b/neqo-http3/src/stream_type_reader.rs
+@@ -59,7 +59,6 @@ impl NewStreamType {
+             }
+             (_, StreamType::BiDi, Role::Server) => Err(Error::HttpFrame),
+             (HTTP3_UNI_STREAM_TYPE_PUSH, StreamType::UniDi, Role::Server)
+-            | (H3_FRAME_TYPE_HEADERS, StreamType::BiDi, Role::Client)
+             | (_, StreamType::BiDi, Role::Client) => Err(Error::HttpStreamCreation),
+             _ => Ok(Some(NewStreamType::Unknown)),
+         }
+@@ -197,13 +196,13 @@ impl NewStreamHeadReader {
+ 
+     fn map_stream_fin(decoded: Option<NewStreamType>) -> Res<Option<NewStreamType>> {
+         match decoded {
+-            Some(NewStreamType::Control)
+-            | Some(NewStreamType::Encoder)
+-            | Some(NewStreamType::Decoder) => Err(Error::HttpClosedCriticalStream),
++            Some(NewStreamType::Control | NewStreamType::Encoder | NewStreamType::Decoder) => {
++                Err(Error::HttpClosedCriticalStream)
++            }
+             None => Err(Error::HttpStreamCreation),
+             Some(NewStreamType::Http) => Err(Error::HttpFrame),
+             Some(NewStreamType::Unknown) => Ok(decoded),
+-            Some(NewStreamType::Push(_)) | Some(NewStreamType::WebTransportStream(_)) => {
++            Some(NewStreamType::Push(_) | NewStreamType::WebTransportStream(_)) => {
+                 unreachable!("PushStream and WebTransport are mapped to None at this stage.")
+             }
+         }
+
+diff --git a/neqo-qpack/src/lib.rs b/neqo-qpack/src/lib.rs
+--- a/neqo-qpack/src/lib.rs
++++ b/neqo-qpack/src/lib.rs
+@@ -39,11 +39,6 @@ pub struct QpackSettings {
+ }
+ 
+ #[derive(Clone, Debug, PartialEq)]
+-#[allow(
+-    renamed_and_removed_lints,
+-    clippy::pub_enum_variant_names,
+-    clippy::enum_variant_names
+-)]
+ pub enum Error {
+     DecompressionFailed,
+     EncoderStream,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn get_alpn(fd: *mut ssl::PRFileDesc, pre: bool) -> Res<Option<String>>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,246 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Meta: Implement all qlog probes
+Once basic qlog support lands in Neqo (#526), we still need to add probes for all the things qlog can log. These should be *relatively* straightforward, and can likely be done as a group effort.
+
+## Up to date list of qlog events
+
+*for qlog crate version [0.13.0](https://docs.rs/qlog/0.13.0/qlog/events/index.html) / draft versions 09 ([quic](https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-quic-events.html#name-quic-event-overview), [h3](https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-h3-events.html#name-introduction))*
+
+### Connectivity events
+
+- [ ] server_listening
+- [x] connection_started
+- [ ] connection_closed
+- [ ] connection_id_updated
+- [ ] spin_bit_updated
+- [x] connection_state_updated
+- [ ] path_assigned (not implemented in qlog crate)
+- [ ] mtu_updated
+
+### Transport events
+
+- [x] version_information
+- [ ] alpn_information
+- [x] parameters_set
+- [ ] parameters_restored
+- [x] packet_sent
+- [x] packet_received
+- [x] packet_dropped
+- [ ] packet_buffered
+- [ ] packets_acked
+- [ ] udp_datagrams_sent
+- [ ] udp_datagrams_received
+- [ ] udp_datagram_dropped
+- [ ] stream_state_updated
+- [ ] frames_processed
+- [ ] stream_data_moved
+- [ ] datagram_data_moved
+- [ ] migration_state_updated
+
+### Security Events
+
+- [ ] key_updated
+- [ ] key_discarded
+
+### Recovery events
+
+- [ ] recovery_parameters_set
+- [x] recovery_metrics_updated
+- [ ] congestion_state_updated
+- [ ] loss_timer_updated
+- [x] packet_lost
+- [ ] marked_for_retransmit
+- [ ] ecn_state_updated
+
+### HTTP3 events
+
+- [ ] parameters_set
+- [ ] parameters_restored
+- [ ] stream_type_set
+- [ ] priority_updated (not implemented in qlog crate)
+- [ ] frame_created
+- [ ] frame_parsed
+- [ ] datagram_created (not implemented in qlog crate)
+- [ ] datagram_parsed (not implemented in qlog crate)
+- [ ] push_resolved
+
+### QPACK
+
+*those have been [removed](https://github.com/quicwg/qlog/pull/335) from the rfc but are still implemented in the qlog crate*
+
+- [ ] qpack_dynamic_table_updated
+- [ ] qpack_headers_decoded
+- [ ] qpack_headers_encoded
+- [x] qpack_instruction_received (partial)
+- [ ] qpack_instruction_sent
+- [ ] qpack_state_updated
+- [ ] qpack_stream_state_updated
+
+## Changelog
+
+- [2025-01-16 @mansf-osk ] updated qlog event list
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/qlog.rs b/neqo-transport/src/qlog.rs
+--- a/neqo-transport/src/qlog.rs
++++ b/neqo-transport/src/qlog.rs
+@@ -164,6 +164,25 @@ pub fn client_version_information_negotiated(
+     });
+ }
+ 
++pub fn server_version_information_failed(
++    qlog: &mut NeqoQlog,
++    server: &[Version],
++    client: WireVersion,
++) {
++    qlog.add_event_data(|| {
++        Some(EventData::VersionInformation(VersionInformation {
++            client_versions: Some(vec![format!("{client:02x}")]),
++            server_versions: Some(
++                server
++                    .iter()
++                    .map(|v| format!("{:02x}", v.wire_version()))
++                    .collect(),
++            ),
++            chosen_version: None,
++        }))
++    });
++}
++
+ pub fn packet_sent(
+     qlog: &mut NeqoQlog,
+     pt: PacketType,
+
+diff --git a/neqo-transport/src/server.rs b/neqo-transport/src/server.rs
+--- a/neqo-transport/src/server.rs
++++ b/neqo-transport/src/server.rs
+@@ -383,11 +383,11 @@ impl Server {
+         }
+     }
+ 
+-    fn create_qlog_trace(&self, attempt_key: &AttemptKey) -> NeqoQlog {
++    fn create_qlog_trace(&self, odcid: &ConnectionIdRef<'_>) -> NeqoQlog {
+         if let Some(qlog_dir) = &self.qlog_dir {
+             let mut qlog_path = qlog_dir.to_path_buf();
+ 
+-            qlog_path.push(format!("{}.qlog", attempt_key.odcid));
++            qlog_path.push(format!("{}.qlog", odcid));
+ 
+             // The original DCID is chosen by the client. Using create_new()
+             // prevents attackers from overwriting existing logs.
+@@ -449,7 +449,7 @@ impl Server {
+             c.set_retry_cids(odcid, initial.src_cid, initial.dst_cid);
+         }
+         c.set_validation(Rc::clone(&self.address_validation));
+-        c.set_qlog(self.create_qlog_trace(attempt_key));
++        c.set_qlog(self.create_qlog_trace(&attempt_key.odcid.as_cid_ref()));
+         if let Some(cfg) = &self.ech_config {
+             if c.server_enable_ech(cfg.config, &cfg.public_name, &cfg.sk, &cfg.pk)
+                 .is_err()
+@@ -487,20 +487,30 @@ impl Server {
+             params,
+         );
+ 
+-        if let Ok(mut c) = sconn {
+-            self.setup_connection(&mut c, &attempt_key, initial, orig_dcid);
+-            let c = Rc::new(RefCell::new(ServerConnectionState {
+-                c,
+-                last_timer: now,
+-                active_attempt: Some(attempt_key.clone()),
+-            }));
+-            cid_mgr.borrow_mut().set_connection(Rc::clone(&c));
+-            let previous_attempt = self.active_attempts.insert(attempt_key, Rc::clone(&c));
+-            debug_assert!(previous_attempt.is_none());
+-            self.process_connection(c, Some(dgram), now)
+-        } else {
+-            qwarn!([self], "Unable to create connection");
+-            None
++        match sconn {
++            Ok(mut c) => {
++                self.setup_connection(&mut c, &attempt_key, initial, orig_dcid);
++                let c = Rc::new(RefCell::new(ServerConnectionState {
++                    c,
++                    last_timer: now,
++                    active_attempt: Some(attempt_key.clone()),
++                }));
++                cid_mgr.borrow_mut().set_connection(Rc::clone(&c));
++                let previous_attempt = self.active_attempts.insert(attempt_key, Rc::clone(&c));
++                debug_assert!(previous_attempt.is_none());
++                self.process_connection(c, Some(dgram), now)
++            }
++            Err(e) => {
++                qwarn!([self], "Unable to create connection");
++                if e == crate::Error::VersionNegotiation {
++                    crate::qlog::server_version_information_failed(
++                        &mut self.create_qlog_trace(&attempt_key.odcid.as_cid_ref()),
++                        self.conn_params.get_versions().all(),
++                        initial.version.wire_version(),
++                    )
++                }
++                None
++            }
+         }
+     }
+ 
+@@ -573,6 +583,13 @@ impl Server {
+                 packet.wire_version(),
+                 self.conn_params.get_versions().all(),
+             );
++
++            crate::qlog::server_version_information_failed(
++                &mut self.create_qlog_trace(packet.dcid()),
++                self.conn_params.get_versions().all(),
++                packet.wire_version(),
++            );
++
+             return Some(Datagram::new(dgram.destination(), dgram.source(), vn));
+         }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn client_version_information_negotiated(
+qlog: &mut NeqoQlog,
+client: &[Version],
+server: &[WireVersion],
+chosen: Version) -> ()
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

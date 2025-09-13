@@ -1,0 +1,175 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Crash in [@ neqo_common::codec::Encoder::encode_uint<T>]
+See [bugzilla#1919678](https://bugzilla.mozilla.org/show_bug.cgi?id=1919678).
+
+Investigating ...
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/connection/mod.rs b/neqo-transport/src/connection/mod.rs
+--- a/neqo-transport/src/connection/mod.rs
++++ b/neqo-transport/src/connection/mod.rs
+@@ -48,7 +48,7 @@ use crate::{
+     quic_datagrams::{DatagramTracking, QuicDatagrams},
+     recovery::{LossRecovery, RecoveryToken, SendProfile, SentPacket},
+     recv_stream::RecvStreamStats,
+-    rtt::{RttEstimate, GRANULARITY, INITIAL_RTT},
++    rtt::{RttEstimate, GRANULARITY},
+     send_stream::SendStream,
+     stats::{Stats, StatsCell},
+     stream_id::StreamType,
+@@ -594,25 +594,9 @@ impl Connection {
+     fn make_resumption_token(&mut self) -> ResumptionToken {
+         debug_assert_eq!(self.role, Role::Client);
+         debug_assert!(self.crypto.has_resumption_token());
+-        // Values less than GRANULARITY are ignored when using the token, so use 0 where needed.
+         let rtt = self.paths.primary().map_or_else(
+-            // If we don't have a path, we don't have an RTT.
+-            || Duration::from_millis(0),
+-            |p| {
+-                let rtt = p.borrow().rtt().estimate();
+-                if p.borrow().rtt().is_guesstimate() {
+-                    // When we have no actual RTT sample, do not encode a guestimated RTT larger
+-                    // than the default initial RTT. (The guess can be very large under lossy
+-                    // conditions.)
+-                    if rtt < INITIAL_RTT {
+-                        rtt
+-                    } else {
+-                        Duration::from_millis(0)
+-                    }
+-                } else {
+-                    rtt
+-                }
+-            },
++            || RttEstimate::default().estimate(),
++            |p| p.borrow().rtt().estimate(),
+         );
+ 
+         self.crypto
+@@ -1412,14 +1396,12 @@ impl Connection {
+                 // that Initial packets were lost.
+                 // Resend Initial CRYPTO frames immediately a few times just
+                 // in case.  As we don't have an RTT estimate yet, this helps
+-                // when there is a short RTT and losses. Also mark all 0-RTT
+-                // data as lost.
++                // when there is a short RTT and losses.
+                 if dcid.is_none()
+                     && self.cid_manager.is_valid(packet.dcid())
+                     && self.stats.borrow().saved_datagrams <= EXTRA_INITIALS
+                 {
+                     self.crypto.resend_unacked(PacketNumberSpace::Initial);
+-                    self.resend_0rtt(now);
+                 }
+             }
+             (PacketType::VersionNegotiation | PacketType::Retry | PacketType::OtherVersion, ..) => {
+@@ -2018,7 +2000,10 @@ impl Connection {
+         // Count how many bytes in this range are non-zero.
+         let pn_len = mem::size_of::<PacketNumber>()
+             - usize::try_from(unacked_range.leading_zeros() / 8).unwrap();
+-        // pn_len can't be zero (unacked_range is > 0)
++        assert!(
++            pn_len > 0,
++            "pn_len can't be zero as unacked_range should be > 0, pn {pn}, largest_acknowledged {largest_acknowledged:?}, tx {tx}"
++        );
+         // TODO(mt) also use `4*path CWND/path MTU` to set a minimum length.
+         builder.pn(pn, pn_len);
+         pn
+@@ -2867,13 +2852,8 @@ impl Connection {
+                     self.handshake(now, packet_version, space, Some(&buf))?;
+                     self.create_resumption_token(now);
+                 } else {
+-                    // If we get a useless CRYPTO frame send outstanding CRYPTO frames and 0-RTT
+-                    // data again.
++                    // If we get a useless CRYPTO frame send outstanding CRYPTO frames again.
+                     self.crypto.resend_unacked(space);
+-                    if space == PacketNumberSpace::Initial {
+-                        self.crypto.resend_unacked(PacketNumberSpace::Handshake);
+-                        self.resend_0rtt(now);
+-                    }
+                 }
+             }
+             Frame::NewToken { token } => {
+@@ -3085,22 +3065,21 @@ impl Connection {
+         stats.largest_acknowledged = max(stats.largest_acknowledged, largest_acknowledged);
+     }
+ 
+-    /// Tell 0-RTT packets that they were "lost".
+-    fn resend_0rtt(&mut self, now: Instant) {
+-        if let Some(path) = self.paths.primary() {
+-            let dropped = self.loss_recovery.drop_0rtt(&path, now);
+-            self.handle_lost_packets(&dropped);
+-        }
+-    }
+-
+     /// When the server rejects 0-RTT we need to drop a bunch of stuff.
+     fn client_0rtt_rejected(&mut self, now: Instant) {
+         if !matches!(self.zero_rtt_state, ZeroRttState::Sending) {
+             return;
+         }
+         qdebug!([self], "0-RTT rejected");
+-        self.resend_0rtt(now);
++
++        // Tell 0-RTT packets that they were "lost".
++        if let Some(path) = self.paths.primary() {
++            let dropped = self.loss_recovery.drop_0rtt(&path, now);
++            self.handle_lost_packets(&dropped);
++        }
++
+         self.streams.zero_rtt_rejected();
++
+         self.crypto.states.discard_0rtt_keys();
+         self.events.client_0rtt_rejected();
+     }
+@@ -3460,7 +3439,7 @@ impl Connection {
+     /// to check the estimated max datagram size and to use smaller datagrams.
+     /// `max_datagram_size` is just a current estimate and will change over
+     /// time depending on the encoded size of the packet number, ack frames, etc.
+-    pub fn send_datagram(&mut self, buf: Vec<u8>, id: impl Into<DatagramTracking>) -> Res<()> {
++    pub fn send_datagram(&mut self, buf: &[u8], id: impl Into<DatagramTracking>) -> Res<()> {
+         self.quic_datagrams
+             .add_datagram(buf, id.into(), &mut self.stats.borrow_mut())
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

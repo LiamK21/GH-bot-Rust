@@ -1,0 +1,99 @@
+<think>
+Okay, I need to figure out whether a unit test is needed for the given patch and issue. The issue is about sending arbitrary amounts of data as a server, which previously limited data based on the client's flow control. The patch modifies the server to handle sending data beyond the initial flow control limits.
+
+First, I'll review the changes in the patch. The main changes are in `neqo-server/src/main.rs`. The code introduces a `ResponseData` struct that manages sending data in chunks. It also modifies the `HttpServer` implementation to handle sending data in multiple writes if the data exceeds the flow control window.
+
+Now, considering whether a test is needed. Since the patch changes how data is sent, a test should verify that the server correctly sends large responses that exceed the client's initial flow control window. Without a test, we can't be sure the patch works as intended.
+
+Next, I'll outline the test. The test should:
+
+1. Create a server and a client.
+2. Send a request to the server.
+3. Measure the response to ensure all data is received, even if it's larger than the flow control limit.
+
+I'll structure the test using Rust's async/await for client-server communication. I'll set up a large response and check if the client receives it completely.
+
+I'll also need to import necessary modules and set up the test environment. The test will fail before the patch because the server wouldn't send all data, and pass after the patch since the server now handles it correctly.
+
+So, the test is necessary and I'll proceed to write it.
+</think>
+
+<Filename>neqo-server/src/main.rs</Filename>
+<imports>
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use neqo_common::qinfo;
+use neqo_http3::Http3Server;
+use neqo_transport::ConnectionIdGenerator;
+use neqo_transport::server::ValidateAddress;
+use neqo_transport::ConnectionParameters;
+use neqo_transport::CongestionControlAlgorithm;
+use neqo_transport::Version;
+use neqo_transport::StreamType;
+use neqo_transport::RandomConnectionIdGenerator;
+use structopt::StructOpt;
+use mio::net::UdpSocket;
+use mio::Poll;
+use mio::Events;
+use mio::Ready;
+use mio::Token;
+use mio::PollOpt;
+use mio_extras::timer::Builder;
+use async_io::AsyncSocket;
+use futures::channel::mpsc;
+use futures::StreamExt;
+</imports>
+<Rust>
+#[test]
+fn test_server_sends_large_response() {
+    let mut args = Args::default();
+    args.max_table_size_encoder = 100;
+    args.max_table_size_decoder = 100;
+    
+    let server = SimpleServer::new(&args, AntiReplay::default(), Rc::new(RefCell::new(RandomConnectionIdGenerator::default())));
+    
+    let (mut sender, mut receiver) = mpsc::channel(1);
+    
+    let handle = std::thread::spawn(move || {
+        let mut poll = Poll::new().unwrap();
+        let mut timer = Builder::default().build().unwrap();
+        
+        poll.register(&mut UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap(), Token(0), Ready::all(), PollOpt::edge().unwrap()).unwrap();
+        
+        let mut events = Events::with_capacity(1024);
+        
+        while let Some(event) = server.next_event() {
+            match event {
+                Http3ServerEvent::Headers { mut stream, headers, fin } => {
+                    let response = ResponseData::from(vec![b'a'; 100000]);
+                    response.send(&mut stream);
+                    if response.done() {
+                        stream.stream_close_send().unwrap();
+                    } else {
+                        server.remaining_data.insert(stream.stream_id(), response);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    
+    let client = AsyncSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = client.local_addr().unwrap();
+    
+    client.connect(addr).unwrap();
+    
+    let mut data = Vec::new();
+    while receiver.try_recv().is_ok() {
+        data.extend(receiver.try_recv().unwrap());
+    }
+    
+    let expected = b"Hello World".to_vec();
+    assert_eq!(data, expected);
+    
+    handle.join().unwrap();
+}
+</Rust>

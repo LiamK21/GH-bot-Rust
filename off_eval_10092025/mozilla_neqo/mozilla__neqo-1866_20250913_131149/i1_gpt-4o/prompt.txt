@@ -1,0 +1,264 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Client spews "Setting timeout of" messages
+Running the `test/test.sh` script generates a ton of messages like
+```
+0s356ms DEBUG [Client e4cf3ef0326dc9b16338] pn=9 type=Short pri-path:1bf8e83784f7e3129ce7 0.0.0.0:53440->127.0.0.1:4433 IpTos(Cs0, NotEct)
+  TX -> ConnectionClose { error_code: Application(0), frame_type: 0, reason_phrase: [107, 116, 104, 120, 98, 121, 101, 33] }
+0s357ms DEBUG [LossRecovery] packet ap-9 sent
+0s357ms DEBUG Setting timeout of 141.61858ms
+0s357ms DEBUG Setting timeout of 141.612121ms
+0s357ms DEBUG Setting timeout of 141.607246ms
+0s357ms DEBUG Setting timeout of 141.602788ms
+0s357ms DEBUG Setting timeout of 141.598496ms
+0s357ms DEBUG Setting timeout of 141.594246ms
+0s357ms DEBUG Setting timeout of 141.590163ms
+0s357ms DEBUG Setting timeout of 141.58608ms
+0s357ms DEBUG Setting timeout of 141.581955ms
+0s357ms DEBUG Setting timeout of 141.577871ms
+```
+after the client closes the connection.
+
+Anyone got any idea where those come from? Maybe @mxinden?
+[client.log](https://github.com/mozilla/neqo/files/15166658/client.log)
+
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-bin/src/client/http09.rs b/neqo-bin/src/client/http09.rs
+--- a/neqo-bin/src/client/http09.rs
++++ b/neqo-bin/src/client/http09.rs
+@@ -25,7 +25,7 @@ use neqo_transport::{
+ };
+ use url::Url;
+ 
+-use super::{get_output_file, qlog_new, Args, Res};
++use super::{get_output_file, qlog_new, Args, CloseState, Res};
+ 
+ pub struct Handler<'a> {
+     streams: HashMap<StreamId, Option<BufWriter<File>>>,
+@@ -142,6 +142,26 @@ pub(crate) fn create_client(
+     Ok(client)
+ }
+ 
++impl TryFrom<&State> for CloseState {
++    type Error = ConnectionError;
++
++    fn try_from(value: &State) -> Result<Self, Self::Error> {
++        let (state, error) = match value {
++            State::Closing { error, .. } | State::Draining { error, .. } => {
++                (CloseState::Closing, error)
++            }
++            State::Closed(error) => (CloseState::Closed, error),
++            _ => return Ok(CloseState::NotClosing),
++        };
++
++        if error.is_error() {
++            Err(error.clone())
++        } else {
++            Ok(state)
++        }
++    }
++}
++
+ impl super::Client for Connection {
+     fn process_output(&mut self, now: Instant) -> Output {
+         self.process_output(now)
+@@ -163,15 +183,8 @@ impl super::Client for Connection {
+         }
+     }
+ 
+-    fn is_closed(&self) -> Result<bool, ConnectionError> {
+-        match self.state() {
+-            State::Closed(
+-                ConnectionError::Transport(neqo_transport::Error::NoError)
+-                | ConnectionError::Application(0),
+-            ) => Ok(true),
+-            State::Closed(err) => Err(err.clone()),
+-            _ => Ok(false),
+-        }
++    fn is_closed(&self) -> Result<CloseState, ConnectionError> {
++        self.state().try_into()
+     }
+ 
+     fn stats(&self) -> neqo_transport::Stats {
+
+diff --git a/neqo-bin/src/client/http3.rs b/neqo-bin/src/client/http3.rs
+--- a/neqo-bin/src/client/http3.rs
++++ b/neqo-bin/src/client/http3.rs
+@@ -27,7 +27,7 @@ use neqo_transport::{
+ };
+ use url::Url;
+ 
+-use super::{get_output_file, qlog_new, Args, Res};
++use super::{get_output_file, qlog_new, Args, CloseState, Res};
+ 
+ pub(crate) struct Handler<'a> {
+     #[allow(
+@@ -105,17 +105,28 @@ pub(crate) fn create_client(
+     Ok(client)
+ }
+ 
+-impl super::Client for Http3Client {
+-    fn is_closed(&self) -> Result<bool, ConnectionError> {
+-        match self.state() {
+-            Http3State::Closed(
+-                ConnectionError::Transport(neqo_transport::Error::NoError)
+-                | ConnectionError::Application(0),
+-            ) => Ok(true),
+-            Http3State::Closed(err) => Err(err.clone()),
+-            _ => Ok(false),
++impl TryFrom<Http3State> for CloseState {
++    type Error = ConnectionError;
++
++    fn try_from(value: Http3State) -> Result<Self, Self::Error> {
++        let (state, error) = match value {
++            Http3State::Closing(error) => (CloseState::Closing, error),
++            Http3State::Closed(error) => (CloseState::Closed, error),
++            _ => return Ok(CloseState::NotClosing),
++        };
++
++        if error.is_error() {
++            Err(error.clone())
++        } else {
++            Ok(state)
+         }
+     }
++}
++
++impl super::Client for Http3Client {
++    fn is_closed(&self) -> Result<CloseState, ConnectionError> {
++        self.state().try_into()
++    }
+ 
+     fn process_output(&mut self, now: Instant) -> Output {
+         self.process_output(now)
+
+diff --git a/neqo-bin/src/client/mod.rs b/neqo-bin/src/client/mod.rs
+--- a/neqo-bin/src/client/mod.rs
++++ b/neqo-bin/src/client/mod.rs
+@@ -345,6 +345,12 @@ trait Handler {
+     fn take_token(&mut self) -> Option<ResumptionToken>;
+ }
+ 
++enum CloseState {
++    NotClosing,
++    Closing,
++    Closed,
++}
++
+ /// Network client, e.g. [`neqo_transport::Connection`] or [`neqo_http3::Http3Client`].
+ trait Client {
+     fn process_output(&mut self, now: Instant) -> Output;
+@@ -355,11 +361,7 @@ trait Client {
+     fn close<S>(&mut self, now: Instant, app_error: AppError, msg: S)
+     where
+         S: AsRef<str> + Display;
+-    /// Returns [`Some(_)`] if the connection is closed.
+-    ///
+-    /// Note that connection was closed without error on
+-    /// [`Some(ConnectionError::Transport(TransportError::NoError))`].
+-    fn is_closed(&self) -> Result<bool, ConnectionError>;
++    fn is_closed(&self) -> Result<CloseState, ConnectionError>;
+     fn stats(&self) -> neqo_transport::Stats;
+ }
+ 
+@@ -381,16 +383,19 @@ impl<'a, H: Handler> Runner<'a, H> {
+                 continue;
+             }
+ 
++            #[allow(clippy::match_same_arms)]
+             match (handler_done, self.client.is_closed()?) {
+                 // more work
+                 (false, _) => {}
+                 // no more work, closing connection
+-                (true, false) => {
++                (true, CloseState::NotClosing) => {
+                     self.client.close(Instant::now(), 0, "kthxbye!");
+                     continue;
+                 }
++                // no more work, already closing connection
++                (true, CloseState::Closing) => {}
+                 // no more work, connection closed, terminating
+-                (true, true) => break,
++                (true, CloseState::Closed) => break,
+             }
+ 
+             match ready(self.socket, self.timeout.as_mut()).await? {
+
+diff --git a/neqo-transport/src/lib.rs b/neqo-transport/src/lib.rs
+--- a/neqo-transport/src/lib.rs
++++ b/neqo-transport/src/lib.rs
+@@ -223,6 +223,16 @@ impl ConnectionError {
+             Self::Transport(_) => None,
+         }
+     }
++
++    /// Checks enclosed error for [`Error::NoError`] and
++    /// [`ConnectionError::Application(0)`].
++    #[must_use]
++    pub fn is_error(&self) -> bool {
++        !matches!(
++            self,
++            ConnectionError::Transport(Error::NoError) | ConnectionError::Application(0),
++        )
++    }
+ }
+ 
+ impl From<CloseError> for ConnectionError {
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn create_client(
+args: &Args,
+local_addr: SocketAddr,
+remote_addr: SocketAddr,
+hostname: &str,
+resumption_token: Option<ResumptionToken>) -> Res<Connection>
+
+fn create_client(
+args: &Args,
+local_addr: SocketAddr,
+remote_addr: SocketAddr,
+hostname: &str,
+resumption_token: Option<ResumptionToken>) -> Res<Http3Client>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

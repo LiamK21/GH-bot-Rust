@@ -1,0 +1,198 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+investigate high CPU use in neqo_transport::send_stream::TxBuffer::next_bytes
+See https://share.firefox.dev/3tXRSIb
+next_bytes uses ~24% of the CPU in this trace, almost all of it in <alloc::collections::btree::map::Iter as core::iter::traits::iterator::Iterator>::next
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -145,8 +145,10 @@ enum RangeState {
+ /// range implies needing-to-be-sent, either initially or as a retransmission.
+ #[derive(Debug, Default, PartialEq)]
+ struct RangeTracker {
+-    // offset, (len, RangeState). Use u64 for len because ranges can exceed 32bits.
++    /// offset, (len, RangeState). Use u64 for len because ranges can exceed 32bits.
+     used: BTreeMap<u64, (u64, RangeState)>,
++    /// this is a cache for first_unmarked_range(), which we check a log
++    first_unmarked: Option<(u64, Option<u64>)>,
+ }
+ 
+ impl RangeTracker {
+@@ -166,19 +168,46 @@ impl RangeTracker {
+ 
+     /// Find the first unmarked range. If all are contiguous, this will return
+     /// (highest_offset(), None).
+-    fn first_unmarked_range(&self) -> (u64, Option<u64>) {
++    fn first_unmarked_range(&mut self) -> (u64, Option<u64>) {
+         let mut prev_end = 0;
+ 
++        if let Some(first_unmarked) = self.first_unmarked {
++            return first_unmarked;
++        }
++
+         for (cur_off, (cur_len, _)) in &self.used {
+             if prev_end == *cur_off {
+                 prev_end = cur_off + cur_len;
+             } else {
+-                return (prev_end, Some(cur_off - prev_end));
++                let res = (prev_end, Some(cur_off - prev_end));
++                self.first_unmarked = Some(res);
++                return res;
+             }
+         }
++        self.first_unmarked = Some((prev_end, None));
+         (prev_end, None)
+     }
+ 
++    /// Check for the common case of adding to the end.  If we can, do it and
++    /// return true.
++    fn extend_final_range(&mut self, new_off: u64, new_len: u64, new_state: RangeState) -> bool {
++        if let Some(mut last) = self.used.last_entry() {
++            let prev_off = *last.key();
++            let (prev_len, prev_state) = last.get_mut();
++            // allow for overlap between new chunk and the last entry
++            if new_off >= prev_off
++                && new_off <= prev_off + *prev_len
++                && new_off + new_len > prev_off + *prev_len
++                && new_state == *prev_state
++            {
++                // simple case, extend the last entry
++                *prev_len = new_off + new_len - prev_off;
++                return true;
++            }
++        }
++        false
++    }
++
+     /// Turn one range into a list of subranges that align with existing
+     /// ranges.
+     /// Check impermissible overlaps in subregions: Sent cannot overwrite Acked.
+@@ -207,6 +236,8 @@ impl RangeTracker {
+         let mut tmp_len = new_len;
+         let mut v = Vec::new();
+ 
++        // we already handled the case of a simple extension of the last item
++
+         // cut previous overlapping range if needed
+         let prev = self.used.range_mut(..tmp_off).next_back();
+         if let Some((prev_off, (prev_len, prev_state))) = prev {
+@@ -300,6 +331,10 @@ impl RangeTracker {
+             return;
+         }
+ 
++        self.first_unmarked = None;
++        if self.extend_final_range(off, len as u64, state) {
++            return;
++        }
+         let subranges = self.chunk_range_on_edges(off, len as u64, state);
+ 
+         for (sub_off, sub_len, sub_state) in subranges {
+@@ -315,6 +350,7 @@ impl RangeTracker {
+             return;
+         }
+ 
++        self.first_unmarked = None;
+         let len = u64::try_from(len).unwrap();
+         let end_off = off + len;
+ 
+@@ -404,7 +440,7 @@ impl TxBuffer {
+         can_buffer
+     }
+ 
+-    pub fn next_bytes(&self) -> Option<(u64, &[u8])> {
++    pub fn next_bytes(&mut self) -> Option<(u64, &[u8])> {
+         let (start, maybe_len) = self.ranges.first_unmarked_range();
+ 
+         if start == self.retired + u64::try_from(self.buffered()).unwrap() {
+@@ -766,11 +802,13 @@ impl SendStream {
+     /// offset.
+     fn next_bytes(&mut self, retransmission_only: bool) -> Option<(u64, &[u8])> {
+         match self.state {
+-            SendStreamState::Send { ref send_buf, .. } => {
+-                send_buf.next_bytes().and_then(|(offset, slice)| {
++            SendStreamState::Send {
++                ref mut send_buf, ..
++            } => {
++                let result = send_buf.next_bytes();
++                if let Some((offset, slice)) = result {
+                     if retransmission_only {
+                         qtrace!(
+-                            [self],
+                             "next_bytes apply retransmission limit at {}",
+                             self.retransmission_offset
+                         );
+@@ -786,13 +824,16 @@ impl SendStream {
+                     } else {
+                         Some((offset, slice))
+                     }
+-                })
++                } else {
++                    None
++                }
+             }
+             SendStreamState::DataSent {
+-                ref send_buf,
++                ref mut send_buf,
+                 fin_sent,
+                 ..
+             } => {
++                let used = send_buf.used(); // immutable first
+                 let bytes = send_buf.next_bytes();
+                 if bytes.is_some() {
+                     bytes
+@@ -800,7 +841,7 @@ impl SendStream {
+                     None
+                 } else {
+                     // Send empty stream frame with fin set
+-                    Some((send_buf.used(), &[]))
++                    Some((used, &[]))
+                 }
+             }
+             SendStreamState::Ready { .. }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

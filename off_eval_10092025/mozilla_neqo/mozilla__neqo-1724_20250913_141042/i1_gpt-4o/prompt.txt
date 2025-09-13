@@ -1,0 +1,2451 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Merge neqo-client and neqo-server
+`neqo-client` and `neqo-server` have a lot of logic in common, yet each duplicates it.
+
+A couple of examples
+
+- A lot of command line arguments are shared between client and server:
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-client/src/main.rs#L123-L219
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-server/src/main.rs#L92-L151
+- Each has (at least) one `process` implementation calling `client.process` and handling its return value.
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-client/src/main.rs#L860-L881
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-server/src/main.rs#L646-L665
+- Each has a similar run loop.
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-client/src/main.rs#L819-L858
+    - https://github.com/mozilla/neqo/blob/ad027cfe2901dc98b3dae20574349f52621c5622/neqo-server/src/main.rs#L686-L707
+- ...
+
+Before making any major changes to `neqo-client` and `neqo-server`, like e.g. https://github.com/mozilla/neqo/issues/1693, I thus suggest merging the two into one crate, and thereby deduplicating the shared logic.
+
+Suggestion:
+- Introduce `neqo-bin/` crate.
+- Move `neqo-common/src/udp.rs` into `neqo-bin/src/udp.rs`.
+- Consolidate shared logic between `neqo-client` and `neqo-server` in `neqo-bin/src/lib.rs` and submodules.
+- Move `neqo-client/src/main.rs` into `neqo-bin/bin/client.rs` and `neqo-server/src/main.rs` into `neqo-bin/bin/server.rs`.
+
+What do folks think? Why have they been split into two separate crates thus far?
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-bin/src/bin/client.rs b/neqo-bin/src/bin/client.rs
+--- a/neqo-bin/src/bin/client.rs
++++ b/neqo-bin/src/bin/client.rs
+@@ -0,0 +1,1277 @@
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use std::{
++    cell::RefCell,
++    collections::{HashMap, VecDeque},
++    fmt::{self, Display},
++    fs::{create_dir_all, File, OpenOptions},
++    io::{self, Write},
++    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
++    path::PathBuf,
++    pin::Pin,
++    process::exit,
++    rc::Rc,
++    time::Instant,
++};
++
++use clap::Parser;
++use futures::{
++    future::{select, Either},
++    FutureExt, TryFutureExt,
++};
++use neqo_common::{
++    self as common, event::Provider, hex, qdebug, qinfo, qlog::NeqoQlog, udp, Datagram, Role,
++};
++use neqo_crypto::{
++    constants::{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256},
++    init, AuthenticationStatus, Cipher, ResumptionToken,
++};
++use neqo_http3::{
++    Error, Header, Http3Client, Http3ClientEvent, Http3Parameters, Http3State, Output, Priority,
++};
++use neqo_transport::{
++    Connection, ConnectionId, EmptyConnectionIdGenerator, Error as TransportError, StreamId,
++    Version,
++};
++use qlog::{events::EventImportance, streamer::QlogStreamer};
++use tokio::time::Sleep;
++use url::{Origin, Url};
++
++#[derive(Debug)]
++pub enum ClientError {
++    ArgumentError(&'static str),
++    Http3Error(neqo_http3::Error),
++    IoError(io::Error),
++    QlogError,
++    TransportError(neqo_transport::Error),
++}
++
++impl From<io::Error> for ClientError {
++    fn from(err: io::Error) -> Self {
++        Self::IoError(err)
++    }
++}
++
++impl From<neqo_http3::Error> for ClientError {
++    fn from(err: neqo_http3::Error) -> Self {
++        Self::Http3Error(err)
++    }
++}
++
++impl From<qlog::Error> for ClientError {
++    fn from(_err: qlog::Error) -> Self {
++        Self::QlogError
++    }
++}
++
++impl From<neqo_transport::Error> for ClientError {
++    fn from(err: neqo_transport::Error) -> Self {
++        Self::TransportError(err)
++    }
++}
++
++impl Display for ClientError {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "Error: {self:?}")?;
++        Ok(())
++    }
++}
++
++impl std::error::Error for ClientError {}
++
++type Res<T> = Result<T, ClientError>;
++
++/// Track whether a key update is needed.
++#[derive(Debug, PartialEq, Eq)]
++struct KeyUpdateState(bool);
++
++impl KeyUpdateState {
++    pub fn maybe_update<F, E>(&mut self, update_fn: F) -> Res<()>
++    where
++        F: FnOnce() -> Result<(), E>,
++        E: Into<ClientError>,
++    {
++        if self.0 {
++            if let Err(e) = update_fn() {
++                let e = e.into();
++                match e {
++                    ClientError::TransportError(TransportError::KeyUpdateBlocked)
++                    | ClientError::Http3Error(Error::TransportError(
++                        TransportError::KeyUpdateBlocked,
++                    )) => (),
++                    _ => return Err(e),
++                }
++            } else {
++                println!("Keys updated");
++                self.0 = false;
++            }
++        }
++        Ok(())
++    }
++
++    fn needed(&self) -> bool {
++        self.0
++    }
++}
++
++#[derive(Debug, Parser)]
++#[command(author, version, about, long_about = None)]
++#[allow(clippy::struct_excessive_bools)] // Not a good use of that lint.
++pub struct Args {
++    #[command(flatten)]
++    shared: neqo_bin::SharedArgs,
++
++    urls: Vec<Url>,
++
++    #[arg(short = 'm', default_value = "GET")]
++    method: String,
++
++    #[arg(short = 'H', long, number_of_values = 2)]
++    header: Vec<String>,
++
++    #[arg(name = "max-push", short = 'p', long, default_value = "10")]
++    max_concurrent_push_streams: u64,
++
++    #[arg(name = "download-in-series", long)]
++    /// Download resources in series using separate connections.
++    download_in_series: bool,
++
++    #[arg(name = "concurrency", long, default_value = "100")]
++    /// The maximum number of requests to have outstanding at one time.
++    concurrency: usize,
++
++    #[arg(name = "output-read-data", long)]
++    /// Output received data to stdout
++    output_read_data: bool,
++
++    #[arg(name = "output-dir", long)]
++    /// Save contents of fetched URLs to a directory
++    output_dir: Option<PathBuf>,
++
++    #[arg(short = 'r', long)]
++    /// Client attempts to resume by making multiple connections to servers.
++    /// Requires that 2 or more URLs are listed for each server.
++    /// Use this for 0-RTT: the stack always attempts 0-RTT on resumption.
++    resume: bool,
++
++    #[arg(name = "key-update", long)]
++    /// Attempt to initiate a key update immediately after confirming the connection.
++    key_update: bool,
++
++    #[arg(name = "ech", long, value_parser = |s: &str| hex::decode(s))]
++    /// Enable encrypted client hello (ECH).
++    /// This takes an encoded ECH configuration in hexadecimal format.
++    ech: Option<Vec<u8>>,
++
++    #[arg(name = "ipv4-only", short = '4', long)]
++    /// Connect only over IPv4
++    ipv4_only: bool,
++
++    #[arg(name = "ipv6-only", short = '6', long)]
++    /// Connect only over IPv6
++    ipv6_only: bool,
++
++    /// The test that this client will run. Currently, we only support "upload".
++    #[arg(name = "test", long)]
++    test: Option<String>,
++
++    /// The request size that will be used for upload test.
++    #[arg(name = "upload-size", long, default_value = "100")]
++    upload_size: usize,
++}
++
++impl Args {
++    fn get_ciphers(&self) -> Vec<Cipher> {
++        self.shared
++            .ciphers
++            .iter()
++            .filter_map(|c| match c.as_str() {
++                "TLS_AES_128_GCM_SHA256" => Some(TLS_AES_128_GCM_SHA256),
++                "TLS_AES_256_GCM_SHA384" => Some(TLS_AES_256_GCM_SHA384),
++                "TLS_CHACHA20_POLY1305_SHA256" => Some(TLS_CHACHA20_POLY1305_SHA256),
++                _ => None,
++            })
++            .collect::<Vec<_>>()
++    }
++
++    fn update_for_tests(&mut self) {
++        let Some(testcase) = self.shared.qns_test.as_ref() else {
++            return;
++        };
++
++        // Only use v1 for most QNS tests.
++        self.shared.quic_parameters.quic_version = vec![Version::Version1];
++        match testcase.as_str() {
++            // TODO: Add "ecn" when that is ready.
++            "http3" => {}
++            "handshake" | "transfer" | "retry" => {
++                self.shared.use_old_http = true;
++            }
++            "zerortt" | "resumption" => {
++                if self.urls.len() < 2 {
++                    eprintln!("Warning: resumption tests won't work without >1 URL");
++                    exit(127);
++                }
++                self.shared.use_old_http = true;
++                self.resume = true;
++            }
++            "multiconnect" => {
++                self.shared.use_old_http = true;
++                self.download_in_series = true;
++            }
++            "chacha20" => {
++                self.shared.use_old_http = true;
++                self.shared.ciphers.clear();
++                self.shared
++                    .ciphers
++                    .extend_from_slice(&[String::from("TLS_CHACHA20_POLY1305_SHA256")]);
++            }
++            "keyupdate" => {
++                self.shared.use_old_http = true;
++                self.key_update = true;
++            }
++            "v2" => {
++                self.shared.use_old_http = true;
++                // Use default version set for this test (which allows compatible vneg.)
++                self.shared.quic_parameters.quic_version.clear();
++            }
++            _ => exit(127),
++        }
++    }
++}
++
++fn get_output_file(
++    url: &Url,
++    output_dir: &Option<PathBuf>,
++    all_paths: &mut Vec<PathBuf>,
++) -> Option<File> {
++    if let Some(ref dir) = output_dir {
++        let mut out_path = dir.clone();
++
++        let url_path = if url.path() == "/" {
++            // If no path is given... call it "root"?
++            "root"
++        } else {
++            // Omit leading slash
++            &url.path()[1..]
++        };
++        out_path.push(url_path);
++
++        if all_paths.contains(&out_path) {
++            eprintln!("duplicate path {}", out_path.display());
++            return None;
++        }
++
++        eprintln!("Saving {url} to {out_path:?}");
++
++        if let Some(parent) = out_path.parent() {
++            create_dir_all(parent).ok()?;
++        }
++
++        let f = OpenOptions::new()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&out_path)
++            .ok()?;
++
++        all_paths.push(out_path);
++        Some(f)
++    } else {
++        None
++    }
++}
++
++enum Ready {
++    Socket,
++    Timeout,
++}
++
++// Wait for the socket to be readable or the timeout to fire.
++async fn ready(
++    socket: &udp::Socket,
++    mut timeout: Option<&mut Pin<Box<Sleep>>>,
++) -> Result<Ready, io::Error> {
++    let socket_ready = Box::pin(socket.readable()).map_ok(|()| Ready::Socket);
++    let timeout_ready = timeout
++        .as_mut()
++        .map_or(Either::Right(futures::future::pending()), Either::Left)
++        .map(|()| Ok(Ready::Timeout));
++    select(socket_ready, timeout_ready).await.factor_first().0
++}
++
++trait StreamHandler {
++    fn process_header_ready(&mut self, stream_id: StreamId, fin: bool, headers: Vec<Header>);
++    fn process_data_readable(
++        &mut self,
++        stream_id: StreamId,
++        fin: bool,
++        data: Vec<u8>,
++        sz: usize,
++        output_read_data: bool,
++    ) -> Res<bool>;
++    fn process_data_writable(&mut self, client: &mut Http3Client, stream_id: StreamId);
++}
++
++enum StreamHandlerType {
++    Download,
++    Upload,
++}
++
++impl StreamHandlerType {
++    fn make_handler(
++        handler_type: &Self,
++        url: &Url,
++        args: &Args,
++        all_paths: &mut Vec<PathBuf>,
++        client: &mut Http3Client,
++        client_stream_id: StreamId,
++    ) -> Box<dyn StreamHandler> {
++        match handler_type {
++            Self::Download => {
++                let out_file = get_output_file(url, &args.output_dir, all_paths);
++                client.stream_close_send(client_stream_id).unwrap();
++                Box::new(DownloadStreamHandler { out_file })
++            }
++            Self::Upload => Box::new(UploadStreamHandler {
++                data: vec![42; args.upload_size],
++                offset: 0,
++                chunk_size: 32768,
++                start: Instant::now(),
++            }),
++        }
++    }
++}
++
++struct DownloadStreamHandler {
++    out_file: Option<File>,
++}
++
++impl StreamHandler for DownloadStreamHandler {
++    fn process_header_ready(&mut self, stream_id: StreamId, fin: bool, headers: Vec<Header>) {
++        if self.out_file.is_none() {
++            println!("READ HEADERS[{stream_id}]: fin={fin} {headers:?}");
++        }
++    }
++
++    fn process_data_readable(
++        &mut self,
++        stream_id: StreamId,
++        fin: bool,
++        data: Vec<u8>,
++        sz: usize,
++        output_read_data: bool,
++    ) -> Res<bool> {
++        if let Some(out_file) = &mut self.out_file {
++            if sz > 0 {
++                out_file.write_all(&data[..sz])?;
++            }
++            return Ok(true);
++        } else if !output_read_data {
++            println!("READ[{stream_id}]: {sz} bytes");
++        } else if let Ok(txt) = String::from_utf8(data.clone()) {
++            println!("READ[{stream_id}]: {txt}");
++        } else {
++            println!("READ[{}]: 0x{}", stream_id, hex(&data));
++        }
++
++        if fin && self.out_file.is_none() {
++            println!("<FIN[{stream_id}]>");
++        }
++
++        Ok(true)
++    }
++
++    fn process_data_writable(&mut self, _client: &mut Http3Client, _stream_id: StreamId) {}
++}
++
++struct UploadStreamHandler {
++    data: Vec<u8>,
++    offset: usize,
++    chunk_size: usize,
++    start: Instant,
++}
++
++impl StreamHandler for UploadStreamHandler {
++    fn process_header_ready(&mut self, stream_id: StreamId, fin: bool, headers: Vec<Header>) {
++        println!("READ HEADERS[{stream_id}]: fin={fin} {headers:?}");
++    }
++
++    fn process_data_readable(
++        &mut self,
++        stream_id: StreamId,
++        _fin: bool,
++        data: Vec<u8>,
++        _sz: usize,
++        _output_read_data: bool,
++    ) -> Res<bool> {
++        if let Ok(txt) = String::from_utf8(data.clone()) {
++            let trimmed_txt = txt.trim_end_matches(char::from(0));
++            let parsed: usize = trimmed_txt.parse().unwrap();
++            if parsed == self.data.len() {
++                let upload_time = Instant::now().duration_since(self.start);
++                println!("Stream ID: {stream_id:?}, Upload time: {upload_time:?}");
++            }
++        } else {
++            panic!("Unexpected data [{}]: 0x{}", stream_id, hex(&data));
++        }
++        Ok(true)
++    }
++
++    fn process_data_writable(&mut self, client: &mut Http3Client, stream_id: StreamId) {
++        while self.offset < self.data.len() {
++            let end = self.offset + self.chunk_size.min(self.data.len() - self.offset);
++            let chunk = &self.data[self.offset..end];
++            match client.send_data(stream_id, chunk) {
++                Ok(amount) => {
++                    if amount == 0 {
++                        break;
++                    }
++                    self.offset += amount;
++                    if self.offset == self.data.len() {
++                        client.stream_close_send(stream_id).unwrap();
++                    }
++                }
++                Err(_) => break,
++            };
++        }
++    }
++}
++
++struct URLHandler<'a> {
++    url_queue: VecDeque<Url>,
++    stream_handlers: HashMap<StreamId, Box<dyn StreamHandler>>,
++    all_paths: Vec<PathBuf>,
++    handler_type: StreamHandlerType,
++    args: &'a Args,
++}
++
++impl<'a> URLHandler<'a> {
++    fn stream_handler(&mut self, stream_id: StreamId) -> Option<&mut Box<dyn StreamHandler>> {
++        self.stream_handlers.get_mut(&stream_id)
++    }
++
++    fn process_urls(&mut self, client: &mut Http3Client) {
++        loop {
++            if self.url_queue.is_empty() {
++                break;
++            }
++            if self.stream_handlers.len() >= self.args.concurrency {
++                break;
++            }
++            if !self.next_url(client) {
++                break;
++            }
++        }
++    }
++
++    fn next_url(&mut self, client: &mut Http3Client) -> bool {
++        let url = self
++            .url_queue
++            .pop_front()
++            .expect("download_next called with empty queue");
++        match client.fetch(
++            Instant::now(),
++            &self.args.method,
++            &url,
++            &to_headers(&self.args.header),
++            Priority::default(),
++        ) {
++            Ok(client_stream_id) => {
++                println!("Successfully created stream id {client_stream_id} for {url}");
++
++                let handler: Box<dyn StreamHandler> = StreamHandlerType::make_handler(
++                    &self.handler_type,
++                    &url,
++                    self.args,
++                    &mut self.all_paths,
++                    client,
++                    client_stream_id,
++                );
++                self.stream_handlers.insert(client_stream_id, handler);
++                true
++            }
++            Err(
++                Error::TransportError(TransportError::StreamLimitError)
++                | Error::StreamLimitError
++                | Error::Unavailable,
++            ) => {
++                self.url_queue.push_front(url);
++                false
++            }
++            Err(e) => {
++                panic!("Can't create stream {e}");
++            }
++        }
++    }
++
++    fn done(&mut self) -> bool {
++        self.stream_handlers.is_empty() && self.url_queue.is_empty()
++    }
++
++    fn on_stream_fin(&mut self, client: &mut Http3Client, stream_id: StreamId) -> bool {
++        self.stream_handlers.remove(&stream_id);
++        self.process_urls(client);
++        if self.done() {
++            client.close(Instant::now(), 0, "kthxbye!");
++            return false;
++        }
++        true
++    }
++}
++
++struct Handler<'a> {
++    #[allow(
++        unknown_lints,
++        clippy::struct_field_names,
++        clippy::redundant_field_names
++    )]
++    url_handler: URLHandler<'a>,
++    key_update: KeyUpdateState,
++    token: Option<ResumptionToken>,
++    output_read_data: bool,
++}
++
++impl<'a> Handler<'a> {
++    pub fn new(
++        url_handler: URLHandler<'a>,
++        key_update: KeyUpdateState,
++        output_read_data: bool,
++    ) -> Self {
++        Self {
++            url_handler,
++            key_update,
++            token: None,
++            output_read_data,
++        }
++    }
++
++    fn maybe_key_update(&mut self, c: &mut Http3Client) -> Res<()> {
++        self.key_update.maybe_update(|| c.initiate_key_update())?;
++        self.url_handler.process_urls(c);
++        Ok(())
++    }
++
++    fn handle(&mut self, client: &mut Http3Client) -> Res<bool> {
++        while let Some(event) = client.next_event() {
++            match event {
++                Http3ClientEvent::AuthenticationNeeded => {
++                    client.authenticated(AuthenticationStatus::Ok, Instant::now());
++                }
++                Http3ClientEvent::HeaderReady {
++                    stream_id,
++                    headers,
++                    fin,
++                    ..
++                } => {
++                    if let Some(handler) = self.url_handler.stream_handler(stream_id) {
++                        handler.process_header_ready(stream_id, fin, headers);
++                    } else {
++                        println!("Data on unexpected stream: {stream_id}");
++                        return Ok(false);
++                    }
++                    if fin {
++                        return Ok(self.url_handler.on_stream_fin(client, stream_id));
++                    }
++                }
++                Http3ClientEvent::DataReadable { stream_id } => {
++                    let mut stream_done = false;
++                    match self.url_handler.stream_handler(stream_id) {
++                        None => {
++                            println!("Data on unexpected stream: {stream_id}");
++                            return Ok(false);
++                        }
++                        Some(handler) => loop {
++                            let mut data = vec![0; 4096];
++                            let (sz, fin) = client
++                                .read_data(Instant::now(), stream_id, &mut data)
++                                .expect("Read should succeed");
++
++                            handler.process_data_readable(
++                                stream_id,
++                                fin,
++                                data,
++                                sz,
++                                self.output_read_data,
++                            )?;
++
++                            if fin {
++                                stream_done = true;
++                                break;
++                            }
++
++                            if sz == 0 {
++                                break;
++                            }
++                        },
++                    }
++
++                    if stream_done {
++                        return Ok(self.url_handler.on_stream_fin(client, stream_id));
++                    }
++                }
++                Http3ClientEvent::DataWritable { stream_id } => {
++                    match self.url_handler.stream_handler(stream_id) {
++                        None => {
++                            println!("Data on unexpected stream: {stream_id}");
++                            return Ok(false);
++                        }
++                        Some(handler) => {
++                            handler.process_data_writable(client, stream_id);
++                            return Ok(true);
++                        }
++                    }
++                }
++                Http3ClientEvent::StateChange(Http3State::Connected)
++                | Http3ClientEvent::RequestsCreatable => {
++                    self.url_handler.process_urls(client);
++                }
++                Http3ClientEvent::ResumptionToken(t) => self.token = Some(t),
++                _ => {
++                    println!("Unhandled event {event:?}");
++                }
++            }
++        }
++
++        Ok(true)
++    }
++}
++
++fn to_headers(values: &[impl AsRef<str>]) -> Vec<Header> {
++    values
++        .iter()
++        .scan(None, |state, value| {
++            if let Some(name) = state.take() {
++                *state = None;
++                Some(Header::new(name, value.as_ref()))
++            } else {
++                *state = Some(value.as_ref().to_string());
++                None
++            }
++        })
++        .collect()
++}
++
++struct ClientRunner<'a> {
++    local_addr: SocketAddr,
++    socket: &'a mut udp::Socket,
++    client: Http3Client,
++    handler: Handler<'a>,
++    timeout: Option<Pin<Box<Sleep>>>,
++    args: &'a Args,
++}
++
++impl<'a> ClientRunner<'a> {
++    fn new(
++        args: &'a mut Args,
++        socket: &'a mut udp::Socket,
++        local_addr: SocketAddr,
++        remote_addr: SocketAddr,
++        hostname: &str,
++        url_queue: VecDeque<Url>,
++        resumption_token: Option<ResumptionToken>,
++    ) -> ClientRunner<'a> {
++        if let Some(testcase) = &args.test {
++            if testcase.as_str() != "upload" {
++                eprintln!("Unsupported test case: {testcase}");
++                exit(127)
++            }
++        }
++
++        let client = create_http3_client(args, local_addr, remote_addr, hostname, resumption_token)
++            .expect("failed to create client");
++        if args.test.is_some() {
++            args.method = String::from("POST");
++        }
++        let key_update = KeyUpdateState(args.key_update);
++        let url_handler = URLHandler {
++            url_queue,
++            stream_handlers: HashMap::new(),
++            all_paths: Vec::new(),
++            handler_type: if args.test.is_some() {
++                StreamHandlerType::Upload
++            } else {
++                StreamHandlerType::Download
++            },
++            args,
++        };
++        let handler = Handler::new(url_handler, key_update, args.output_read_data);
++
++        Self {
++            local_addr,
++            socket,
++            client,
++            handler,
++            timeout: None,
++            args,
++        }
++    }
++
++    async fn run(mut self) -> Res<Option<ResumptionToken>> {
++        loop {
++            if !self.handler.handle(&mut self.client)? {
++                break;
++            }
++
++            self.process(None).await?;
++
++            match ready(self.socket, self.timeout.as_mut()).await? {
++                Ready::Socket => loop {
++                    let dgrams = self.socket.recv(&self.local_addr)?;
++                    if dgrams.is_empty() {
++                        break;
++                    }
++                    for dgram in &dgrams {
++                        self.process(Some(dgram)).await?;
++                    }
++                    self.handler.maybe_key_update(&mut self.client)?;
++                },
++                Ready::Timeout => {
++                    self.timeout = None;
++                }
++            }
++
++            if let Http3State::Closed(..) = self.client.state() {
++                break;
++            }
++        }
++
++        let token = if self.args.test.is_none() && self.args.resume {
++            // If we haven't received an event, take a token if there is one.
++            // Lots of servers don't provide NEW_TOKEN, but a session ticket
++            // without NEW_TOKEN is better than nothing.
++            self.handler
++                .token
++                .take()
++                .or_else(|| self.client.take_resumption_token(Instant::now()))
++        } else {
++            None
++        };
++        Ok(token)
++    }
++
++    async fn process(&mut self, mut dgram: Option<&Datagram>) -> Result<(), io::Error> {
++        loop {
++            match self.client.process(dgram.take(), Instant::now()) {
++                Output::Datagram(dgram) => {
++                    self.socket.writable().await?;
++                    self.socket.send(dgram)?;
++                }
++                Output::Callback(new_timeout) => {
++                    qinfo!("Setting timeout of {:?}", new_timeout);
++                    self.timeout = Some(Box::pin(tokio::time::sleep(new_timeout)));
++                    break;
++                }
++                Output::None => {
++                    qdebug!("Output::None");
++                    break;
++                }
++            }
++        }
++
++        Ok(())
++    }
++}
++
++fn create_http3_client(
++    args: &mut Args,
++    local_addr: SocketAddr,
++    remote_addr: SocketAddr,
++    hostname: &str,
++    resumption_token: Option<ResumptionToken>,
++) -> Res<Http3Client> {
++    let mut transport = Connection::new_client(
++        hostname,
++        &[&args.shared.alpn],
++        Rc::new(RefCell::new(EmptyConnectionIdGenerator::default())),
++        local_addr,
++        remote_addr,
++        args.shared.quic_parameters.get(args.shared.alpn.as_str()),
++        Instant::now(),
++    )?;
++    let ciphers = args.get_ciphers();
++    if !ciphers.is_empty() {
++        transport.set_ciphers(&ciphers)?;
++    }
++    let mut client = Http3Client::new_with_conn(
++        transport,
++        Http3Parameters::default()
++            .max_table_size_encoder(args.shared.max_table_size_encoder)
++            .max_table_size_decoder(args.shared.max_table_size_decoder)
++            .max_blocked_streams(args.shared.max_blocked_streams)
++            .max_concurrent_push_streams(args.max_concurrent_push_streams),
++    );
++
++    let qlog = qlog_new(args, hostname, client.connection_id())?;
++    client.set_qlog(qlog);
++    if let Some(ech) = &args.ech {
++        client.enable_ech(ech).expect("enable ECH");
++    }
++    if let Some(token) = resumption_token {
++        client
++            .enable_resumption(Instant::now(), token)
++            .expect("enable resumption");
++    }
++
++    Ok(client)
++}
++
++fn qlog_new(args: &Args, hostname: &str, cid: &ConnectionId) -> Res<NeqoQlog> {
++    if let Some(qlog_dir) = &args.shared.qlog_dir {
++        let mut qlog_path = qlog_dir.clone();
++        let filename = format!("{hostname}-{cid}.sqlog");
++        qlog_path.push(filename);
++
++        let f = OpenOptions::new()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&qlog_path)?;
++
++        let streamer = QlogStreamer::new(
++            qlog::QLOG_VERSION.to_string(),
++            Some("Example qlog".to_string()),
++            Some("Example qlog description".to_string()),
++            None,
++            std::time::Instant::now(),
++            common::qlog::new_trace(Role::Client),
++            EventImportance::Base,
++            Box::new(f),
++        );
++
++        Ok(NeqoQlog::enabled(streamer, qlog_path)?)
++    } else {
++        Ok(NeqoQlog::disabled())
++    }
++}
++
++#[tokio::main]
++async fn main() -> Res<()> {
++    init();
++
++    let mut args = Args::parse();
++    args.update_for_tests();
++
++    let urls_by_origin = args
++        .urls
++        .clone()
++        .into_iter()
++        .fold(HashMap::<Origin, VecDeque<Url>>::new(), |mut urls, url| {
++            urls.entry(url.origin()).or_default().push_back(url);
++            urls
++        })
++        .into_iter()
++        .filter_map(|(origin, urls)| match origin {
++            Origin::Tuple(_scheme, h, p) => Some(((h, p), urls)),
++            Origin::Opaque(x) => {
++                eprintln!("Opaque origin {x:?}");
++                None
++            }
++        });
++
++    for ((host, port), mut urls) in urls_by_origin {
++        if args.resume && urls.len() < 2 {
++            eprintln!("Resumption to {host} cannot work without at least 2 URLs.");
++            exit(127);
++        }
++
++        let remote_addr = format!("{host}:{port}").to_socket_addrs()?.find(|addr| {
++            !matches!(
++                (addr, args.ipv4_only, args.ipv6_only),
++                (SocketAddr::V4(..), false, true) | (SocketAddr::V6(..), true, false)
++            )
++        });
++        let Some(remote_addr) = remote_addr else {
++            eprintln!("No compatible address found for: {host}");
++            exit(1);
++        };
++
++        let local_addr = match remote_addr {
++            SocketAddr::V4(..) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from([0; 4])), 0),
++            SocketAddr::V6(..) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from([0; 16])), 0),
++        };
++
++        let mut socket = udp::Socket::bind(local_addr)?;
++        let real_local = socket.local_addr().unwrap();
++        println!(
++            "{} Client connecting: {:?} -> {:?}",
++            if args.shared.use_old_http { "H9" } else { "H3" },
++            real_local,
++            remote_addr,
++        );
++
++        let hostname = format!("{host}");
++        let mut token: Option<ResumptionToken> = None;
++        let mut first = true;
++        while !urls.is_empty() {
++            let to_request = if (args.resume && first) || args.download_in_series {
++                urls.pop_front().into_iter().collect()
++            } else {
++                std::mem::take(&mut urls)
++            };
++
++            first = false;
++
++            token = if args.shared.use_old_http {
++                old::ClientRunner::new(
++                    &args,
++                    &mut socket,
++                    real_local,
++                    remote_addr,
++                    &hostname,
++                    to_request,
++                    token,
++                )?
++                .run()
++                .await?
++            } else {
++                ClientRunner::new(
++                    &mut args,
++                    &mut socket,
++                    real_local,
++                    remote_addr,
++                    &hostname,
++                    to_request,
++                    token,
++                )
++                .run()
++                .await?
++            };
++        }
++    }
++
++    Ok(())
++}
++
++mod old {
++    use std::{
++        cell::RefCell,
++        collections::{HashMap, VecDeque},
++        fs::File,
++        io::{self, Write},
++        net::SocketAddr,
++        path::PathBuf,
++        pin::Pin,
++        rc::Rc,
++        time::Instant,
++    };
++
++    use neqo_common::{event::Provider, qdebug, qinfo, udp, Datagram};
++    use neqo_crypto::{AuthenticationStatus, ResumptionToken};
++    use neqo_transport::{
++        Connection, ConnectionEvent, EmptyConnectionIdGenerator, Error, Output, State, StreamId,
++        StreamType,
++    };
++    use tokio::time::Sleep;
++    use url::Url;
++
++    use super::{get_output_file, qlog_new, ready, Args, KeyUpdateState, Ready, Res};
++
++    struct HandlerOld<'b> {
++        streams: HashMap<StreamId, Option<File>>,
++        url_queue: VecDeque<Url>,
++        all_paths: Vec<PathBuf>,
++        args: &'b Args,
++        token: Option<ResumptionToken>,
++        key_update: KeyUpdateState,
++    }
++
++    impl<'b> HandlerOld<'b> {
++        fn download_urls(&mut self, client: &mut Connection) {
++            loop {
++                if self.url_queue.is_empty() {
++                    break;
++                }
++                if self.streams.len() >= self.args.concurrency {
++                    break;
++                }
++                if !self.download_next(client) {
++                    break;
++                }
++            }
++        }
++
++        fn download_next(&mut self, client: &mut Connection) -> bool {
++            if self.key_update.needed() {
++                println!("Deferring requests until after first key update");
++                return false;
++            }
++            let url = self
++                .url_queue
++                .pop_front()
++                .expect("download_next called with empty queue");
++            match client.stream_create(StreamType::BiDi) {
++                Ok(client_stream_id) => {
++                    println!("Created stream {client_stream_id} for {url}");
++                    let req = format!("GET {}\r\n", url.path());
++                    _ = client
++                        .stream_send(client_stream_id, req.as_bytes())
++                        .unwrap();
++                    client.stream_close_send(client_stream_id).unwrap();
++                    let out_file =
++                        get_output_file(&url, &self.args.output_dir, &mut self.all_paths);
++                    self.streams.insert(client_stream_id, out_file);
++                    true
++                }
++                Err(e @ (Error::StreamLimitError | Error::ConnectionState)) => {
++                    println!("Cannot create stream {e:?}");
++                    self.url_queue.push_front(url);
++                    false
++                }
++                Err(e) => {
++                    panic!("Error creating stream {e:?}");
++                }
++            }
++        }
++
++        /// Read and maybe print received data from a stream.
++        // Returns bool: was fin received?
++        fn read_from_stream(
++            client: &mut Connection,
++            stream_id: StreamId,
++            output_read_data: bool,
++            maybe_out_file: &mut Option<File>,
++        ) -> Res<bool> {
++            let mut data = vec![0; 4096];
++            loop {
++                let (sz, fin) = client.stream_recv(stream_id, &mut data)?;
++                if sz == 0 {
++                    return Ok(fin);
++                }
++
++                if let Some(out_file) = maybe_out_file {
++                    out_file.write_all(&data[..sz])?;
++                } else if !output_read_data {
++                    println!("READ[{stream_id}]: {sz} bytes");
++                } else {
++                    println!(
++                        "READ[{}]: {}",
++                        stream_id,
++                        String::from_utf8(data.clone()).unwrap()
++                    );
++                }
++                if fin {
++                    return Ok(true);
++                }
++            }
++        }
++
++        fn maybe_key_update(&mut self, c: &mut Connection) -> Res<()> {
++            self.key_update.maybe_update(|| c.initiate_key_update())?;
++            self.download_urls(c);
++            Ok(())
++        }
++
++        fn read(&mut self, client: &mut Connection, stream_id: StreamId) -> Res<()> {
++            let mut maybe_maybe_out_file = self.streams.get_mut(&stream_id);
++            match &mut maybe_maybe_out_file {
++                None => {
++                    println!("Data on unexpected stream: {stream_id}");
++                    return Ok(());
++                }
++                Some(maybe_out_file) => {
++                    let fin_recvd = Self::read_from_stream(
++                        client,
++                        stream_id,
++                        self.args.output_read_data,
++                        maybe_out_file,
++                    )?;
++
++                    if fin_recvd {
++                        if maybe_out_file.is_none() {
++                            println!("<FIN[{stream_id}]>");
++                        }
++                        self.streams.remove(&stream_id);
++                        self.download_urls(client);
++                    }
++                }
++            }
++            Ok(())
++        }
++
++        /// Handle events on the connection.
++        ///
++        /// Returns `Ok(true)` when done, i.e. url queue is empty and streams are closed.
++        fn handle(&mut self, client: &mut Connection) -> Res<bool> {
++            while let Some(event) = client.next_event() {
++                match event {
++                    ConnectionEvent::AuthenticationNeeded => {
++                        client.authenticated(AuthenticationStatus::Ok, Instant::now());
++                    }
++                    ConnectionEvent::RecvStreamReadable { stream_id } => {
++                        self.read(client, stream_id)?;
++                    }
++                    ConnectionEvent::SendStreamWritable { stream_id } => {
++                        println!("stream {stream_id} writable");
++                    }
++                    ConnectionEvent::SendStreamComplete { stream_id } => {
++                        println!("stream {stream_id} complete");
++                    }
++                    ConnectionEvent::SendStreamCreatable { stream_type } => {
++                        println!("stream {stream_type:?} creatable");
++                        if stream_type == StreamType::BiDi {
++                            self.download_urls(client);
++                        }
++                    }
++                    ConnectionEvent::StateChange(
++                        State::WaitInitial | State::Handshaking | State::Connected,
++                    ) => {
++                        println!("{event:?}");
++                        self.download_urls(client);
++                    }
++                    ConnectionEvent::StateChange(State::Confirmed) => {
++                        self.maybe_key_update(client)?;
++                    }
++                    ConnectionEvent::ResumptionToken(token) => {
++                        self.token = Some(token);
++                    }
++                    _ => {
++                        println!("Unhandled event {event:?}");
++                    }
++                }
++            }
++
++            if self.streams.is_empty() && self.url_queue.is_empty() {
++                // Handler is done.
++                return Ok(true);
++            }
++
++            Ok(false)
++        }
++    }
++
++    pub struct ClientRunner<'a> {
++        local_addr: SocketAddr,
++        socket: &'a mut udp::Socket,
++        client: Connection,
++        handler: HandlerOld<'a>,
++        timeout: Option<Pin<Box<Sleep>>>,
++        args: &'a Args,
++    }
++
++    impl<'a> ClientRunner<'a> {
++        pub fn new(
++            args: &'a Args,
++            socket: &'a mut udp::Socket,
++            local_addr: SocketAddr,
++            remote_addr: SocketAddr,
++            origin: &str,
++            url_queue: VecDeque<Url>,
++            token: Option<ResumptionToken>,
++        ) -> Res<ClientRunner<'a>> {
++            let alpn = match args.shared.alpn.as_str() {
++                "hq-29" | "hq-30" | "hq-31" | "hq-32" => args.shared.alpn.as_str(),
++                _ => "hq-interop",
++            };
++
++            let mut client = Connection::new_client(
++                origin,
++                &[alpn],
++                Rc::new(RefCell::new(EmptyConnectionIdGenerator::default())),
++                local_addr,
++                remote_addr,
++                args.shared.quic_parameters.get(alpn),
++                Instant::now(),
++            )?;
++
++            if let Some(tok) = token {
++                client.enable_resumption(Instant::now(), tok)?;
++            }
++
++            let ciphers = args.get_ciphers();
++            if !ciphers.is_empty() {
++                client.set_ciphers(&ciphers)?;
++            }
++
++            client.set_qlog(qlog_new(args, origin, client.odcid().unwrap())?);
++
++            let key_update = KeyUpdateState(args.key_update);
++            let handler = HandlerOld {
++                streams: HashMap::new(),
++                url_queue,
++                all_paths: Vec::new(),
++                args,
++                token: None,
++                key_update,
++            };
++
++            Ok(Self {
++                local_addr,
++                socket,
++                client,
++                handler,
++                timeout: None,
++                args,
++            })
++        }
++
++        pub async fn run(mut self) -> Res<Option<ResumptionToken>> {
++            loop {
++                let handler_done = self.handler.handle(&mut self.client)?;
++
++                match (handler_done, self.args.resume, self.handler.token.is_some()) {
++                    // Handler isn't done. Continue.
++                    (false, _, _) => {},
++                    // Handler done. Resumption token needed but not present. Continue.
++                    (true, true, false) => {
++                        qdebug!("Handler done. Waiting for resumption token.");
++                    }
++                    // Handler is done, no resumption token needed. Close.
++                    (true, false, _) |
++                    // Handler is done, resumption token needed and present. Close.
++                    (true, true, true) => {
++                        self.client.close(Instant::now(), 0, "kthxbye!");
++                    }
++                }
++
++                self.process(None).await?;
++
++                if let State::Closed(..) = self.client.state() {
++                    return Ok(self.handler.token.take());
++                }
++
++                match ready(self.socket, self.timeout.as_mut()).await? {
++                    Ready::Socket => loop {
++                        let dgrams = self.socket.recv(&self.local_addr)?;
++                        if dgrams.is_empty() {
++                            break;
++                        }
++                        for dgram in &dgrams {
++                            self.process(Some(dgram)).await?;
++                        }
++                        self.handler.maybe_key_update(&mut self.client)?;
++                    },
++                    Ready::Timeout => {
++                        self.timeout = None;
++                    }
++                }
++            }
++        }
++
++        async fn process(&mut self, mut dgram: Option<&Datagram>) -> Result<(), io::Error> {
++            loop {
++                match self.client.process(dgram.take(), Instant::now()) {
++                    Output::Datagram(dgram) => {
++                        self.socket.writable().await?;
++                        self.socket.send(dgram)?;
++                    }
++                    Output::Callback(new_timeout) => {
++                        qinfo!("Setting timeout of {:?}", new_timeout);
++                        self.timeout = Some(Box::pin(tokio::time::sleep(new_timeout)));
++                        break;
++                    }
++                    Output::None => {
++                        qdebug!("Output::None");
++                        break;
++                    }
++                }
++            }
++
++            Ok(())
++        }
++    }
++}
+
+diff --git a/neqo-bin/src/bin/server/main.rs b/neqo-bin/src/bin/server/main.rs
+--- a/neqo-bin/src/bin/server/main.rs
++++ b/neqo-bin/src/bin/server/main.rs
+@@ -0,0 +1,622 @@
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use std::{
++    cell::RefCell,
++    cmp::min,
++    collections::HashMap,
++    fmt::{self, Display},
++    fs::OpenOptions,
++    io::{self, Read},
++    net::{SocketAddr, ToSocketAddrs},
++    path::PathBuf,
++    pin::Pin,
++    process::exit,
++    rc::Rc,
++    time::{Duration, Instant},
++};
++
++use clap::Parser;
++use futures::{
++    future::{select, select_all, Either},
++    FutureExt,
++};
++use neqo_common::{hex, qinfo, qwarn, udp, Datagram, Header};
++use neqo_crypto::{
++    constants::{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256},
++    generate_ech_keys, init_db, random, AntiReplay, Cipher,
++};
++use neqo_http3::{
++    Error, Http3OrWebTransportStream, Http3Parameters, Http3Server, Http3ServerEvent, StreamId,
++};
++use neqo_transport::{
++    server::ValidateAddress, ConnectionIdGenerator, Output, RandomConnectionIdGenerator, Version,
++};
++use tokio::time::Sleep;
++
++use crate::old_https::Http09Server;
++
++const ANTI_REPLAY_WINDOW: Duration = Duration::from_secs(10);
++
++mod old_https;
++
++#[derive(Debug)]
++pub enum ServerError {
++    ArgumentError(&'static str),
++    Http3Error(neqo_http3::Error),
++    IoError(io::Error),
++    QlogError,
++    TransportError(neqo_transport::Error),
++}
++
++impl From<io::Error> for ServerError {
++    fn from(err: io::Error) -> Self {
++        Self::IoError(err)
++    }
++}
++
++impl From<neqo_http3::Error> for ServerError {
++    fn from(err: neqo_http3::Error) -> Self {
++        Self::Http3Error(err)
++    }
++}
++
++impl From<qlog::Error> for ServerError {
++    fn from(_err: qlog::Error) -> Self {
++        Self::QlogError
++    }
++}
++
++impl From<neqo_transport::Error> for ServerError {
++    fn from(err: neqo_transport::Error) -> Self {
++        Self::TransportError(err)
++    }
++}
++
++impl Display for ServerError {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "Error: {self:?}")?;
++        Ok(())
++    }
++}
++
++impl std::error::Error for ServerError {}
++
++#[derive(Debug, Parser)]
++#[command(author, version, about, long_about = None)]
++struct Args {
++    #[command(flatten)]
++    shared: neqo_bin::SharedArgs,
++
++    /// List of IP:port to listen on
++    #[arg(default_value = "[::]:4433")]
++    hosts: Vec<String>,
++
++    #[arg(short = 'd', long, default_value = "./test-fixture/db")]
++    /// NSS database directory.
++    db: PathBuf,
++
++    #[arg(short = 'k', long, default_value = "key")]
++    /// Name of key from NSS database.
++    key: String,
++
++    #[arg(name = "retry", long)]
++    /// Force a retry
++    retry: bool,
++
++    #[arg(name = "ech", long)]
++    /// Enable encrypted client hello (ECH).
++    /// This generates a new set of ECH keys when it is invoked.
++    /// The resulting configuration is printed to stdout in hexadecimal format.
++    ech: bool,
++}
++
++impl Args {
++    fn get_ciphers(&self) -> Vec<Cipher> {
++        self.shared
++            .ciphers
++            .iter()
++            .filter_map(|c| match c.as_str() {
++                "TLS_AES_128_GCM_SHA256" => Some(TLS_AES_128_GCM_SHA256),
++                "TLS_AES_256_GCM_SHA384" => Some(TLS_AES_256_GCM_SHA384),
++                "TLS_CHACHA20_POLY1305_SHA256" => Some(TLS_CHACHA20_POLY1305_SHA256),
++                _ => None,
++            })
++            .collect::<Vec<_>>()
++    }
++
++    fn listen_addresses(&self) -> Vec<SocketAddr> {
++        self.hosts
++            .iter()
++            .filter_map(|host| host.to_socket_addrs().ok())
++            .flatten()
++            .chain(self.shared.quic_parameters.preferred_address_v4())
++            .chain(self.shared.quic_parameters.preferred_address_v6())
++            .collect()
++    }
++
++    fn now(&self) -> Instant {
++        if self.shared.qns_test.is_some() {
++            // When NSS starts its anti-replay it blocks any acceptance of 0-RTT for a
++            // single period.  This ensures that an attacker that is able to force a
++            // server to reboot is unable to use that to flush the anti-replay buffers
++            // and have something replayed.
++            //
++            // However, this is a massive inconvenience for us when we are testing.
++            // As we can't initialize `AntiReplay` in the past (see `neqo_common::time`
++            // for why), fast forward time here so that the connections get times from
++            // in the future.
++            //
++            // This is NOT SAFE.  Don't do this.
++            Instant::now() + ANTI_REPLAY_WINDOW
++        } else {
++            Instant::now()
++        }
++    }
++}
++
++fn qns_read_response(filename: &str) -> Option<Vec<u8>> {
++    let mut file_path = PathBuf::from("/www");
++    file_path.push(filename.trim_matches(|p| p == '/'));
++
++    OpenOptions::new()
++        .read(true)
++        .open(&file_path)
++        .map_err(|_e| eprintln!("Could not open {}", file_path.display()))
++        .ok()
++        .and_then(|mut f| {
++            let mut data = Vec::new();
++            match f.read_to_end(&mut data) {
++                Ok(sz) => {
++                    println!("{} bytes read from {}", sz, file_path.display());
++                    Some(data)
++                }
++                Err(e) => {
++                    eprintln!("Error reading data: {e:?}");
++                    None
++                }
++            }
++        })
++}
++
++trait HttpServer: Display {
++    fn process(&mut self, dgram: Option<&Datagram>, now: Instant) -> Output;
++    fn process_events(&mut self, args: &Args, now: Instant);
++    fn set_qlog_dir(&mut self, dir: Option<PathBuf>);
++    fn set_ciphers(&mut self, ciphers: &[Cipher]);
++    fn validate_address(&mut self, when: ValidateAddress);
++    fn enable_ech(&mut self) -> &[u8];
++}
++
++struct ResponseData {
++    data: Vec<u8>,
++    offset: usize,
++    remaining: usize,
++}
++
++impl From<&[u8]> for ResponseData {
++    fn from(data: &[u8]) -> Self {
++        Self::from(data.to_vec())
++    }
++}
++
++impl From<Vec<u8>> for ResponseData {
++    fn from(data: Vec<u8>) -> Self {
++        let remaining = data.len();
++        Self {
++            data,
++            offset: 0,
++            remaining,
++        }
++    }
++}
++
++impl ResponseData {
++    fn repeat(buf: &[u8], total: usize) -> Self {
++        Self {
++            data: buf.to_owned(),
++            offset: 0,
++            remaining: total,
++        }
++    }
++
++    fn send(&mut self, stream: &mut Http3OrWebTransportStream) {
++        while self.remaining > 0 {
++            let end = min(self.data.len(), self.offset + self.remaining);
++            let slice = &self.data[self.offset..end];
++            match stream.send_data(slice) {
++                Ok(0) => {
++                    return;
++                }
++                Ok(sent) => {
++                    self.remaining -= sent;
++                    self.offset = (self.offset + sent) % self.data.len();
++                }
++                Err(e) => {
++                    qwarn!("Error writing to stream {}: {:?}", stream, e);
++                    return;
++                }
++            }
++        }
++    }
++
++    fn done(&self) -> bool {
++        self.remaining == 0
++    }
++}
++
++struct SimpleServer {
++    server: Http3Server,
++    /// Progress writing to each stream.
++    remaining_data: HashMap<StreamId, ResponseData>,
++    posts: HashMap<Http3OrWebTransportStream, usize>,
++}
++
++impl SimpleServer {
++    const MESSAGE: &'static [u8] = b"I am the very model of a modern Major-General,\n\
++        I've information vegetable, animal, and mineral,\n\
++        I know the kings of England, and I quote the fights historical\n\
++        From Marathon to Waterloo, in order categorical;\n\
++        I'm very well acquainted, too, with matters mathematical,\n\
++        I understand equations, both the simple and quadratical,\n\
++        About binomial theorem, I'm teeming with a lot o' news,\n\
++        With many cheerful facts about the square of the hypotenuse.\n";
++
++    pub fn new(
++        args: &Args,
++        anti_replay: AntiReplay,
++        cid_mgr: Rc<RefCell<dyn ConnectionIdGenerator>>,
++    ) -> Self {
++        let server = Http3Server::new(
++            args.now(),
++            &[args.key.clone()],
++            &[args.shared.alpn.clone()],
++            anti_replay,
++            cid_mgr,
++            Http3Parameters::default()
++                .connection_parameters(args.shared.quic_parameters.get(&args.shared.alpn))
++                .max_table_size_encoder(args.shared.max_table_size_encoder)
++                .max_table_size_decoder(args.shared.max_table_size_decoder)
++                .max_blocked_streams(args.shared.max_blocked_streams),
++            None,
++        )
++        .expect("We cannot make a server!");
++        Self {
++            server,
++            remaining_data: HashMap::new(),
++            posts: HashMap::new(),
++        }
++    }
++}
++
++impl Display for SimpleServer {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        self.server.fmt(f)
++    }
++}
++
++impl HttpServer for SimpleServer {
++    fn process(&mut self, dgram: Option<&Datagram>, now: Instant) -> Output {
++        self.server.process(dgram, now)
++    }
++
++    fn process_events(&mut self, args: &Args, _now: Instant) {
++        while let Some(event) = self.server.next_event() {
++            match event {
++                Http3ServerEvent::Headers {
++                    mut stream,
++                    headers,
++                    fin,
++                } => {
++                    println!("Headers (request={stream} fin={fin}): {headers:?}");
++
++                    let post = if let Some(method) = headers.iter().find(|&h| h.name() == ":method")
++                    {
++                        method.value() == "POST"
++                    } else {
++                        false
++                    };
++                    if post {
++                        self.posts.insert(stream, 0);
++                        continue;
++                    }
++
++                    let mut response =
++                        if let Some(path) = headers.iter().find(|&h| h.name() == ":path") {
++                            if args.shared.qns_test.is_some() {
++                                if let Some(data) = qns_read_response(path.value()) {
++                                    ResponseData::from(data)
++                                } else {
++                                    ResponseData::from(Self::MESSAGE)
++                                }
++                            } else if let Ok(count) =
++                                path.value().trim_matches(|p| p == '/').parse::<usize>()
++                            {
++                                ResponseData::repeat(Self::MESSAGE, count)
++                            } else {
++                                ResponseData::from(Self::MESSAGE)
++                            }
++                        } else {
++                            stream
++                                .cancel_fetch(Error::HttpRequestIncomplete.code())
++                                .unwrap();
++                            continue;
++                        };
++
++                    stream
++                        .send_headers(&[
++                            Header::new(":status", "200"),
++                            Header::new("content-length", response.remaining.to_string()),
++                        ])
++                        .unwrap();
++                    response.send(&mut stream);
++                    if response.done() {
++                        stream.stream_close_send().unwrap();
++                    } else {
++                        self.remaining_data.insert(stream.stream_id(), response);
++                    }
++                }
++                Http3ServerEvent::DataWritable { mut stream } => {
++                    if self.posts.get_mut(&stream).is_none() {
++                        if let Some(remaining) = self.remaining_data.get_mut(&stream.stream_id()) {
++                            remaining.send(&mut stream);
++                            if remaining.done() {
++                                self.remaining_data.remove(&stream.stream_id());
++                                stream.stream_close_send().unwrap();
++                            }
++                        }
++                    }
++                }
++
++                Http3ServerEvent::Data {
++                    mut stream,
++                    data,
++                    fin,
++                } => {
++                    if let Some(received) = self.posts.get_mut(&stream) {
++                        *received += data.len();
++                    }
++                    if fin {
++                        if let Some(received) = self.posts.remove(&stream) {
++                            let msg = received.to_string().as_bytes().to_vec();
++                            stream
++                                .send_headers(&[Header::new(":status", "200")])
++                                .unwrap();
++                            stream.send_data(&msg).unwrap();
++                            stream.stream_close_send().unwrap();
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++
++    fn set_qlog_dir(&mut self, dir: Option<PathBuf>) {
++        self.server.set_qlog_dir(dir);
++    }
++
++    fn validate_address(&mut self, v: ValidateAddress) {
++        self.server.set_validation(v);
++    }
++
++    fn set_ciphers(&mut self, ciphers: &[Cipher]) {
++        self.server.set_ciphers(ciphers);
++    }
++
++    fn enable_ech(&mut self) -> &[u8] {
++        let (sk, pk) = generate_ech_keys().expect("should create ECH keys");
++        self.server
++            .enable_ech(random::<1>()[0], "public.example", &sk, &pk)
++            .unwrap();
++        self.server.ech_config()
++    }
++}
++
++struct ServersRunner {
++    args: Args,
++    server: Box<dyn HttpServer>,
++    timeout: Option<Pin<Box<Sleep>>>,
++    sockets: Vec<(SocketAddr, udp::Socket)>,
++}
++
++impl ServersRunner {
++    pub fn new(args: Args) -> Result<Self, io::Error> {
++        let hosts = args.listen_addresses();
++        if hosts.is_empty() {
++            eprintln!("No valid hosts defined");
++            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No hosts"));
++        }
++        let sockets = hosts
++            .into_iter()
++            .map(|host| {
++                let socket = udp::Socket::bind(host)?;
++                let local_addr = socket.local_addr()?;
++                println!("Server waiting for connection on: {local_addr:?}");
++
++                Ok((host, socket))
++            })
++            .collect::<Result<_, io::Error>>()?;
++        let server = Self::create_server(&args);
++
++        Ok(Self {
++            args,
++            server,
++            timeout: None,
++            sockets,
++        })
++    }
++
++    fn create_server(args: &Args) -> Box<dyn HttpServer> {
++        // Note: this is the exception to the case where we use `Args::now`.
++        let anti_replay = AntiReplay::new(Instant::now(), ANTI_REPLAY_WINDOW, 7, 14)
++            .expect("unable to setup anti-replay");
++        let cid_mgr = Rc::new(RefCell::new(RandomConnectionIdGenerator::new(10)));
++
++        let mut svr: Box<dyn HttpServer> = if args.shared.use_old_http {
++            Box::new(
++                Http09Server::new(
++                    args.now(),
++                    &[args.key.clone()],
++                    &[args.shared.alpn.clone()],
++                    anti_replay,
++                    cid_mgr,
++                    args.shared.quic_parameters.get(&args.shared.alpn),
++                )
++                .expect("We cannot make a server!"),
++            )
++        } else {
++            Box::new(SimpleServer::new(args, anti_replay, cid_mgr))
++        };
++        svr.set_ciphers(&args.get_ciphers());
++        svr.set_qlog_dir(args.shared.qlog_dir.clone());
++        if args.retry {
++            svr.validate_address(ValidateAddress::Always);
++        }
++        if args.ech {
++            let cfg = svr.enable_ech();
++            println!("ECHConfigList: {}", hex(cfg));
++        }
++        svr
++    }
++
++    /// Tries to find a socket, but then just falls back to sending from the first.
++    fn find_socket(&mut self, addr: SocketAddr) -> &mut udp::Socket {
++        let ((_host, first_socket), rest) = self.sockets.split_first_mut().unwrap();
++        rest.iter_mut()
++            .map(|(_host, socket)| socket)
++            .find(|socket| {
++                socket
++                    .local_addr()
++                    .ok()
++                    .map_or(false, |socket_addr| socket_addr == addr)
++            })
++            .unwrap_or(first_socket)
++    }
++
++    async fn process(&mut self, mut dgram: Option<&Datagram>) -> Result<(), io::Error> {
++        loop {
++            match self.server.process(dgram.take(), self.args.now()) {
++                Output::Datagram(dgram) => {
++                    let socket = self.find_socket(dgram.source());
++                    socket.writable().await?;
++                    socket.send(dgram)?;
++                }
++                Output::Callback(new_timeout) => {
++                    qinfo!("Setting timeout of {:?}", new_timeout);
++                    self.timeout = Some(Box::pin(tokio::time::sleep(new_timeout)));
++                    break;
++                }
++                Output::None => {
++                    break;
++                }
++            }
++        }
++        Ok(())
++    }
++
++    // Wait for any of the sockets to be readable or the timeout to fire.
++    async fn ready(&mut self) -> Result<Ready, io::Error> {
++        let sockets_ready = select_all(
++            self.sockets
++                .iter()
++                .map(|(_host, socket)| Box::pin(socket.readable())),
++        )
++        .map(|(res, inx, _)| match res {
++            Ok(()) => Ok(Ready::Socket(inx)),
++            Err(e) => Err(e),
++        });
++        let timeout_ready = self
++            .timeout
++            .as_mut()
++            .map_or(Either::Right(futures::future::pending()), Either::Left)
++            .map(|()| Ok(Ready::Timeout));
++        select(sockets_ready, timeout_ready).await.factor_first().0
++    }
++
++    async fn run(&mut self) -> Result<(), io::Error> {
++        loop {
++            match self.ready().await? {
++                Ready::Socket(inx) => loop {
++                    let (host, socket) = self.sockets.get_mut(inx).unwrap();
++                    let dgrams = socket.recv(host)?;
++                    if dgrams.is_empty() {
++                        break;
++                    }
++                    for dgram in dgrams {
++                        self.process(Some(&dgram)).await?;
++                    }
++                },
++                Ready::Timeout => {
++                    self.timeout = None;
++                    self.process(None).await?;
++                }
++            }
++
++            self.server.process_events(&self.args, self.args.now());
++            self.process(None).await?;
++        }
++    }
++}
++
++enum Ready {
++    Socket(usize),
++    Timeout,
++}
++
++#[tokio::main]
++async fn main() -> Result<(), io::Error> {
++    const HQ_INTEROP: &str = "hq-interop";
++
++    let mut args = Args::parse();
++    assert!(!args.key.is_empty(), "Need at least one key");
++
++    init_db(args.db.clone());
++
++    if let Some(testcase) = args.shared.qns_test.as_ref() {
++        if args.shared.quic_parameters.quic_version.is_empty() {
++            // Quic Interop Runner expects the server to support `Version1`
++            // only. Exceptions are testcases `versionnegotiation` (not yet
++            // implemented) and `v2`.
++            if testcase != "v2" {
++                args.shared.quic_parameters.quic_version = vec![Version::Version1];
++            }
++        } else {
++            qwarn!("Both -V and --qns-test were set. Ignoring testcase specific versions.");
++        }
++
++        // TODO: More options to deduplicate with client?
++        match testcase.as_str() {
++            "http3" => (),
++            "zerortt" => {
++                args.shared.use_old_http = true;
++                args.shared.alpn = String::from(HQ_INTEROP);
++                args.shared.quic_parameters.max_streams_bidi = 100;
++            }
++            "handshake" | "transfer" | "resumption" | "multiconnect" | "v2" => {
++                args.shared.use_old_http = true;
++                args.shared.alpn = String::from(HQ_INTEROP);
++            }
++            "chacha20" => {
++                args.shared.use_old_http = true;
++                args.shared.alpn = String::from(HQ_INTEROP);
++                args.shared.ciphers.clear();
++                args.shared
++                    .ciphers
++                    .extend_from_slice(&[String::from("TLS_CHACHA20_POLY1305_SHA256")]);
++            }
++            "retry" => {
++                args.shared.use_old_http = true;
++                args.shared.alpn = String::from(HQ_INTEROP);
++                args.retry = true;
++            }
++            _ => exit(127),
++        }
++    }
++
++    let mut servers_runner = ServersRunner::new(args)?;
++    servers_runner.run().await
++}
+
+diff --git a/neqo-bin/src/bin/server/old_https.rs b/neqo-bin/src/bin/server/old_https.rs
+--- a/neqo-bin/src/bin/server/old_https.rs
++++ b/neqo-bin/src/bin/server/old_https.rs
+@@ -0,0 +1,256 @@
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use std::{
++    cell::RefCell, collections::HashMap, fmt::Display, path::PathBuf, rc::Rc, time::Instant,
++};
++
++use neqo_common::{event::Provider, hex, qdebug, Datagram};
++use neqo_crypto::{generate_ech_keys, random, AllowZeroRtt, AntiReplay, Cipher};
++use neqo_http3::Error;
++use neqo_transport::{
++    server::{ActiveConnectionRef, Server, ValidateAddress},
++    ConnectionEvent, ConnectionIdGenerator, ConnectionParameters, Output, State, StreamId,
++};
++use regex::Regex;
++
++use super::{qns_read_response, Args, HttpServer};
++
++#[derive(Default)]
++struct Http09StreamState {
++    writable: bool,
++    data_to_send: Option<(Vec<u8>, usize)>,
++}
++
++pub struct Http09Server {
++    server: Server,
++    write_state: HashMap<StreamId, Http09StreamState>,
++    read_state: HashMap<StreamId, Vec<u8>>,
++}
++
++impl Http09Server {
++    pub fn new(
++        now: Instant,
++        certs: &[impl AsRef<str>],
++        protocols: &[impl AsRef<str>],
++        anti_replay: AntiReplay,
++        cid_manager: Rc<RefCell<dyn ConnectionIdGenerator>>,
++        conn_params: ConnectionParameters,
++    ) -> Result<Self, Error> {
++        Ok(Self {
++            server: Server::new(
++                now,
++                certs,
++                protocols,
++                anti_replay,
++                Box::new(AllowZeroRtt {}),
++                cid_manager,
++                conn_params,
++            )?,
++            write_state: HashMap::new(),
++            read_state: HashMap::new(),
++        })
++    }
++
++    fn save_partial(
++        &mut self,
++        stream_id: StreamId,
++        partial: Vec<u8>,
++        conn: &mut ActiveConnectionRef,
++    ) {
++        let url_dbg = String::from_utf8(partial.clone())
++            .unwrap_or_else(|_| format!("<invalid UTF-8: {}>", hex(&partial)));
++        if partial.len() < 4096 {
++            qdebug!("Saving partial URL: {}", url_dbg);
++            self.read_state.insert(stream_id, partial);
++        } else {
++            qdebug!("Giving up on partial URL {}", url_dbg);
++            conn.borrow_mut().stream_stop_sending(stream_id, 0).unwrap();
++        }
++    }
++
++    fn write(
++        &mut self,
++        stream_id: StreamId,
++        data: Option<Vec<u8>>,
++        conn: &mut ActiveConnectionRef,
++    ) {
++        let resp = data.unwrap_or_else(|| Vec::from(&b"404 That request was nonsense\r\n"[..]));
++        if let Some(stream_state) = self.write_state.get_mut(&stream_id) {
++            match stream_state.data_to_send {
++                None => stream_state.data_to_send = Some((resp, 0)),
++                Some(_) => {
++                    qdebug!("Data already set, doing nothing");
++                }
++            }
++            if stream_state.writable {
++                self.stream_writable(stream_id, conn);
++            }
++        } else {
++            self.write_state.insert(
++                stream_id,
++                Http09StreamState {
++                    writable: false,
++                    data_to_send: Some((resp, 0)),
++                },
++            );
++        }
++    }
++
++    fn stream_readable(
++        &mut self,
++        stream_id: StreamId,
++        conn: &mut ActiveConnectionRef,
++        args: &Args,
++    ) {
++        if !stream_id.is_client_initiated() || !stream_id.is_bidi() {
++            qdebug!("Stream {} not client-initiated bidi, ignoring", stream_id);
++            return;
++        }
++        let mut data = vec![0; 4000];
++        let (sz, fin) = conn
++            .borrow_mut()
++            .stream_recv(stream_id, &mut data)
++            .expect("Read should succeed");
++
++        if sz == 0 {
++            if !fin {
++                qdebug!("size 0 but !fin");
++            }
++            return;
++        }
++
++        data.truncate(sz);
++        let buf = if let Some(mut existing) = self.read_state.remove(&stream_id) {
++            existing.append(&mut data);
++            existing
++        } else {
++            data
++        };
++
++        let Ok(msg) = std::str::from_utf8(&buf[..]) else {
++            self.save_partial(stream_id, buf, conn);
++            return;
++        };
++
++        let re = if args.shared.qns_test.is_some() {
++            Regex::new(r"GET +/(\S+)(?:\r)?\n").unwrap()
++        } else {
++            Regex::new(r"GET +/(\d+)(?:\r)?\n").unwrap()
++        };
++        let m = re.captures(msg);
++        let resp = match m.and_then(|m| m.get(1)) {
++            None => {
++                self.save_partial(stream_id, buf, conn);
++                return;
++            }
++            Some(path) => {
++                let path = path.as_str();
++                eprintln!("Path = '{path}'");
++                if args.shared.qns_test.is_some() {
++                    qns_read_response(path)
++                } else {
++                    let count = path.parse().unwrap();
++                    Some(vec![b'a'; count])
++                }
++            }
++        };
++        self.write(stream_id, resp, conn);
++    }
++
++    fn stream_writable(&mut self, stream_id: StreamId, conn: &mut ActiveConnectionRef) {
++        match self.write_state.get_mut(&stream_id) {
++            None => {
++                eprintln!("Unknown stream {stream_id}, ignoring event");
++            }
++            Some(stream_state) => {
++                stream_state.writable = true;
++                if let Some((data, ref mut offset)) = &mut stream_state.data_to_send {
++                    let sent = conn
++                        .borrow_mut()
++                        .stream_send(stream_id, &data[*offset..])
++                        .unwrap();
++                    qdebug!("Wrote {}", sent);
++                    *offset += sent;
++                    self.server.add_to_waiting(conn);
++                    if *offset == data.len() {
++                        eprintln!("Sent {sent} on {stream_id}, closing");
++                        conn.borrow_mut().stream_close_send(stream_id).unwrap();
++                        self.write_state.remove(&stream_id);
++                    } else {
++                        stream_state.writable = false;
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl HttpServer for Http09Server {
++    fn process(&mut self, dgram: Option<&Datagram>, now: Instant) -> Output {
++        self.server.process(dgram, now)
++    }
++
++    fn process_events(&mut self, args: &Args, now: Instant) {
++        let active_conns = self.server.active_connections();
++        for mut acr in active_conns {
++            loop {
++                let event = match acr.borrow_mut().next_event() {
++                    None => break,
++                    Some(e) => e,
++                };
++                eprintln!("Event {event:?}");
++                match event {
++                    ConnectionEvent::NewStream { stream_id } => {
++                        self.write_state
++                            .insert(stream_id, Http09StreamState::default());
++                    }
++                    ConnectionEvent::RecvStreamReadable { stream_id } => {
++                        self.stream_readable(stream_id, &mut acr, args);
++                    }
++                    ConnectionEvent::SendStreamWritable { stream_id } => {
++                        self.stream_writable(stream_id, &mut acr);
++                    }
++                    ConnectionEvent::StateChange(State::Connected) => {
++                        acr.connection()
++                            .borrow_mut()
++                            .send_ticket(now, b"hi!")
++                            .unwrap();
++                    }
++                    ConnectionEvent::StateChange(_)
++                    | ConnectionEvent::SendStreamComplete { .. } => (),
++                    e => eprintln!("unhandled event {e:?}"),
++                }
++            }
++        }
++    }
++
++    fn set_qlog_dir(&mut self, dir: Option<PathBuf>) {
++        self.server.set_qlog_dir(dir);
++    }
++
++    fn validate_address(&mut self, v: ValidateAddress) {
++        self.server.set_validation(v);
++    }
++
++    fn set_ciphers(&mut self, ciphers: &[Cipher]) {
++        self.server.set_ciphers(ciphers);
++    }
++
++    fn enable_ech(&mut self) -> &[u8] {
++        let (sk, pk) = generate_ech_keys().expect("generate ECH keys");
++        self.server
++            .enable_ech(random::<1>()[0], "public.example", &sk, &pk)
++            .expect("enable ECH");
++        self.server.ech_config()
++    }
++}
++
++impl Display for Http09Server {
++    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
++        write!(f, "Http 0.9 server ")
++    }
++}
+
+diff --git a/neqo-bin/src/lib.rs b/neqo-bin/src/lib.rs
+--- a/neqo-bin/src/lib.rs
++++ b/neqo-bin/src/lib.rs
+@@ -0,0 +1,204 @@
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use std::{
++    fmt::{self, Display},
++    net::{SocketAddr, ToSocketAddrs},
++    path::PathBuf,
++    time::Duration,
++};
++
++use clap::Parser;
++use neqo_transport::{
++    tparams::PreferredAddress, CongestionControlAlgorithm, ConnectionParameters, StreamType,
++    Version,
++};
++
++#[derive(Debug, Parser)]
++pub struct SharedArgs {
++    #[arg(short = 'a', long, default_value = "h3")]
++    /// ALPN labels to negotiate.
++    ///
++    /// This client still only does HTTP/3 no matter what the ALPN says.
++    pub alpn: String,
++
++    #[arg(name = "qlog-dir", long, value_parser=clap::value_parser!(PathBuf))]
++    /// Enable QLOG logging and QLOG traces to this directory
++    pub qlog_dir: Option<PathBuf>,
++
++    #[arg(name = "encoder-table-size", long, default_value = "16384")]
++    pub max_table_size_encoder: u64,
++
++    #[arg(name = "decoder-table-size", long, default_value = "16384")]
++    pub max_table_size_decoder: u64,
++
++    #[arg(name = "max-blocked-streams", short = 'b', long, default_value = "10")]
++    pub max_blocked_streams: u16,
++
++    #[arg(short = 'c', long, number_of_values = 1)]
++    /// The set of TLS cipher suites to enable.
++    /// From: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`.
++    pub ciphers: Vec<String>,
++
++    #[arg(name = "qns-test", long)]
++    /// Enable special behavior for use with QUIC Network Simulator
++    pub qns_test: Option<String>,
++
++    #[arg(name = "use-old-http", short = 'o', long)]
++    /// Use http 0.9 instead of HTTP/3
++    pub use_old_http: bool,
++
++    #[command(flatten)]
++    pub quic_parameters: QuicParameters,
++}
++
++#[derive(Debug, Parser)]
++pub struct QuicParameters {
++    #[arg(
++        short = 'Q',
++        long,
++        num_args = 1..,
++        value_delimiter = ' ',
++        number_of_values = 1,
++        value_parser = from_str)]
++    /// A list of versions to support, in hex.
++    /// The first is the version to attempt.
++    /// Adding multiple values adds versions in order of preference.
++    /// If the first listed version appears in the list twice, the position
++    /// of the second entry determines the preference order of that version.
++    pub quic_version: Vec<Version>,
++
++    #[arg(long, default_value = "16")]
++    /// Set the `MAX_STREAMS_BIDI` limit.
++    pub max_streams_bidi: u64,
++
++    #[arg(long, default_value = "16")]
++    /// Set the `MAX_STREAMS_UNI` limit.
++    pub max_streams_uni: u64,
++
++    #[arg(long = "idle", default_value = "30")]
++    /// The idle timeout for connections, in seconds.
++    pub idle_timeout: u64,
++
++    #[arg(long = "cc", default_value = "newreno")]
++    /// The congestion controller to use.
++    pub congestion_control: CongestionControlAlgorithm,
++
++    #[arg(long = "pacing")]
++    /// Whether pacing is enabled.
++    pub pacing: bool,
++
++    #[arg(name = "preferred-address-v4", long)]
++    /// An IPv4 address for the server preferred address.
++    pub preferred_address_v4: Option<String>,
++
++    #[arg(name = "preferred-address-v6", long)]
++    /// An IPv6 address for the server preferred address.
++    pub preferred_address_v6: Option<String>,
++}
++
++impl QuicParameters {
++    fn get_sock_addr<F>(opt: &Option<String>, v: &str, f: F) -> Option<SocketAddr>
++    where
++        F: FnMut(&SocketAddr) -> bool,
++    {
++        let addr = opt
++            .iter()
++            .filter_map(|spa| spa.to_socket_addrs().ok())
++            .flatten()
++            .find(f);
++        assert_eq!(
++            opt.is_some(),
++            addr.is_some(),
++            "unable to resolve '{}' to an {} address",
++            opt.as_ref().unwrap(),
++            v,
++        );
++        addr
++    }
++
++    #[must_use]
++    pub fn preferred_address_v4(&self) -> Option<SocketAddr> {
++        Self::get_sock_addr(&self.preferred_address_v4, "IPv4", SocketAddr::is_ipv4)
++    }
++
++    #[must_use]
++    pub fn preferred_address_v6(&self) -> Option<SocketAddr> {
++        Self::get_sock_addr(&self.preferred_address_v6, "IPv6", SocketAddr::is_ipv6)
++    }
++
++    #[must_use]
++    pub fn preferred_address(&self) -> Option<PreferredAddress> {
++        let v4 = self.preferred_address_v4();
++        let v6 = self.preferred_address_v6();
++        if v4.is_none() && v6.is_none() {
++            None
++        } else {
++            let v4 = v4.map(|v4| {
++                let SocketAddr::V4(v4) = v4 else {
++                    unreachable!();
++                };
++                v4
++            });
++            let v6 = v6.map(|v6| {
++                let SocketAddr::V6(v6) = v6 else {
++                    unreachable!();
++                };
++                v6
++            });
++            Some(PreferredAddress::new(v4, v6))
++        }
++    }
++
++    #[must_use]
++    pub fn get(&self, alpn: &str) -> ConnectionParameters {
++        let params = ConnectionParameters::default()
++            .max_streams(StreamType::BiDi, self.max_streams_bidi)
++            .max_streams(StreamType::UniDi, self.max_streams_uni)
++            .idle_timeout(Duration::from_secs(self.idle_timeout))
++            .cc_algorithm(self.congestion_control)
++            .pacing(self.pacing);
++
++        if let Some(&first) = self.quic_version.first() {
++            let all = if self.quic_version[1..].contains(&first) {
++                &self.quic_version[1..]
++            } else {
++                &self.quic_version
++            };
++            params.versions(first, all.to_vec())
++        } else {
++            let version = match alpn {
++                "h3" | "hq-interop" => Version::Version1,
++                "h3-29" | "hq-29" => Version::Draft29,
++                "h3-30" | "hq-30" => Version::Draft30,
++                "h3-31" | "hq-31" => Version::Draft31,
++                "h3-32" | "hq-32" => Version::Draft32,
++                _ => Version::default(),
++            };
++            params.versions(version, Version::all())
++        }
++    }
++}
++
++fn from_str(s: &str) -> Result<Version, Error> {
++    let v = u32::from_str_radix(s, 16)
++        .map_err(|_| Error::Argument("versions need to be specified in hex"))?;
++    Version::try_from(v).map_err(|_| Error::Argument("unknown version"))
++}
++
++#[derive(Debug)]
++pub enum Error {
++    Argument(&'static str),
++}
++
++impl Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        write!(f, "Error: {self:?}")?;
++        Ok(())
++    }
++}
++
++impl std::error::Error for Error {}
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

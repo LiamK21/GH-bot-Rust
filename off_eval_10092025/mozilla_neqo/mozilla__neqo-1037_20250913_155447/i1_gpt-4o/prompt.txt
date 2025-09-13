@@ -1,0 +1,1111 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Server crash in interop runner
+Likely benign, but worth investigating
+
+```
+client          | 0s187ms DEBUG [Client 3815fa45c827f56c] delay duration 108.374972ms
+server          |    0: backtrace::backtrace::libunwind::trace
+server          |              at ./cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.46/src/backtrace/libunwind.rs:86
+server          |    1: backtrace::backtrace::trace_unsynchronized
+server          |              at ./cargo/registry/src/github.com-1ecc6299db9ec823/backtrace-0.3.46/src/backtrace/mod.rs:66
+server          |    2: std::sys_common::backtrace::_print_fmt
+server          |              at src/libstd/sys_common/backtrace.rs:78
+server          |    3: <std::sys_common::backtrace::_print::DisplayBacktrace as core::fmt::Display>::fmt
+server          |              at src/libstd/sys_common/backtrace.rs:59
+server          |    4: core::fmt::write
+server          |              at src/libcore/fmt/mod.rs:1076
+server          |    5: std::io::Write::write_fmt
+server          |              at src/libstd/io/mod.rs:1537
+server          |    6: std::sys_common::backtrace::_print
+server          |              at src/libstd/sys_common/backtrace.rs:62
+server          |    7: std::sys_common::backtrace::print
+server          |              at src/libstd/sys_common/backtrace.rs:49
+server          |    8: std::panicking::default_hook::{{closure}}
+server          |              at src/libstd/panicking.rs:198
+server          |    9: std::panicking::default_hook
+server          |              at src/libstd/panicking.rs:218
+server          |   10: std::panicking::rust_panic_with_hook
+server          |              at src/libstd/panicking.rs:486
+server          |   11: rust_begin_unwind
+server          |              at src/libstd/panicking.rs:388
+server          |   12: core::panicking::panic_fmt
+server          |              at src/libcore/panicking.rs:101
+server          |   13: core::panicking::panic
+server          |              at src/libcore/panicking.rs:56
+server          |   14: core::option::Option<T>::unwrap
+server          |              at ./rustc/d3fb005a39e62501b8b0b356166e515ae24e2e54/src/libcore/macros/mod.rs:10
+server          |   15: neqo_server::old_https::Http09Server::stream_readable
+server          |              at neqo-server/src/old_https.rs:105
+server          |   16: <neqo_server::old_https::Http09Server as neqo_server::HttpServer>::process_events
+server          |              at neqo-server/src/old_https.rs:169
+server          |   17: neqo_server::ServersRunner::process_datagrams_and_events
+server          |              at neqo-server/src/main.rs:454
+server          |   18: neqo_server::ServersRunner::run
+server          |              at neqo-server/src/main.rs:506
+server          |   19: neqo_server::main
+server          |              at neqo-server/src/main.rs:545
+server          |   20: std::rt::lang_start::{{closure}}
+server          |              at ./rustc/d3fb005a39e62501b8b0b356166e515ae24e2e54/src/libstd/rt.rs:67
+server          |   21: std::rt::lang_start_internal::{{closure}}
+server          |              at src/libstd/rt.rs:52
+server          |   22: std::panicking::try::do_call
+server          |              at src/libstd/panicking.rs:297
+server          |   23: std::panicking::try
+server          |              at src/libstd/panicking.rs:274
+server          |   24: std::panic::catch_unwind
+server          |              at src/libstd/panic.rs:394
+server          |   25: std::rt::lang_start_internal
+server          |              at src/libstd/rt.rs:51
+server          |   26: main
+server          |   27: __libc_start_main
+server          |   28: _start
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-client/src/main.rs b/neqo-client/src/main.rs
+--- a/neqo-client/src/main.rs
++++ b/neqo-client/src/main.rs
+@@ -20,7 +20,7 @@ use neqo_http3::{
+ use neqo_qpack::QpackSettings;
+ use neqo_transport::{
+     CongestionControlAlgorithm, Connection, ConnectionId, Error as TransportError,
+-    FixedConnectionIdManager, QuicVersion,
++    FixedConnectionIdManager as EmptyConnectionIdGenerator, QuicVersion,
+ };
+ 
+ use std::cell::RefCell;
+@@ -123,20 +123,10 @@ pub struct Args {
+     #[structopt(short = "h", long, number_of_values = 2)]
+     header: Vec<String>,
+ 
+-    #[structopt(
+-        name = "encoder-table-size",
+-        short = "e",
+-        long,
+-        default_value = "16384"
+-    )]
++    #[structopt(name = "encoder-table-size", long, default_value = "16384")]
+     max_table_size_encoder: u64,
+ 
+-    #[structopt(
+-        name = "decoder-table-size",
+-        short = "f",
+-        long,
+-        default_value = "16384"
+-    )]
++    #[structopt(name = "decoder-table-size", long, default_value = "16384")]
+     max_table_size_decoder: u64,
+ 
+     #[structopt(name = "max-blocked-streams", short = "b", long, default_value = "10")]
+@@ -150,9 +140,14 @@ pub struct Args {
+     use_old_http: bool,
+ 
+     #[structopt(name = "download-in-series", long)]
+-    /// Download resources in series using separate connections
++    /// Download resources in series using separate connections.
++    /// Only works with old HTTP (that is, `-o`).
+     download_in_series: bool,
+ 
++    #[structopt(name = "concurrency", long, default_value = "100")]
++    /// The maximum number of requests to have outstanding at one time.
++    concurrency: usize,
++
+     #[structopt(name = "output-read-data", long)]
+     /// Output received data to stdout
+     output_read_data: bool,
+@@ -198,12 +193,10 @@ impl Args {
+     }
+ }
+ 
+-fn emit_datagram(socket: &UdpSocket, d: Option<Datagram>) -> io::Result<()> {
+-    if let Some(d) = d {
+-        let sent = socket.send(&d[..])?;
+-        if sent != d.len() {
+-            eprintln!("Unable to send all {} bytes of datagram", d.len());
+-        }
++fn emit_datagram(socket: &UdpSocket, d: Datagram) -> io::Result<()> {
++    let sent = socket.send_to(&d[..], d.destination())?;
++    if sent != d.len() {
++        eprintln!("Unable to send all {} bytes of datagram", d.len());
+     }
+     Ok(())
+ }
+@@ -251,7 +244,6 @@ fn get_output_file(
+ 
+ fn process_loop(
+     local_addr: &SocketAddr,
+-    remote_addr: &SocketAddr,
+     socket: &UdpSocket,
+     client: &mut Http3Client,
+     handler: &mut Handler,
+@@ -265,10 +257,9 @@ fn process_loop(
+         let mut exiting = !handler.handle(client)?;
+ 
+         loop {
+-            let output = client.process_output(Instant::now());
+-            match output {
++            match client.process_output(Instant::now()) {
+                 Output::Datagram(dgram) => {
+-                    if let Err(e) = emit_datagram(&socket, Some(dgram)) {
++                    if let Err(e) = emit_datagram(&socket, dgram) {
+                         eprintln!("UDP write error: {}", e);
+                         client.close(Instant::now(), 0, e.to_string());
+                         exiting = true;
+@@ -292,20 +283,20 @@ fn process_loop(
+             return Ok(client.state());
+         }
+ 
+-        match socket.recv(&mut buf[..]) {
++        match socket.recv_from(&mut buf[..]) {
+             Err(ref err)
+                 if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted => {}
+             Err(err) => {
+                 eprintln!("UDP error: {}", err);
+                 exit(1)
+             }
+-            Ok(sz) => {
++            Ok((sz, remote)) => {
+                 if sz == buf.len() {
+                     eprintln!("Received more than {} bytes", buf.len());
+                     continue;
+                 }
+                 if sz > 0 {
+-                    let d = Datagram::new(*remote_addr, *local_addr, &buf[..sz]);
++                    let d = Datagram::new(remote, *local_addr, &buf[..sz]);
+                     client.process_input(d, Instant::now());
+                     handler.maybe_key_update(client)?;
+                 }
+@@ -328,6 +319,9 @@ impl<'a> Handler<'a> {
+             if self.url_queue.is_empty() {
+                 break;
+             }
++            if self.streams.len() >= self.args.concurrency {
++                break;
++            }
+             if !self.download_next(client) {
+                 break;
+             }
+@@ -449,6 +443,7 @@ impl<'a> Handler<'a> {
+ 
+                     if stream_done {
+                         self.streams.remove(&stream_id);
++                        self.download_urls(client);
+                         if self.done() {
+                             client.close(Instant::now(), 0, "kthxbye!");
+                             return Ok(false);
+@@ -505,7 +500,7 @@ fn client(
+     let mut transport = Connection::new_client(
+         hostname,
+         &[&args.alpn],
+-        Rc::new(RefCell::new(FixedConnectionIdManager::new(0))),
++        Rc::new(RefCell::new(EmptyConnectionIdGenerator::new(0))),
+         local_addr,
+         remote_addr,
+         &CongestionControlAlgorithm::NewReno,
+@@ -539,7 +534,7 @@ fn client(
+         key_update,
+     };
+ 
+-    process_loop(&local_addr, &remote_addr, &socket, &mut client, &mut h)?;
++    process_loop(&local_addr, &socket, &mut client, &mut h)?;
+ 
+     Ok(())
+ }
+@@ -638,22 +633,20 @@ fn main() -> Res<()> {
+             }
+             Ok(s) => s,
+         };
+-        socket
+-            .connect(&remote_addr)
+-            .expect("Unable to connect UDP socket");
+ 
++        let real_local = socket.local_addr().unwrap();
+         println!(
+             "{} Client connecting: {:?} -> {:?}",
+             if args.use_old_http { "H9" } else { "H3" },
+-            socket.local_addr().unwrap(),
+-            remote_addr
++            real_local,
++            remote_addr,
+         );
+ 
+         if !args.use_old_http {
+             client(
+                 &args,
+                 socket,
+-                local_addr,
++                real_local,
+                 remote_addr,
+                 &format!("{}", host),
+                 &urls,
+@@ -672,7 +665,7 @@ fn main() -> Res<()> {
+                 old::old_client(
+                     &args,
+                     &socket,
+-                    local_addr,
++                    real_local,
+                     remote_addr,
+                     &format!("{}", host),
+                     &[first_url],
+@@ -685,7 +678,7 @@ fn main() -> Res<()> {
+             old::old_client(
+                 &args,
+                 &socket,
+-                local_addr,
++                real_local,
+                 remote_addr,
+                 &format!("{}", host),
+                 &urls,
+@@ -698,7 +691,7 @@ fn main() -> Res<()> {
+                 token = old::old_client(
+                     &args,
+                     &socket,
+-                    local_addr,
++                    real_local,
+                     remote_addr,
+                     &format!("{}", host),
+                     &[url],
+@@ -729,8 +722,9 @@ mod old {
+     use neqo_common::{event::Provider, Datagram};
+     use neqo_crypto::{AuthenticationStatus, ResumptionToken};
+     use neqo_transport::{
+-        CongestionControlAlgorithm, Connection, ConnectionEvent, Error, FixedConnectionIdManager,
+-        Output, QuicVersion, State, StreamType,
++        CongestionControlAlgorithm, Connection, ConnectionEvent, Error,
++        FixedConnectionIdManager as EmptyConnectionIdGenerator, Output, QuicVersion, State,
++        StreamType,
+     };
+ 
+     use super::{emit_datagram, get_output_file, Args};
+@@ -750,6 +744,9 @@ mod old {
+                 if self.url_queue.is_empty() {
+                     break;
+                 }
++                if self.streams.len() >= self.args.concurrency {
++                    break;
++                }
+                 if !self.download_next(client) {
+                     break;
+                 }
+@@ -847,6 +844,7 @@ mod old {
+                             println!("<FIN[{}]>", stream_id);
+                         }
+                         self.streams.remove(&stream_id);
++                        self.download_urls(client);
+                         if self.streams.is_empty() && self.url_queue.is_empty() {
+                             return Ok(false);
+                         }
+@@ -915,7 +913,6 @@ mod old {
+ 
+     fn process_loop_old(
+         local_addr: &SocketAddr,
+-        remote_addr: &SocketAddr,
+         socket: &UdpSocket,
+         client: &mut Connection,
+         handler: &mut HandlerOld,
+@@ -929,10 +926,9 @@ mod old {
+             let mut exiting = !handler.handle(client)?;
+ 
+             loop {
+-                let output = client.process_output(Instant::now());
+-                match output {
++                match client.process_output(Instant::now()) {
+                     Output::Datagram(dgram) => {
+-                        if let Err(e) = emit_datagram(&socket, Some(dgram)) {
++                        if let Err(e) = emit_datagram(&socket, dgram) {
+                             eprintln!("UDP write error: {}", e);
+                             client.close(Instant::now(), 0, e.to_string());
+                             exiting = true;
+@@ -956,27 +952,24 @@ mod old {
+                 return Ok(client.state().clone());
+             }
+ 
+-            let sz = match socket.recv(&mut buf[..]) {
+-                Err(ref err)
+-                    if err.kind() == ErrorKind::WouldBlock
+-                        || err.kind() == ErrorKind::Interrupted =>
+-                {
+-                    0
+-                }
++            match socket.recv_from(&mut buf[..]) {
+                 Err(err) => {
+-                    eprintln!("UDP error: {}", err);
+-                    exit(1)
++                    if err.kind() != ErrorKind::WouldBlock && err.kind() != ErrorKind::Interrupted {
++                        eprintln!("UDP error: {}", err);
++                        exit(1);
++                    }
++                }
++                Ok((sz, addr)) => {
++                    if sz == buf.len() {
++                        eprintln!("Received more than {} bytes", buf.len());
++                        continue;
++                    }
++                    if sz > 0 {
++                        let d = Datagram::new(addr, *local_addr, &buf[..sz]);
++                        client.process_input(d, Instant::now());
++                        handler.maybe_key_update(client)?;
++                    }
+                 }
+-                Ok(sz) => sz,
+-            };
+-            if sz == buf.len() {
+-                eprintln!("Received more than {} bytes", buf.len());
+-                continue;
+-            }
+-            if sz > 0 {
+-                let d = Datagram::new(*remote_addr, *local_addr, &buf[..sz]);
+-                client.process_input(d, Instant::now());
+-                handler.maybe_key_update(client)?;
+             }
+         }
+     }
+@@ -1002,7 +995,7 @@ mod old {
+         let mut client = Connection::new_client(
+             origin,
+             &[alpn],
+-            Rc::new(RefCell::new(FixedConnectionIdManager::new(0))),
++            Rc::new(RefCell::new(EmptyConnectionIdGenerator::new(0))),
+             local_addr,
+             remote_addr,
+             &CongestionControlAlgorithm::NewReno,
+@@ -1030,7 +1023,7 @@ mod old {
+             key_update,
+         };
+ 
+-        process_loop_old(&local_addr, &remote_addr, &socket, &mut client, &mut h)?;
++        process_loop_old(&local_addr, &socket, &mut client, &mut h)?;
+ 
+         let token = if args.resume {
+             // If we haven't received an event, take a token if there is one.
+
+diff --git a/neqo-server/src/main.rs b/neqo-server/src/main.rs
+--- a/neqo-server/src/main.rs
++++ b/neqo-server/src/main.rs
+@@ -8,7 +8,6 @@
+ #![warn(clippy::use_self)]
+ 
+ use std::cell::RefCell;
+-use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::fmt::Display;
+ use std::fs::OpenOptions;
+@@ -33,11 +32,14 @@ use neqo_crypto::{
+ };
+ use neqo_http3::{Error, Http3Server, Http3ServerEvent};
+ use neqo_qpack::QpackSettings;
+-use neqo_transport::{server::ValidateAddress, FixedConnectionIdManager, Output};
++use neqo_transport::{
++    server::ValidateAddress, FixedConnectionIdManager as RandomConnectionIdGenerator, Output,
++};
+ 
+ use crate::old_https::Http09Server;
+ 
+ const TIMER_TOKEN: Token = Token(0xffff_ffff);
++const ANTI_REPLAY_WINDOW: Duration = Duration::from_secs(10);
+ 
+ mod old_https;
+ 
+@@ -48,20 +50,10 @@ struct Args {
+     #[structopt(default_value = "[::]:4433")]
+     hosts: Vec<String>,
+ 
+-    #[structopt(
+-        name = "encoder-table-size",
+-        short = "e",
+-        long,
+-        default_value = "16384"
+-    )]
++    #[structopt(name = "encoder-table-size", long, default_value = "16384")]
+     max_table_size_encoder: u64,
+ 
+-    #[structopt(
+-        name = "decoder-table-size",
+-        short = "f",
+-        long,
+-        default_value = "16384"
+-    )]
++    #[structopt(name = "decoder-table-size", long, default_value = "16384")]
+     max_table_size_decoder: u64,
+ 
+     #[structopt(short = "b", long, default_value = "10")]
+@@ -106,6 +98,14 @@ struct Args {
+     /// The set of TLS cipher suites to enable.
+     /// From: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256.
+     ciphers: Vec<String>,
++
++    #[structopt(name = "preferred-address-v4", long)]
++    /// An IPv4 address for the server preferred address.
++    preferred_address_v4: Option<String>,
++
++    #[structopt(name = "preferred-address-v6", long)]
++    /// An IPv6 address for the server preferred address.
++    preferred_address_v6: Option<String>,
+ }
+ 
+ impl Args {
+@@ -121,13 +121,32 @@ impl Args {
+             .collect::<Vec<_>>()
+     }
+ 
+-    fn host_socket_addrs(&self) -> Vec<SocketAddr> {
++    fn listen_addresses(&self) -> Vec<SocketAddr> {
+         self.hosts
+             .iter()
+             .filter_map(|host| host.to_socket_addrs().ok())
+-            .flat_map(|x| x)
++            .flatten()
+             .collect()
+     }
++
++    fn now(&self) -> Instant {
++        if self.qns_test.is_some() {
++            // When NSS starts its anti-replay it blocks any acceptance of 0-RTT for a
++            // single period.  This ensures that an attacker that is able to force a
++            // server to reboot is unable to use that to flush the anti-replay buffers
++            // and have something replayed.
++            //
++            // However, this is a massive inconvenience for us when we are testing.
++            // As we can't initialize `AntiReplay` in the past (see `neqo_common::time`
++            // for why), fast forward time here so that the connections get times from
++            // in the future.
++            //
++            // This is NOT SAFE.  Don't do this.
++            Instant::now() + ANTI_REPLAY_WINDOW
++        } else {
++            Instant::now()
++        }
++    }
+ }
+ 
+ fn emit_packet(socket: &mut UdpSocket, out_dgram: Datagram) {
+@@ -164,19 +183,19 @@ fn qns_read_response(filename: &str) -> Option<Vec<u8>> {
+ }
+ 
+ trait HttpServer: Display {
+-    fn process(&mut self, dgram: Option<Datagram>) -> Output;
+-    fn process_events(&mut self, args: &Args);
++    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output;
++    fn process_events(&mut self, args: &Args, now: Instant);
+     fn set_qlog_dir(&mut self, dir: Option<PathBuf>);
+     fn set_ciphers(&mut self, ciphers: &[Cipher]);
+     fn validate_address(&mut self, when: ValidateAddress);
+ }
+ 
+ impl HttpServer for Http3Server {
+-    fn process(&mut self, dgram: Option<Datagram>) -> Output {
+-        self.process(dgram, Instant::now())
++    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output {
++        self.process(dgram, now)
+     }
+ 
+-    fn process_events(&mut self, args: &Args) {
++    fn process_events(&mut self, args: &Args, _now: Instant) {
+         while let Some(event) = self.next_event() {
+             match event {
+                 Http3ServerEvent::Headers {
+@@ -241,35 +260,6 @@ impl HttpServer for Http3Server {
+     }
+ }
+ 
+-fn process(
+-    server: &mut dyn HttpServer,
+-    svr_timeout: &mut Option<Timeout>,
+-    inx: usize,
+-    dgram: Option<Datagram>,
+-    timer: &mut Timer<usize>,
+-    socket: &mut UdpSocket,
+-) -> bool {
+-    match server.process(dgram) {
+-        Output::Datagram(dgram) => {
+-            emit_packet(socket, dgram);
+-            true
+-        }
+-        Output::Callback(new_timeout) => {
+-            if let Some(svr_timeout) = svr_timeout {
+-                timer.cancel_timeout(svr_timeout);
+-            }
+-
+-            qinfo!("Setting timeout of {:?} for {}", new_timeout, server);
+-            *svr_timeout = Some(timer.set_timeout(new_timeout, inx));
+-            false
+-        }
+-        Output::None => {
+-            qdebug!("Output::None");
+-            false
+-        }
+-    }
+-}
+-
+ fn read_dgram(
+     socket: &mut UdpSocket,
+     local_address: &SocketAddr,
+@@ -300,31 +290,36 @@ struct ServersRunner {
+     args: Args,
+     poll: Poll,
+     hosts: Vec<SocketAddr>,
++    server: Box<dyn HttpServer>,
++    timeout: Option<Timeout>,
+     sockets: Vec<UdpSocket>,
+-    servers: HashMap<SocketAddr, (Box<dyn HttpServer>, Option<Timeout>)>,
++    active_sockets: HashSet<usize>,
+     timer: Timer<usize>,
+-    active_servers: HashSet<usize>,
+ }
+ 
+ impl ServersRunner {
+     pub fn new(args: Args) -> Result<Self, io::Error> {
+-        Ok(Self {
++        let server = Self::create_server(&args);
++        let mut runner = Self {
+             args,
+             poll: Poll::new()?,
++            hosts: Vec::new(),
++            server,
++            timeout: None,
+             sockets: Vec::new(),
+-            servers: HashMap::new(),
++            active_sockets: HashSet::new(),
+             timer: Builder::default()
+                 .tick_duration(Duration::from_millis(1))
+                 .build::<usize>(),
+-            hosts: Vec::new(),
+-            active_servers: HashSet::new(),
+-        })
++        };
++        runner.init()?;
++        Ok(runner)
+     }
+ 
+     /// Init Poll for all hosts. Create sockets, and a map of the
+     /// socketaddrs to instances of the HttpServer handling that addr.
+-    pub fn init(&mut self) -> Result<(), io::Error> {
+-        self.hosts = self.args.host_socket_addrs();
++    fn init(&mut self) -> Result<(), io::Error> {
++        self.hosts = self.args.listen_addresses();
+         if self.hosts.is_empty() {
+             eprintln!("No valid hosts defined");
+             return Err(io::Error::new(io::ErrorKind::InvalidInput, "No hosts"));
+@@ -347,11 +342,10 @@ impl ServersRunner {
+                 Ok(s) => s,
+             };
+ 
+-            let res = socket.only_v6();
+-            let also_v4 = if res.is_ok() && !res.unwrap() {
+-                " as well as V4"
+-            } else {
++            let also_v4 = if socket.only_v6().unwrap_or(true) {
+                 ""
++            } else {
++                " as well as V4"
+             };
+             println!(
+                 "Server waiting for connection on: {:?}{}",
+@@ -366,8 +360,6 @@ impl ServersRunner {
+             )?;
+ 
+             self.sockets.push(socket);
+-            self.servers
+-                .insert(local_addr, (self.create_server(), None));
+         }
+ 
+         self.poll
+@@ -376,99 +368,110 @@ impl ServersRunner {
+         Ok(())
+     }
+ 
+-    fn create_server(&self) -> Box<dyn HttpServer> {
+-        let anti_replay = AntiReplay::new(Instant::now(), Duration::from_secs(10), 7, 14)
++    fn create_server(args: &Args) -> Box<dyn HttpServer> {
++        // Note: this is the exception to the case where we use `Args::now`.
++        let anti_replay = AntiReplay::new(Instant::now(), ANTI_REPLAY_WINDOW, 7, 14)
+             .expect("unable to setup anti-replay");
+-        let cid_mgr = Rc::new(RefCell::new(FixedConnectionIdManager::new(10)));
++        let cid_mgr = Rc::new(RefCell::new(RandomConnectionIdGenerator::new(10)));
+ 
+-        let mut svr: Box<dyn HttpServer> = if self.args.use_old_http {
++        let mut svr: Box<dyn HttpServer> = if args.use_old_http {
+             Box::new(
+                 Http09Server::new(
+-                    Instant::now(),
+-                    &[self.args.key.clone()],
+-                    &[self.args.alpn.clone()],
++                    args.now(),
++                    &[args.key.clone()],
++                    &[args.alpn.clone()],
+                     anti_replay,
+                     cid_mgr,
+                 )
+                 .expect("We cannot make a server!"),
+             )
+         } else {
+-            Box::new(
+-                Http3Server::new(
+-                    Instant::now(),
+-                    &[self.args.key.clone()],
+-                    &[self.args.alpn.clone()],
+-                    anti_replay,
+-                    cid_mgr,
+-                    QpackSettings {
+-                        max_table_size_encoder: self.args.max_table_size_encoder,
+-                        max_table_size_decoder: self.args.max_table_size_decoder,
+-                        max_blocked_streams: self.args.max_blocked_streams,
+-                    },
+-                )
+-                .expect("We cannot make a server!"),
++            let server = Http3Server::new(
++                args.now(),
++                &[args.key.clone()],
++                &[args.alpn.clone()],
++                anti_replay,
++                cid_mgr,
++                QpackSettings {
++                    max_table_size_encoder: args.max_table_size_encoder,
++                    max_table_size_decoder: args.max_table_size_decoder,
++                    max_blocked_streams: args.max_blocked_streams,
++                },
+             )
++            .expect("We cannot make a server!");
++            Box::new(server)
+         };
+-        svr.set_ciphers(&self.args.get_ciphers());
+-        svr.set_qlog_dir(self.args.qlog_dir.clone());
+-        if self.args.retry {
++        svr.set_ciphers(&args.get_ciphers());
++        svr.set_qlog_dir(args.qlog_dir.clone());
++        if args.retry {
+             svr.validate_address(ValidateAddress::Always);
+         }
+         svr
+     }
+ 
++    /// Tries to find a socket, but then just falls back to sending from the first.
++    fn find_socket(&mut self, addr: SocketAddr) -> &mut UdpSocket {
++        let (first, rest) = self.sockets.split_first_mut().unwrap();
++        rest.iter_mut()
++            .find(|s| {
++                s.local_addr()
++                    .ok()
++                    .map_or(false, |socket_addr| socket_addr == addr)
++            })
++            .unwrap_or(first)
++    }
++
++    fn process(&mut self, inx: usize, dgram: Option<Datagram>) -> bool {
++        match self.server.process(dgram, self.args.now()) {
++            Output::Datagram(dgram) => {
++                let socket = self.find_socket(dgram.source());
++                emit_packet(socket, dgram);
++                true
++            }
++            Output::Callback(new_timeout) => {
++                if let Some(to) = &self.timeout {
++                    self.timer.cancel_timeout(to);
++                }
++
++                qinfo!("Setting timeout of {:?} for socket {}", new_timeout, inx);
++                self.timeout = Some(self.timer.set_timeout(new_timeout, inx));
++                false
++            }
++            Output::None => {
++                qdebug!("Output::None");
++                false
++            }
++        }
++    }
++
+     fn process_datagrams_and_events(
+         &mut self,
+         inx: usize,
+         read_socket: bool,
+     ) -> Result<(), io::Error> {
+-        if let Some(socket) = self.sockets.get_mut(inx) {
+-            if let Some((ref mut server, svr_timeout)) =
+-                self.servers.get_mut(&socket.local_addr().unwrap())
+-            {
+-                if read_socket {
+-                    loop {
+-                        let dgram = read_dgram(socket, &self.hosts[inx])?;
+-                        if dgram.is_none() {
+-                            break;
+-                        }
+-                        let _ = process(
+-                            &mut **server,
+-                            svr_timeout,
+-                            inx,
+-                            dgram,
+-                            &mut self.timer,
+-                            socket,
+-                        );
++        if self.sockets.get_mut(inx).is_some() {
++            if read_socket {
++                loop {
++                    let socket = self.sockets.get_mut(inx).unwrap();
++                    let dgram = read_dgram(socket, &self.hosts[inx])?;
++                    if dgram.is_none() {
++                        break;
+                     }
+-                } else {
+-                    let _ = process(
+-                        &mut **server,
+-                        svr_timeout,
+-                        inx,
+-                        None,
+-                        &mut self.timer,
+-                        socket,
+-                    );
+-                }
+-                server.process_events(&self.args);
+-                if process(
+-                    &mut **server,
+-                    svr_timeout,
+-                    inx,
+-                    None,
+-                    &mut self.timer,
+-                    socket,
+-                ) {
+-                    self.active_servers.insert(inx);
++                    let _ = self.process(inx, dgram);
+                 }
++            } else {
++                let _ = self.process(inx, None);
++            }
++            self.server.process_events(&self.args, self.args.now());
++            if self.process(inx, None) {
++                self.active_sockets.insert(inx);
+             }
+         }
+         Ok(())
+     }
+ 
+     fn process_active_conns(&mut self) -> Result<(), io::Error> {
+-        let curr_active = mem::take(&mut self.active_servers);
++        let curr_active = mem::take(&mut self.active_sockets);
+         for inx in curr_active {
+             self.process_datagrams_and_events(inx, false)?;
+         }
+@@ -489,7 +492,7 @@ impl ServersRunner {
+             // If there are active servers do not block in poll.
+             self.poll.poll(
+                 &mut events,
+-                if self.active_servers.is_empty() {
++                if self.active_sockets.is_empty() {
+                     None
+                 } else {
+                     Some(Duration::from_millis(0))
+@@ -541,6 +544,5 @@ fn main() -> Result<(), io::Error> {
+     }
+ 
+     let mut servers_runner = ServersRunner::new(args)?;
+-    servers_runner.init()?;
+     servers_runner.run()
+ }
+
+diff --git a/neqo-server/src/old_https.rs b/neqo-server/src/old_https.rs
+--- a/neqo-server/src/old_https.rs
++++ b/neqo-server/src/old_https.rs
+@@ -16,11 +16,13 @@ use std::time::Instant;
+ 
+ use regex::Regex;
+ 
+-use neqo_common::{event::Provider, Datagram};
++use neqo_common::{event::Provider, hex, qdebug, Datagram};
+ use neqo_crypto::{AllowZeroRtt, AntiReplay, Cipher};
+ use neqo_http3::Error;
+-use neqo_transport::server::{ActiveConnectionRef, Server, ValidateAddress};
+-use neqo_transport::{ConnectionEvent, ConnectionIdManager, Output, State};
++use neqo_transport::{
++    server::{ActiveConnectionRef, Server, ValidateAddress},
++    ConnectionEvent, ConnectionIdManager as ConnectionIdGenerator, Output, State,
++};
+ 
+ use super::{qns_read_response, Args, HttpServer};
+ 
+@@ -32,7 +34,8 @@ struct Http09StreamState {
+ 
+ pub struct Http09Server {
+     server: Server,
+-    stream_state: HashMap<(ActiveConnectionRef, u64), Http09StreamState>,
++    write_state: HashMap<u64, Http09StreamState>,
++    read_state: HashMap<u64, Vec<u8>>,
+ }
+ 
+ impl Http09Server {
+@@ -41,24 +44,61 @@ impl Http09Server {
+         certs: &[impl AsRef<str>],
+         protocols: &[impl AsRef<str>],
+         anti_replay: AntiReplay,
+-        cid_manager: Rc<RefCell<dyn ConnectionIdManager>>,
++        cid_manager: Rc<RefCell<dyn ConnectionIdGenerator>>,
+     ) -> Result<Self, Error> {
++        let server = Server::new(
++            now,
++            certs,
++            protocols,
++            anti_replay,
++            Box::new(AllowZeroRtt {}),
++            cid_manager,
++        )?;
+         Ok(Self {
+-            server: Server::new(
+-                now,
+-                certs,
+-                protocols,
+-                anti_replay,
+-                Box::new(AllowZeroRtt {}),
+-                cid_manager,
+-            )?,
+-            stream_state: HashMap::new(),
++            server,
++            write_state: HashMap::new(),
++            read_state: HashMap::new(),
+         })
+     }
+ 
+-    fn stream_readable(&mut self, stream_id: u64, mut conn: &mut ActiveConnectionRef, args: &Args) {
++    fn save_partial(&mut self, stream_id: u64, partial: Vec<u8>, conn: &mut ActiveConnectionRef) {
++        let url_dbg = String::from_utf8(partial.clone())
++            .unwrap_or_else(|_| format!("<invalid UTF-8: {}>", hex(&partial)));
++        if partial.len() < 4096 {
++            qdebug!("Saving partial URL: {}", url_dbg);
++            self.read_state.insert(stream_id, partial);
++        } else {
++            qdebug!("Giving up on partial URL {}", url_dbg);
++            conn.borrow_mut().stream_stop_sending(stream_id, 0).unwrap();
++        }
++    }
++
++    fn write(&mut self, stream_id: u64, data: Option<Vec<u8>>, conn: &mut ActiveConnectionRef) {
++        let resp = data.unwrap_or_else(|| Vec::from(&b"404 That request was nonsense\r\n"[..]));
++        if let Some(stream_state) = self.write_state.get_mut(&stream_id) {
++            match stream_state.data_to_send {
++                None => stream_state.data_to_send = Some((resp, 0)),
++                Some(_) => {
++                    qdebug!("Data already set, doing nothing");
++                }
++            }
++            if stream_state.writable {
++                self.stream_writable(stream_id, conn);
++            }
++        } else {
++            self.write_state.insert(
++                stream_id,
++                Http09StreamState {
++                    writable: false,
++                    data_to_send: Some((resp, 0)),
++                },
++            );
++        }
++    }
++
++    fn stream_readable(&mut self, stream_id: u64, conn: &mut ActiveConnectionRef, args: &Args) {
+         if stream_id % 4 != 0 {
+-            eprintln!("Stream {} not client-initiated bidi, ignoring", stream_id);
++            qdebug!("Stream {} not client-initiated bidi, ignoring", stream_id);
+             return;
+         }
+         let mut data = vec![0; 4000];
+@@ -69,28 +109,37 @@ impl Http09Server {
+ 
+         if sz == 0 {
+             if !fin {
+-                eprintln!("size 0 but !fin");
++                qdebug!("size 0 but !fin");
+             }
+             return;
+         }
+ 
+-        let msg = match std::str::from_utf8(&data[..sz]) {
+-            Ok(s) => s,
+-            Err(e) => {
+-                eprintln!("invalid string. Is this HTTP 0.9? error: {}", e);
+-                conn.borrow_mut().stream_close_send(stream_id).unwrap();
+-                return;
+-            }
++        data.truncate(sz);
++        let buf = if let Some(mut existing) = self.read_state.remove(&stream_id) {
++            existing.append(&mut data);
++            existing
++        } else {
++            data
++        };
++
++        let msg = if let Ok(s) = std::str::from_utf8(&buf[..]) {
++            s
++        } else {
++            self.save_partial(stream_id, buf, conn);
++            return;
+         };
+ 
+         let re = if args.qns_test.is_some() {
+-            Regex::new(r"GET +/(\S+)(\r)?\n").unwrap()
++            Regex::new(r"GET +/(\S+)(?:\r)?\n").unwrap()
+         } else {
+-            Regex::new(r"GET +/(\d+)(\r)?\n").unwrap()
++            Regex::new(r"GET +/(\d+)(?:\r)?\n").unwrap()
+         };
+         let m = re.captures(&msg);
+         let resp = match m.and_then(|m| m.get(1)) {
+-            None => Some(b"Hello World".to_vec()),
++            None => {
++                self.save_partial(stream_id, buf, conn);
++                return;
++            }
+             Some(path) => {
+                 let path = path.as_str();
+                 eprintln!("Path = '{}'", path);
+@@ -102,23 +151,11 @@ impl Http09Server {
+                 }
+             }
+         };
+-        let stream_state = self
+-            .stream_state
+-            .get_mut(&(conn.clone(), stream_id))
+-            .unwrap();
+-        match stream_state.data_to_send {
+-            None => stream_state.data_to_send = resp.map(|r| (r, 0)),
+-            Some(_) => {
+-                eprintln!("Data already set, doing nothing");
+-            }
+-        }
+-        if stream_state.writable {
+-            self.stream_writable(stream_id, &mut conn);
+-        }
++        self.write(stream_id, resp, conn);
+     }
+ 
+     fn stream_writable(&mut self, stream_id: u64, conn: &mut ActiveConnectionRef) {
+-        match self.stream_state.get_mut(&(conn.clone(), stream_id)) {
++        match self.write_state.get_mut(&stream_id) {
+             None => {
+                 eprintln!("Unknown stream {}, ignoring event", stream_id);
+             }
+@@ -129,13 +166,13 @@ impl Http09Server {
+                         .borrow_mut()
+                         .stream_send(stream_id, &data[*offset..])
+                         .unwrap();
+-                    eprintln!("Wrote {}", sent);
++                    qdebug!("Wrote {}", sent);
+                     *offset += sent;
+                     self.server.add_to_waiting(conn.clone());
+                     if *offset == data.len() {
+                         eprintln!("Sent {} on {}, closing", sent, stream_id);
+                         conn.borrow_mut().stream_close_send(stream_id).unwrap();
+-                        self.stream_state.remove(&(conn.clone(), stream_id));
++                        self.write_state.remove(&stream_id);
+                     } else {
+                         stream_state.writable = false;
+                     }
+@@ -146,11 +183,11 @@ impl Http09Server {
+ }
+ 
+ impl HttpServer for Http09Server {
+-    fn process(&mut self, dgram: Option<Datagram>) -> Output {
+-        self.server.process(dgram, Instant::now())
++    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output {
++        self.server.process(dgram, now)
+     }
+ 
+-    fn process_events(&mut self, args: &Args) {
++    fn process_events(&mut self, args: &Args, now: Instant) {
+         let active_conns = self.server.active_connections();
+         for mut acr in active_conns {
+             loop {
+@@ -158,12 +195,11 @@ impl HttpServer for Http09Server {
+                     None => break,
+                     Some(e) => e,
+                 };
++                eprintln!("Event {:?}", event);
+                 match event {
+                     ConnectionEvent::NewStream { stream_id } => {
+-                        self.stream_state.insert(
+-                            (acr.clone(), stream_id.as_u64()),
+-                            Http09StreamState::default(),
+-                        );
++                        self.write_state
++                            .insert(stream_id.as_u64(), Http09StreamState::default());
+                     }
+                     ConnectionEvent::RecvStreamReadable { stream_id } => {
+                         self.stream_readable(stream_id, &mut acr, args);
+@@ -174,10 +210,11 @@ impl HttpServer for Http09Server {
+                     ConnectionEvent::StateChange(State::Connected) => {
+                         acr.connection()
+                             .borrow_mut()
+-                            .send_ticket(Instant::now(), b"hi!")
++                            .send_ticket(now, b"hi!")
+                             .unwrap();
+                     }
+-                    ConnectionEvent::StateChange(_) => (),
++                    ConnectionEvent::StateChange(_)
++                    | ConnectionEvent::SendStreamComplete { .. } => (),
+                     e => eprintln!("unhandled event {:?}", e),
+                 }
+             }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> Res<()>
+
+fn process_loop(
+local_addr: &SocketAddr,
+socket: &UdpSocket,
+client: &mut Http3Client,
+handler: &mut Handler) -> Res<neqo_http3::Http3State>
+
+fn get_output_file(
+url: &Url,
+output_dir: &Option<PathBuf>,
+all_paths: &mut Vec<PathBuf>) -> Option<File>
+
+fn client(
+args: &Args,
+socket: UdpSocket,
+local_addr: SocketAddr,
+remote_addr: SocketAddr,
+hostname: &str,
+urls: &[Url]) -> Res<()>
+
+fn main() -> Result<(), io::Error>
+
+fn qns_read_response(filename: &str) -> Option<Vec<u8>>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

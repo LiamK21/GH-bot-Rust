@@ -1,0 +1,39 @@
+#neqo-bin/src/udp.rs
+#[cfg(test)]
+mod tests {
+use neqo_bin::udp::Socket;
+use tokio;
+use neqo_common::Datagram;
+use std::net::SocketAddr;
+
+#[test]
+fn test_datagram_tos() {
+  let sender = Socket::bind("127.0.0.1:0").unwrap();
+  let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let mut receiver = Socket::bind(receiver_addr).unwrap();
+
+  let datagram = Datagram::new(
+      sender.local_addr().unwrap(),
+      receiver.local_addr().unwrap(),
+      neqo_common::IpTos::from((neqo_common::IpTosDscp::Le, neqo_common::IpTosEcn::Ect1)),
+      None,
+      "Hello, world!".as_bytes().to_vec(),
+  );
+
+  sender.writable().await.unwrap();
+  sender.send(datagram.clone()).unwrap();
+
+  receiver.readable().await.unwrap();
+  let received_datagram = receiver
+      .recv(&receiver_addr)
+      .unwrap()
+      .into_iter()
+      .next()
+      .unwrap();
+
+  assert_eq!(
+      neqo_common::IpTosEcn::from(datagram.tos()),
+      neqo_common::IpTosEcn::from(received_datagram.tos())
+  );
+}
+}

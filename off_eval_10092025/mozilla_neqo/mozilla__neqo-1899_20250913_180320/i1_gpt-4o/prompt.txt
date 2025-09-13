@@ -1,0 +1,215 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Explore multi-packet I/O (aka. fast UDP I/O)
+### Summary
+
+Explore multi-packet at (a) the I/O layer (`sendmmsg`, `recvmmsg`, GSO, GRO) and (b) within the Neqo state machines.
+
+### Very early draft
+
+Have a fixed sized send and fixed sized receive buffer.
+
+``` rust
+write: [Box<[u8; MAX_MTU * MAX_GSO_SEGMENTS]>; MAX_SENDMMSG_BATCH_SIZE],
+read: [Box<[u8; MAX_MTU * MAX_GRO_SEGMENTS]>; MAX_RECVMMSG_BATCH_SIZE],
+```
+
+- can be used across multiple connections, e.g. one pair per process
+- would this be too much per Firefox tab?
+
+Have `fn process` take a set of input `Datagram`'s and a set of to-be-written-to output `Datagrams`.
+
+``` rust
+fn process<'a>(&mut self, input: impl Iterator<Item = &'a Datagram>, output: impl Iterator<Item = &'a mut Datagram>, now: Instant) -> Option<Duration>
+```
+
+- process datagrams in batches
+- `input` `Datagram`s are a view into the `read` buffer and `output` `Datagram`s are a view into the  `write` buffer thus **no allocation**
+- we can as well wrap the iterators in separate types, offering stricter access methods to prevent misuse
+
+Have `Socket::send` and `Socket::recv` take `write` and `read` buffer respectively.
+
+Have `Datagram` carry a `segment_size` (taken from `quinn-udp`).
+
+``` diff
+  #[derive(Clone, PartialEq, Eq)]
+  pub struct Datagram {
+      src: SocketAddr,
+      dst: SocketAddr,
+      tos: IpTos,
+      ttl: Option<u8>,
+      d: Vec<u8>,
++     /// The segment size if this transmission contains multiple datagrams.
++     /// This is `None` if the [`Datagram`] only contains a single datagram
++     segment_size: Option<usize>,
+  }
+```
+
+- a single `process` call can write one or more (same size) datagrams for a single destination into a _single_ `Datagram`
+
+### Next steps
+
+- [ ] Write benchmarks
+    - [x] https://github.com/mozilla/neqo/pull/1758
+    - [ ] More is always good
+- [ ] Expose `quinn-udp`s multi-packet APIs through `neqo_common::udp`
+    - [ ] https://github.com/mozilla/neqo/pull/1741
+- [ ] Pass multiple packets to and accept from `neqo-http3` / `neqo-transport` `process` method.
+    - [ ] changing the function signature and simply iterating over the datagrams like [`process_multiple_input`](https://github.com/mozilla/neqo/blob/aca1352b6bf93d8fe2cf0f627dc2fdf83a0bf95d/neqo-transport/src/connection/mod.rs#L984-L1000) is easy, taking actual advantage of accessing the whole batch at once is hard
+
+### Past discussions
+
+- https://github.com/mozilla/neqo/pull/1530/
+- Would close https://github.com/mozilla/neqo/issues/1206.
+
+
+
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-bin/src/client/mod.rs b/neqo-bin/src/client/mod.rs
+--- a/neqo-bin/src/client/mod.rs
++++ b/neqo-bin/src/client/mod.rs
+@@ -418,7 +418,7 @@ impl<'a, H: Handler> Runner<'a, H> {
+             match self.client.process_output(Instant::now()) {
+                 Output::Datagram(dgram) => {
+                     self.socket.writable().await?;
+-                    self.socket.send(dgram)?;
++                    self.socket.send(&dgram)?;
+                 }
+                 Output::Callback(new_timeout) => {
+                     qdebug!("Setting timeout of {:?}", new_timeout);
+
+diff --git a/neqo-bin/src/server/mod.rs b/neqo-bin/src/server/mod.rs
+--- a/neqo-bin/src/server/mod.rs
++++ b/neqo-bin/src/server/mod.rs
+@@ -232,7 +232,7 @@ impl ServerRunner {
+                 Output::Datagram(dgram) => {
+                     let socket = self.find_socket(dgram.source());
+                     socket.writable().await?;
+-                    socket.send(dgram)?;
++                    socket.send(&dgram)?;
+                 }
+                 Output::Callback(new_timeout) => {
+                     qdebug!("Setting timeout of {:?}", new_timeout);
+
+diff --git a/neqo-bin/src/udp.rs b/neqo-bin/src/udp.rs
+--- a/neqo-bin/src/udp.rs
++++ b/neqo-bin/src/udp.rs
+@@ -58,22 +58,19 @@ impl Socket {
+     }
+ 
+     /// Send the UDP datagram on the specified socket.
+-    pub fn send(&self, d: Datagram) -> io::Result<()> {
++    pub fn send(&self, d: &Datagram) -> io::Result<()> {
+         let transmit = Transmit {
+             destination: d.destination(),
+             ecn: EcnCodepoint::from_bits(Into::<u8>::into(d.tos())),
+-            contents: Vec::from(d).into(),
++            contents: d,
+             segment_size: None,
+             src_ip: None,
+         };
+ 
+-        let n = self.socket.try_io(Interest::WRITABLE, || {
+-            self.state
+-                .send((&self.socket).into(), slice::from_ref(&transmit))
++        self.socket.try_io(Interest::WRITABLE, || {
++            self.state.send((&self.socket).into(), &transmit)
+         })?;
+ 
+-        assert_eq!(n, 1, "only passed one slice");
+-
+         Ok(())
+     }
+ 
+@@ -149,7 +146,7 @@ mod tests {
+         );
+ 
+         sender.writable().await?;
+-        sender.send(datagram.clone())?;
++        sender.send(&datagram)?;
+ 
+         receiver.readable().await?;
+         let received_datagram = receiver
+@@ -189,17 +186,14 @@ mod tests {
+                 IpTosDscp::Le,
+                 IpTosEcn::Ect1,
+             )))),
+-            contents: msg.clone().into(),
++            contents: &msg,
+             segment_size: Some(SEGMENT_SIZE),
+             src_ip: None,
+         };
+         sender.writable().await?;
+-        let n = sender.socket.try_io(Interest::WRITABLE, || {
+-            sender
+-                .state
+-                .send((&sender.socket).into(), slice::from_ref(&transmit))
++        sender.socket.try_io(Interest::WRITABLE, || {
++            sender.state.send((&sender.socket).into(), &transmit)
+         })?;
+-        assert_eq!(n, 1, "only passed one slice");
+ 
+         // Allow for one GSO sendmmsg to result in multiple GRO recvmmsg.
+         let mut num_received = 0;
+
+diff --git a/neqo-common/src/datagram.rs b/neqo-common/src/datagram.rs
+--- a/neqo-common/src/datagram.rs
++++ b/neqo-common/src/datagram.rs
+@@ -81,12 +81,6 @@ impl std::fmt::Debug for Datagram {
+     }
+ }
+ 
+-impl From<Datagram> for Vec<u8> {
+-    fn from(datagram: Datagram) -> Self {
+-        datagram.d
+-    }
+-}
+-
+ #[cfg(test)]
+ use test_fixture::datagram;
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

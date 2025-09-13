@@ -1,0 +1,569 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+`http3` QNS test failing with quiche
+For example, https://github.com/mozilla/neqo/actions/runs/9984006511/job/27593040941#step:6:708
+```
+server  | 4s622ms TRACE Decoded uint 4012674743313439673
+server  | 4s622ms INFO [Http3 server connection] Connection error: HTTP/3 error: HttpFrame.
+```
+The first line comes from https://github.com/mozilla/neqo/blob/9e3ff0d95dd6ee06b70c45511015c59a4e3e47cb/neqo-http3/src/stream_type_reader.rs#L131
+
+The error comes from https://github.com/mozilla/neqo/blob/9e3ff0d95dd6ee06b70c45511015c59a4e3e47cb/neqo-http3/src/stream_type_reader.rs#L144
+
+I.e., from https://github.com/mozilla/neqo/blob/9e3ff0d95dd6ee06b70c45511015c59a4e3e47cb/neqo-http3/src/stream_type_reader.rs#L55
+
+Based on the value `4012674743313439673`, it really does look though like the `self.read` call in https://github.com/mozilla/neqo/blob/9e3ff0d95dd6ee06b70c45511015c59a4e3e47cb/neqo-http3/src/stream_type_reader.rs#L122
+returns garbage?
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-http3/src/connection.rs b/neqo-http3/src/connection.rs
+--- a/neqo-http3/src/connection.rs
++++ b/neqo-http3/src/connection.rs
+@@ -533,7 +533,9 @@ impl Http3Connection {
+                 Ok(ReceiveOutput::ControlFrames(rest))
+             }
+             ReceiveOutput::NewStream(
+-                NewStreamType::Push(_) | NewStreamType::Http | NewStreamType::WebTransportStream(_),
++                NewStreamType::Push(_)
++                | NewStreamType::Http(_)
++                | NewStreamType::WebTransportStream(_),
+             ) => Ok(output),
+             ReceiveOutput::NewStream(_) => {
+                 unreachable!("NewStream should have been handled already")
+@@ -723,7 +725,7 @@ impl Http3Connection {
+                     )),
+                 );
+             }
+-            NewStreamType::Http => {
++            NewStreamType::Http(_) => {
+                 qinfo!([self], "A new http stream {}.", stream_id);
+             }
+             NewStreamType::WebTransportStream(session_id) => {
+@@ -755,9 +757,9 @@ impl Http3Connection {
+             NewStreamType::Control | NewStreamType::Decoder | NewStreamType::Encoder => {
+                 self.stream_receive(conn, stream_id)
+             }
+-            NewStreamType::Push(_) | NewStreamType::Http | NewStreamType::WebTransportStream(_) => {
+-                Ok(ReceiveOutput::NewStream(stream_type))
+-            }
++            NewStreamType::Push(_)
++            | NewStreamType::Http(_)
++            | NewStreamType::WebTransportStream(_) => Ok(ReceiveOutput::NewStream(stream_type)),
+             NewStreamType::Unknown => Ok(ReceiveOutput::NoOutput),
+         }
+     }
+@@ -919,7 +921,7 @@ impl Http3Connection {
+                     message_type: MessageType::Response,
+                     stream_type,
+                     stream_id,
+-                    header_frame_type_read: false,
++                    first_frame_type: None,
+                 },
+                 Rc::clone(&self.qpack_decoder),
+                 recv_events,
+
+diff --git a/neqo-http3/src/connection_client.rs b/neqo-http3/src/connection_client.rs
+--- a/neqo-http3/src/connection_client.rs
++++ b/neqo-http3/src/connection_client.rs
+@@ -1094,7 +1094,7 @@ impl Http3Client {
+             ReceiveOutput::NewStream(NewStreamType::Push(push_id)) => {
+                 self.handle_new_push_stream(stream_id, push_id)
+             }
+-            ReceiveOutput::NewStream(NewStreamType::Http) => Err(Error::HttpStreamCreation),
++            ReceiveOutput::NewStream(NewStreamType::Http(_)) => Err(Error::HttpStreamCreation),
+             ReceiveOutput::NewStream(NewStreamType::WebTransportStream(session_id)) => {
+                 self.base_handler.webtransport_create_stream_remote(
+                     StreamId::from(session_id),
+@@ -1162,7 +1162,7 @@ impl Http3Client {
+                     message_type: MessageType::Response,
+                     stream_type: Http3StreamType::Push,
+                     stream_id,
+-                    header_frame_type_read: false,
++                    first_frame_type: None,
+                 },
+                 Rc::clone(&self.base_handler.qpack_decoder),
+                 Box::new(RecvPushEvents::new(push_id, Rc::clone(&self.push_handler))),
+
+diff --git a/neqo-http3/src/connection_server.rs b/neqo-http3/src/connection_server.rs
+--- a/neqo-http3/src/connection_server.rs
++++ b/neqo-http3/src/connection_server.rs
+@@ -318,7 +318,7 @@ impl Http3ServerHandler {
+     fn handle_stream_readable(&mut self, conn: &mut Connection, stream_id: StreamId) -> Res<()> {
+         match self.base_handler.handle_stream_readable(conn, stream_id)? {
+             ReceiveOutput::NewStream(NewStreamType::Push(_)) => Err(Error::HttpStreamCreation),
+-            ReceiveOutput::NewStream(NewStreamType::Http) => {
++            ReceiveOutput::NewStream(NewStreamType::Http(first_frame_type)) => {
+                 self.base_handler.add_streams(
+                     stream_id,
+                     Box::new(SendMessage::new(
+@@ -333,7 +333,7 @@ impl Http3ServerHandler {
+                             message_type: MessageType::Request,
+                             stream_type: Http3StreamType::Http,
+                             stream_id,
+-                            header_frame_type_read: true,
++                            first_frame_type: Some(first_frame_type),
+                         },
+                         Rc::clone(&self.base_handler.qpack_decoder),
+                         Box::new(self.events.clone()),
+
+diff --git a/neqo-http3/src/features/extended_connect/webtransport_session.rs b/neqo-http3/src/features/extended_connect/webtransport_session.rs
+--- a/neqo-http3/src/features/extended_connect/webtransport_session.rs
++++ b/neqo-http3/src/features/extended_connect/webtransport_session.rs
+@@ -70,7 +70,7 @@ impl WebTransportSession {
+                     message_type: MessageType::Response,
+                     stream_type: Http3StreamType::ExtendedConnect,
+                     stream_id: session_id,
+-                    header_frame_type_read: false,
++                    first_frame_type: None,
+                 },
+                 qpack_decoder,
+                 Box::new(stream_event_listener.clone()),
+
+diff --git a/neqo-http3/src/frames/hframe.rs b/neqo-http3/src/frames/hframe.rs
+--- a/neqo-http3/src/frames/hframe.rs
++++ b/neqo-http3/src/frames/hframe.rs
+@@ -12,19 +12,31 @@ use neqo_transport::StreamId;
+ 
+ use crate::{frames::reader::FrameDecoder, settings::HSettings, Error, Priority, Res};
+ 
+-pub type HFrameType = u64;
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct HFrameType(pub u64);
+ 
+-pub const H3_FRAME_TYPE_DATA: HFrameType = 0x0;
+-pub const H3_FRAME_TYPE_HEADERS: HFrameType = 0x1;
+-pub const H3_FRAME_TYPE_CANCEL_PUSH: HFrameType = 0x3;
+-pub const H3_FRAME_TYPE_SETTINGS: HFrameType = 0x4;
+-pub const H3_FRAME_TYPE_PUSH_PROMISE: HFrameType = 0x5;
+-pub const H3_FRAME_TYPE_GOAWAY: HFrameType = 0x7;
+-pub const H3_FRAME_TYPE_MAX_PUSH_ID: HFrameType = 0xd;
+-pub const H3_FRAME_TYPE_PRIORITY_UPDATE_REQUEST: HFrameType = 0xf0700;
+-pub const H3_FRAME_TYPE_PRIORITY_UPDATE_PUSH: HFrameType = 0xf0701;
++pub const H3_FRAME_TYPE_DATA: HFrameType = HFrameType(0x0);
++pub const H3_FRAME_TYPE_HEADERS: HFrameType = HFrameType(0x1);
++pub const H3_FRAME_TYPE_CANCEL_PUSH: HFrameType = HFrameType(0x3);
++pub const H3_FRAME_TYPE_SETTINGS: HFrameType = HFrameType(0x4);
++pub const H3_FRAME_TYPE_PUSH_PROMISE: HFrameType = HFrameType(0x5);
++pub const H3_FRAME_TYPE_GOAWAY: HFrameType = HFrameType(0x7);
++pub const H3_FRAME_TYPE_MAX_PUSH_ID: HFrameType = HFrameType(0xd);
++pub const H3_FRAME_TYPE_PRIORITY_UPDATE_REQUEST: HFrameType = HFrameType(0xf0700);
++pub const H3_FRAME_TYPE_PRIORITY_UPDATE_PUSH: HFrameType = HFrameType(0xf0701);
+ 
+-pub const H3_RESERVED_FRAME_TYPES: &[HFrameType] = &[0x2, 0x6, 0x8, 0x9];
++pub const H3_RESERVED_FRAME_TYPES: &[HFrameType] = &[
++    HFrameType(0x2),
++    HFrameType(0x6),
++    HFrameType(0x8),
++    HFrameType(0x9),
++];
++
++impl From<HFrameType> for u64 {
++    fn from(t: HFrameType) -> Self {
++        t.0
++    }
++}
+ 
+ // data for DATA frame is not read into HFrame::Data.
+ #[derive(PartialEq, Eq, Debug)]
+@@ -74,7 +86,9 @@ impl HFrame {
+             Self::MaxPushId { .. } => H3_FRAME_TYPE_MAX_PUSH_ID,
+             Self::PriorityUpdateRequest { .. } => H3_FRAME_TYPE_PRIORITY_UPDATE_REQUEST,
+             Self::PriorityUpdatePush { .. } => H3_FRAME_TYPE_PRIORITY_UPDATE_PUSH,
+-            Self::Grease => Decoder::from(&random::<7>()).decode_uint(7).unwrap() * 0x1f + 0x21,
++            Self::Grease => {
++                HFrameType(Decoder::from(&random::<7>()).decode_uint(7).unwrap() * 0x1f + 0x21)
++            }
+         }
+     }
+ 
+@@ -143,14 +157,14 @@ impl HFrame {
+ }
+ 
+ impl FrameDecoder<Self> for HFrame {
+-    fn frame_type_allowed(frame_type: u64) -> Res<()> {
++    fn frame_type_allowed(frame_type: HFrameType) -> Res<()> {
+         if H3_RESERVED_FRAME_TYPES.contains(&frame_type) {
+             return Err(Error::HttpFrameUnexpected);
+         }
+         Ok(())
+     }
+ 
+-    fn decode(frame_type: u64, frame_len: u64, data: Option<&[u8]>) -> Res<Option<Self>> {
++    fn decode(frame_type: HFrameType, frame_len: u64, data: Option<&[u8]>) -> Res<Option<Self>> {
+         if frame_type == H3_FRAME_TYPE_DATA {
+             Ok(Some(Self::Data { len: frame_len }))
+         } else if let Some(payload) = data {
+@@ -207,7 +221,7 @@ impl FrameDecoder<Self> for HFrame {
+         }
+     }
+ 
+-    fn is_known_type(frame_type: u64) -> bool {
++    fn is_known_type(frame_type: HFrameType) -> bool {
+         matches!(
+             frame_type,
+             H3_FRAME_TYPE_DATA
+
+diff --git a/neqo-http3/src/frames/reader.rs b/neqo-http3/src/frames/reader.rs
+--- a/neqo-http3/src/frames/reader.rs
++++ b/neqo-http3/src/frames/reader.rs
+@@ -14,23 +14,25 @@ use neqo_common::{
+ };
+ use neqo_transport::{Connection, StreamId};
+ 
++use super::hframe::HFrameType;
+ use crate::{Error, RecvStream, Res};
+ 
+ const MAX_READ_SIZE: usize = 4096;
+ 
+ pub trait FrameDecoder<T> {
+-    fn is_known_type(frame_type: u64) -> bool;
++    fn is_known_type(frame_type: HFrameType) -> bool;
++
+     /// # Errors
+     ///
+     /// Returns `HttpFrameUnexpected` if frames is not alowed, i.e. is a `H3_RESERVED_FRAME_TYPES`.
+-    fn frame_type_allowed(_frame_type: u64) -> Res<()> {
++    fn frame_type_allowed(_frame_type: HFrameType) -> Res<()> {
+         Ok(())
+     }
+ 
+     /// # Errors
+     ///
+     /// If a frame cannot be properly decoded.
+-    fn decode(frame_type: u64, frame_len: u64, data: Option<&[u8]>) -> Res<Option<T>>;
++    fn decode(frame_type: HFrameType, frame_len: u64, data: Option<&[u8]>) -> Res<Option<T>>;
+ }
+ 
+ pub trait StreamReader {
+@@ -95,7 +97,7 @@ enum FrameReaderState {
+ #[derive(Debug)]
+ pub struct FrameReader {
+     state: FrameReaderState,
+-    frame_type: u64,
++    frame_type: HFrameType,
+     frame_len: u64,
+ }
+ 
+@@ -112,13 +114,13 @@ impl FrameReader {
+             state: FrameReaderState::GetType {
+                 decoder: IncrementalDecoderUint::default(),
+             },
+-            frame_type: 0,
++            frame_type: HFrameType(u64::MAX),
+             frame_len: 0,
+         }
+     }
+ 
+     #[must_use]
+-    pub fn new_with_type(frame_type: u64) -> Self {
++    pub fn new_with_type(frame_type: HFrameType) -> Self {
+         Self {
+             state: FrameReaderState::GetLength {
+                 decoder: IncrementalDecoderUint::default(),
+@@ -202,13 +204,13 @@ impl FrameReader {
+             FrameReaderState::GetType { decoder } => {
+                 if let Some(v) = decoder.consume(&mut input) {
+                     qtrace!("FrameReader::receive: read frame type {}", v);
+-                    self.frame_type_decoded::<T>(v)?;
++                    self.frame_type_decoded::<T>(HFrameType(v))?;
+                 }
+             }
+             FrameReaderState::GetLength { decoder } => {
+                 if let Some(len) = decoder.consume(&mut input) {
+                     qtrace!(
+-                        "FrameReader::receive: frame type {} length {}",
++                        "FrameReader::receive: frame type {:?} length {}",
+                         self.frame_type,
+                         len
+                     );
+@@ -218,7 +220,7 @@ impl FrameReader {
+             FrameReaderState::GetData { decoder } => {
+                 if let Some(data) = decoder.consume(&mut input) {
+                     qtrace!(
+-                        "received frame {}: {}",
++                        "received frame {:?}: {}",
+                         self.frame_type,
+                         hex_with_len(&data[..])
+                     );
+@@ -236,7 +238,7 @@ impl FrameReader {
+ }
+ 
+ impl FrameReader {
+-    fn frame_type_decoded<T: FrameDecoder<T>>(&mut self, frame_type: u64) -> Res<()> {
++    fn frame_type_decoded<T: FrameDecoder<T>>(&mut self, frame_type: HFrameType) -> Res<()> {
+         T::frame_type_allowed(frame_type)?;
+         self.frame_type = frame_type;
+         self.state = FrameReaderState::GetLength {
+
+diff --git a/neqo-http3/src/frames/wtframe.rs b/neqo-http3/src/frames/wtframe.rs
+--- a/neqo-http3/src/frames/wtframe.rs
++++ b/neqo-http3/src/frames/wtframe.rs
+@@ -6,6 +6,7 @@
+ 
+ use neqo_common::{Decoder, Encoder};
+ 
++use super::hframe::HFrameType;
+ use crate::{frames::reader::FrameDecoder, Error, Res};
+ 
+ pub type WebTransportFrameType = u64;
+@@ -29,10 +30,10 @@ impl WebTransportFrame {
+ }
+ 
+ impl FrameDecoder<Self> for WebTransportFrame {
+-    fn decode(frame_type: u64, frame_len: u64, data: Option<&[u8]>) -> Res<Option<Self>> {
++    fn decode(frame_type: HFrameType, frame_len: u64, data: Option<&[u8]>) -> Res<Option<Self>> {
+         if let Some(payload) = data {
+             let mut dec = Decoder::from(payload);
+-            if frame_type == WT_FRAME_CLOSE_SESSION {
++            if frame_type == HFrameType(WT_FRAME_CLOSE_SESSION) {
+                 if frame_len > WT_FRAME_CLOSE_MAX_MESSAGE_SIZE + 4 {
+                     return Err(Error::HttpMessageError);
+                 }
+@@ -50,7 +51,7 @@ impl FrameDecoder<Self> for WebTransportFrame {
+         }
+     }
+ 
+-    fn is_known_type(frame_type: u64) -> bool {
+-        frame_type == WT_FRAME_CLOSE_SESSION
++    fn is_known_type(frame_type: HFrameType) -> bool {
++        frame_type == HFrameType(WT_FRAME_CLOSE_SESSION)
+     }
+ }
+
+diff --git a/neqo-http3/src/recv_message.rs b/neqo-http3/src/recv_message.rs
+--- a/neqo-http3/src/recv_message.rs
++++ b/neqo-http3/src/recv_message.rs
+@@ -11,7 +11,7 @@ use neqo_qpack::decoder::QPackDecoder;
+ use neqo_transport::{Connection, StreamId};
+ 
+ use crate::{
+-    frames::{FrameReader, HFrame, StreamReaderConnectionWrapper, H3_FRAME_TYPE_HEADERS},
++    frames::{hframe::HFrameType, FrameReader, HFrame, StreamReaderConnectionWrapper},
+     headers_checks::{headers_valid, is_interim},
+     priority::PriorityHandler,
+     push_controller::PushController,
+@@ -24,7 +24,7 @@ pub struct RecvMessageInfo {
+     pub message_type: MessageType,
+     pub stream_type: Http3StreamType,
+     pub stream_id: StreamId,
+-    pub header_frame_type_read: bool,
++    pub first_frame_type: Option<u64>,
+ }
+ 
+ /*
+@@ -94,11 +94,11 @@ impl RecvMessage {
+     ) -> Self {
+         Self {
+             state: RecvMessageState::WaitingForResponseHeaders {
+-                frame_reader: if message_info.header_frame_type_read {
+-                    FrameReader::new_with_type(H3_FRAME_TYPE_HEADERS)
+-                } else {
+-                    FrameReader::new()
+-                },
++                frame_reader: message_info
++                    .first_frame_type
++                    .map_or_else(FrameReader::new, |frame_type| {
++                        FrameReader::new_with_type(HFrameType(frame_type))
++                    }),
+             },
+             message_type: message_info.message_type,
+             stream_type: message_info.stream_type,
+
+diff --git a/neqo-http3/src/stream_type_reader.rs b/neqo-http3/src/stream_type_reader.rs
+--- a/neqo-http3/src/stream_type_reader.rs
++++ b/neqo-http3/src/stream_type_reader.rs
+@@ -9,8 +9,9 @@ use neqo_qpack::{decoder::QPACK_UNI_STREAM_TYPE_DECODER, encoder::QPACK_UNI_STRE
+ use neqo_transport::{Connection, StreamId, StreamType};
+ 
+ use crate::{
+-    control_stream_local::HTTP3_UNI_STREAM_TYPE_CONTROL, frames::H3_FRAME_TYPE_HEADERS, CloseType,
+-    Error, Http3StreamType, ReceiveOutput, RecvStream, Res, Stream,
++    control_stream_local::HTTP3_UNI_STREAM_TYPE_CONTROL,
++    frames::{hframe::HFrameType, reader::FrameDecoder, HFrame, H3_FRAME_TYPE_HEADERS},
++    CloseType, Error, Http3StreamType, ReceiveOutput, RecvStream, Res, Stream,
+ };
+ 
+ pub const HTTP3_UNI_STREAM_TYPE_PUSH: u64 = 0x1;
+@@ -24,7 +25,7 @@ pub enum NewStreamType {
+     Encoder,
+     Push(u64),
+     WebTransportStream(u64),
+-    Http,
++    Http(u64),
+     Unknown,
+ }
+ 
+@@ -37,7 +38,7 @@ impl NewStreamType {
+     ///
+     /// Push streams received by the server are not allowed and this function will return
+     /// `HttpStreamCreation` error.
+-    const fn final_stream_type(
++    fn final_stream_type(
+         stream_type: u64,
+         trans_stream_type: StreamType,
+         role: Role,
+@@ -49,8 +50,18 @@ impl NewStreamType {
+             (HTTP3_UNI_STREAM_TYPE_PUSH, StreamType::UniDi, Role::Client)
+             | (WEBTRANSPORT_UNI_STREAM, StreamType::UniDi, _)
+             | (WEBTRANSPORT_STREAM, StreamType::BiDi, _) => Ok(None),
+-            (H3_FRAME_TYPE_HEADERS, StreamType::BiDi, Role::Server) => Ok(Some(Self::Http)),
+-            (_, StreamType::BiDi, Role::Server) => Err(Error::HttpFrame),
++            (_, StreamType::BiDi, Role::Server) => {
++                // The "stream_type" for a bidirectional stream is a frame type. We accept
++                // WEBTRANSPORT_STREAM (above), and HEADERS, and we have to ignore unknown types,
++                // but any other frame type is bad if we know about it.
++                if <HFrame as FrameDecoder<HFrame>>::is_known_type(HFrameType(stream_type))
++                    && HFrameType(stream_type) != H3_FRAME_TYPE_HEADERS
++                {
++                    Err(Error::HttpFrame)
++                } else {
++                    Ok(Some(Self::Http(stream_type)))
++                }
++            }
+             (HTTP3_UNI_STREAM_TYPE_PUSH, StreamType::UniDi, Role::Server)
+             | (_, StreamType::BiDi, Role::Client) => Err(Error::HttpStreamCreation),
+             _ => Ok(Some(Self::Unknown)),
+@@ -190,7 +201,7 @@ impl NewStreamHeadReader {
+                 Err(Error::HttpClosedCriticalStream)
+             }
+             None => Err(Error::HttpStreamCreation),
+-            Some(NewStreamType::Http) => Err(Error::HttpFrame),
++            Some(NewStreamType::Http(_)) => Err(Error::HttpFrame),
+             Some(NewStreamType::Unknown) => Ok(decoded),
+             Some(NewStreamType::Push(_) | NewStreamType::WebTransportStream(_)) => {
+                 unreachable!("PushStream and WebTransport are mapped to None at this stage.")
+@@ -216,9 +227,9 @@ impl RecvStream for NewStreamHeadReader {
+     }
+ 
+     fn receive(&mut self, conn: &mut Connection) -> Res<(ReceiveOutput, bool)> {
++        let t = self.get_type(conn)?;
+         Ok((
+-            self.get_type(conn)?
+-                .map_or(ReceiveOutput::NoOutput, ReceiveOutput::NewStream),
++            t.map_or(ReceiveOutput::NoOutput, ReceiveOutput::NewStream),
+             self.done(),
+         ))
+     }
+@@ -240,7 +251,8 @@ mod tests {
+         WEBTRANSPORT_UNI_STREAM,
+     };
+     use crate::{
+-        control_stream_local::HTTP3_UNI_STREAM_TYPE_CONTROL, frames::H3_FRAME_TYPE_HEADERS,
++        control_stream_local::HTTP3_UNI_STREAM_TYPE_CONTROL,
++        frames::{H3_FRAME_TYPE_HEADERS, H3_FRAME_TYPE_SETTINGS},
+         CloseType, Error, NewStreamType, ReceiveOutput, RecvStream, Res,
+     };
+ 
+@@ -384,16 +396,20 @@ mod tests {
+     fn decode_stream_http() {
+         let mut t = Test::new(StreamType::BiDi, Role::Server);
+         t.decode(
+-            &[H3_FRAME_TYPE_HEADERS],
++            &[u64::from(H3_FRAME_TYPE_HEADERS)],
+             false,
+-            &Ok((ReceiveOutput::NewStream(NewStreamType::Http), true)),
++            &Ok((
++                ReceiveOutput::NewStream(NewStreamType::Http(u64::from(H3_FRAME_TYPE_HEADERS))),
++                true,
++            )),
+             true,
+         );
+ 
+         let mut t = Test::new(StreamType::UniDi, Role::Server);
+         t.decode(
+-            &[H3_FRAME_TYPE_HEADERS], /* this is the same as a HTTP3_UNI_STREAM_TYPE_PUSH which
+-                                       * is not aallowed on the server side. */
++            &[u64::from(H3_FRAME_TYPE_HEADERS)], /* this is the same as a
++                                                  * HTTP3_UNI_STREAM_TYPE_PUSH which
++                                                  * is not aallowed on the server side. */
+             false,
+             &Err(Error::HttpStreamCreation),
+             true,
+@@ -401,7 +417,7 @@ mod tests {
+ 
+         let mut t = Test::new(StreamType::BiDi, Role::Client);
+         t.decode(
+-            &[H3_FRAME_TYPE_HEADERS],
++            &[u64::from(H3_FRAME_TYPE_HEADERS)],
+             false,
+             &Err(Error::HttpStreamCreation),
+             true,
+@@ -409,8 +425,8 @@ mod tests {
+ 
+         let mut t = Test::new(StreamType::UniDi, Role::Client);
+         t.decode(
+-            &[H3_FRAME_TYPE_HEADERS, 0xaaaa_aaaa], /* this is the same as a
+-                                                    * HTTP3_UNI_STREAM_TYPE_PUSH */
++            &[u64::from(H3_FRAME_TYPE_HEADERS), 0xaaaa_aaaa], /* this is the same as a
++                                                               * HTTP3_UNI_STREAM_TYPE_PUSH */
+             false,
+             &Ok((
+                 ReceiveOutput::NewStream(NewStreamType::Push(0xaaaa_aaaa)),
+@@ -418,6 +434,14 @@ mod tests {
+             )),
+             true,
+         );
++
++        let mut t = Test::new(StreamType::BiDi, Role::Server);
++        t.decode(
++            &[H3_FRAME_TYPE_SETTINGS.into()],
++            true,
++            &Err(Error::HttpFrame),
++            true,
++        );
+     }
+ 
+     #[test]
+@@ -478,7 +502,8 @@ mod tests {
+         t.decode(
+             &[WEBTRANSPORT_UNI_STREAM],
+             false,
+-            &Err(Error::HttpFrame),
++            // WEBTRANSPORT_UNI_STREAM is treated as an unknown frame type here.
++            &Ok((ReceiveOutput::NewStream(NewStreamType::Http(84)), true)),
+             true,
+         );
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

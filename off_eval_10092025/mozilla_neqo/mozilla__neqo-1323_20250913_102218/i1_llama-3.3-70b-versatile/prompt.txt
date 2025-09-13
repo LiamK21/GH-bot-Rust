@@ -1,0 +1,512 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Remove InternalErrors added in #1085
+Maybe we can remove all InternalErrors
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-qpack/src/encoder.rs b/neqo-qpack/src/encoder.rs
+--- a/neqo-qpack/src/encoder.rs
++++ b/neqo-qpack/src/encoder.rs
+@@ -312,7 +312,7 @@ impl QPackEncoder {
+                     false,
+                     "can_evict_to should have checked and make sure this operation is possible"
+                 );
+-                return Err(Error::InternalError(1));
++                return Err(Error::InternalError);
+             }
+             self.max_entries = cap / 32;
+             self.next_capacity = None;
+@@ -530,7 +530,7 @@ fn map_stream_send_atomic_error(err: &TransportError) -> Error {
+         }
+         _ => {
+             debug_assert!(false, "Unexpected error");
+-            Error::InternalError(2)
++            Error::InternalError
+         }
+     }
+ }
+
+diff --git a/neqo-qpack/src/lib.rs b/neqo-qpack/src/lib.rs
+--- a/neqo-qpack/src/lib.rs
++++ b/neqo-qpack/src/lib.rs
+@@ -45,7 +45,7 @@ pub enum Error {
+     EncoderStream,
+     DecoderStream,
+     ClosedCriticalStream,
+-    InternalError(u16),
++    InternalError,
+ 
+     // These are internal errors, they will be transformed into one of the above.
+     NeedMoreData, /* Return when an input stream does not have more data that a decoder
+
+diff --git a/neqo-server/src/main.rs b/neqo-server/src/main.rs
+--- a/neqo-server/src/main.rs
++++ b/neqo-server/src/main.rs
+@@ -29,8 +29,6 @@ use futures::{
+     future::{select, select_all, Either},
+     FutureExt,
+ };
+-use tokio::{net::UdpSocket, time::Sleep};
+-
+ use neqo_common::{hex, qdebug, qinfo, qwarn, Datagram, Header, IpTos};
+ use neqo_crypto::{
+     constants::{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256},
+@@ -45,6 +43,7 @@ use neqo_transport::{
+     Version,
+ };
+ use structopt::StructOpt;
++use tokio::{net::UdpSocket, time::Sleep};
+ 
+ use crate::old_https::Http09Server;
+
+diff --git a/neqo-transport/src/addr_valid.rs b/neqo-transport/src/addr_valid.rs
+--- a/neqo-transport/src/addr_valid.rs
++++ b/neqo-transport/src/addr_valid.rs
+@@ -20,8 +20,7 @@ use neqo_crypto::{
+ use smallvec::SmallVec;
+ 
+ use crate::{
+-    cid::ConnectionId, packet::PacketBuilder, recovery::RecoveryToken, stats::FrameStats, Error,
+-    Res,
++    cid::ConnectionId, packet::PacketBuilder, recovery::RecoveryToken, stats::FrameStats, Res,
+ };
+ 
+ /// A prefix we add to Retry tokens to distinguish them from NEW_TOKEN tokens.
+@@ -434,9 +433,6 @@ impl NewTokenSender {
+ 
+                 builder.encode_varint(crate::frame::FRAME_TYPE_NEW_TOKEN);
+                 builder.encode_vvec(&t.token);
+-                if builder.len() > builder.limit() {
+-                    return Err(Error::InternalError(7));
+-                }
+ 
+                 tokens.push(RecoveryToken::NewToken(t.seqno));
+                 stats.new_token += 1;
+
+diff --git a/neqo-transport/src/cid.rs b/neqo-transport/src/cid.rs
+--- a/neqo-transport/src/cid.rs
++++ b/neqo-transport/src/cid.rs
+@@ -532,10 +532,6 @@ impl ConnectionIdManager {
+         builder.encode_varint(0u64);
+         builder.encode_vec(1, &entry.cid);
+         builder.encode(&entry.srt);
+-        if builder.len() > builder.limit() {
+-            return Err(Error::InternalError(8));
+-        }
+-
+         stats.new_connection_id += 1;
+         Ok(true)
+     }
+
+diff --git a/neqo-transport/src/connection/mod.rs b/neqo-transport/src/connection/mod.rs
+--- a/neqo-transport/src/connection/mod.rs
++++ b/neqo-transport/src/connection/mod.rs
+@@ -1935,9 +1935,6 @@ impl Connection {
+                 .as_ref()
+                 .unwrap_or(&close)
+                 .write_frame(&mut builder);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(10));
+-            }
+             encoder = builder.build(tx)?;
+         }
+ 
+@@ -1982,7 +1979,7 @@ impl Connection {
+         if builder.is_full() {
+             return Ok(());
+         }
+-        self.paths.write_frames(builder, tokens, frame_stats)?;
++        self.paths.write_frames(builder, tokens, frame_stats);
+         if builder.is_full() {
+             return Ok(());
+         }
+@@ -2107,7 +2104,7 @@ impl Connection {
+                 builder,
+                 &mut tokens,
+                 stats,
+-            )?;
++            );
+         }
+         let ack_end = builder.len();
+ 
+@@ -2122,7 +2119,7 @@ impl Connection {
+                 &mut self.stats.borrow_mut().frame_tx,
+                 full_mtu,
+                 now,
+-            )? {
++            ) {
+                 builder.enable_padding(true);
+             }
+         }
+
+diff --git a/neqo-transport/src/connection/state.rs b/neqo-transport/src/connection/state.rs
+--- a/neqo-transport/src/connection/state.rs
++++ b/neqo-transport/src/connection/state.rs
+@@ -218,9 +218,6 @@ impl StateSignaling {
+         if matches!(self, Self::HandshakeDone) && builder.remaining() >= 1 {
+             *self = Self::Idle;
+             builder.encode_varint(FRAME_TYPE_HANDSHAKE_DONE);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(14));
+-            }
+             Ok(Some(RecoveryToken::HandshakeDone))
+         } else {
+             Ok(None)
+
+diff --git a/neqo-transport/src/crypto.rs b/neqo-transport/src/crypto.rs
+--- a/neqo-transport/src/crypto.rs
++++ b/neqo-transport/src/crypto.rs
+@@ -225,7 +225,7 @@ impl Crypto {
+                 self.tls.read_secret(TLS_EPOCH_ZERO_RTT),
+             ),
+         };
+-        let secret = secret.ok_or(Error::InternalError(1))?;
++        let secret = secret.ok_or(Error::InternalError)?;
+         self.states
+             .set_0rtt_keys(version, dir, &secret, cipher.unwrap());
+         Ok(true)
+@@ -259,12 +259,12 @@ impl Crypto {
+         let read_secret = self
+             .tls
+             .read_secret(TLS_EPOCH_HANDSHAKE)
+-            .ok_or(Error::InternalError(2))?;
++            .ok_or(Error::InternalError)?;
+         let cipher = match self.tls.info() {
+             None => self.tls.preinfo()?.cipher_suite(),
+             Some(info) => Some(info.cipher_suite()),
+         }
+-        .ok_or(Error::InternalError(3))?;
++        .ok_or(Error::InternalError)?;
+         self.states
+             .set_handshake_keys(self.version, &write_secret, &read_secret, cipher);
+         qdebug!([self], "Handshake keys installed");
+@@ -288,7 +288,7 @@ impl Crypto {
+         let read_secret = self
+             .tls
+             .read_secret(TLS_EPOCH_APPLICATION_DATA)
+-            .ok_or(Error::InternalError(4))?;
++            .ok_or(Error::InternalError)?;
+         self.states
+             .set_application_read_key(version, read_secret, expire_0rtt)?;
+         qdebug!([self], "application read keys installed");
+@@ -662,7 +662,7 @@ impl CryptoDxState {
+         // The numbers in `Self::limit` assume a maximum packet size of 2^11.
+         if body.len() > 2048 {
+             debug_assert!(false);
+-            return Err(Error::InternalError(12));
++            return Err(Error::InternalError);
+         }
+         self.invoked()?;
+ 
+@@ -1550,9 +1550,6 @@ impl CryptoStreams {
+             builder.encode_varint(crate::frame::FRAME_TYPE_CRYPTO);
+             builder.encode_varint(offset);
+             builder.encode_vvec(&data[..length]);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(15));
+-            }
+ 
+             cs.tx.mark_as_sent(offset, length);
+
+diff --git a/neqo-transport/src/lib.rs b/neqo-transport/src/lib.rs
+--- a/neqo-transport/src/lib.rs
++++ b/neqo-transport/src/lib.rs
+@@ -68,7 +68,7 @@ pub enum Error {
+     NoError,
+     // Each time tihe error is return a different parameter is supply.
+     // This will be use to distinguish each occurance of this error.
+-    InternalError(u16),
++    InternalError,
+     ConnectionRefused,
+     FlowControlError,
+     StreamLimitError,
+
+diff --git a/neqo-transport/src/packet/mod.rs b/neqo-transport/src/packet/mod.rs
+--- a/neqo-transport/src/packet/mod.rs
++++ b/neqo-transport/src/packet/mod.rs
+@@ -356,7 +356,7 @@ impl PacketBuilder {
+         if self.len() > self.limit {
+             qwarn!("Packet contents are more than the limit");
+             debug_assert!(false);
+-            return Err(Error::InternalError(5));
++            return Err(Error::InternalError);
+         }
+ 
+         self.pad_for_crypto(crypto);
+
+diff --git a/neqo-transport/src/packet/retry.rs b/neqo-transport/src/packet/retry.rs
+--- a/neqo-transport/src/packet/retry.rs
++++ b/neqo-transport/src/packet/retry.rs
+@@ -45,7 +45,7 @@ where
+     .try_with(|aead| f(&aead.borrow()))
+     .map_err(|e| {
+         qerror!("Unable to access Retry AEAD: {:?}", e);
+-        Error::InternalError(6)
++        Error::InternalError
+     })?
+ }
+
+diff --git a/neqo-transport/src/path.rs b/neqo-transport/src/path.rs
+--- a/neqo-transport/src/path.rs
++++ b/neqo-transport/src/path.rs
+@@ -31,7 +31,7 @@ use crate::{
+     sender::PacketSender,
+     stats::FrameStats,
+     tracking::{PacketNumberSpace, SentPacket},
+-    Error, Res, Stats,
++    Stats,
+ };
+ 
+ /// This is the MTU that we assume when using IPv6.
+@@ -415,7 +415,7 @@ impl Paths {
+         builder: &mut PacketBuilder,
+         tokens: &mut Vec<RecoveryToken>,
+         stats: &mut FrameStats,
+-    ) -> Res<()> {
++    ) {
+         while let Some(seqno) = self.to_retire.pop() {
+             if builder.remaining() < 1 + Encoder::varint_len(seqno) {
+                 self.to_retire.push(seqno);
+@@ -423,9 +423,6 @@ impl Paths {
+             }
+             builder.encode_varint(FRAME_TYPE_RETIRE_CONNECTION_ID);
+             builder.encode_varint(seqno);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(20));
+-            }
+             tokens.push(RecoveryToken::RetireConnectionId(seqno));
+             stats.retire_connection_id += 1;
+         }
+@@ -434,8 +431,6 @@ impl Paths {
+         self.primary()
+             .borrow_mut()
+             .write_cc_frames(builder, tokens, stats);
+-
+-        Ok(())
+     }
+ 
+     pub fn lost_retire_cid(&mut self, lost: u64) {
+@@ -774,9 +769,9 @@ impl Path {
+         stats: &mut FrameStats,
+         mtu: bool, // Whether the packet we're writing into will be a full MTU.
+         now: Instant,
+-    ) -> Res<bool> {
++    ) -> bool {
+         if builder.remaining() < 9 {
+-            return Ok(false);
++            return false;
+         }
+ 
+         // Send PATH_RESPONSE.
+@@ -784,9 +779,6 @@ impl Path {
+             qtrace!([self], "Responding to path challenge {}", hex(challenge));
+             builder.encode_varint(FRAME_TYPE_PATH_RESPONSE);
+             builder.encode(&challenge[..]);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(21));
+-            }
+ 
+             // These frames are not retransmitted in the usual fashion.
+             // There is no token, therefore we need to count `all` specially.
+@@ -794,7 +786,7 @@ impl Path {
+             stats.all += 1;
+ 
+             if builder.remaining() < 9 {
+-                return Ok(true);
++                return true;
+             }
+             true
+         } else {
+@@ -807,9 +799,6 @@ impl Path {
+             let data = <[u8; 8]>::try_from(&random(8)[..]).unwrap();
+             builder.encode_varint(FRAME_TYPE_PATH_CHALLENGE);
+             builder.encode(&data);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(22));
+-            }
+ 
+             // As above, no recovery token.
+             stats.path_challenge += 1;
+@@ -821,9 +810,9 @@ impl Path {
+                 mtu,
+                 sent: now,
+             };
+-            Ok(true)
++            true
+         } else {
+-            Ok(resp_sent)
++            resp_sent
+         }
+     }
+
+diff --git a/neqo-transport/src/tracking.rs b/neqo-transport/src/tracking.rs
+--- a/neqo-transport/src/tracking.rs
++++ b/neqo-transport/src/tracking.rs
+@@ -24,7 +24,6 @@ use crate::{
+     packet::{PacketBuilder, PacketNumber, PacketType},
+     recovery::RecoveryToken,
+     stats::FrameStats,
+-    Error, Res,
+ };
+ 
+ // TODO(mt) look at enabling EnumMap for this: https://stackoverflow.com/a/44905797/1375574
+@@ -724,14 +723,10 @@ impl AckTracker {
+         builder: &mut PacketBuilder,
+         tokens: &mut Vec<RecoveryToken>,
+         stats: &mut FrameStats,
+-    ) -> Res<()> {
++    ) {
+         if let Some(space) = self.get_mut(pn_space) {
+             space.write_frame(now, rtt, builder, tokens, stats);
+-            if builder.len() > builder.limit() {
+-                return Err(Error::InternalError(24));
+-            }
+         }
+-        Ok(())
+     }
+ }
+ 
+@@ -1060,16 +1055,14 @@ mod tests {
+ 
+         let mut tokens = Vec::new();
+         let mut stats = FrameStats::default();
+-        tracker
+-            .write_frame(
+-                PacketNumberSpace::Initial,
+-                *NOW,
+-                RTT,
+-                &mut builder,
+-                &mut tokens,
+-                &mut stats,
+-            )
+-            .unwrap();
++        tracker.write_frame(
++            PacketNumberSpace::Initial,
++            *NOW,
++            RTT,
++            &mut builder,
++            &mut tokens,
++            &mut stats,
++        );
+         assert_eq!(stats.ack, 1);
+ 
+         // Mark another packet as received so we have cause to send another ACK in that space.
+@@ -1088,16 +1081,14 @@ mod tests {
+         assert!(tracker
+             .ack_time(NOW.checked_sub(Duration::from_millis(1)).unwrap())
+             .is_none());
+-        tracker
+-            .write_frame(
+-                PacketNumberSpace::Initial,
+-                *NOW,
+-                RTT,
+-                &mut builder,
+-                &mut tokens,
+-                &mut stats,
+-            )
+-            .unwrap();
++        tracker.write_frame(
++            PacketNumberSpace::Initial,
++            *NOW,
++            RTT,
++            &mut builder,
++            &mut tokens,
++            &mut stats,
++        );
+         assert_eq!(stats.ack, 1);
+         if let RecoveryToken::Ack(tok) = &tokens[0] {
+             tracker.acked(tok); // Should be a noop.
+@@ -1121,16 +1112,14 @@ mod tests {
+         builder.set_limit(10);
+ 
+         let mut stats = FrameStats::default();
+-        tracker
+-            .write_frame(
+-                PacketNumberSpace::Initial,
+-                *NOW,
+-                RTT,
+-                &mut builder,
+-                &mut Vec::new(),
+-                &mut stats,
+-            )
+-            .unwrap();
++        tracker.write_frame(
++            PacketNumberSpace::Initial,
++            *NOW,
++            RTT,
++            &mut builder,
++            &mut Vec::new(),
++            &mut stats,
++        );
+         assert_eq!(stats.ack, 0);
+         assert_eq!(builder.len(), 1); // Only the short packet header has been added.
+     }
+@@ -1154,16 +1143,14 @@ mod tests {
+         builder.set_limit(32);
+ 
+         let mut stats = FrameStats::default();
+-        tracker
+-            .write_frame(
+-                PacketNumberSpace::Initial,
+-                *NOW,
+-                RTT,
+-                &mut builder,
+-                &mut Vec::new(),
+-                &mut stats,
+-            )
+-            .unwrap();
++        tracker.write_frame(
++            PacketNumberSpace::Initial,
++            *NOW,
++            RTT,
++            &mut builder,
++            &mut Vec::new(),
++            &mut stats,
++        );
+         assert_eq!(stats.ack, 1);
+ 
+         let mut dec = builder.as_decoder();
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn map_stream_send_atomic_error(err: &TransportError) -> Error
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

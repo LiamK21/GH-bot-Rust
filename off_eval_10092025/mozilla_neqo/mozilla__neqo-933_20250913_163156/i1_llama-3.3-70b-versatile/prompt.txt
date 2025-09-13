@@ -1,0 +1,534 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Defer start of persistent congestion
+Persistent congestion cannot include packets that are sent prior to getting an RTT estimate.
+
+We don't get an RTT estimate from Initial packets very often, as we often discard keys before getting that measurement.  Handshake packets often do produce an estimate, but that doesn't necessarily help with 0-RTT and 0.5-RTT packets.  In other words, RTT measurement is not a natural product of the handshake, so it cannot be tied to anything in the handshake.
+
+Thus, the persistent congestion measurement needs to know the packet number of the first packet sent after receiving an RTT measurement.  This is complicated by there being multiple packet number spaces.  We can either track only the Application Data space, track the time that we received an RTT estimate, or change to a single space for packet numbers.  The last is something done in some implementations, but I don't think that it would suit ours well.  Recording the time of first estimate is likely best.
+
+We can replace the counter I recently added with `Option<Instant>` as the counter being non-zero was the only valuable option.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/cc.rs b/neqo-transport/src/cc.rs
+--- a/neqo-transport/src/cc.rs
++++ b/neqo-transport/src/cc.rs
+@@ -5,6 +5,7 @@
+ // except according to those terms.
+ 
+ // Congestion control
++#![deny(clippy::pedantic)]
+ 
+ use std::cmp::{max, min};
+ use std::fmt::{self, Display};
+@@ -17,12 +18,12 @@ use crate::tracking::SentPacket;
+ use neqo_common::{const_max, const_min, qdebug, qinfo, qlog::NeqoQlog, qtrace};
+ 
+ pub const MAX_DATAGRAM_SIZE: usize = PATH_MTU_V6;
+-pub const INITIAL_CWND_PKTS: usize = 10;
+-const INITIAL_WINDOW: usize = const_min(
+-    INITIAL_CWND_PKTS * MAX_DATAGRAM_SIZE,
++pub const CWND_INITIAL_PKTS: usize = 10;
++const CWND_INITIAL: usize = const_min(
++    CWND_INITIAL_PKTS * MAX_DATAGRAM_SIZE,
+     const_max(2 * MAX_DATAGRAM_SIZE, 14720),
+ );
+-pub const MIN_CONG_WINDOW: usize = MAX_DATAGRAM_SIZE * 2;
++pub const CWND_MIN: usize = MAX_DATAGRAM_SIZE * 2;
+ /// The number of packets we allow to burst from the pacer.
+ pub(crate) const PACING_BURST_SIZE: usize = 2;
+ const PERSISTENT_CONG_THRESH: u32 = 3;
+@@ -44,11 +45,11 @@ pub struct CongestionControl {
+ impl Default for CongestionControl {
+     fn default() -> Self {
+         Self {
+-            congestion_window: INITIAL_WINDOW,
++            congestion_window: CWND_INITIAL,
+             bytes_in_flight: 0,
+             acked_bytes: 0,
+             congestion_recovery_start_time: None,
+-            ssthresh: std::usize::MAX,
++            ssthresh: usize::MAX,
+             pacer: None,
+             in_recovery: false,
+             qlog: NeqoQlog::disabled(),
+@@ -166,17 +167,28 @@ impl CongestionControl {
+ 
+     fn detect_persistent_congestion(
+         &mut self,
++        first_rtt_sample_time: Option<Instant>,
+         prev_largest_acked_sent: Option<Instant>,
+         pto: Duration,
+         lost_packets: &[SentPacket],
+     ) {
++        if first_rtt_sample_time.is_none() {
++            return;
++        }
++
+         let pc_period = pto * PERSISTENT_CONG_THRESH;
+ 
+         let mut last_pn = 1 << 62; // Impossibly large, but not enough to overflow.
+         let mut start = None;
++
++        // Look for the first lost packet after the previous largest acknowledged.
++        // Ignore packets that weren't ack-eliciting for the start of this range.
++        // Also, make sure to ignore any packets sent before we got an RTT estimate
++        // as we might not have sent PTO packets soon enough after those.
++        let cutoff = max(first_rtt_sample_time, prev_largest_acked_sent);
+         for p in lost_packets
+             .iter()
+-            .skip_while(|p| Some(p.time_sent) <= prev_largest_acked_sent)
++            .skip_while(|p| Some(p.time_sent) < cutoff)
+         {
+             if p.pn != last_pn + 1 {
+                 // Not a contiguous range of lost packets, start over.
+@@ -190,7 +202,7 @@ impl CongestionControl {
+             if let Some(t) = start {
+                 if p.time_sent.duration_since(t) > pc_period {
+                     // In persistent congestion.  Stop.
+-                    self.congestion_window = MIN_CONG_WINDOW;
++                    self.congestion_window = CWND_MIN;
+                     self.acked_bytes = 0;
+                     qlog::metrics_updated(
+                         &mut self.qlog,
+@@ -208,6 +220,7 @@ impl CongestionControl {
+     pub fn on_packets_lost(
+         &mut self,
+         now: Instant,
++        first_rtt_sample_time: Option<Instant>,
+         prev_largest_acked_sent: Option<Instant>,
+         pto: Duration,
+         lost_packets: &[SentPacket],
+@@ -229,8 +242,12 @@ impl CongestionControl {
+ 
+         let last_lost_pkt = lost_packets.last().unwrap();
+         self.on_congestion_event(now, last_lost_pkt.time_sent);
+-
+-        self.detect_persistent_congestion(prev_largest_acked_sent, pto, lost_packets);
++        self.detect_persistent_congestion(
++            first_rtt_sample_time,
++            prev_largest_acked_sent,
++            pto,
++            lost_packets,
++        );
+     }
+ 
+     pub fn discard(&mut self, pkt: &SentPacket) {
+@@ -284,7 +301,7 @@ impl CongestionControl {
+             self.congestion_recovery_start_time = Some(now);
+             self.congestion_window /= 2; // kLossReductionFactor = 0.5
+             self.acked_bytes /= 2;
+-            self.congestion_window = max(self.congestion_window, MIN_CONG_WINDOW);
++            self.congestion_window = max(self.congestion_window, CWND_MIN);
+             self.ssthresh = self.congestion_window;
+             qinfo!(
+                 [self],
+@@ -306,11 +323,10 @@ impl CongestionControl {
+                 &mut self.qlog_curr_cong_state,
+                 CongestionState::Recovery,
+             );
+-        } else {
+-            qdebug!([self], "Cong event but already in recovery");
+         }
+     }
+ 
++    #[allow(clippy::unused_self)]
+     fn app_limited(&self) -> bool {
+         //TODO(agrover): how do we get this info??
+         false
+@@ -342,11 +358,12 @@ impl CongestionControl {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{CongestionControl, INITIAL_WINDOW, MIN_CONG_WINDOW, PERSISTENT_CONG_THRESH};
++    use crate::cc::{CongestionControl, CWND_INITIAL, CWND_MIN, PERSISTENT_CONG_THRESH};
+     use crate::packet::{PacketNumber, PacketType};
+     use crate::tracking::SentPacket;
++    use std::convert::TryFrom;
+     use std::rc::Rc;
+-    use std::time::Duration;
++    use std::time::{Duration, Instant};
+     use test_fixture::now;
+ 
+     const PTO: Duration = Duration::from_millis(100);
+@@ -400,43 +417,43 @@ mod tests {
+ 
+         cc.on_packet_sent(&sent_packets[0], RTT);
+         assert_eq!(cc.acked_bytes, 0);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW);
+-        assert_eq!(cc.ssthresh(), std::usize::MAX);
++        assert_eq!(cc.cwnd(), CWND_INITIAL);
++        assert_eq!(cc.ssthresh(), usize::MAX);
+         assert_eq!(cc.bif(), 103);
+ 
+         cc.on_packet_sent(&sent_packets[1], RTT);
+         assert_eq!(cc.acked_bytes, 0);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW);
+-        assert_eq!(cc.ssthresh(), std::usize::MAX);
++        assert_eq!(cc.cwnd(), CWND_INITIAL);
++        assert_eq!(cc.ssthresh(), usize::MAX);
+         assert_eq!(cc.bif(), 208);
+ 
+-        cc.on_packets_lost(time_after1, None, PTO, &sent_packets[0..1]);
++        cc.on_packets_lost(time_after1, Some(time_now), None, PTO, &sent_packets[0..1]);
+ 
+         // We are now in recovery
+         assert_eq!(cc.acked_bytes, 0);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW / 2);
+-        assert_eq!(cc.ssthresh(), INITIAL_WINDOW / 2);
++        assert_eq!(cc.cwnd(), CWND_INITIAL / 2);
++        assert_eq!(cc.ssthresh(), CWND_INITIAL / 2);
+         assert_eq!(cc.bif(), 105);
+ 
+         // Send a packet after recovery starts
+         cc.on_packet_sent(&sent_packets[2], RTT);
+         assert_eq!(cc.acked_bytes, 0);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW / 2);
+-        assert_eq!(cc.ssthresh(), INITIAL_WINDOW / 2);
++        assert_eq!(cc.cwnd(), CWND_INITIAL / 2);
++        assert_eq!(cc.ssthresh(), CWND_INITIAL / 2);
+         assert_eq!(cc.bif(), 212);
+ 
+         // and ack it. cwnd increases slightly
+         cc.on_packets_acked(&sent_packets[2..3]);
+         assert_eq!(cc.acked_bytes, sent_packets[2].size);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW / 2);
+-        assert_eq!(cc.ssthresh(), INITIAL_WINDOW / 2);
++        assert_eq!(cc.cwnd(), CWND_INITIAL / 2);
++        assert_eq!(cc.ssthresh(), CWND_INITIAL / 2);
+         assert_eq!(cc.bif(), 105);
+ 
+         // Packet from before is lost. Should not hurt cwnd.
+-        cc.on_packets_lost(time_after3, None, PTO, &sent_packets[1..2]);
++        cc.on_packets_lost(time_after3, Some(time_now), None, PTO, &sent_packets[1..2]);
+         assert_eq!(cc.acked_bytes, sent_packets[2].size);
+-        assert_eq!(cc.cwnd(), INITIAL_WINDOW / 2);
+-        assert_eq!(cc.ssthresh(), INITIAL_WINDOW / 2);
++        assert_eq!(cc.cwnd(), CWND_INITIAL / 2);
++        assert_eq!(cc.ssthresh(), CWND_INITIAL / 2);
+         assert_eq!(cc.bif(), 0);
+     }
+ 
+@@ -458,10 +475,10 @@ mod tests {
+             cc.on_packet_sent(p, RTT);
+         }
+ 
+-        cc.on_packets_lost(now(), None, PTO, lost_packets);
+-        if cc.cwnd() == INITIAL_WINDOW / 2 {
++        cc.on_packets_lost(now(), Some(now()), None, PTO, lost_packets);
++        if cc.cwnd() == CWND_INITIAL / 2 {
+             false
+-        } else if cc.cwnd() == MIN_CONG_WINDOW {
++        } else if cc.cwnd() == CWND_MIN {
+             true
+         } else {
+             panic!("unexpected cwnd");
+@@ -585,6 +602,13 @@ mod tests {
+             lost(4, false, GAP),
+             lost(5, true, GAP + PC),
+         ]));
++        assert!(!persistent_congestion(&[
++            lost(1, true, ZERO),
++            lost(2, true, PTO),
++            lost(4, false, GAP),
++            lost(5, true, GAP + RTT),
++            lost(6, true, GAP + RTT + SUB_PC),
++        ]));
+         assert!(persistent_congestion(&[
+             lost(1, true, ZERO),
+             lost(2, true, PTO),
+@@ -593,4 +617,116 @@ mod tests {
+             lost(6, true, GAP + RTT + PC),
+         ]));
+     }
++
++    /// Get a time, in multiples of `PTO`, relative to `now()`.
++    fn by_pto(t: u32) -> Instant {
++        now() + (PTO * t)
++    }
++
++    /// Make packets that will be made lost.
++    /// `times` is the time of sending, in multiples of `PTO`, relative to `now()`.
++    fn make_lost(times: &[u32]) -> Vec<SentPacket> {
++        times
++            .iter()
++            .enumerate()
++            .map(|(i, &t)| {
++                SentPacket::new(
++                    PacketType::Short,
++                    u64::try_from(i).unwrap(),
++                    by_pto(t),
++                    true,
++                    Rc::default(),
++                    1000,
++                )
++            })
++            .collect::<Vec<_>>()
++    }
++
++    /// Call `detect_persistent_congestion` using times relative to now and the fixed PTO time.
++    /// `last_ack` and `rtt_time` are times in multiples of `PTO`, relative to `now()`,
++    /// for the time of the largest acknowledged and the first RTT sample, respectively.
++    fn persistent_congestion_by_pto(last_ack: u32, rtt_time: u32, lost: &[SentPacket]) -> bool {
++        let mut cc = CongestionControl::default();
++        assert_eq!(cc.cwnd(), CWND_INITIAL);
++
++        let last_ack = Some(by_pto(last_ack));
++        let rtt_time = Some(by_pto(rtt_time));
++
++        // Persistent congestion is never declared if the RTT time is `None`.
++        cc.detect_persistent_congestion(None, None, PTO, lost);
++        assert_eq!(cc.cwnd(), CWND_INITIAL);
++        cc.detect_persistent_congestion(None, last_ack, PTO, lost);
++        assert_eq!(cc.cwnd(), CWND_INITIAL);
++
++        cc.detect_persistent_congestion(rtt_time, last_ack, PTO, lost);
++        cc.cwnd() == CWND_MIN
++    }
++
++    /// No persistent congestion can be had if there are no lost packets.
++    #[test]
++    fn persistent_congestion_no_lost() {
++        let lost = make_lost(&[]);
++        assert!(!persistent_congestion_by_pto(0, 0, &lost));
++    }
++
++    /// No persistent congestion can be had if there is only one lost packet.
++    #[test]
++    fn persistent_congestion_one_lost() {
++        let lost = make_lost(&[1]);
++        assert!(!persistent_congestion_by_pto(0, 0, &lost));
++    }
++
++    /// Persistent congestion can't happen based on old packets.
++    #[test]
++    fn persistent_congestion_past() {
++        // Packets sent prior to either the last acknowledged or the first RTT
++        // sample are not considered.  So 0 is ignored.
++        let lost = make_lost(&[0, PERSISTENT_CONG_THRESH + 1, PERSISTENT_CONG_THRESH + 2]);
++        assert!(!persistent_congestion_by_pto(1, 1, &lost));
++        assert!(!persistent_congestion_by_pto(0, 1, &lost));
++        assert!(!persistent_congestion_by_pto(1, 0, &lost));
++    }
++
++    /// Persistent congestion doesn't start unless the packet is ack-eliciting.
++    #[test]
++    fn persistent_congestion_ack_eliciting() {
++        let mut lost = make_lost(&[1, PERSISTENT_CONG_THRESH + 2]);
++        lost[0] = SentPacket::new(
++            lost[0].pt,
++            lost[0].pn,
++            lost[0].time_sent,
++            false,
++            Rc::default(),
++            lost[0].size,
++        );
++        assert!(!persistent_congestion_by_pto(0, 0, &lost));
++    }
++
++    /// Detect persistent congestion.  Note that the first lost packet needs to have a time
++    /// greater than the previously acknowledged packet AND the first RTT sample.  And the
++    /// difference in times needs to be greater than the persistent congestion threshold.
++    #[test]
++    fn persistent_congestion_min() {
++        let lost = make_lost(&[1, PERSISTENT_CONG_THRESH + 2]);
++        assert!(persistent_congestion_by_pto(0, 0, &lost));
++    }
++
++    /// Make sure that not having a previous largest acknowledged also results
++    /// in detecting persistent congestion.  (This is not expected to happen, but
++    /// the code permits it).
++    #[test]
++    fn persistent_congestion_no_prev_ack() {
++        let lost = make_lost(&[1, PERSISTENT_CONG_THRESH + 2]);
++        let mut cc = CongestionControl::default();
++        cc.detect_persistent_congestion(Some(by_pto(0)), None, PTO, &lost);
++        assert_eq!(cc.cwnd(), CWND_MIN);
++    }
++
++    /// The code asserts on ordering errors.
++    #[test]
++    #[should_panic]
++    fn persistent_congestion_unsorted() {
++        let lost = make_lost(&[PERSISTENT_CONG_THRESH + 2, 1]);
++        assert!(!persistent_congestion_by_pto(0, 0, &lost));
++    }
+ }
+
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -2681,7 +2681,7 @@ impl ::std::fmt::Display for Connection {
+ mod tests {
+     use super::*;
+     use crate::cc::PACING_BURST_SIZE;
+-    use crate::cc::{INITIAL_CWND_PKTS, MAX_DATAGRAM_SIZE, MIN_CONG_WINDOW};
++    use crate::cc::{CWND_INITIAL_PKTS, CWND_MIN, MAX_DATAGRAM_SIZE};
+     use crate::frame::{CloseError, StreamType};
+     use crate::packet::PACKET_BIT_LONG;
+     use crate::path::PATH_MTU_V6;
+@@ -4408,7 +4408,7 @@ mod tests {
+     /// value could fail as a result of variations, so it's OK to just
+     /// change this value, but it is good to first understand where the
+     /// change came from.
+-    const POST_HANDSHAKE_CWND: usize = PATH_MTU_V6 * (INITIAL_CWND_PKTS + 1) + 75;
++    const POST_HANDSHAKE_CWND: usize = PATH_MTU_V6 * (CWND_INITIAL_PKTS + 1) + 75;
+ 
+     /// Determine the number of packets required to fill the CWND.
+     const fn cwnd_packets(data: usize) -> usize {
+@@ -4672,7 +4672,7 @@ mod tests {
+             client.process_input(dgram, now);
+         }
+ 
+-        assert_eq!(client.loss_recovery.cwnd(), MIN_CONG_WINDOW);
++        assert_eq!(client.loss_recovery.cwnd(), CWND_MIN);
+         now
+     }
+
+diff --git a/neqo-transport/src/recovery.rs b/neqo-transport/src/recovery.rs
+--- a/neqo-transport/src/recovery.rs
++++ b/neqo-transport/src/recovery.rs
+@@ -53,7 +53,7 @@ pub enum RecoveryToken {
+ 
+ #[derive(Debug)]
+ struct RttVals {
+-    samples: u64,
++    first_sample_time: Option<Instant>,
+     latest_rtt: Duration,
+     smoothed_rtt: Duration,
+     rttvar: Duration,
+@@ -64,7 +64,7 @@ struct RttVals {
+ impl RttVals {
+     pub fn set_initial_rtt(&mut self, rtt: Duration) {
+         // Only allow this when there are no samples.
+-        debug_assert!(self.samples == 0);
++        debug_assert!(self.first_sample_time.is_none());
+         self.latest_rtt = rtt;
+         self.min_rtt = rtt;
+         self.smoothed_rtt = rtt;
+@@ -76,6 +76,7 @@ impl RttVals {
+         mut qlog: &mut NeqoQlog,
+         mut rtt_sample: Duration,
+         ack_delay: Duration,
++        now: Instant,
+     ) {
+         // min_rtt ignores ack delay.
+         self.min_rtt = min(self.min_rtt, rtt_sample);
+@@ -86,8 +87,9 @@ impl RttVals {
+             rtt_sample -= ack_delay;
+         }
+ 
+-        if self.samples == 0 {
++        if self.first_sample_time.is_none() {
+             self.set_initial_rtt(rtt_sample);
++            self.first_sample_time = Some(now);
+         } else {
+             // Calculate EWMA RTT (based on {{?RFC6298}}).
+             let rttvar_sample = if self.smoothed_rtt > rtt_sample {
+@@ -100,7 +102,6 @@ impl RttVals {
+             self.rttvar = (self.rttvar * 3 + rttvar_sample) / 4;
+             self.smoothed_rtt = (self.smoothed_rtt * 7 + rtt_sample) / 8;
+         }
+-        self.samples += 1;
+         qtrace!(
+             "RTT latest={:?} -> estimate={:?}~{:?}",
+             self.latest_rtt,
+@@ -130,12 +131,16 @@ impl RttVals {
+                 Duration::from_millis(0)
+             }
+     }
++
++    fn first_sample_time(&self) -> Option<Instant> {
++        self.first_sample_time
++    }
+ }
+ 
+ impl Default for RttVals {
+     fn default() -> Self {
+         Self {
+-            samples: 0,
++            first_sample_time: None,
+             latest_rtt: INITIAL_RTT,
+             smoothed_rtt: INITIAL_RTT,
+             rttvar: INITIAL_RTT / 2,
+@@ -703,7 +708,7 @@ impl LossRecovery {
+             if any_ack_eliciting {
+                 let latest_rtt = now - largest_acked_pkt.time_sent;
+                 self.rtt_vals
+-                    .update_rtt(&mut self.qlog, latest_rtt, ack_delay);
++                    .update_rtt(&mut self.qlog, latest_rtt, ack_delay, now);
+             }
+         }
+ 
+@@ -725,8 +730,9 @@ impl LossRecovery {
+         // The PTO for congestion control is the raw number, without exponential
+         // backoff, so that we can determine persistent congestion.
+         let pto_raw = self.pto_raw(pn_space);
++        let first_rtt_sample = self.rtt_vals.first_sample_time();
+         self.cc
+-            .on_packets_lost(now, prev_largest_acked, pto_raw, &lost);
++            .on_packets_lost(now, first_rtt_sample, prev_largest_acked, pto_raw, &lost);
+ 
+         // This must happen after on_packets_lost. If in recovery, this could
+         // take us out, and then lost packets will start a new recovery period
+@@ -920,6 +926,8 @@ impl LossRecovery {
+         qtrace!([self], "timeout {:?}", now);
+ 
+         let loss_delay = self.loss_delay();
++        let first_rtt_sample = self.rtt_vals.first_sample_time();
++
+         let mut lost_packets = Vec::new();
+         for space in self.spaces.iter_mut() {
+             let first = lost_packets.len(); // The first packet lost in this space.
+@@ -927,6 +935,7 @@ impl LossRecovery {
+             space.detect_lost_packets(now, loss_delay, pto, &mut lost_packets);
+             self.cc.on_packets_lost(
+                 now,
++                first_rtt_sample,
+                 space.largest_acked_sent_time,
+                 Self::pto_raw_inner(&self.rtt_vals, space.space()),
+                 &lost_packets[first..],
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

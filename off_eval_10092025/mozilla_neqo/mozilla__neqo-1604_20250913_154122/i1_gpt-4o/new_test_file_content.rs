@@ -1,0 +1,30 @@
+#neqo-common/src/udp.rs
+#[cfg(test)]
+mod tests {
+use super::Socket;
+use crate::{Datagram, IpTos, IpTosDscp, IpTosEcn};
+use std::net::SocketAddr;
+
+#[test]
+fn test_socket_send_recv() {
+    let sender = Socket::bind("127.0.0.1:0").unwrap();
+    let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let receiver = Socket::bind(receiver_addr).unwrap();
+
+    let datagram = Datagram::new(
+        sender.local_addr().unwrap(),
+        receiver.local_addr().unwrap(),
+        IpTos::from((IpTosDscp::Le, IpTosEcn::Ect1)),
+        None,
+        "Hello, world!".as_bytes().to_vec(),
+    );
+
+    sender.writable().await.unwrap();
+    sender.send(datagram.clone()).unwrap();
+
+    receiver.readable().await.unwrap();
+    let received_datagram = receiver.recv(&receiver_addr).unwrap().unwrap();
+
+    assert_eq!(datagram.into_data(), received_datagram.into_data());
+}
+}

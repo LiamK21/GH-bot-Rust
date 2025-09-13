@@ -1,0 +1,299 @@
+#neqo-bin/src/server/http09.rs
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Display, path::PathBuf, rc::Rc, time::Instant,
+};
+
+use neqo_common::{event::Provider, hex, qdebug, qerror, qinfo, qwarn, Datagram};
+use neqo_crypto::{generate_ech_keys, random, AllowZeroRtt, AntiReplay, Cipher};
+use neqo_http3::Error;
+use neqo_transport::{
+    server::{ActiveConnectionRef, Server, ValidateAddress},
+    ConnectionEvent, ConnectionIdGenerator, ConnectionParameters, Output, State, StreamId,
+};
+use regex::Regex;
+
+use super::{qns_read_response, Args};
+
+#[derive(Default)]
+struct HttpStreamState {
+    writable: bool,
+    data_to_send: Option<(Vec<u8>, usize)>,
+}
+
+pub struct HttpServer {
+    server: Server,
+    write_state: HashMap<StreamId, HttpStreamState>,
+    read_state: HashMap<StreamId, Vec<u8>>,
+}
+
+impl HttpServer {
+    pub fn new(
+        now: Instant,
+        certs: &[impl AsRef<str>],
+        protocols: &[impl AsRef<str>],
+        anti_replay: AntiReplay,
+        cid_manager: Rc<RefCell<dyn ConnectionIdGenerator>>,
+        conn_params: ConnectionParameters,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            server: Server::new(
+                now,
+                certs,
+                protocols,
+                anti_replay,
+                Box::new(AllowZeroRtt {}),
+                cid_manager,
+                conn_params,
+            )?,
+            write_state: HashMap::new(),
+            read_state: HashMap::new(),
+        })
+    }
+
+    fn save_partial(
+        &mut self,
+        stream_id: StreamId,
+        partial: Vec<u8>,
+        conn: &mut ActiveConnectionRef,
+    ) {
+        let url_dbg = String::from_utf8(partial.clone())
+            .unwrap_or_else(|_| format!("<invalid UTF-8: {}>", hex(&partial)));
+        if partial.len() < 4096 {
+            qdebug!("Saving partial URL: {}", url_dbg);
+            self.read_state.insert(stream_id, partial);
+        } else {
+            qdebug!("Giving up on partial URL {}", url_dbg);
+            conn.borrow_mut().stream_stop_sending(stream_id, 0).unwrap();
+        }
+    }
+
+    fn write(
+        &mut self,
+        stream_id: StreamId,
+        data: Option<Vec<u8>>,
+        conn: &mut ActiveConnectionRef,
+    ) {
+        let resp = data.unwrap_or_else(|| Vec::from(&b"404 That request was nonsense\r\n"[..]));
+        if let Some(stream_state) = self.write_state.get_mut(&stream_id) {
+            match stream_state.data_to_send {
+                None => stream_state.data_to_send = Some((resp, 0)),
+                Some(_) => {
+                    qdebug!("Data already set, doing nothing");
+                }
+            }
+            if stream_state.writable {
+                self.stream_writable(stream_id, conn);
+            }
+        } else {
+            self.write_state.insert(
+                stream_id,
+                HttpStreamState {
+                    writable: false,
+                    data_to_send: Some((resp, 0)),
+                },
+            );
+        }
+    }
+
+    fn stream_readable(
+        &mut self,
+        stream_id: StreamId,
+        conn: &mut ActiveConnectionRef,
+        args: &Args,
+    ) {
+        if !stream_id.is_client_initiated() || !stream_id.is_bidi() {
+            qdebug!("Stream {} not client-initiated bidi, ignoring", stream_id);
+            return;
+        }
+        let mut data = vec![0; 4000];
+        let (sz, fin) = conn
+            .borrow_mut()
+            .stream_recv(stream_id, &mut data)
+            .expect("Read should succeed");
+
+        if sz == 0 {
+            if !fin {
+                qdebug!("size 0 but !fin");
+            }
+            return;
+        }
+
+        data.truncate(sz);
+        let buf = if let Some(mut existing) = self.read_state.remove(&stream_id) {
+            existing.append(&mut data);
+            existing
+        } else {
+            data
+        };
+
+        let Ok(msg) = std::str::from_utf8(&buf[..]) else {
+            self.save_partial(stream_id, buf, conn);
+            return;
+        };
+
+        let re = if args.shared.qns_test.is_some() {
+            Regex::new(r"GET +/(\S+)(?:\r)?\n").unwrap()
+        } else {
+            Regex::new(r"GET +/(\d+)(?:\r)?\n").unwrap()
+        };
+        let m = re.captures(msg);
+        let Some(path) = m.and_then(|m| m.get(1)) else {
+            self.save_partial(stream_id, buf, conn);
+            return;
+        };
+
+        let resp = {
+            let path = path.as_str();
+            qdebug!("Path = '{path}'");
+            if args.shared.qns_test.is_some() {
+                match qns_read_response(path) {
+                    Ok(data) => Some(data),
+                    Err(e) => {
+                        qerror!("Failed to read {path}: {e}");
+                        Some(b"404".to_vec())
+                    }
+                }
+            } else {
+                let count = path.parse().unwrap();
+                Some(vec![b'a'; count])
+            }
+        };
+        self.write(stream_id, resp, conn);
+    }
+
+    fn stream_writable(&mut self, stream_id: StreamId, conn: &mut ActiveConnectionRef) {
+        match self.write_state.get_mut(&stream_id) {
+            None => {
+                qwarn!("Unknown stream {stream_id}, ignoring event");
+            }
+            Some(stream_state) => {
+                stream_state.writable = true;
+                if let Some((data, ref mut offset)) = &mut stream_state.data_to_send {
+                    let sent = conn
+                        .borrow_mut()
+                        .stream_send(stream_id, &data[*offset..])
+                        .unwrap();
+                    qdebug!("Wrote {}", sent);
+                    *offset += sent;
+                    self.server.add_to_waiting(conn);
+                    if *offset == data.len() {
+                        qinfo!("Sent {sent} on {stream_id}, closing");
+                        conn.borrow_mut().stream_close_send(stream_id).unwrap();
+                        self.write_state.remove(&stream_id);
+                    } else {
+                        stream_state.writable = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl super::HttpServer for HttpServer {
+    fn process(&mut self, dgram: Option<&Datagram>, now: Instant) -> Output {
+        self.server.process(dgram, now)
+    }
+
+    fn process_events(&mut self, args: &Args, now: Instant) {
+        let active_conns = self.server.active_connections();
+        for mut acr in active_conns {
+            loop {
+                let event = match acr.borrow_mut().next_event() {
+                    None => break,
+                    Some(e) => e,
+                };
+                match event {
+                    ConnectionEvent::NewStream { stream_id } => {
+                        self.write_state
+                            .insert(stream_id, HttpStreamState::default());
+                    }
+                    ConnectionEvent::RecvStreamReadable { stream_id } => {
+                        self.stream_readable(stream_id, &mut acr, args);
+                    }
+                    ConnectionEvent::SendStreamWritable { stream_id } => {
+                        self.stream_writable(stream_id, &mut acr);
+                    }
+                    ConnectionEvent::StateChange(State::Connected) => {
+                        acr.connection()
+                            .borrow_mut()
+                            .send_ticket(now, b"hi!")
+                            .unwrap();
+                    }
+                    ConnectionEvent::StateChange(_)
+                    | ConnectionEvent::SendStreamCreatable { .. }
+                    | ConnectionEvent::SendStreamComplete { .. } => (),
+                    e => qwarn!("unhandled event {e:?}"),
+                }
+            }
+        }
+    }
+
+    fn set_qlog_dir(&mut self, dir: Option<PathBuf>) {
+        self.server.set_qlog_dir(dir);
+    }
+
+    fn validate_address(&mut self, v: ValidateAddress) {
+        self.server.set_validation(v);
+    }
+
+    fn set_ciphers(&mut self, ciphers: &[Cipher]) {
+        self.server.set_ciphers(ciphers);
+    }
+
+    fn enable_ech(&mut self) -> &[u8] {
+        let (sk, pk) = generate_ech_keys().expect("generate ECH keys");
+        self.server
+            .enable_ech(random::<1>()[0], "public.example", &sk, &pk)
+            .expect("enable ECH");
+        self.server.ech_config()
+    }
+
+    fn has_events(&self) -> bool {
+        self.server.has_active_connections()
+    }
+}
+
+impl Display for HttpServer {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        write!(f, "Http 0.9 server ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+use super::server;
+use std::collections::HashMap;
+use neqo_transport::server::{ActiveConnectionRef, Server, ValidateAddress};
+use neqo_transport::ConnectionEvent;
+use neqo_http3::Error;
+use neqo_common::event::Provider;
+use neqo_common::time::Instant;
+use neqo_crypto::AntiReplay;
+use neqo_crypto::RandomConnectionIdGenerator;
+use neqo_crypto::init_db;
+use neqo_transport::ConnectionIdGenerator;
+use neqo_transport::Output;
+use neqo_transport::State;
+use neqo_transport::StreamId;
+
+#[test]
+fn test_stream_readable() {
+  let mut args = server::Args { shared: server::SharedArgs { qns_test: Some(()), ..Default::default() }, ..Default::default() };
+  let now = Instant::now();
+  let anti_replay = AntiReplay::new(now, 7, 7, 14).unwrap();
+  let cid_mgr = std::rc::Rc::new(std::cell::RefCell::new(RandomConnectionIdGenerator::new(10)));
+  let mut http_server = server::HttpServer::new(&args, anti_replay, cid_mgr).unwrap();
+  let mut acr = ActiveConnectionRef::new(0, ValidateAddress::Never);
+  let stream_id = StreamId::new(0, true, true);
+  let event = ConnectionEvent::RecvStreamReadable { stream_id };
+  http_server.process_events(now);
+  http_server.stream_readable(stream_id, &mut acr);
+  assert!(http_server.write_state.len() > 0);
+}
+}

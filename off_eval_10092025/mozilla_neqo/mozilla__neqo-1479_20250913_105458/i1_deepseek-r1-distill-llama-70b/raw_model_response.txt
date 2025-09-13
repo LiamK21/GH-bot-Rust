@@ -1,0 +1,55 @@
+<think>
+Okay, I need to figure out if a unit test is required for the given patch. The issue is about multiple ACK ranges not counting towards the congestion window (cwnd) because they're considered app_limited. The patch adds a new field first_app_limited to track when the app might be underutilizing the cwnd. 
+
+Looking at the patch, it modifies the on_packets_acked function and introduces this new field. The tests provided in the patch, like app_limited_slow_start and app_limited_congestion_avoidance, seem to check if the cwnd doesn't grow when app_limited. But I'm not sure if these tests cover the specific scenario where multiple ACK ranges cause underutilization.
+
+I think a new test is needed because the existing tests might not cover the exact case where multiple ACKs are processed, and only the first one correctly updates the cwnd. The test should simulate sending multiple packets, then receiving multiple ACK ranges, and check that the cwnd increases correctly only for the relevant packets.
+
+So, I'll create a test that sends several packets, then acknowledges them in multiple ranges. I'll check that the cwnd only grows for the packets sent before the app became limited. This will ensure the patch fixes the issue where later ACKs were ignored.
+
+I'll structure the test by initializing the congestion control, sending multiple packets, then acknowledging them in batches. After each ACK, I'll assert that the cwnd and acked_bytes are updated as expected. This should validate that the patch correctly handles multiple ACK ranges and only counts the appropriate packets towards cwnd.
+</think>
+
+<Filename> neqo-transport/src/cc/classic_cc.rs </Filename>
+<imports>
+use super::ClassicCongestionControl;
+use neqo_common::qinfo;
+use std::time::Duration;
+</imports>
+<Rust>
+#[test]
+fn test_multiple_ack_ranges_cwnd() {
+    let mut cc = ClassicCongestionControl::new(super::NewReno::default());
+    let mut now = std::time::Instant::now();
+    let mut next_pn = 0;
+    
+    // Send 10 packets
+    let mut sent_packets = Vec::new();
+    for _ in 0..10 {
+        let p = SentPacket::new(
+            PacketType::Short,
+            next_pn,
+            now,
+            true,
+            Vec::new(),
+            MAX_DATAGRAM_SIZE,
+        );
+        next_pn += 1;
+        cc.on_packet_sent(&p);
+        sent_packets.push(p);
+    }
+    
+    // First ACK range covering packets 0-4
+    now += Duration::from_secs(1);
+    cc.on_packets_acked(&sent_packets[0..5].to_vec(), Duration::from_secs(1), now);
+    assert_eq!(cc.congestion_window, (5 + 1) * MAX_DATAGRAM_SIZE);
+    
+    // Second ACK range covering packets 5-9
+    now += Duration::from_secs(1);
+    cc.on_packets_acked(&sent_packets[5..10].to_vec(), Duration::from_secs(1), now);
+    assert_eq!(cc.congestion_window, (10 + 1) * MAX_DATAGRAM_SIZE);
+    
+    // Ensure only the first 5 packets counted towards cwnd
+    assert_eq!(cc.acked_bytes, 0);
+}
+</Rust>
