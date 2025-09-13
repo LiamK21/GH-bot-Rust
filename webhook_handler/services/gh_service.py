@@ -51,13 +51,19 @@ class GitHubService:
         repo = self._pr_data.repo
         pr_description = self._pr_data.description
         pr_title = self._pr_data.title
+        issue_description: str = f"{pr_title} {pr_description}"
 
+        if repo == "glean":
+            logger.marker(f"Checking for linked Bugzilla issues in PR #{self._pr_data.number}") # type: ignore[attr-defined]
+            linked_issue_description = self._get_bugzilla_issue(issue_description)
+            if linked_issue_description:
+                return linked_issue_description
+            
         # The regex patterns look for instances of "#123" or direct links in the PR title and description.
         # It will only capture the issue/bug number.
         issue_pattern = r"#(\d+)"
         url_pattern = rf"\bhttps://github\.com/{re.escape(owner)}/{re.escape(repo)}/issues/(\d+)\b"
 
-        issue_description: str = f"{pr_title} {pr_description}"
         issue_matches: list[str] = re.findall(
             issue_pattern, issue_description, re.IGNORECASE
         )
@@ -171,6 +177,66 @@ class GitHubService:
 
         logger.error("No GitHub issue found")
         return None
+
+    def _get_bugzilla_issue(self, issue_description: str) -> str | None:
+        bugzilla_url_pattern = r"\bhttps://bugzilla\.mozilla\.org/show_bug\.cgi\?id=(\d+)\b"
+        bugzilla_bug_id_pattern = r"\bbug\s+(\d+)\b"
+        bugzilla_url_matches: list[str] = re.findall(
+        bugzilla_url_pattern, issue_description, re.IGNORECASE
+        )
+        bugzilla__bug_id_matches: list[str] = re.findall(
+        bugzilla_bug_id_pattern, issue_description, re.IGNORECASE
+        )
+        all_matches = bugzilla_url_matches + bugzilla__bug_id_matches
+        if all_matches:
+            for bug_id in all_matches:
+                bug_id = int(bug_id)
+                if not bug_id:
+                    continue
+                
+                return self._fetch_bugzilla_data(bug_id)
+        return ""
+    
+    def _fetch_bugzilla_data(self, bug_id: int) -> str:
+        """
+        Fetches data from Bugzilla API.
+
+        Parameters:
+            bug_id (str): Bugzilla id.
+
+        Returns:
+            dict: Data.
+        """
+        url = f"https://bugzilla.mozilla.org/rest/bug?id={bug_id}&include_fields=id,summary,component,description"
+        response = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+        if response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
+            logger.info("[*] Sleeping...")
+            reset_time = int(response.headers["X-RateLimit-Reset"])
+            wait_time = reset_time - int(time.time()) + 1
+            time.sleep(max(wait_time, 1))
+            return self._fetch_bugzilla_data(bug_id)
+        response.raise_for_status()
+        bug_data: dict = response.json()
+        
+        if "bugs" in bug_data and len(bug_data["bugs"]) == 1:
+            bug = bug_data["bugs"][0]
+            bug_bug_id: int = bug.get("id")
+            if not bug_bug_id:
+                print(f"[!] Invalid Bugzilla bug ID: {bug_bug_id}")
+                return ""
+            
+            component: str = bug.get("component", "")
+            # We are only interested in Glean bugs
+            if not "glean" in component.lower():
+                return ""
+            summary, descrption =  bug.get("summary", ""), bug.get("description", "")
+            # Both summary and description should not be empty
+            if not summary and not descrption:
+                return ""
+            return summary + "\n" + descrption
+        
+        return response.json()
+
 
     def add_comment_to_pr(self, comment) -> tuple[int, dict]:
         """
