@@ -1,6 +1,9 @@
 import logging
 from pathlib import Path
 
+import docker
+from docker.errors import ImageNotFound
+
 from webhook_handler.helper import logger
 from webhook_handler.helper.custom_errors import *
 from webhook_handler.models import LLM, PipelineInputs, PullRequestData
@@ -263,3 +266,32 @@ class BotRunner:
                     self._pr_data.number, model, i_attempt, self._generation_completed
                 )
             )
+
+    def teardown(self) -> None:
+        """
+        Remove all temporary created directories, files, and data
+        """
+        self._config._teardown()
+        image_tag = f"{self._pr_data.image_tag}:latest"
+        try:
+            client = docker.from_env()
+            client.images.remove(image=f"{image_tag}:latest", force=True)
+            self._logger.success(f"Removed Docker image {image_tag}")  # type: ignore[attr-defined]
+            pass
+        except ImageNotFound:
+            self._logger.error(f"Docker image {image_tag} not found, skipping removal")  # type: ignore[attr-defined]
+        except Exception as e:
+            self._logger.error(f"Failed to remove Docker image '{image_tag}': {e}")
+        
+        
+        self._gh_api = None
+        self._issue_statement = None
+        self._pdf_candidate = None
+        self._pr_diff_ctx = None
+        self._pipeline_inputs = None
+        self._cst_builder = None
+        self._llm_handler = None
+        self._docker_service = None
+        self._environment_prepared = False
+        self._logger.info("Teardown completed")
+        
