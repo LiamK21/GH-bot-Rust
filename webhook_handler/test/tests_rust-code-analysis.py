@@ -16,7 +16,7 @@ def _setup(payload: dict) -> tuple[Config, BotRunner]:
         return config, runner
 
 def _teardown(payload: dict, config: Config, runner: BotRunner) -> None:
-        config._teardown()
+        runner.teardown()
         del payload
         del config
         del runner
