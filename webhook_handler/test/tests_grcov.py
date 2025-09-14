@@ -30,7 +30,7 @@ class TestGeneration1180(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner
@@ -54,7 +54,7 @@ class TestGeneration1394(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner
@@ -78,7 +78,7 @@ class TestGeneration1394(TestCase):
 #         _setup_dirs(self.config, self.runner, self.payload)
 
 #     def tearDown(self) -> None:
-#         self.config._teardown()
+#         self.runner.teardown()
 
 #     def test_generation1394(self):
 #         generation_completed = False
@@ -103,7 +103,7 @@ class TestGeneration1326(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner
@@ -127,7 +127,7 @@ class TestGeneration1321(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner

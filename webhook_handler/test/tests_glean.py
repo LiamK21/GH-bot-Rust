@@ -32,7 +32,7 @@ class TestGeneration3226(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner
@@ -56,7 +56,7 @@ class TestGeneration3246(TestCase):
         _setup_dirs(self.config, self.runner, self.payload)
 
     def tearDown(self) -> None:
-        self.config._teardown()
+        self.runner.teardown()
         del self.payload
         del self.config
         del self.runner
