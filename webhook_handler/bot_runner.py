@@ -275,7 +275,7 @@ class BotRunner:
         image_tag = f"{self._pr_data.image_tag}:latest"
         try:
             client = docker.from_env()
-            client.images.remove(image=f"{image_tag}:latest", force=True)
+            client.images.remove(image=image_tag, force=True)
             self._logger.success(f"Removed Docker image {image_tag}")  # type: ignore[attr-defined]
             pass
         except ImageNotFound:
