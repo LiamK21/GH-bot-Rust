@@ -1,0 +1,65 @@
+<think>
+Okay, so I need to figure out whether a unit test is needed for the given patch. Let's start by understanding the problem and the patch.
+
+The issue is a ThreadSanitizer report about a lock-order inversion, which could lead to a deadlock. It's happening in the scheduler.rs file, specifically in the start_scheduler function. The problem occurs when two threads are acquiring mutexes in the wrong order, creating a cycle that can cause a deadlock.
+
+Looking at the patch provided, it's modifying the loop inside start_scheduler. The original code uses a condvar.wait_timeout_while and handles the result in a way that might be causing the deadlock. The patch restructures this by introducing a 'timed_out' flag and adjusting when the global Glean is accessed, ensuring that the lock isn't held when submitting the metrics ping.
+
+Now, I need to determine if a test is needed. Since the issue is about concurrency and potential deadlocks, it's a tricky area. Concurrency bugs can be hard to reproduce, but having a test that catches such issues is beneficial. Without a test, it's difficult to ensure the patch works as intended and doesn't reintroduce the problem in the future.
+
+The patch changes how the condvar is handled and when the metrics ping is submitted. The test should simulate the scenario where the condvar times out and ensure that the metrics are submitted correctly without causing a deadlock.
+
+I'll need to write a test that checks the behavior after applying the patch. The test should create a scheduler, let it run, and verify that the metrics ping is submitted when the timeout occurs. It should also ensure that no deadlock happens during this process.
+
+So, the test will likely involve creating a test harness that initializes the scheduler, waits for the timeout, and checks that the expected metrics are submitted. I'll need to use some synchronization primitives like channels or atomic variables to track whether the submission happened as expected.
+
+I'll structure the test to start the scheduler in a separate thread, wait for the timeout, and then assert that the metrics were submitted. Since the original issue was intermittent, the test should be designed to reliably reproduce the scenario that triggers the deadlock, thus ensuring the patch fixes it.
+
+In summary, a test is needed to verify that the deadlock no longer occurs and that the metrics are correctly submitted after the patch. The test will focus on the scenario where the condvar times out and ensure the submission happens without holding the lock, thus preventing the lock-order inversion.
+</think>
+
+The test will check if the deadlock condition is resolved by ensuring the metrics ping is correctly scheduled without holding the lock.
+
+glean-core/src/scheduler.rs
+<imports>
+use super::start_scheduler;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use chrono::DateTime;
+use chrono::offset::FixedOffset;
+</imports>
+
+<Rust>
+#[test]
+fn test_metrics_ping_submitted_after_timeout() {
+    let _ = env_logger::try_init();
+    let submit_called = Arc::new(AtomicBool::new(false));
+    let submit_called_clone = submit_called.clone();
+    
+    let when = When::Now;
+    let now = DateTime::from(chrono::Local::now().timestamp());
+    
+    let handle = start_scheduler(
+        &submit_called_clone,
+        now,
+        when,
+    );
+
+    let timeout = Duration::from_secs(1);
+    let start = std::time::Instant::now();
+    loop {
+        if submit_called.load(Ordering::Relaxed) {
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!("Test timed out waiting for metrics ping submission");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    handle.join().unwrap();
+    
+    assert!(submit_called.load(Ordering::Relaxed));
+}
+</Rust>

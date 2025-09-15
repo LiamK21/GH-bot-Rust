@@ -1,0 +1,82 @@
+<think>
+Okay, I need to figure out how to write a regression test for the given patch. Let me start by understanding the issue and the changes made.
+
+The problem was that the `process_ping_upload_response` function didn't handle cases where there was no HTTP status code because the upload wasn't attempted. The patch introduces an `UploadResult` enum to better represent different outcomes, including recoverable and unrecoverable failures, as well as HTTP statuses.
+
+Looking at the patch, I see that the function signature changed from taking a `u16` status to an `UploadResult`. The FFI bindings were also updated, and new constants were added for the result types. Additionally, tests were added in the `upload.rs` file to ensure the constants match.
+
+Since this is a regression test, it should check if the function correctly handles cases where there's no status code. Specifically, when the status is an unrecoverable failure, the function should delete the file and not retry.
+
+I'll need to write a test that simulates an unrecoverable failure. The test should create a ping, submit it, and then process the upload response with `UnrecoverableFailure`. It should verify that the file is deleted and that no further upload tasks are generated.
+
+I'll structure the test by initializing Glean, registering a ping type, submitting a ping, creating an upload manager, and then processing the response with the unrecoverable status. Finally, I'll check if the file exists and if the upload task is done.
+
+I should also make sure to import all necessary modules and use the correct functions. The test should be self-contained and not rely on external modules beyond what's provided.
+
+So, putting it all together, the test will ensure that when an unrecoverable failure occurs, the upload manager correctly handles it by deleting the file and not scheduling any further tasks.
+</think>
+
+<Filename> glean-core/src/upload/mod.rs </Filename>
+<imports>
+use super::PingUploadManager;
+use crate::internal_pings::InternalPings;
+use crate::metrics::PingType;
+use crate::storage::StorageManager;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
+</imports>
+<Rust>
+#[test]
+fn test_unrecoverable_upload_response_deletes_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let (mut glean, dir) = {
+        let mut glean = Glean::new(
+            PathBuf::from(temp_dir.path()),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+        )
+        .unwrap();
+        (glean, temp_dir)
+    };
+
+    // Register a ping for testing
+    let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
+    glean.register_ping_type(&ping_type).unwrap();
+
+    // Submit a ping
+    glean.submit_ping(&ping_type, None).unwrap();
+
+    // Create a new upload_manager
+    let upload_manager = PingUploadManager::new(&dir.path()).unwrap();
+
+    // Wait for processing of pending pings directory to finish.
+    let mut upload_task = upload_manager.get_upload_task();
+    while upload_task == PingUploadTask::Wait {
+        std::thread::sleep(Duration::from_millis(10));
+        upload_task = upload_manager.get_upload_task();
+    }
+
+    // Get the pending ping directory path
+    let pending_pings_dir = dir.path().join("pending_pings");
+
+    // Get the submitted PingRequest
+    match upload_task {
+        PingUploadTask::Upload(request) => {
+            // Simulate the processing of a unrecoverable failure
+            let uuid = request.uuid;
+            upload_manager.process_ping_upload_response(&uuid, UploadResult::UnrecoverableFailure);
+            // Verify file was deleted
+            assert!(!pending_pings_dir.join(uuid).exists());
+        }
+        _ => panic!("Expected upload manager to return the next request!"),
+    }
+
+    // Verify that after request is returned, none are left
+    assert_eq!(upload_manager.get_upload_task(), PingUploadTask::Done);
+}
+</Rust>

@@ -1,0 +1,69 @@
+#glean-core/rlb/src/private/datetime.rs
+#[cfg(test)]
+mod tests {
+use super::DatetimeMetric;
+use crate::common_test::new_glean;
+use chrono::prelude::*;
+use chrono::FixedOffset;
+use chrono::TimeZone;
+
+#[test]
+fn test_datetime_truncation() {
+    let _ = new_glean(None, true);
+
+    // Test all possible time units
+    let time_units = vec![
+        TimeUnit::Day,
+        TimeUnit::Hour,
+        TimeUnit::Minute,
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ];
+
+    for tu in time_units {
+        let metric: DatetimeMetric = DatetimeMetric::new(
+            CommonMetricData {
+                name: "datetime".into(),
+                category: "test".into(),
+                send_in_pings: vec!["test1".into()],
+                ..Default::default()
+            },
+            tu.clone(),
+        );
+
+        let sample_date = FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 34, 56);
+        let sample_date_nano = sample_date.nanosecond(789_123_456);
+
+        metric.set(Some(sample_date_nano));
+
+        let retrieved = metric.test_get_value(None).unwrap();
+
+        // Depending on the time unit, check truncation
+        match tu {
+            TimeUnit::Day => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(0, 0, 0));
+            }
+            TimeUnit::Hour => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 0, 0));
+            }
+            TimeUnit::Minute => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 34, 0));
+            }
+            TimeUnit::Second => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 34, 56));
+            }
+            TimeUnit::Millisecond => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 34, 56).nanosecond(0));
+            }
+            TimeUnit::Microsecond => {
+                assert_eq!(retrieved, FixedOffset::east(0).ymd(2023, 10, 5).and_hms(12, 34, 56).nanosecond(789_000));
+            }
+            TimeUnit::Nanosecond => {
+                assert_eq!(retrieved, sample_date_nano);
+            }
+        }
+    }
+}
+}

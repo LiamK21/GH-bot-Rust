@@ -1,0 +1,76 @@
+<think>
+Okay, so I need to figure out if a unit test is needed for the given patch. Let me start by understanding the issue and the changes made.
+
+The issue is about changing the pre-init queue in Glean from a bounded queue to an unbounded one but making it behave like a bounded queue. The problem before was that a bounded queue would allocate all its space upfront, which isn't efficient, especially for large queues. By switching to an unbounded queue but adding size checks, we can have a queue that grows as needed but still prevents indefinite growth by enforcing a max size.
+
+Looking at the patch, the main changes are:
+
+1. The import of `unbounded` from `crossbeam_channel` is now used instead of `bounded` for the pre-init queue.
+2. The `DispatchGuard` struct now has a `max_queue_size` field.
+3. The `send` method in `DispatchGuard` checks if the queue length is below `max_queue_size` before sending. If it's full, it increments the overflow count and returns `DispatchError::QueueFull`.
+
+Now, to determine if a test is needed. Since the behavior of the queue has changed, we should test that the queue respects the max size. Without a test, we can't be sure that the new implementation doesn't allow the queue to exceed the max size or that it correctly returns the error when full.
+
+The test should verify two scenarios:
+1. When the queue is below max size, sending tasks works without error.
+2. When the queue is full, sending a task results in `QueueFull` error and the overflow count increments.
+
+I'll write a test that creates a dispatcher with a small max size, sends tasks until it's full, and then tries to send one more to check for the error and overflow.
+
+I'll also need to handle the threads properly, ensuring that the receiver isn't blocking and that all tasks are processed or the test times out. Using `ctrlc` to handle shutdown might help, but perhaps using `tokio` would make it easier to manage async tasks. However, since the code is in `std::thread`, maybe using `std::sync::mpsc` or ensuring the test doesn't hang is crucial.
+
+Wait, the dispatcher uses crossbeam channels, which are async-friendly. So maybe using `tokio` is better for the test. I'll set up a runtime, send multiple tasks, and check the behavior.
+
+I should also make sure that after filling the queue, the overflow count increases and the next send returns `QueueFull`.
+
+So, the test steps are:
+1. Initialize the dispatcher with a max_queue_size of 2.
+2. Send two tasks; they should be accepted without error.
+3. Send a third task; it should return `QueueFull` and the overflow count should be 1.
+4. Ensure that the overflow count is correctly incremented.
+
+I'll structure the test using `tokio` to handle the async sends and await the results. I'll also use `Arc` and `AtomicUsize` to track the overflow count, as it's shared between the dispatcher and the test.
+
+I need to import the necessary modules, like `tokio` for the runtime and `std::sync::Arc` for shared state. Also, I'll have to handle any potential timeouts to prevent the test from hanging.
+
+So, putting it all together, the test will create a dispatcher, send tasks, check for errors, and assert the overflow count. This should ensure that the patch works as intended.
+</think>
+
+The patch modifies the queue behavior to use an unbounded queue with a max size check, so a test is needed to verify that the queue respects the max size and correctly handles overflow.
+
+<Filename> glean-core/src/dispatcher/mod.rs </Filename>
+<imports>
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::Builder;
+use super::Dispatch;
+use super::DispatchError;
+</imports>
+<Rust>
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_preinit_queue_respects_max_size() {
+    let rt = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
+    let max_queue_size = 2;
+    let dispatch = Dispatch::new(max_queue_size);
+    let overflow_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Send two tasks to fill the queue
+    let task1 = async { /* task */ };
+    let task2 = async { /* task */ };
+    
+    dispatch.send(task1).await.unwrap();
+    dispatch.send(task2).await.unwrap();
+
+    // Try to send a third task which should fail
+    let result = dispatch.send(async { /* task */ }).await;
+    assert_eq!(result, Err(DispatchError::QueueFull));
+    
+    // Verify overflow count is incremented
+    assert_eq!(overflow_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+</Rust>

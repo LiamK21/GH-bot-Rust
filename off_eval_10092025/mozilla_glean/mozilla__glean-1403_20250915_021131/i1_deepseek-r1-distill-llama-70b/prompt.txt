@@ -1,0 +1,202 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Increase the resolution of first_run_date
+In :gkabbz 's [investigation](https://colab.research.google.com/drive/1xHte6gSrW36GBw-dFcedYoTSLKTmgfC_#scrollTo=HrZrTWO2TxXo), it may be helpful to have higher resolution for first_run_date to better group it into UTC days.
+
+As a solution, this may be as simple as changing the unit on `first_run_date`, but that should go through data review as it is "collecting more data (at a higher resolution)".
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -8,6 +8,7 @@ use super::{metrics::*, CommonMetricData, Lifetime};
+ pub struct CoreMetrics {
+     pub client_id: UuidMetric,
+     pub first_run_date: DatetimeMetric,
++    pub first_run_hour: DatetimeMetric,
+     pub os: StringMetric,
+ }
+ 
+@@ -35,6 +36,18 @@ impl CoreMetrics {
+                 TimeUnit::Day,
+             ),
+ 
++            first_run_hour: DatetimeMetric::new(
++                CommonMetricData {
++                    name: "first_run_hour".into(),
++                    category: "glean.validation".into(),
++                    send_in_pings: vec!["metrics".into(), "baseline".into()],
++                    lifetime: Lifetime::User,
++                    disabled: false,
++                    dynamic_label: None,
++                },
++                TimeUnit::Hour,
++            ),
++
+             os: StringMetric::new(CommonMetricData {
+                 name: "os".into(),
+                 category: "".into(),
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -333,6 +333,7 @@ impl Glean {
+             .is_none()
+         {
+             self.core_metrics.first_run_date.set(self, None);
++            self.core_metrics.first_run_hour.set(self, None);
+             // The `first_run_date` field is generated on the very first run
+             // and persisted across upload toggling. We can assume that, the only
+             // time it is set, that's indeed our "first run".
+@@ -445,14 +446,16 @@ impl Glean {
+         // so that it can't be accessed until this function is done.
+         let _lock = self.upload_manager.clear_ping_queue();
+ 
+-        // There is only one metric that we want to survive after clearing all
+-        // metrics: first_run_date. Here, we store its value so we can restore
+-        // it after clearing the metrics.
++        // There are only two metrics that we want to survive after clearing all
++        // metrics: first_run_date and first_run_hour. Here, we store their values
++        // so we can restore them after clearing the metrics.
+         let existing_first_run_date = self
+             .core_metrics
+             .first_run_date
+             .get_value(self, "glean_client_info");
+ 
++        let existing_first_run_hour = self.core_metrics.first_run_hour.get_value(self, "metrics");
++
+         // Clear any pending pings.
+         let ping_maker = PingMaker::new();
+         if let Err(err) = ping_maker.clear_pending_pings(self.get_data_path()) {
+@@ -495,6 +498,13 @@ impl Glean {
+                     .set(self, Some(existing_first_run_date));
+             }
+ 
++            // Restore the first_run_hour.
++            if let Some(existing_first_run_hour) = existing_first_run_hour {
++                self.core_metrics
++                    .first_run_hour
++                    .set(self, Some(existing_first_run_hour));
++            }
++
+             self.upload_enabled = false;
+         }
+     }
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -169,7 +169,7 @@ fn experiments_status_is_correctly_toggled() {
+ }
+ 
+ #[test]
+-fn client_id_and_first_run_date_must_be_regenerated() {
++fn client_id_and_first_run_date_and_first_run_hour_must_be_regenerated() {
+     let dir = tempfile::tempdir().unwrap();
+     let tmpname = dir.path().display().to_string();
+     {
+@@ -187,6 +187,11 @@ fn client_id_and_first_run_date_must_be_regenerated() {
+             .first_run_date
+             .test_get_value_as_string(&glean, "glean_client_info")
+             .is_none());
++        assert!(glean
++            .core_metrics
++            .first_run_hour
++            .test_get_value_as_string(&glean, "metrics")
++            .is_none());
+     }
+ 
+     {
+@@ -201,6 +206,11 @@ fn client_id_and_first_run_date_must_be_regenerated() {
+             .first_run_date
+             .test_get_value_as_string(&glean, "glean_client_info")
+             .is_some());
++        assert!(glean
++            .core_metrics
++            .first_run_hour
++            .test_get_value_as_string(&glean, "metrics")
++            .is_some());
+     }
+ }
+ 
+@@ -257,6 +267,34 @@ fn first_run_date_is_managed_correctly_when_toggling_uploading() {
+     );
+ }
+ 
++#[test]
++fn first_run_hour_is_managed_correctly_when_toggling_uploading() {
++    let (mut glean, _) = new_glean(None);
++
++    let original_first_run_hour = glean
++        .core_metrics
++        .first_run_hour
++        .get_value(&glean, "metrics");
++
++    glean.set_upload_enabled(false);
++    assert_eq!(
++        original_first_run_hour,
++        glean
++            .core_metrics
++            .first_run_hour
++            .get_value(&glean, "metrics")
++    );
++
++    glean.set_upload_enabled(true);
++    assert_eq!(
++        original_first_run_hour,
++        glean
++            .core_metrics
++            .first_run_hour
++            .get_value(&glean, "metrics")
++    );
++}
++
+ #[test]
+ fn client_id_is_managed_correctly_when_toggling_uploading() {
+     let (mut glean, _) = new_glean(None);
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn first_run_date_is_managed_correctly_when_toggling_uploading() -> ()
+
+fn experiments_status_is_correctly_toggled() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,787 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the labeled type in the RLB
+As the title says.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/common_test.rs b/glean-core/rlb/src/common_test.rs
+--- a/glean-core/rlb/src/common_test.rs
++++ b/glean-core/rlb/src/common_test.rs
+@@ -0,0 +1,57 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use crate::ClientInfoMetrics;
++use crate::Configuration;
++use std::sync::{Mutex, MutexGuard};
++
++use once_cell::sync::Lazy;
++
++pub(crate) const GLOBAL_APPLICATION_ID: &str = "org.mozilla.rlb.test";
++
++// Because Glean uses a global-singleton, we need to run the tests one-by-one to
++// avoid different tests stomping over each other.
++// This is only an issue because we're resetting Glean, this cannot happen in normal
++// use of the RLB.
++//
++// We use a global lock to force synchronization of all tests, even if run multi-threaded.
++// This allows us to run without `--test-threads 1`.`
++pub(crate) fn lock_test() -> MutexGuard<'static, ()> {
++    static GLOBAL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
++
++    // This is going to be called from all the tests: make sure
++    // to enable logging.
++    env_logger::try_init().ok();
++
++    let lock = GLOBAL_LOCK.lock().unwrap();
++
++    lock
++}
++
++// Create a new instance of Glean with a temporary directory.
++// We need to keep the `TempDir` alive, so that it's not deleted before we stop using it.
++pub(crate) fn new_glean(
++    configuration: Option<Configuration>,
++    clear_stores: bool,
++) -> tempfile::TempDir {
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    let cfg = match configuration {
++        Some(c) => c,
++        None => Configuration {
++            data_path: tmpname,
++            application_id: GLOBAL_APPLICATION_ID.into(),
++            upload_enabled: true,
++            max_events: None,
++            delay_ping_lifetime_io: false,
++            channel: Some("testing".into()),
++            server_endpoint: Some("invalid-test-host".into()),
++            uploader: None,
++        },
++    };
++
++    crate::test_reset_glean(cfg, ClientInfoMetrics::unknown(), clear_stores);
++    dir
++}
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -56,6 +56,9 @@ pub mod net;
+ pub mod private;
+ mod system;
+ 
++#[cfg(test)]
++mod common_test;
++
+ const LANGUAGE_BINDING_NAME: &str = "Rust";
+ 
+ /// State to keep track for the Rust Language bindings.
+@@ -496,7 +499,6 @@ pub(crate) fn test_get_experiment_data(experiment_id: String) -> RecordedExperim
+ }
+ 
+ /// Destroy the global Glean state.
+-#[cfg(test)]
+ pub(crate) fn destroy_glean(clear_stores: bool) {
+     // Destroy the existing glean instance from glean-core.
+     if was_initialize_called() {
+@@ -519,10 +521,9 @@ pub(crate) fn destroy_glean(clear_stores: bool) {
+     }
+ }
+ 
++/// TEST ONLY FUNCTION.
+ /// Resets the Glean state and triggers init again.
+-#[cfg(test)]
+-#[allow(dead_code)]
+-pub(crate) fn reset_glean(cfg: Configuration, client_info: ClientInfoMetrics, clear_stores: bool) {
++pub fn test_reset_glean(cfg: Configuration, client_info: ClientInfoMetrics, clear_stores: bool) {
+     destroy_glean(clear_stores);
+ 
+     // Always log pings for tests
+
+diff --git a/glean-core/rlb/src/private/counter.rs b/glean-core/rlb/src/private/counter.rs
+--- a/glean-core/rlb/src/private/counter.rs
++++ b/glean-core/rlb/src/private/counter.rs
+@@ -84,6 +84,8 @@ impl glean_core::traits::Counter for CounterMetric {
+         error: ErrorType,
+         ping_name: S,
+     ) -> i32 {
++        dispatcher::block_on_queue();
++
+         crate::with_glean_mut(|glean| {
+             glean_core::test_get_num_recorded_errors(&glean, self.0.meta(), error, ping_name.into())
+                 .unwrap_or(0)
+
+diff --git a/glean-core/rlb/src/private/labeled.rs b/glean-core/rlb/src/private/labeled.rs
+--- a/glean-core/rlb/src/private/labeled.rs
++++ b/glean-core/rlb/src/private/labeled.rs
+@@ -0,0 +1,381 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use inherent::inherent;
++use std::sync::Arc;
++
++use glean_core::metrics::MetricType;
++use glean_core::ErrorType;
++
++use crate::dispatcher;
++
++/// Sealed traits protect against downstream implementations.
++///
++/// We wrap it in a private module that is inaccessible outside of this module.
++mod private {
++    use crate::{
++        private::BooleanMetric, private::CounterMetric, private::StringMetric, CommonMetricData,
++    };
++    use std::sync::Arc;
++
++    /// The sealed labeled trait.
++    ///
++    /// This also allows us to hide methods, that are only used internally
++    /// and should not be visible to users of the object implementing the
++    /// `Labeled<T>` trait.
++    pub trait Sealed {
++        /// The `glean_core` metric type representing the labeled metric.
++        type Inner: glean_core::metrics::MetricType + Clone;
++
++        /// Create a new metric object implementing this trait from the inner type.
++        fn from_inner(metric: Self::Inner) -> Self;
++
++        /// Create a new `glean_core` metric from the metadata.
++        fn new_inner(meta: crate::CommonMetricData) -> Self::Inner;
++    }
++
++    // `LabeledMetric<BooleanMetric>` is possible.
++    //
++    // See [Labeled Booleans](https://mozilla.github.io/glean/book/user/metrics/labeled_booleans.html).
++    impl Sealed for BooleanMetric {
++        type Inner = glean_core::metrics::BooleanMetric;
++
++        fn from_inner(metric: Self::Inner) -> Self {
++            BooleanMetric(Arc::new(metric))
++        }
++
++        fn new_inner(meta: CommonMetricData) -> Self::Inner {
++            glean_core::metrics::BooleanMetric::new(meta)
++        }
++    }
++
++    // `LabeledMetric<StringMetric>` is possible.
++    //
++    // See [Labeled Strings](https://mozilla.github.io/glean/book/user/metrics/labeled_strings.html).
++    impl Sealed for StringMetric {
++        type Inner = glean_core::metrics::StringMetric;
++
++        fn from_inner(metric: Self::Inner) -> Self {
++            StringMetric(Arc::new(metric))
++        }
++
++        fn new_inner(meta: CommonMetricData) -> Self::Inner {
++            glean_core::metrics::StringMetric::new(meta)
++        }
++    }
++
++    // `LabeledMetric<CounterMetric>` is possible.
++    //
++    // See [Labeled Counters](https://mozilla.github.io/glean/book/user/metrics/labeled_counters.html).
++    impl Sealed for CounterMetric {
++        type Inner = glean_core::metrics::CounterMetric;
++
++        fn from_inner(metric: Self::Inner) -> Self {
++            CounterMetric(Arc::new(metric))
++        }
++
++        fn new_inner(meta: CommonMetricData) -> Self::Inner {
++            glean_core::metrics::CounterMetric::new(meta)
++        }
++    }
++}
++
++/// Marker trait for metrics that can be nested inside a labeled metric.
++///
++/// This trait is sealed and cannot be implemented for types outside this crate.
++pub trait AllowLabeled: private::Sealed {}
++
++// Implement the trait for everything we marked as allowed.
++impl<T> AllowLabeled for T where T: private::Sealed {}
++
++// We need to wrap the glean-core type: otherwise if we try to implement
++// the trait for the metric in `glean_core::metrics` we hit error[E0117]:
++// only traits defined in the current crate can be implemented for arbitrary
++// types.
++
++/// This implements the specific facing API for recording labeled metrics.
++///
++/// Instances of this type are automatically generated by the parser
++/// at build time, allowing developers to record values that were previously
++/// registered in the metrics.yaml file.
++/// Unlike most metric types, `LabeledMetric` does not have its own corresponding
++/// storage, but records metrics for the underlying metric type `T` in the storage
++/// for that type.
++#[derive(Clone)]
++pub struct LabeledMetric<T: AllowLabeled>(
++    pub(crate) Arc<glean_core::metrics::LabeledMetric<T::Inner>>,
++);
++
++impl<T> LabeledMetric<T>
++where
++    T: AllowLabeled,
++{
++    /// The public constructor used by automatically generated metrics.
++    pub fn new(meta: glean_core::CommonMetricData, labels: Option<Vec<String>>) -> Self {
++        let submetric = T::new_inner(meta);
++        let core = glean_core::metrics::LabeledMetric::new(submetric, labels);
++        Self(Arc::new(core))
++    }
++}
++
++#[inherent(pub)]
++impl<T> glean_core::traits::Labeled<T> for LabeledMetric<T>
++where
++    T: AllowLabeled + Clone,
++{
++    /// Gets a specific metric for a given label.
++    ///
++    /// If a set of acceptable labels were specified in the `metrics.yaml` file,
++    /// and the given label is not in the set, it will be recorded under the special `OTHER_LABEL` label.
++    ///
++    /// If a set of acceptable labels was not specified in the `metrics.yaml` file,
++    /// only the first 16 unique labels will be used.
++    /// After that, any additional labels will be recorded under the special `OTHER_LABEL` label.
++    ///
++    /// Labels must be `snake_case` and less than 30 characters.
++    /// If an invalid label is used, the metric will be recorded in the special `OTHER_LABEL` label.
++    fn get(&self, label: &str) -> T {
++        let inner = self.0.get(label);
++        T::from_inner(inner)
++    }
++
++    /// **Exported for test purposes.**
++    ///
++    /// Gets the number of recorded errors for the given metric and error type.
++    ///
++    /// # Arguments
++    ///
++    /// * `error` - The type of error
++    /// * `ping_name` - represents the optional name of the ping to retrieve the
++    ///   metric for. Defaults to the first value in `send_in_pings`.
++    ///
++    /// # Returns
++    ///
++    /// The number of errors reported.
++    fn test_get_num_recorded_errors<'a, S: Into<Option<&'a str>>>(
++        &self,
++        error: ErrorType,
++        ping_name: S,
++    ) -> i32 {
++        dispatcher::block_on_queue();
++
++        crate::with_glean_mut(|glean| {
++            glean_core::test_get_num_recorded_errors(
++                &glean,
++                self.0.get_submetric().meta(),
++                error,
++                ping_name.into(),
++            )
++            .unwrap_or(0)
++        })
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use super::ErrorType;
++    use crate::common_test::{lock_test, new_glean};
++    use crate::destroy_glean;
++    use crate::private::{BooleanMetric, CounterMetric, LabeledMetric, StringMetric};
++    use crate::CommonMetricData;
++
++    #[test]
++    fn test_labeled_counter_type() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<CounterMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_counter".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        metric.get("label1").add(1);
++        metric.get("label2").add(2);
++        assert_eq!(1, metric.get("label1").test_get_value("test1").unwrap());
++        assert_eq!(2, metric.get("label2").test_get_value("test1").unwrap());
++    }
++
++    #[test]
++    fn test_other_label_with_predefined_labels() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<CounterMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_counter".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            Some(vec!["foo".into(), "bar".into(), "baz".into()]),
++        );
++
++        metric.get("foo").add(1);
++        metric.get("foo").add(2);
++        metric.get("bar").add(1);
++        metric.get("not_there").add(1);
++        metric.get("also_not_there").add(1);
++        metric.get("not_me").add(1);
++
++        assert_eq!(3, metric.get("foo").test_get_value(None).unwrap());
++        assert_eq!(1, metric.get("bar").test_get_value(None).unwrap());
++        assert!(metric.get("baz").test_get_value(None).is_none());
++        // The rest all lands in the __other__ bucket.
++        assert_eq!(3, metric.get("__other__").test_get_value(None).unwrap());
++    }
++
++    #[test]
++    fn test_other_label_without_predefined_labels() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<CounterMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_counter".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        // Record in 20 labels: it will go over the maximum number of supported
++        // dynamic labels.
++        for i in 0..=20 {
++            metric.get(format!("label_{}", i).as_str()).add(1);
++        }
++        // Record in a label once again.
++        metric.get("label_0").add(1);
++
++        assert_eq!(2, metric.get("label_0").test_get_value(None).unwrap());
++        for i in 1..15 {
++            assert_eq!(
++                1,
++                metric
++                    .get(format!("label_{}", i).as_str())
++                    .test_get_value(None)
++                    .unwrap()
++            );
++        }
++        assert_eq!(5, metric.get("__other__").test_get_value(None).unwrap());
++    }
++
++    #[test]
++    fn test_other_label_without_predefined_labels_before_glean_init() {
++        let _lock = lock_test();
++
++        // We explicitly want Glean to not be initialized.
++        destroy_glean(true);
++
++        let metric: LabeledMetric<CounterMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_counter".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        // Record in 20 labels: it will go over the maximum number of supported
++        // dynamic labels.
++        for i in 0..=20 {
++            metric.get(format!("label_{}", i).as_str()).add(1);
++        }
++        // Record in a label once again.
++        metric.get("label_0").add(1);
++
++        // Initialize Glean.
++        let _t = new_glean(None, false);
++
++        assert_eq!(2, metric.get("label_0").test_get_value(None).unwrap());
++        for i in 1..15 {
++            assert_eq!(
++                1,
++                metric
++                    .get(format!("label_{}", i).as_str())
++                    .test_get_value(None)
++                    .unwrap()
++            );
++        }
++        assert_eq!(5, metric.get("__other__").test_get_value(None).unwrap());
++    }
++
++    #[test]
++    fn test_labeled_string_type() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<StringMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_string".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        metric.get("label1").set("foo");
++        metric.get("label2").set("bar");
++        assert_eq!("foo", metric.get("label1").test_get_value("test1").unwrap());
++        assert_eq!("bar", metric.get("label2").test_get_value("test1").unwrap());
++    }
++
++    #[test]
++    fn test_labeled_boolean_type() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<BooleanMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_boolean".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        metric.get("label1").set(false);
++        metric.get("label2").set(true);
++        assert!(!metric.get("label1").test_get_value("test1").unwrap());
++        assert!(metric.get("label2").test_get_value("test1").unwrap());
++    }
++
++    #[test]
++    fn test_invalid_labels_record_errors() {
++        let _lock = lock_test();
++
++        let _t = new_glean(None, true);
++
++        let metric: LabeledMetric<BooleanMetric> = LabeledMetric::new(
++            CommonMetricData {
++                name: "labeled_boolean".into(),
++                category: "labeled".into(),
++                send_in_pings: vec!["test1".into()],
++                ..Default::default()
++            },
++            None,
++        );
++
++        let invalid_label = "!#I'm invalid#--_";
++        metric.get(invalid_label).set(true);
++        assert_eq!(true, metric.get("__other__").test_get_value(None).unwrap());
++        assert_eq!(
++            1,
++            metric.test_get_num_recorded_errors(ErrorType::InvalidLabel, None)
++        );
++    }
++}
+
+diff --git a/glean-core/rlb/src/private/mod.rs b/glean-core/rlb/src/private/mod.rs
+--- a/glean-core/rlb/src/private/mod.rs
++++ b/glean-core/rlb/src/private/mod.rs
+@@ -6,6 +6,7 @@
+ 
+ mod boolean;
+ mod counter;
++mod labeled;
+ mod ping;
+ mod recorded_experiment_data;
+ mod string;
+@@ -14,6 +15,7 @@ mod uuid;
+ pub use self::uuid::UuidMetric;
+ pub use boolean::BooleanMetric;
+ pub use counter::CounterMetric;
++pub use labeled::{AllowLabeled, LabeledMetric};
+ pub use ping::PingType;
+ pub use recorded_experiment_data::RecordedExperimentData;
+ pub use string::StringMetric;
+
+diff --git a/glean-core/rlb/src/private/string.rs b/glean-core/rlb/src/private/string.rs
+--- a/glean-core/rlb/src/private/string.rs
++++ b/glean-core/rlb/src/private/string.rs
+@@ -88,6 +88,8 @@ impl glean_core::traits::String for StringMetric {
+         error: ErrorType,
+         ping_name: S,
+     ) -> i32 {
++        dispatcher::block_on_queue();
++
+         crate::with_glean_mut(|glean| {
+             glean_core::test_get_num_recorded_errors(&glean, self.0.meta(), error, ping_name.into())
+                 .unwrap_or(0)
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -3,49 +3,14 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use crate::private::{BooleanMetric, CounterMetric};
+-use once_cell::sync::Lazy;
+ use std::path::PathBuf;
+-use std::sync::Mutex;
+ 
+ use super::*;
+-
+-// Because glean_preview is a global-singleton, we need to run the tests one-by-one to avoid different tests stomping over each other.
+-// This is only an issue because we're resetting Glean, this cannot happen in normal use of the
+-// RLB.
+-//
+-// We use a global lock to force synchronization of all tests, even if run multi-threaded.
+-// This allows us to run without `--test-threads 1`.`
+-static GLOBAL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+-const GLOBAL_APPLICATION_ID: &str = "org.mozilla.rlb.test";
+-
+-// Create a new instance of Glean with a temporary directory.
+-// We need to keep the `TempDir` alive, so that it's not deleted before we stop using it.
+-fn new_glean(configuration: Option<Configuration>, clear_stores: bool) -> tempfile::TempDir {
+-    let dir = tempfile::tempdir().unwrap();
+-    let tmpname = dir.path().display().to_string();
+-
+-    let cfg = match configuration {
+-        Some(c) => c,
+-        None => Configuration {
+-            data_path: tmpname,
+-            application_id: GLOBAL_APPLICATION_ID.into(),
+-            upload_enabled: true,
+-            max_events: None,
+-            delay_ping_lifetime_io: false,
+-            channel: Some("testing".into()),
+-            server_endpoint: Some("invalid-test-host".into()),
+-            uploader: None,
+-        },
+-    };
+-
+-    crate::reset_glean(cfg, ClientInfoMetrics::unknown(), clear_stores);
+-    dir
+-}
++use crate::common_test::{lock_test, new_glean, GLOBAL_APPLICATION_ID};
+ 
+ #[test]
+ fn send_a_ping() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     let (s, r) = crossbeam_channel::bounded::<String>(1);
+ 
+@@ -97,8 +62,7 @@ fn send_a_ping() {
+ 
+ #[test]
+ fn disabling_upload_disables_metrics_recording() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     let _t = new_glean(None, true);
+     crate::dispatcher::block_on_queue();
+@@ -119,9 +83,7 @@ fn disabling_upload_disables_metrics_recording() {
+ 
+ #[test]
+ fn test_experiments_recording() {
+-    // setup glean for the test
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     let _t = new_glean(None, true);
+ 
+@@ -145,8 +107,7 @@ fn test_experiments_recording() {
+ 
+ #[test]
+ fn test_experiments_recording_before_glean_inits() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     // Destroy the existing glean instance from glean-core so that we
+     // can test the pre-init queueing of the experiment api commands.
+@@ -184,7 +145,7 @@ fn test_experiments_recording_before_glean_inits() {
+     let dir = tempfile::tempdir().unwrap();
+     let tmpname = dir.path().display().to_string();
+ 
+-    reset_glean(
++    test_reset_glean(
+         Configuration {
+             data_path: tmpname,
+             application_id: GLOBAL_APPLICATION_ID.into(),
+@@ -222,8 +183,7 @@ fn test_sending_of_startup_baseline_ping() {
+ 
+ #[test]
+ fn initialize_must_not_crash_if_data_dir_is_messed_up() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     let dir = tempfile::tempdir().unwrap();
+     let tmpdirname = dir.path().display().to_string();
+@@ -243,7 +203,7 @@ fn initialize_must_not_crash_if_data_dir_is_messed_up() {
+         uploader: None,
+     };
+ 
+-    reset_glean(cfg, ClientInfoMetrics::unknown(), false);
++    test_reset_glean(cfg, ClientInfoMetrics::unknown(), false);
+     // TODO(bug 1675215): ensure initialize runs through dispatcher.
+     // Glean init is async and, for this test, it bails out early due to
+     // an caused by not being able to create the data dir: we can do nothing
+@@ -256,8 +216,7 @@ fn initialize_must_not_crash_if_data_dir_is_messed_up() {
+ 
+ #[test]
+ fn queued_recorded_metrics_correctly_record_during_init() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     destroy_glean(true);
+ 
+@@ -290,13 +249,12 @@ fn queued_recorded_metrics_correctly_record_during_init() {
+ 
+ #[test]
+ fn initializing_twice_is_a_noop() {
+-    let _lock = GLOBAL_LOCK.lock().unwrap();
+-    env_logger::try_init().ok();
++    let _lock = lock_test();
+ 
+     let dir = tempfile::tempdir().unwrap();
+     let tmpname = dir.path().display().to_string();
+ 
+-    reset_glean(
++    test_reset_glean(
+         Configuration {
+             data_path: tmpname.clone(),
+             application_id: GLOBAL_APPLICATION_ID.into(),
+@@ -313,7 +271,7 @@ fn initializing_twice_is_a_noop() {
+ 
+     dispatcher::block_on_queue();
+ 
+-    reset_glean(
++    test_reset_glean(
+         Configuration {
+             data_path: tmpname,
+             application_id: GLOBAL_APPLICATION_ID.into(),
+
+diff --git a/glean-core/src/traits/labeled.rs b/glean-core/src/traits/labeled.rs
+--- a/glean-core/src/traits/labeled.rs
++++ b/glean-core/src/traits/labeled.rs
+@@ -2,7 +2,7 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use crate::metrics::MetricType;
++use crate::ErrorType;
+ 
+ /// A description for the `LabeledMetric` type.
+ ///
+@@ -10,7 +10,7 @@ use crate::metrics::MetricType;
+ /// implemented in the related type in `../metrics/`.
+ pub trait Labeled<T>
+ where
+-    T: MetricType + Clone,
++    T: Clone,
+ {
+     /// Gets a specific metric for a given label.
+     ///
+@@ -25,9 +25,22 @@ where
+     /// If an invalid label is used, the metric will be recorded in the special `OTHER_LABEL` label.
+     fn get(&self, label: &str) -> T;
+ 
+-    /// Gets the template submetric.
++    /// **Exported for test purposes.**
+     ///
+-    /// The template submetric is the actual metric that is cloned and modified
+-    /// to record for a specific label.
+-    fn get_submetric(&self) -> &T;
++    /// Gets the number of recorded errors for the given metric and error type.
++    ///
++    /// # Arguments
++    ///
++    /// * `error` - The type of error
++    /// * `ping_name` - represents the optional name of the ping to retrieve the
++    ///   metric for. Defaults to the first value in `send_in_pings`.
++    ///
++    /// # Returns
++    ///
++    /// The number of errors reported.
++    fn test_get_num_recorded_errors<'a, S: Into<Option<&'a str>>>(
++        &self,
++        error: ErrorType,
++        ping_name: S,
++    ) -> i32;
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn destroy_glean(clear_stores: bool) -> ()
+
+fn initializing_twice_is_a_noop() -> ()
+
+fn send_a_ping() -> ()
+
+fn initialize_must_not_crash_if_data_dir_is_messed_up() -> ()
+
+fn disabling_upload_disables_metrics_recording() -> ()
+
+fn queued_recorded_metrics_correctly_record_during_init() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

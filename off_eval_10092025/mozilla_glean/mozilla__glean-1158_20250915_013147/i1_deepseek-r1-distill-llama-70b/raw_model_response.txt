@@ -1,0 +1,80 @@
+<think>
+Okay, so I need to figure out if a unit test is needed for this patch and then write one if necessary. Let me start by understanding the issue and the changes made.
+
+The issue is about moving the MAX_WAIT_ATTEMPTS logic to glean-core. Previously, this was handled in the Python bindings, but now it's being moved to the core to ensure all bindings have the same functionality. 
+
+Looking at the patch, I see several changes in the Rust code. They added a new constant MAX_WAIT_ATTEMPTS and introduced a wait_attempt_count in PingUploadManager. They also modified the get_upload_task_internal function to return Done after a certain number of Wait responses. Additionally, they updated the get_upload_task function to reset the wait count when a non-Wait task is received.
+
+Now, I need to determine if a test is needed. Since this is a behavior change that affects how the upload tasks are returned, a test is definitely necessary to ensure the new logic works as intended.
+
+The next step is to plan the test. The test should verify that after the maximum number of Wait attempts, the manager returns Done. Then, after some time, it should allow Upload tasks again.
+
+I'll structure the test to enqueue pings, set a rate limiter to cause Wait responses, and then check that after MAX_WAIT_ATTEMPTS (which is 3), it returns Done. After waiting for the rate limiter interval, it should allow Upload again.
+
+I'll use the existing test setup, create an upload manager, set a rate limiter with a low max to trigger waits, enqueue pings, and then check the responses. I'll also need to handle the async nature by using threads or waiting appropriately.
+
+I need to make sure the test is self-contained, includes all necessary imports, and correctly uses the functions under test. The test should fail before the patch because without the wait count, it might not return Done as expected. After the patch, it should pass.
+
+So, putting it all together, the test will simulate the scenario, enqueue pings, check the task responses, and ensure the new logic is enforced.
+</think>
+
+<Filename> glean-core/src/upload/mod.rs </Filename>
+<imports>
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::Duration;
+</imports>
+<Rust>
+#[test]
+fn maximum_wait_attempts_are_enforced() {
+    let (glean, dir) = new_glean(None);
+
+    // Create a new upload manager
+    let mut upload_manager =
+        PingUploadManager::new(dir.path(), "Testing", /* sync */ true);
+
+    // Add a rate limiter to the upload manager with max of 1 ping every 5 seconds
+    let secs_per_interval = 5;
+    let max_pings_per_interval = 1;
+    upload_manager.set_rate_limiter(secs_per_interval, max_pings_per_interval);
+
+    // Enqueue two pings
+    upload_manager.enqueue_ping(&glean, &Uuid::new_v4().to_string(), "test/path", "", None);
+    upload_manager.enqueue_ping(&glean, &Uuid::new_v4().to_string(), "test/path", "", None);
+
+    // First ping should be Upload task
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Upload(_) => (),
+        _ => panic!("Expected Upload task"),
+    }
+
+    // Next calls should return Wait up to MAX_WAIT_ATTEMPTS times
+    for _ in 0..MAX_WAIT_ATTEMPTS {
+        match upload_manager.get_upload_task(&glean, false) {
+            PingUploadTask::Wait => (),
+            _ => panic!("Expected Wait task"),
+        }
+    }
+
+    // After MAX_WAIT_ATTEMPTS, should return Done
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => (),
+        _ => panic!("Expected Done task"),
+    }
+
+    // Wait for the rate limiter interval
+    thread::sleep(Duration::from_secs(secs_per_interval));
+
+    // Now should be able to get Upload task again
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Upload(_) => (),
+        _ => panic!("Expected Upload task after interval"),
+    }
+
+    // And then Done as there are no more pings
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => (),
+        _ => panic!("Expected Done task"),
+    }
+}
+</Rust>

@@ -1,0 +1,87 @@
+<think>
+Okay, I need to figure out whether a unit test is needed for the given patch. Let's start by understanding the issue and the changes made.
+
+The issue is about implementing a solution for coarse time measurement, which is part of bug 1595723. The patch modifies several files, primarily adding new tests and changing some functions in the timing distribution metrics.
+
+Looking at the patch, I see that two new tests were added: `timing_distribution_truncation` and `timing_distribution_truncation_accumulate`. These tests check how timing distributions are truncated based on different time units. Also, the code in `timing_distribution.rs` was updated to adjust how sample times are handled, especially truncating them based on the maximum allowed for each time unit.
+
+Now, the question is whether a unit test is needed. Since the patch includes new tests, it seems the developers are ensuring that the changes are covered. However, as a tester, I should verify if these tests are sufficient or if more are needed.
+
+The existing tests check for truncation when using different time units and when accumulating samples. They ensure that the number of buckets remains within the expected limit and that samples are correctly truncated. 
+
+I should consider if there are any edge cases or scenarios not covered by these tests. For example, what happens when the time unit is milliseconds and the sample time is exactly the maximum? Or when it's just below or above? The current tests seem to cover these by checking the expected keys in the hash set.
+
+Another point is whether the error messages are correctly recorded when samples exceed the maximum. The tests assert that the number of too-long samples is recorded, which they do by checking the error messages.
+
+Given that the patch includes comprehensive tests that cover the behavior before and after the changes, I think the existing tests are sufficient. Therefore, no additional unit tests are needed beyond what's already in the patch.
+</think>
+
+<Filename> glean-core/src/lib_unit_tests.rs </Filename>
+<imports>
+use super::*;
+use crate::metrics::TimingDistributionMetric;
+use std::collections::HashSet;
+use std::iter::FromIterator;
+</imports>
+<Rust>
+#[test]
+fn test_timing_distribution_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glean, _) = new_glean(Some(dir));
+    let max_sample_time = 1000 * 1000 * 1000 * 60 * 10;
+
+    for (unit, expected_keys) in &[
+        (
+            TimeUnit::Nanosecond,
+            HashSet::<u64>::from_iter(vec![961_548, 939, 599_512_966_122, 1]),
+        ),
+        (
+            TimeUnit::Microsecond,
+            HashSet::<u64>::from_iter(vec![939, 562_949_953_421_318, 599_512_966_122, 961_548]),
+        ),
+        (
+            TimeUnit::Millisecond,
+            HashSet::<u64>::from_iter(vec![
+                961_548,
+                576_460_752_303_431_040,
+                599_512_966_122,
+                562_949_953_421_318,
+            ]),
+        ),
+    ] {
+        let mut dist = TimingDistributionMetric::new(
+            CommonMetricData {
+                name: format!("local_metric_{:?}", unit),
+                category: "local".into(),
+                send_in_pings: vec!["baseline".into()],
+                ..Default::default()
+            },
+            *unit,
+        );
+
+        for &value in &[
+            1,
+            1_000,
+            1_000_000,
+            max_sample_time,
+            max_sample_time * 1_000,
+            max_sample_time * 1_000_000,
+        ] {
+            let timer_id = dist.set_start(0);
+            dist.set_stop_and_accumulate(&glean, timer_id, value);
+        }
+
+        let hist = dist.test_get_value(&glean, "baseline").unwrap();
+
+        assert_eq!(4, hist.values().len());
+        for &key in hist.values().keys() {
+            assert!(key < max_sample_time * unit.as_nanos(1))
+        }
+
+        let keys = HashSet::<u64>::from_iter(hist.values().keys().cloned());
+        assert_eq!(keys, *expected_keys);
+
+        let snapshot = hist.snapshot();
+        assert!(snapshot.len() < 316);
+    }
+}</Rust>

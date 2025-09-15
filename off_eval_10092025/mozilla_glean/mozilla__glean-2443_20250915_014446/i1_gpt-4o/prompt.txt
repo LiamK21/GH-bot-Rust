@@ -1,0 +1,331 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Server Knobs: Invert the `disabled` parameter in the Server Knobs API to reduce confusion
+Since the Glean metrics property is actually `disabled` defaulting to `false` rather than `enabled` with a default of `true`, this creates Server Knobs feature configurations that look like `"category.name": true` in order to _disable_ a metric.
+
+If this were inverted in the API so that instead we were passing in the `enabled` state of the metric, it would be much less confusing
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -170,9 +170,9 @@ pub fn set_experiment_inactive(experiment_id: String) {
+ 
+ /// Set the remote configuration values for the metrics' disabled property
+ ///
+-/// See [`glean_core::Glean::set_metrics_disabled_config`].
+-pub fn glean_set_metrics_disabled_config(json: String) {
+-    glean_core::glean_set_metrics_disabled_config(json)
++/// See [`glean_core::Glean::set_metrics_enabled_config`].
++pub fn glean_set_metrics_enabled_config(json: String) {
++    glean_core::glean_set_metrics_enabled_config(json)
+ }
+ 
+ /// Performs the collection/cleanup operations required by becoming active.
+
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -12,7 +12,7 @@ use crate::event_database::EventDatabase;
+ use crate::internal_metrics::{AdditionalMetrics, CoreMetrics, DatabaseMetrics};
+ use crate::internal_pings::InternalPings;
+ use crate::metrics::{
+-    self, ExperimentMetric, Metric, MetricType, MetricsDisabledConfig, PingType, RecordedExperiment,
++    self, ExperimentMetric, Metric, MetricType, MetricsEnabledConfig, PingType, RecordedExperiment,
+ };
+ use crate::ping::PingMaker;
+ use crate::storage::{StorageManager, INTERNAL_STORAGE};
+@@ -153,7 +153,7 @@ pub struct Glean {
+     pub(crate) app_build: String,
+     pub(crate) schedule_metrics_pings: bool,
+     pub(crate) remote_settings_epoch: AtomicU8,
+-    pub(crate) remote_settings_metrics_config: Arc<Mutex<MetricsDisabledConfig>>,
++    pub(crate) remote_settings_metrics_config: Arc<Mutex<MetricsEnabledConfig>>,
+ }
+ 
+ impl Glean {
+@@ -207,7 +207,7 @@ impl Glean {
+             // Subprocess doesn't use "metrics" pings so has no need for a scheduler.
+             schedule_metrics_pings: false,
+             remote_settings_epoch: AtomicU8::new(0),
+-            remote_settings_metrics_config: Arc::new(Mutex::new(MetricsDisabledConfig::new())),
++            remote_settings_metrics_config: Arc::new(Mutex::new(MetricsEnabledConfig::new())),
+         };
+ 
+         // Ensuring these pings are registered.
+@@ -703,14 +703,14 @@ impl Glean {
+         metric.test_get_value(self)
+     }
+ 
+-    /// Set configuration for metrics' disabled property, typically from a remote_settings experiment
+-    /// or rollout
++    /// Set configuration to override the default metric enabled/disabled state, typically from a
++    /// remote_settings experiment or rollout
+     ///
+     /// # Arguments
+     ///
+-    /// * `json` - The stringified JSON representation of a `MetricsDisabledConfig` object
+-    pub fn set_metrics_disabled_config(&self, cfg: MetricsDisabledConfig) {
+-        // Set the current MetricsDisabledConfig, keeping the lock until the epoch is
++    /// * `json` - The stringified JSON representation of a `MetricsEnabledConfig` object
++    pub fn set_metrics_enabled_config(&self, cfg: MetricsEnabledConfig) {
++        // Set the current MetricsEnabledConfig, keeping the lock until the epoch is
+         // updated to prevent against reading a "new" config but an "old" epoch
+         let mut lock = self.remote_settings_metrics_config.lock().unwrap();
+         *lock = cfg;
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -28,7 +28,7 @@ use crossbeam_channel::unbounded;
+ use once_cell::sync::{Lazy, OnceCell};
+ use uuid::Uuid;
+ 
+-use metrics::MetricsDisabledConfig;
++use metrics::MetricsEnabledConfig;
+ 
+ mod common_metric_data;
+ mod core;
+@@ -773,13 +773,14 @@ pub fn glean_test_get_experiment_data(experiment_id: String) -> Option<RecordedE
+     core::with_glean(|glean| glean.test_get_experiment_data(experiment_id.to_owned()))
+ }
+ 
+-/// Sets a remote configuration for the metrics' disabled property
++/// Sets a remote configuration to override metrics' default enabled/disabled
++/// state
+ ///
+-/// See [`core::Glean::set_metrics_disabled_config`].
+-pub fn glean_set_metrics_disabled_config(json: String) {
+-    match MetricsDisabledConfig::try_from(json) {
++/// See [`core::Glean::set_metrics_enabled_config`].
++pub fn glean_set_metrics_enabled_config(json: String) {
++    match MetricsEnabledConfig::try_from(json) {
+         Ok(cfg) => launch_with_glean(|glean| {
+-            glean.set_metrics_disabled_config(cfg);
++            glean.set_metrics_enabled_config(cfg);
+         }),
+         Err(e) => {
+             log::error!("Error setting metrics feature config: {:?}", e);
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -852,15 +852,15 @@ fn test_set_metrics_disabled() {
+     );
+ 
+     // 2. Set a configuration to disable the metrics
+-    let mut metrics_disabled_config = json!(
++    let mut metrics_enabled_config = json!(
+         {
+-            "category.string_metric": true,
+-            "category.labeled_string_metric": true,
++            "category.string_metric": false,
++            "category.labeled_string_metric": false,
+         }
+     )
+     .to_string();
+-    glean.set_metrics_disabled_config(
+-        MetricsDisabledConfig::try_from(metrics_disabled_config).unwrap(),
++    glean.set_metrics_enabled_config(
++        MetricsEnabledConfig::try_from(metrics_enabled_config).unwrap(),
+     );
+ 
+     // 3. Since the metrics were disabled, setting a new value will be ignored
+@@ -883,9 +883,9 @@ fn test_set_metrics_disabled() {
+     );
+ 
+     // 4. Set a new configuration where the metrics are enabled
+-    metrics_disabled_config = json!({}).to_string();
+-    glean.set_metrics_disabled_config(
+-        MetricsDisabledConfig::try_from(metrics_disabled_config).unwrap(),
++    metrics_enabled_config = json!({}).to_string();
++    glean.set_metrics_enabled_config(
++        MetricsEnabledConfig::try_from(metrics_enabled_config).unwrap(),
+     );
+ 
+     // 5. Since the metrics are now enabled, setting a new value should work
+@@ -917,14 +917,14 @@ fn test_remote_settings_epoch() {
+     assert_eq!(0u8, current_epoch, "Current epoch must start at 0");
+ 
+     // 2. Set a configuration which will trigger incrementing the epoch
+-    let metrics_disabled_config = json!(
++    let metrics_enabled_config = json!(
+         {
+-            "category.string_metric": true
++            "category.string_metric": false
+         }
+     )
+     .to_string();
+-    glean.set_metrics_disabled_config(
+-        MetricsDisabledConfig::try_from(metrics_disabled_config).unwrap(),
++    glean.set_metrics_enabled_config(
++        MetricsEnabledConfig::try_from(metrics_enabled_config).unwrap(),
+     );
+ 
+     // 3. Ensure the epoch updated
+@@ -951,14 +951,14 @@ fn test_remote_settings_epoch_updates_in_metric() {
+     );
+ 
+     // 2. Set a configuration to disable the `category.string_metric`
+-    let metrics_disabled_config = json!(
++    let metrics_enabled_config = json!(
+         {
+-            "category.string_metric": true
++            "category.string_metric": false
+         }
+     )
+     .to_string();
+-    glean.set_metrics_disabled_config(
+-        MetricsDisabledConfig::try_from(metrics_disabled_config).unwrap(),
++    glean.set_metrics_enabled_config(
++        MetricsEnabledConfig::try_from(metrics_enabled_config).unwrap(),
+     );
+ 
+     // 3. Ensure the epoch was updated
+
+diff --git a/glean-core/src/metrics/metrics_enabled_config.rs b/glean-core/src/metrics/metrics_enabled_config.rs
+--- a/glean-core/src/metrics/metrics_enabled_config.rs
++++ b/glean-core/src/metrics/metrics_enabled_config.rs
+@@ -0,0 +1,46 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use std::{collections::HashMap, convert::TryFrom};
++
++use serde::{Deserialize, Serialize};
++
++/// Represents a list of metrics and an associated boolean property
++/// indicating if the metric is enabledfrom the remote-settings
++/// configuration store. The expected format of this data is stringified JSON
++/// in the following format:
++/// ```json
++/// {
++///     "category.metric_name": true
++/// }
++/// ```
++#[derive(Serialize, Deserialize, Debug, Clone, Default)]
++pub struct MetricsEnabledConfig {
++    /// This is a `HashMap` consisting of base_identifiers as keys
++    /// and bool values representing an override for the `disabled`
++    /// property of the metric, only inverted to reduce confusion.
++    /// If a particular metric has a value of `true` here, it means
++    /// the default of the metric will be overriden and set to the
++    /// enabled state.
++    #[serde(flatten)]
++    pub metrics_enabled: HashMap<String, bool>,
++}
++
++impl MetricsEnabledConfig {
++    /// Creates a new MetricsEnabledConfig
++    pub fn new() -> Self {
++        Default::default()
++    }
++}
++
++impl TryFrom<String> for MetricsEnabledConfig {
++    type Error = crate::ErrorKind;
++
++    fn try_from(json: String) -> Result<Self, Self::Error> {
++        match serde_json::from_str(json.as_str()) {
++            Ok(config) => Ok(config),
++            Err(e) => Err(crate::ErrorKind::Json(e)),
++        }
++    }
++}
+
+diff --git a/glean-core/src/metrics/mod.rs b/glean-core/src/metrics/mod.rs
+--- a/glean-core/src/metrics/mod.rs
++++ b/glean-core/src/metrics/mod.rs
+@@ -21,7 +21,7 @@ mod experiment;
+ pub(crate) mod labeled;
+ mod memory_distribution;
+ mod memory_unit;
+-mod metrics_disabled_config;
++mod metrics_enabled_config;
+ mod numerator;
+ mod ping;
+ mod quantity;
+@@ -69,7 +69,7 @@ pub use self::uuid::UuidMetric;
+ pub use crate::histogram::HistogramType;
+ pub use recorded_experiment::RecordedExperiment;
+ 
+-pub use self::metrics_disabled_config::MetricsDisabledConfig;
++pub use self::metrics_enabled_config::MetricsEnabledConfig;
+ 
+ /// A snapshot of all buckets and the accumulated sum of a distribution.
+ //
+@@ -195,11 +195,11 @@ pub trait MetricType {
+         }
+         // The epoch's didn't match so we need to look up the disabled flag
+         // by the base_identifier from the in-memory HashMap
+-        let metrics_disabled = &glean
++        let metrics_enabled = &glean
+             .remote_settings_metrics_config
+             .lock()
+             .unwrap()
+-            .metrics_disabled;
++            .metrics_enabled;
+         // Get the value from the remote configuration if it is there, otherwise return the default value.
+         let current_disabled = {
+             let base_id = self.meta().base_identifier();
+@@ -207,8 +207,11 @@ pub trait MetricType {
+                 .split_once('/')
+                 .map(|split| split.0)
+                 .unwrap_or(&base_id);
+-            if let Some(is_disabled) = metrics_disabled.get(identifier) {
+-                u8::from(*is_disabled)
++            // NOTE: The `!` preceding the `*is_enabled` is important for inverting the logic since the
++            // underlying property in the metrics.yaml is `disabled` and the outward API is treating it as
++            // if it were `enabled` to make it easier to understand.
++            if let Some(is_enabled) = metrics_enabled.get(identifier) {
++                u8::from(!*is_enabled)
+             } else {
+                 u8::from(self.meta().inner.disabled)
+             }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn set_experiment_inactive(experiment_id: String) -> ()
+
+pub fn glean_test_get_experiment_data(experiment_id: String) -> Option<RecordedExperiment>
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

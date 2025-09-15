@@ -1,0 +1,129 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+FOG needs to be able to block on init
+FOG aims to be better than Telemetry, but we discovered in bug 1837230 that there's one place where it's not (yet): collecting early data in short sessions.
+
+This is because of a variety of things described in bug 1839426, but boils down to the application shutting down without even calling the Glean SDK's init, let alone waiting for it to complete. This means the data lives and dies in memory in the preinit queue.
+
+To deal with this while maintaining the preferred common case of initializing opportunistically on idle (which is preferred for performance reasons over kicking off Glean SDK init early), we need to, in these short no-init sessions, ensure init's run before calling shutdown.
+
+Wrinkles for the design to consider:
+* We're shutting down, so we don't want to execute forever. See all those timeouts in `shutdown()`? We're going to need something like that for this init.
+* Calling init multiple times logs a warning. FOG's common case will always call init twice: once on idle and again during shutdown (unless we force FOG to store state around whether it called init the first time (which we don't, since the SDK stores that anyway)). Might want to handle that.
+* There is no timeout on thread joining. But there is a timeout on blocking on a dispatcher queue, which is pretty much the last thing done in the `glean.init` thread... if we use timing block on the preinit queue, think about how we'll prevent future-us from putting things after the queue flush that are important to complete before `shutdown()` is run.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -473,6 +473,10 @@ fn initialize_inner(
+             });
+ 
+             // Signal Dispatcher that init is complete
++            // bug 1839433: It is important that this happens after any init tasks
++            // that shutdown() depends on. At time of writing that's only setting up
++            // the global Glean, but it is probably best to flush the preinit queue
++            // as late as possible in the glean.init thread.
+             match dispatcher::flush_init() {
+                 Ok(task_count) if task_count > 0 => {
+                     core::with_glean(|glean| {
+@@ -562,19 +566,45 @@ fn uploader_shutdown() {
+ 
+ /// Shuts down Glean in an orderly fashion.
+ pub fn shutdown() {
+-    // Either init was never called or Glean was not fully initialized
+-    // (e.g. due to an error).
+-    // There's the potential that Glean is not initialized _yet_,
+-    // but in progress. That's fine, we shutdown either way before doing any work.
+-    if !was_initialize_called() || core::global_glean().is_none() {
++    // Shutdown might have been called
++    // 1) Before init was called
++    //    * (data loss, oh well. Not enough time to do squat)
++    // 2) After init was called, but before it completed
++    //    * (we're willing to wait a little bit for init to complete)
++    // 3) After init completed
++    //    * (we can shut down immediately)
++
++    // Case 1: "Before init was called"
++    if !was_initialize_called() {
+         log::warn!("Shutdown called before Glean is initialized");
+         if let Err(e) = dispatcher::kill() {
+             log::error!("Can't kill dispatcher thread: {:?}", e);
+         }
++        return;
++    }
+ 
++    // Case 2: "After init was called, but before it completed"
++    if core::global_glean().is_none() {
++        log::warn!("Shutdown called before Glean is initialized. Waiting.");
++        // We can't join on the `glean.init` thread because there's no (easy) way
++        // to do that with a timeout. Instead, we wait for the preinit queue to
++        // empty, which is the last meaningful thing we do on that thread.
++
++        // TODO: Make the timeout configurable?
++        // We don't need the return value, as we're less interested in whether
++        // this times out than we are in whether there's a Global Glean at the end.
++        let _ = dispatcher::block_on_queue_timeout(Duration::from_secs(10));
++    }
++    // We can't shut down Glean if there's no Glean to shut down.
++    if core::global_glean().is_none() {
++        log::warn!("Waiting for Glean initialization timed out. Exiting.");
++        if let Err(e) = dispatcher::kill() {
++            log::error!("Can't kill dispatcher thread: {:?}", e);
++        }
+         return;
+     }
+ 
++    // Case 3: "After init completed"
+     crate::launch_with_glean_mut(|glean| {
+         glean.cancel_metrics_ping_scheduler();
+         glean.set_dirty_flag(false);
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn initialize_inner(
+cfg: InternalConfiguration,
+client_info: ClientInfoMetrics,
+callbacks: Box<dyn OnGleanEvents>) -> ()
+
+fn uploader_shutdown() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

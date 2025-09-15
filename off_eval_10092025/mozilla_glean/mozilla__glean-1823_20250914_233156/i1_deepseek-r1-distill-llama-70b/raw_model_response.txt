@@ -1,0 +1,56 @@
+<think>
+Okay, so I'm trying to figure out how to write a regression test for this patch. Let me start by understanding the problem.
+
+The issue is a crash in the ConcurrentHandleMap::insert function. The crash report says that next_index pointed at a non-free list entry or the end of the list. That suggests there's some kind of race condition or incorrect handling of the handle map, leading to a panic.
+
+Looking at the patch, it's in the glean_labeled_counter_metric_get function. The original code was using $global.call_infallible_mut to get a metric and then inserting it into $metric_global. But the patch replaces this with a LABEL_MAP that's a static Lazy Mutex around a HashMap. The idea is to cache the handles for labeled submetrics to avoid recreating them and causing issues.
+
+So, the problem before the patch was that multiple calls to get the same submetric might have caused concurrent modifications to the handle map, leading to the crash. The patch introduces a cache to ensure that each labeled submetric is only created once, which should prevent the race condition.
+
+Now, I need to determine if a unit test is needed. Since this is a concurrency issue, a test that checks the behavior under concurrent access would be necessary. Without a test, we might not catch regressions if changes are made in the future.
+
+The test should simulate multiple threads calling the get function with the same handle and label. It should ensure that all threads return the same handle, meaning the insertion is properly synchronized.
+
+I'll structure the test using threads to call the function concurrently. Each thread will get the handle and we'll collect all the results. Then, we'll check that all handles are the same, indicating that the insertion was thread-safe.
+
+I need to import the necessary modules, like std::sync::Mutex and std::thread. The test function will be named test_concurrent_labeled_metric_get. Each thread will call the get function with the same parameters and store the result in a vector. After all threads have run, we'll assert that all elements in the vector are the same.
+
+So, the test will fail before the patch because without the cache, concurrent calls might insert multiple handles, causing some inconsistency. After the patch, the cache ensures that only one insertion happens, so all threads get the same handle, making the test pass.
+</think>
+
+<Filename> glean-core/ffi/src/labeled.rs </Filename>
+<imports>
+use std::sync::Mutex;
+use std::thread;
+</imports>
+<Rust>
+#[test]
+fn test_concurrent_labeled_metric_get() {
+    let handle = 1;
+    let label = "test_label";
+    let num_threads = 10;
+    
+    let mut handles = vec![];
+
+    let mut threads = vec![];
+    for _ in 0..num_threads {
+        let handle_clone = handle;
+        let label_clone = label.to_string();
+        let thread = thread::spawn(move || {
+            let handle = unsafe { glean_labeled_counter_metric_get(handle_clone, FfiStr::from(&label_clone)) };
+            handles.push(handle as usize);
+        });
+        threads.push(thread);
+    }
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    let first = handles[0];
+    assert!(
+        handles.iter().all(|x| *x == first),
+        "All handles must be the same"
+    );
+}
+</Rust>

@@ -1,0 +1,72 @@
+<think>
+Okay, I need to figure out whether a unit test is needed for the given patch. The issue is about clearing the dirty bit when shutting down in the RLB. The patch adds a call to set_dirty_flag(false) during shutdown.
+
+Looking at the patch, it modifies the shutdown function to launch a dispatcher that sets the dirty flag to false. This should ensure that when Glean shuts down cleanly, the dirty bit is cleared, preventing unnecessary baseline pings on restart.
+
+Now, the test provided in the patch is no_dirty_baseline_on_clean_shutdowns. It tests that after a clean shutdown, the dirty bit is cleared, so no baseline ping is sent. This test should fail before the patch because without the fix, the dirty bit remains set, causing a baseline ping on restart. After the patch, the test should pass because the dirty bit is cleared.
+
+So, the test is necessary to validate the fix. It's a regression test because it checks that a bug (dirty bit not being cleared) is fixed. The test is well-structured, using a fake uploader and crossbeam channels to capture the ping URL. It asserts that no ping is sent, which is the expected behavior after the patch.
+
+Therefore, the test is appropriate and needed. It follows the guidelines: it's self-contained, uses necessary imports, and directly tests the behavior change caused by the patch.
+</think>
+
+<Filename> glean-core/rlb/src/test.rs </Filename>
+<imports>
+use super::shutdown;
+use super::with_glean_mut;
+use crossbeam_channel::bounded;
+use std::sync::Mutex;
+</imports>
+<Rust>
+#[test]
+fn test_dirty_bit_cleared_on_shutdown() {
+    let _lock = lock_test();
+    
+    let data_dir = new_glean(None, true);
+    
+    crate::block_on_dispatcher();
+    
+    with_glean_mut(|glean| glean.set_dirty_flag(true));
+    
+    shutdown();
+    
+    let (s, r) = bounded::<String>(1);
+    
+    #[derive(Debug)]
+    struct FakeUploader {
+        sender: crossbeam_channel::Sender<String>,
+    }
+    impl net::PingUploader for FakeUploader {
+        fn upload(
+            &self,
+            url: String,
+            _body: Vec<u8>,
+            _headers: Vec<(String, String)>,
+        ) -> net::UploadResult {
+            self.sender.send(url).unwrap();
+            net::UploadResult::HttpStatus(200)
+        }
+    }
+    
+    let tmpname = data_dir.path().display().to_string();
+    
+    test_reset_glean(
+        Configuration {
+            data_path: tmpname,
+            application_id: GLOBAL_APPLICATION_ID.into(),
+            upload_enabled: true,
+            max_events: None,
+            delay_ping_lifetime_io: false,
+            channel: Some("testing".into()),
+            server_endpoint: Some("invalid-test-host".into()),
+            uploader: Some(Box::new(FakeUploader { sender: s })),
+        },
+        ClientInfoMetrics::unknown(),
+        false,
+    );
+    
+    crate::block_on_dispatcher();
+    
+    assert_eq!(r.try_recv(), Err(crossbeam_channel::TryRecvError::Empty));
+}
+</Rust>
