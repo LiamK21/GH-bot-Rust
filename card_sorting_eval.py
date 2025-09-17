@@ -71,7 +71,7 @@ def main(eval_dir: Path):
     
     with open(OUTPUT_FILE, "w") as f:
                 f.write("Card Sorting Evaluation Results\n")
-                f.write("===============================\n\n")
+                f.write("=======================================\n\n")
     
     for s in os.listdir(eval_dir):
         if Path(eval_dir, s).is_dir() and _is_mozilla_repo_dir(s):
@@ -81,20 +81,20 @@ def main(eval_dir: Path):
     
     with open(OUTPUT_FILE, "a") as f:
         f.write("\n\nOverall Metrics\n")
-        f.write("-------------------------------\n")
+        f.write("----------------------------------------\n")
         f.write(f"Total Tests: {TOTAL_TESTS}\n")
         f.write(f"Total Passed Tests: {PASSED_TESTS}\n")
-        f.write(f"GPT-4o Passed Tests: {GPT_4O_PASSED_TESTS}\n")
-        f.write(f"DeepSeek Passed Tests: {DEEPSEEK_PASSED_TESTS}\n")
-        f.write(f"Llama Passed Tests: {LLAMA_PASSED_TESTS}\n\n")
+        f.write(f"- GPT-4o Passed Tests: {GPT_4O_PASSED_TESTS}\n")
+        f.write(f"- DeepSeek Passed Tests: {DEEPSEEK_PASSED_TESTS}\n")
+        f.write(f"- Llama Passed Tests: {LLAMA_PASSED_TESTS}\n\n")
         
         f.write(f"Total Runs: {TOTAL_RUNS}\n")
-        f.write(f"GPT-4o Test Runs: {GPT_4O_TEST_RUNS}\n")
-        f.write(f"DeepSeek Test Runs: {DEEPSEEK_TEST_RUNS}\n")
-        f.write(f"Llama Test Runs: {LLAMA_TEST_RUNS}\n\n")
+        f.write(f"- GPT-4o Test Runs: {GPT_4O_TEST_RUNS}\n")
+        f.write(f"- DeepSeek Test Runs: {DEEPSEEK_TEST_RUNS}\n")
+        f.write(f"- Llama Test Runs: {LLAMA_TEST_RUNS}\n\n")
         
         f.write("Total Failure per Group:\n")
-        f.write("-------------------------------\n")
+        f.write("----------------------------------------\n")
         for k, v in FAILURES_2_COUNT.items():
             f.write(f"{k}: {v}\n")
 
@@ -124,7 +124,7 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
     curr_repo = os.path.basename(repo_dir).split("_")[1]
     with open(OUTPUT_FILE, "a") as f:
         f.write(f"Repository: {curr_repo}\n")
-        f.write("-------------------------------\n")
+        f.write("----------------------------------------\n")
 
     # Data structure to hold failure reasons
     # idea here is to have "error_code": [list of pr dirs that failed with this error code]
@@ -162,17 +162,17 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
     
     total_tests = len(os.listdir(repo_dir))
     with open(OUTPUT_FILE, "a") as f:
-        f.write(f"Total Tests in {curr_repo}: {total_tests}\n")
-        f.write(f"Total run in {curr_repo}: ")
-        f.write("\n".join(f"{key}: {value}" for key, value in total_runs.items()))
-        f.write(f"\nTotal Passed Tests in {curr_repo}: ")
-        f.write("\n".join(f"{key}: {value}" for key, value in passed_tests.items()))
-        f.write(f"\nTotal Erroneus Tests in {curr_repo}: ")
-        f.write("\n".join(f"{key}: {value}" for key, value in erroneus_tests.items()))
-        f.write("\n\nFailure Classifications:\n")
+        f.write(f"Total Tests: {total_tests}\n")
+        f.write("Runs:\n")
+        f.write("\n".join(f"- {key}: {value}" for key, value in total_runs.items()))
+        f.write("\nPassed Runs (=Tests):\n")
+        f.write("\n".join(f"- {key}: {value}" for key, value in passed_tests.items()))
+        f.write("\nErroneus Runs:\n")
+        f.write("\n".join(f"- {key}: {value}" for key, value in erroneus_tests.items()))
+        f.write("\n\nFailure Classifications:\n- - - - - - - - - - - - -\n")
         for failure_type, pr_list in fail2pr.items():
-            f.write(f"{failure_type}: {", ".join(pr_list)} [{len(pr_list)}] occurrences\n")
-        f.write("\n-------------------------------\n")
+            f.write(f"[{len(pr_list)}] {failure_type}: {", ".join(pr_list)}\n")
+        f.write("\n----------------------------------------\n")
     
     TOTAL_TESTS += total_tests
     PASSED_TESTS += passed_tests["total"]
@@ -183,7 +183,6 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
     GPT_4O_TEST_RUNS += total_runs[Model.GPT_4O]
     DEEPSEEK_TEST_RUNS += total_runs[Model.DEEPSEEK]
     LLAMA_TEST_RUNS += total_runs[Model.LLAMA]
-    TOTAL_RUNS += total_runs["total"]
     
     
     
@@ -213,7 +212,7 @@ def _is_pr_dir(dir_name: str) -> bool:
 def _handle_pr_dir(pr_dir: Path, fail2pr: dict[str, list[str]], total_runs: dict[str, int], erroneus_tests: dict[str, int], passed_tests: dict[str, int]):
     model_attempts = os.listdir(pr_dir)
     if not any(Path(pr_dir, attempt).is_dir() for attempt in model_attempts):
-        fail2pr[FailureType.PRE_PROMPT_FAILURE].append(pr_dir.name.rsplit("_", 2)[0])
+        fail2pr[FailureType.PRE_PROMPT_FAILURE].append(pr_dir.name.rsplit("_", 2)[0].split("__")[1])
         return
     for model_attempt in model_attempts:
         model_attempt_path = Path(pr_dir, model_attempt)
@@ -221,7 +220,7 @@ def _handle_pr_dir(pr_dir: Path, fail2pr: dict[str, list[str]], total_runs: dict
             curr_model = model_attempt.split("_")[1]
             total_runs[curr_model] += 1
             total_runs["total"] += 1
-            pr_dir_name = pr_dir.name.rsplit("_", 2)[0]
+            pr_dir_name = pr_dir.name.rsplit("_", 2)[0].split("__")[1]
             _handle_model_attempt_dir(model_attempt_path, pr_dir_name, fail2pr, erroneus_tests, passed_tests)
         else:
             continue
@@ -246,6 +245,11 @@ def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[s
     if len(files) == 6: # All files are present, we can check the after.txt file to see if the test passed or failed
         after_content = Path(model_dir, "after.txt").read_text()
         has_test_passed = True
+        # Exit code only present if tests were run post 17.09.2025 17:00
+        exit_code = re.search(r"Exit Code:(\d+)", after_content)
+        if exit_code and exit_code.group(1) != "0": # Non-zero exit code, test failed
+            has_test_passed = False
+        
         
         for line in after_content.splitlines():
             if line.strip().startswith("error"):
@@ -265,6 +269,7 @@ def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[s
                 break
             
         if has_test_passed: # Test passed
+            print(f"[+] Test passed for PR {pr_dir_name}")
             passed_tests["total"] += 1
             curr_model = model_dir.name.split("_")[1]
             passed_tests[curr_model] += 1
