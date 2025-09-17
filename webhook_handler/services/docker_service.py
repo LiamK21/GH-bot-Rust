@@ -163,8 +163,9 @@ class DockerService:
                 f"cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
             )
             exec_result = container.exec_run(test_command, stdout=True, stderr=True)
-            stdout = exec_result.output.decode()
-            test_result = self._evaluate_test(stdout)
+            stdout = "Exit Code:" + str(exec_result.exit_code) + "\n" + exec_result.output.decode()
+            test_result = exec_result.exit_code == 0
+            logger.info(f"[+] Test result: {test_result}")
             return test_result, stdout
 
         except ImageNotFound as e:
