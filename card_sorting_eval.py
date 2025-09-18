@@ -269,7 +269,6 @@ def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[s
                 break
             
         if has_test_passed: # Test passed
-            print(f"[+] Test passed for PR {pr_dir_name}")
             passed_tests["total"] += 1
             curr_model = model_dir.name.split("_")[1]
             passed_tests[curr_model] += 1
@@ -281,6 +280,10 @@ def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[s
             
         
     else: # We know that an error occurred
+        erroneus_tests["total"] += 1
+        curr_model = model_dir.name.split("_")[1]
+        erroneus_tests[curr_model] += 1
+        erroneus_tests[curr_model] += 1
         if not files: # Empty directory, pre-prompt failure
             fail2pr[FailureType.PRE_PROMPT_FAILURE].append(pr_dir_name)
         elif len(files) == 1: # Only prompt.txt file is present, model query failure
