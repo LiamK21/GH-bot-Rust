@@ -41,6 +41,14 @@ class PullRequestDiffContext:
             for pr_file_diff in self._pr_file_diffs
             if pr_file_diff.is_non_source_code_file
         ]
+        
+    @property
+    def config_file_diffs(self) -> list[PullRequestFileDiff]:
+        return [
+            pr_file_diff
+            for pr_file_diff in self._pr_file_diffs
+            if pr_file_diff.is_config_file
+        ]
 
     @property
     def test_file_diffs(self) -> list[PullRequestFileDiff]:
@@ -115,7 +123,7 @@ class PullRequestDiffContext:
             str: Updated diff between before and after code files
         """
         patch: list[str] = []
-        for pr_file_diff in self.source_code_file_diffs:
+        for pr_file_diff in self.source_code_file_diffs + self.config_file_diffs:
             if filename == pr_file_diff.name:
                 diff = git_diff.unified_diff_with_function_context(
                     pr_file_diff.before,

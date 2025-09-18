@@ -67,6 +67,23 @@ class PullRequestFileDiff:
             and not self.is_test_file
             and self.name.endswith(".rs")
         )
+    
+    @property
+    def is_config_file(self) -> bool:
+        """
+        Determines whether this PR changed config file or not
+
+        Returns:
+            bool: True if this PR changed config file is config file, False otherwise
+        """
+
+        config_file_names = [
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo/config",
+            ".cargo/config.toml",
+        ]
+        return any(self.name.endswith(cfg_name) for cfg_name in config_file_names)
 
     def unified_code_diff(self) -> str:
         """
