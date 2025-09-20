@@ -141,51 +141,9 @@ class CSTBuilder:
             assert (
                 declaration_list is not None
             ), "Expected a declaration_list in the mod tests module, no mod block exists!"
-            # Check if there need to be imports added
-            i = 0
-            while i < len(declaration_list.named_children):
-                curr_child = declaration_list.named_children[i]
-                i += 1
-                child_type = curr_child.type
-                # Assumption: All imports are at the top of the mod tests block
-                if child_type != "use_declaration":
-                    break
-
-                curr_import = cast(bytes, curr_child.text).decode("utf-8").strip()
-                # Remove directly matching imports
-                if curr_import in imports:
-                    imports.remove(curr_import)
-
-                # Remove imports that are covered by a glob import
-                elif curr_import == "use super::*;":
-                    for imp in imports:
-                        if imp.startswith("use super::"):
-                            imports.remove(imp)
-
-                # Check if the current import contains an import as part of a group import
-                # Note that the other way around is not checked
-                # e.g., check if 'use std::path::Path;' is part of 'use std::path::{Path, PathBuf};'
-                else:
-                    # [std, path, {Path, PathBuf}]
-                    curr_import_list = (
-                        curr_import.lstrip("use ").rstrip(";").split("::")
-                    )
-                    for imp in imports:
-                        # [std, path, Path]
-                        imp_list = imp.lstrip("use ").rstrip(";").split("::")
-                        if len(imp_list) == len(curr_import_list):
-                            same_crate: bool = True
-                            for j in range(len(imp_list) - 1):
-                                if imp_list[j] != curr_import_list[j]:
-                                    same_crate = False
-                                    break
-                            if same_crate:
-                                import_in_curr_import = curr_import_list[
-                                    -1
-                                ].__contains__(imp_list[-1])
-                                if import_in_curr_import:
-                                    imports.remove(imp)
-
+            
+            i = self._remove_duplicate_imports(declaration_list, imports)
+            
             last_function_item: Node | None = None
             for child in declaration_list.named_children[i:]:
                 if child.type == "function_item":
@@ -204,7 +162,11 @@ class CSTBuilder:
 
             # extract indentation
             lines = file_content.splitlines()
-            last_import_line = declaration_list.named_children[i - 1].end_point[0]
+            import_point = declaration_list.named_children[i - 1]
+            if import_point.type == "function_item":
+                last_import_line = import_point.start_point[0]
+            else:
+                last_import_line = declaration_list.named_children[i - 1].end_point[0]
             import_indentation = len(lines[last_import_line]) - len(
                 lines[last_import_line].lstrip()
             )
@@ -264,70 +226,100 @@ class CSTBuilder:
 
         return None
 
-    @staticmethod
-    def _get_added_removed_lines(
-        diff: str,
-    ) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
-        """
-        Analyzes diff to extract which lines have been changed.
 
+    def _remove_duplicate_imports(self, declaration_list: Node, imports: list[str]) -> int:
+        """
+        Scan file for existing imports and remove any duplicate imports that are provided by the model
+        
         Parameters:
-            diff (str): The diff to analyze
-
+            declaration_list (Node): The 'mod tests' block node to scan for existing imports
+            imports (list): The list of imports from the model to check for duplicates
+        
         Returns:
-            list: Added lines
-            list: Removed lines
+            int: The index of the first non-import child (+1) in the declaration_list
         """
-
-        added: list[tuple[int, str]] = []
-        removed: list[tuple[int, str]] = []
-
-        hunk_header_regex = re.compile(
-            r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@"
-        )  # matches "@@ -10,7 +10,8 @@", but captures only 10 and 8
-        diff_lines = diff.splitlines()
+        def _transform_group_import_into_single_imports(group_import: str) -> list[str]:
+            root = group_import.strip()[: group_import.index("{")]
+            items = group_import[group_import.index("{") + 1 : group_import.index("}")]
+            split = items.split(",")
+            return [root + item.strip() + ";" for item in split if item.strip()]
+        
+        
         i = 0
-
-        while i < len(diff_lines):
-            line = diff_lines[i]
-            match = hunk_header_regex.match(line)
-            if match:
-                # start lines
-                old_start = int(match.group(1))  # first group: original file start line
-                new_start = int(match.group(2))  # second group: new file start line
-
-                # line counters
-                current_line_original = old_start - 1
-                current_line_updated = new_start - 1
-                i += 1
-
-                while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
-                    patch_line = diff_lines[i]
-
-                    # lines that begin with '+' but not "+++" are added lines
-                    if patch_line.startswith("+") and not patch_line.startswith("+++"):
-                        current_line_updated += 1
-                        added_text = patch_line[1:]  # remove leading '+'
-                        added.append((current_line_updated, added_text))
-
-                    # lines that begin with '-' but not "---" are removed lines
-                    elif patch_line.startswith("-") and not patch_line.startswith(
-                        "---"
-                    ):
-                        current_line_original += 1
-                        removed_text = patch_line[1:]  # remove leading '-'
-                        removed.append((current_line_original, removed_text))
-
-                    else:
-                        # skip other lines
-                        current_line_original += 1
-                        current_line_updated += 1
-
-                    i += 1
+        while i < len(declaration_list.named_children):
+            curr_child = declaration_list.named_children[i]
+            i += 1
+            child_type = curr_child.type
+            # Assumption: All imports are at the top of the mod tests block
+            # import statements
+            if child_type == "use_declaration":
+                pass
+            # check that there are no collisions with extern crate declarations
+            elif child_type == "extern_crate_declaration":
+                crate_declaration = cast(bytes, curr_child.text).decode("utf-8").strip()
+                crate_name = crate_declaration.replace("extern crate", "").rstrip(";").strip()
+                for imp in imports:
+                    imp_list = imp.removeprefix("use ").removesuffix(";").strip().split("::")
+                    if crate_name in imp_list[-1]:
+                        imports.remove(imp)
+                continue
             else:
-                i += 1
+                break
 
-        return added, removed
+            existing_import = cast(bytes, curr_child.text).decode("utf-8").strip()
+            
+            # Handle group imports
+            if existing_import.__contains__("{") and existing_import.__contains__("}"):
+                existing_imports = _transform_group_import_into_single_imports(existing_import)
+                for existing_import in existing_imports:
+                    self._handle_single_imports(existing_import, imports)
+                continue
+            
+            self._handle_single_imports(existing_import, imports)
+            
+        return i
+    
+    def _handle_single_imports(self, existing_import: str, imports: list[str]) -> None:
+        """
+        Remove any single import from the imports list that is already present,
+        either as an exact match, as part of a glob import, or colliding with an existing import.
+        
+        Parameters:
+            existing_import (str): The existing import statement to check against
+            imports (list): The list of imports from the model to check for duplicates
+        """
+        existing_import_list = existing_import.removeprefix("use ").removesuffix(";").split("::")
+        
+        imp_idx = 0
+        while imp_idx < len(imports):
+            imp = imports[imp_idx]
+            imp_list = imp.strip().removeprefix("use ").removesuffix(";").split("::")
+            
+            # Remove directly matching imports    
+            if imp_list == existing_import_list:
+                imports.remove(imp)
+                continue
+            
+            # Remove imports that are covered by a glob import
+            elif existing_import_list[-1] == "*":
+                if len(imp_list) >= len(existing_import_list):
+                    same_crate: bool = True
+                    for j in range(len(existing_import_list) - 1):
+                        if imp_list[j] != existing_import_list[j]:
+                            same_crate = False
+                            break
+                    if same_crate:
+                        imports.remove(imp)
+                        continue
+            
+            # Remove imports that collide with an existing import
+            # Assumption: If the last part of the import is the same, 
+            #             it is assumed that the model import is false
+            elif existing_import_list[-1] == imp_list[-1]:
+                imports.remove(imp)
+                continue
+            
+            imp_idx += 1
 
     # def _slice_rust_code(
     #     self, source_code: str, global_funcs: list[str], class2methods: dict
