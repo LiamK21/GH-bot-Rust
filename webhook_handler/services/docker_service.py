@@ -55,13 +55,8 @@ class DockerService:
     def _build_image(self, tag: str) -> None:
         """Builds the Docker image from the Dockerfiles in the dockerfile directory"""
         build_args = {"commit_hash": self._pr_data.base_commit}
-        repo_name = self._pr_data.repo.lower()
-        if self._pr_data.repo == "grcov" and int(self._pr_data.number) < 703:
-            logger.warning("Using old Dockerfile for grcov")  # type: ignore[attr-defined]
-            dockerfile_path = Path("dockerfiles", f"Dockerfile_grcov_old")
-        else:
-            logger.marker(f"Using standard Dockerfile for {repo_name}")  # type: ignore[attr-defined]
-            dockerfile_path = Path("dockerfiles", f"Dockerfile_{repo_name}")
+        dockerfile_name = self._get_docker_image()
+        dockerfile_path = Path(self._project_root, "dockerfiles", dockerfile_name)
         build_succeeded = False
         try:
             self._client.images.build(
@@ -117,6 +112,20 @@ class DockerService:
                             )
                 except APIError as list_err:
                     logger.error(f"Error listing dangling images: {list_err}")
+
+    def _get_docker_image(self) -> str:
+        """Returns the Docker image"""
+        repo = self._pr_data.repo.lower()
+        pr_number = self._pr_data.number
+        if repo == "grcov" and int(self._pr_data.number) < 703:
+            logger.info("Using old Dockerfile for grcov")  
+            return "Dockerfile_grcov_old"
+        elif repo == "rust-code-analysis" and int(pr_number) < 700:
+            logger.info("Using old Dockerfile for rust-code-analysis")
+            return "Dockerfile_rust-code-analysis_old"
+        else:
+            logger.marker(f"Using standard Dockerfile for {repo}")  # type: ignore[attr-defined]
+            return f"Dockerfile_{repo}"
 
     def run_test_in_container(
         self,
