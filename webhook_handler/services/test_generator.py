@@ -128,7 +128,11 @@ class TestGenerator:
 
         if fail_2_pass:
             logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
-            self._handle_commenting(filename)
+            logger.marker("Running code coverage to verify usability of generated test") # type: ignore[attr-defined]
+            coverage_passed = self._determine_test_usability(filename, new_test, imports)
+            if coverage_passed:
+                logger.marker("[*] Handling commenting on PR") # type: ignore[attr-defined]
+                self._handle_commenting(filename)
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return True
         else:
@@ -191,11 +195,6 @@ class TestGenerator:
         logger.info("Getting file content from head commit rather than checking out commit...")
         pr_file_diff = self._pr_diff_ctx.get_specific_file_diff(filename)
         file_content = pr_file_diff.after if pr_file_diff else ""
-        # logger.warning("An error occurred while fetching the file content from head commit")
-
-        # file_content = general.get_candidate_file(
-        #     self._pr_data.head_commit, filename, self._config.cloned_repo_dir
-        # )
 
         if file_content:
             logger.marker(f"File {filename} exists in head commit")  # type: ignore[attr-defined]
@@ -260,6 +259,50 @@ class TestGenerator:
             raise ExecutionError(
                 "Cannot run test in post-PR codebase without old file content"
             )
+
+    def _determine_test_usability(self, filename: str, new_test: str, imports: list[str]) -> bool:
+        if not self._config.cloned_repo_dir:
+            raise DataMissingError(
+                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+            )
+        if not self._generation_dir:
+            raise DataMissingError(
+                "generation_dir", "None", "Generation dir should not be None"
+            )
+            
+        pr_file_diff = self._pr_diff_ctx.get_specific_file_diff(filename)
+        file_content = pr_file_diff.after if pr_file_diff else ""
+
+        if file_content:
+            new_file_content = self._cst_builder.append_test(
+                file_content, new_test, imports
+            )
+        else:
+            logger.critical(f"File {filename} does not exist in head commit")  # type: ignore[attr-defined]
+            raise ExecutionError(
+                f"File {filename} should exist in head commit but does not"
+            )
+            
+        # We first want to run code coverage in a container only with the golden patch to evaluate it before the auto-generated test
+        logger.marker("Running code coverage with golden patch only...")  # type: ignore[attr-defined]
+        golden_code_patch = self._pr_diff_ctx.golden_code_patch
+        non_augmented_line_coverage = self._docker_service.run_coverage_in_container(filename, golden_code_patch)
+        
+        logger.marker("Running code coverage with golden patch and generated test...")  # type: ignore[attr-defined]
+        golden_code_patch: str = self._pr_diff_ctx.get_updated_golden_code_patch(
+                filename, new_file_content
+            )
+        augmented_line_coverage = self._docker_service.run_coverage_in_container(filename, golden_code_patch)
+        if not non_augmented_line_coverage or not augmented_line_coverage:
+            logger.error("Could not retrieve line coverage, marking test as non-usable")  # type: ignore[attr-defined]
+            return False
+        if augmented_line_coverage < non_augmented_line_coverage:
+            logger.warning("Generated test does not improve line coverage, marking as non-usable")  # type: ignore[attr-defined]
+            return False
+        else:
+            logger.success("Generated test improves line coverage, marking as usable")  # type: ignore[attr-defined]
+            return True
+        
 
     def _handle_commenting(
         self, filename: str, no_test_gen_reason: str | None = None
