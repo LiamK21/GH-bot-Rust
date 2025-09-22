@@ -166,14 +166,20 @@ class DockerService:
             )
 
             logger.marker("Tests to run: %s" % ", ".join(tests_to_run))  # type: ignore[attr-defined]
-
-            test_command: str = (
+            if is_golden_patch:
+                test_command: str = (
                 "/bin/sh -c 'cd /app/testbed && "
-                f"cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
-            )
+                f"cargo llvm-cov --no-report -- --nocapture " + " ".join(tests_to_run) + "'"
+                )
+            else:
+                test_command = (
+                    "/bin/sh -c 'cd /app/testbed && "
+                    "cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
+                )
             exec_result = container.exec_run(test_command, stdout=True, stderr=True)
-            stdout = "Exit Code:" + str(exec_result.exit_code) + "\n" + exec_result.output.decode()
-            test_result = exec_result.exit_code == 0
+            stdout: str = exec_result.output.decode()
+            test_result: bool = exec_result.exit_code == 0
+            stdout = "Exit Code:" + str(exec_result.exit_code) + "\n" + stdout
             logger.info(f"[+] Test result: {test_result}")
             return test_result, stdout
 
@@ -301,33 +307,65 @@ class DockerService:
 
         logger.info("[+] Patch applied successfully.")
 
-    @staticmethod
-    def _evaluate_test(stdout: str) -> bool:
-        """
-        Evaluates the test result from the stdout.
+    def run_coverage_in_container(self, filename: str, patch: str) -> float | None:
+        container: Container | None = None
+        try:
+            logger.marker("Creating container...")  # type: ignore[attr-defined]
+            container = self._client.containers.create(
+                image=self._pr_data.image_tag,
+                command="/bin/sh -c 'sleep infinity'",  # keep the container running
+                tty=True,  # allocate a TTY for interactive use
+                detach=True,
+            )
+            container.start()
+            logger.marker(f"Container {container.short_id} started")  # type: ignore[attr-defined]
 
-        Parameters:
-            stdout (str): The stdout from running the test command
+            # Create placeholder empty files for PRs that add new files
+            self._handle_newly_added_files(patch, container)
 
-        Returns:
-            bool: True if the test has passed, False otherwise
-        """
-        logger.info("[+] Test command executed.")
-        test_result: bool = False
+            # Add the patch file to the container and apply it
+            self._add_file_and_apply_patch_in_container(
+                container, patch, True
+            )
+            split_filename = filename.removeprefix("src/").removesuffix(".rs").split("/")
 
-        # Determine matches that indicate test results
-        # Could not compile errors:
-        compilation_error_pattern = re.compile(r"could not compile", re.IGNORECASE)
-        # Failed tests: test <test_name> ... FAILED
-        test_failed_pattern = re.compile(r"test\s+\S+\s+\.\.\.\s+FAILED", re.IGNORECASE)
+            logger.marker("Running coverage generation...")  # type: ignore[attr-defined]
+            coverage_generation_command: str = (
+            "/bin/sh -c 'cd /app/testbed && "
+            "cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
+            f"{"::".join(split_filename)}::tests '" 
+            )
+            exec_result = container.exec_run(coverage_generation_command, stdout=True, stderr=True)
+            
+            logger.marker("Retrieving line coverage...")  # type: ignore[attr-defined]
+            coverage_retrieval_command: str = (
+                "/bin/sh -c 'cd /app/testbed && "
+                f"python3 /app/retrieve_line_coverage.py {"/".join(split_filename)}.rs'"
+            )
+            exec_result = container.exec_run(coverage_retrieval_command, stdout=True, stderr=True)
+            stdout = exec_result.output.decode()
+            try:
+                stdout = float(stdout.strip())
+            except ValueError:
+                stdout = None
+            logger.info(f"[+] Line Coverage: {stdout}")
+                        
+            return stdout
 
-        compilation_error_matches = compilation_error_pattern.findall(stdout)
-        test_failed_matches = test_failed_pattern.findall(stdout)
-
-        if compilation_error_matches or test_failed_matches:
-            test_result = False
-        else:
-            test_result = True
-
-        logger.info(f"[+] Test result: {test_result}")
-        return test_result
+        except ImageNotFound as e:
+            logger.critical(f"Docker image not found: {e}")
+            raise ExecutionError("Docker image not found")
+        except APIError as e:
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+        except Exception as e:
+            logger.critical(f"Unexpected error: {e}")
+            raise ExecutionError("Unexpected Docker error")
+        finally:
+            # Cleanup
+            # os.remove(patch_file_path)
+            if container is not None:
+                container.stop()
+                container.remove()
+                logger.info("[*] Container stopped and removed.")
+                
