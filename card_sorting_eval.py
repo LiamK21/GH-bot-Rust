@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -38,11 +39,6 @@ class FailureType(StrEnum):
     ASSERTION_FAILURE = "Assertion Failure"
 
 
-# Directories
-EVALUATION_DIR = "off_eval_10092025"
-GEN_TESTS_DIR = "generated_tests_10092025"
-OUTPUT_FILE = Path(Path.cwd(), "card_sorting_evaluation.txt")
-
 # Test metrics
 TOTAL_TESTS = 0
 PASSED_TESTS = 0
@@ -65,38 +61,56 @@ FAILURES_2_COUNT: dict[str, int] = {
     FailureType.RESPONSE_FILENAME_NOT_EXISTENT: 0,
     FailureType.TEST_PASS_PRE_PR: 0,
 }
+PLOTTING_DATA_FAILURE_CUTOFF = 10  # Only show top 10 failure reasons
 
 
 def main(eval_dir: Path):
+    path_to_json_file = Path(Path.cwd(), eval_dir, "plotting_data.json")
+    path_to_json_file.touch(exist_ok=True)
+    plotting_data = {}
+    plotting_data["pie_chart"] = {}
+    plotting_data["stacked_bar_chart"] = {}
+    plotting_data["horizontal_bar_chart"] = {}
     
-    with open(OUTPUT_FILE, "w") as f:
-                f.write("Card Sorting Evaluation Results\n")
-                f.write("=======================================\n\n")
+    _write_to_output_file(eval_dir, "Card Sorting Evaluation Results\n=======================================")
     
     for s in os.listdir(eval_dir):
         if Path(eval_dir, s).is_dir() and _is_mozilla_repo_dir(s):
-            _handle_mozilla_repo_dir(Path(eval_dir, s))
+            _handle_mozilla_repo_dir(Path(eval_dir, s), eval_dir, plotting_data)
         else:
             continue
     
-    with open(OUTPUT_FILE, "a") as f:
-        f.write("\n\nOverall Metrics\n")
-        f.write("----------------------------------------\n")
-        f.write(f"Total Tests: {TOTAL_TESTS}\n")
-        f.write(f"Total Passed Tests: {PASSED_TESTS}\n")
-        f.write(f"- GPT-4o Passed Tests: {GPT_4O_PASSED_TESTS}\n")
-        f.write(f"- DeepSeek Passed Tests: {DEEPSEEK_PASSED_TESTS}\n")
-        f.write(f"- Llama Passed Tests: {LLAMA_PASSED_TESTS}\n\n")
-        
-        f.write(f"Total Runs: {TOTAL_RUNS}\n")
-        f.write(f"- GPT-4o Test Runs: {GPT_4O_TEST_RUNS}\n")
-        f.write(f"- DeepSeek Test Runs: {DEEPSEEK_TEST_RUNS}\n")
-        f.write(f"- Llama Test Runs: {LLAMA_TEST_RUNS}\n\n")
-        
-        f.write("Total Failure per Group:\n")
-        f.write("----------------------------------------\n")
-        for k, v in FAILURES_2_COUNT.items():
-            f.write(f"{k}: {v}\n")
+    for repo, passed_tests in plotting_data["stacked_bar_chart"].items():
+        total_passed_tests = passed_tests["total"]
+        plotting_data["pie_chart"][repo] = total_passed_tests 
+        del plotting_data["stacked_bar_chart"][repo]["total"]
+    
+    
+    failure_data = dict(sorted(FAILURES_2_COUNT.items(), key=lambda item: item[1], reverse=True))
+    _parse_failure_data_to_json(plotting_data, "total", failure_data)
+    
+    
+    output_metrics = (
+        "\n\n----------------------------------------\n"
+        "Overall Metrics\n"
+        "----------------------------------------\n"
+        f"Total Tests: {TOTAL_TESTS}\n"
+        f"Total Passed Tests: {PASSED_TESTS}\n"
+        f"- GPT-4o Passed Tests: {GPT_4O_PASSED_TESTS}\n"
+        f"- DeepSeek Passed Tests: {DEEPSEEK_PASSED_TESTS}\n"
+        f"- Llama Passed Tests: {LLAMA_PASSED_TESTS}\n\n"
+        f"Total Runs: {TOTAL_RUNS}\n"
+        f"- GPT-4o Test Runs: {GPT_4O_TEST_RUNS}\n"
+        f"- DeepSeek Test Runs: {DEEPSEEK_TEST_RUNS}\n"
+        f"- Llama Test Runs: {LLAMA_TEST_RUNS}\n\n"
+        "Total Failure per Group:\n"
+        "----------------------------------------\n"
+        + "\n".join(f"{k}: {v}" for k, v in FAILURES_2_COUNT.items())
+    )
+    _write_to_output_file(eval_dir, output_metrics)
+    _write_to_plotting_data_file(eval_dir, plotting_data)
+    
+    
 
 def _is_mozilla_repo_dir(dir_name: str) -> bool:
     dir_parts = dir_name.split("_")
@@ -109,7 +123,7 @@ def _is_mozilla_repo_dir(dir_name: str) -> bool:
         return False
     return True
  
-def _handle_mozilla_repo_dir(repo_dir: Path):
+def _handle_mozilla_repo_dir(repo_dir: Path, eval_dir: Path, plotting_data: dict):
     global FAILURES_2_COUNT
     global TOTAL_RUNS
     global GPT_4O_TEST_RUNS
@@ -122,9 +136,6 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
     global LLAMA_PASSED_TESTS
     
     curr_repo = os.path.basename(repo_dir).split("_")[1]
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(f"Repository: {curr_repo}\n")
-        f.write("----------------------------------------\n")
 
     # Data structure to hold failure reasons
     # idea here is to have "error_code": [list of pr dirs that failed with this error code]
@@ -160,19 +171,29 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
         if Path(repo_dir, repo_pr).is_dir() and _is_pr_dir(repo_pr):
             _handle_pr_dir(Path(repo_dir, repo_pr), fail2pr, total_runs, erroneus_tests, passed_tests)
     
+    plotting_data["stacked_bar_chart"][curr_repo] = passed_tests
+    fail_2_amount: dict[str, int] = {k: len(v) for k, v in fail2pr.items()}
+    
+    fail_2_amount_sorted = dict(sorted(fail_2_amount.items(), key=lambda item: item[1], reverse=True))
+    _parse_failure_data_to_json(plotting_data, curr_repo, fail_2_amount_sorted)
+    
     total_tests = len(os.listdir(repo_dir))
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(f"Total Tests: {total_tests}\n")
-        f.write("Runs:\n")
-        f.write("\n".join(f"- {key}: {value}" for key, value in total_runs.items()))
-        f.write("\nPassed Runs (=Tests):\n")
-        f.write("\n".join(f"- {key}: {value}" for key, value in passed_tests.items()))
-        f.write("\nErroneus Runs:\n")
-        f.write("\n".join(f"- {key}: {value}" for key, value in erroneus_tests.items()))
-        f.write("\n\nFailure Classifications:\n- - - - - - - - - - - - -\n")
-        for failure_type, pr_list in fail2pr.items():
-            f.write(f"[{len(pr_list)}] {failure_type}: {", ".join(pr_list)}\n")
-        f.write("\n----------------------------------------\n")
+    repository_metrics = (
+        "\n\n----------------------------------------\n"
+        f"Repository: {curr_repo}"
+        "\n----------------------------------------\n"
+        f"Total Tests: {total_tests}\n"
+        "Runs:\n"
+        + "\n".join(f"- {key}: {value}" for key, value in total_runs.items())
+        + "\nPassed Runs (=Tests):\n"
+        + "\n".join(f"- {key}: {value}" for key, value in passed_tests.items())
+        + "\nErroneus Runs:\n"
+        + "\n".join(f"- {key}: {value}" for key, value in erroneus_tests.items())
+        + "\n\nFailure Classifications:\n- - - - - - - - - - - - -\n"
+        + "\n".join(f"[{len(pr_list)}] {failure_type}: {', '.join(pr_list)}" for failure_type, pr_list in fail2pr.items())
+    )
+    
+    _write_to_output_file(eval_dir, repository_metrics)
     
     TOTAL_TESTS += total_tests
     PASSED_TESTS += passed_tests["total"]
@@ -185,14 +206,10 @@ def _handle_mozilla_repo_dir(repo_dir: Path):
     LLAMA_TEST_RUNS += total_runs[Model.LLAMA]
     
     
-    
-    
     for k, v in fail2pr.items():
         if FAILURES_2_COUNT.get(k) is None:
             FAILURES_2_COUNT[k] = 0
         FAILURES_2_COUNT[k] += len(v)
-
-
 
 def _is_pr_dir(dir_name: str) -> bool:
     owner, rest = dir_name.split("__")
@@ -207,7 +224,6 @@ def _is_pr_dir(dir_name: str) -> bool:
     if not pr_number.isdigit():
         return False
     return True
-
 
 def _handle_pr_dir(pr_dir: Path, fail2pr: dict[str, list[str]], total_runs: dict[str, int], erroneus_tests: dict[str, int], passed_tests: dict[str, int]):
     model_attempts = os.listdir(pr_dir)
@@ -226,7 +242,6 @@ def _handle_pr_dir(pr_dir: Path, fail2pr: dict[str, list[str]], total_runs: dict
             continue
     pass
 
-
 def _is_model_dir(dir_name: str) -> bool:
     dir_parts = dir_name.split("_")
     if not len(dir_parts) == 2:
@@ -238,7 +253,6 @@ def _is_model_dir(dir_name: str) -> bool:
     if model not in [m.value for m in Model]:
         return False
     return True
-
 
 def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[str, list[str]], erroneus_tests: dict[str, int], passed_tests: dict[str, int]):
     files = os.listdir(model_dir)
@@ -299,30 +313,70 @@ def _handle_model_attempt_dir(model_dir: Path, pr_dir_name: str, fail2pr: dict[s
         elif len(files) == 5: # only after.txt file is missing, test passed pre-PR
             fail2pr[FailureType.TEST_PASS_PRE_PR].append(pr_dir_name)
 
-def _validate_eval_dir(eval_dir: Path):
-    if not eval_dir.exists() or not eval_dir.is_dir():
-        print(
-            f"[!] Error: Evaluation directory {eval_dir} does not exist or is not a directory."
-        )
-        sys.exit(1)
+def _write_to_output_file(eval_dir: Path, content: str):
+    output_file = "card_sorting_evaluation.txt"
+    path_to_output_file = Path(Path.cwd(), eval_dir, output_file)
     
+    if not path_to_output_file.exists():
+        path_to_output_file.touch()
+    
+    with open(path_to_output_file, "a") as f:
+        f.write(content)
+
+def _parse_failure_data_to_json(plotting_data: dict, curr_repo: str, fail_2_amount_sorted: dict[str, int]):
+    """
+    Parse the failure data to JSON format for plotting. 
+    Only keep the top PLOTTING_DATA_FAILURE_CUTOFF failure reasons + ties.
+    """
+    cutoff_idx = PLOTTING_DATA_FAILURE_CUTOFF - 1
+    cutoff_value = [*fail_2_amount_sorted.values()][cutoff_idx]
+    while len(fail_2_amount_sorted) > cutoff_idx:
+        vals = list(fail_2_amount_sorted.values())
+        if vals[cutoff_idx] == cutoff_value:
+            cutoff_idx += 1
+        else:
+            keys = list(fail_2_amount_sorted.keys())
+            del fail_2_amount_sorted[keys[cutoff_idx]] 
+        
+    plotting_data["horizontal_bar_chart"][curr_repo] = fail_2_amount_sorted
+
+def _write_to_plotting_data_file(eval_dir: Path, content: dict):
+    path_to_json_file = Path(Path.cwd(), eval_dir, "plotting_data.json")
+    path_to_json_file.touch(exist_ok=True)
+    
+    with open(path_to_json_file, "a") as jf:
+        json.dump(content, jf, indent=2)
+    
+
+def _validate_eval_dir(eval_dir: Path):
     for dir in os.listdir(eval_dir):
         if not Path(eval_dir, dir).is_dir():
             continue
         owner, repo = dir.split("_")
         if not owner == "mozilla":
             print(
-                f"[!] Error: Unknown repository owner {owner} found in evaluation directory."
+                f"[!] Error: Unknown directory with repository owner {owner} found in evaluation directory."
             )
             sys.exit(1)
         if repo not in [e.value for e in Repository]:
             print(
-                f"[!] Error: Unknown repository directory {dir} found in evaluation directory."
+                f"[!] Error: Unknown Unknown directory with repository name {dir} found in evaluation directory."
             )
             sys.exit(1)
 
+def _validate_sys_args(args: list[str]) -> Path:
+    if len(args) != 1:
+        print(f"Usage: python card_sorting_eval.py <evaluation_directory_in_CWD>")
+        sys.exit(1)
+    eval_dir = args[0]
+    path_to_eval_dir = Path(Path.cwd(), eval_dir)
+    if not path_to_eval_dir.exists() or not path_to_eval_dir.is_dir():
+        print(f"[!] Error: Evaluation directory {eval_dir} does not exist in {Path.cwd()}.")
+        sys.exit(1)
+    return path_to_eval_dir
 
 if __name__ == "__main__":
-    eval_dir = Path(Path.cwd(), EVALUATION_DIR)
+    passed_args = sys.argv
+    eval_dir = _validate_sys_args(passed_args[1:])
     _validate_eval_dir(eval_dir)
     main(eval_dir)
