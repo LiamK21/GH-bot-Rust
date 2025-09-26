@@ -40,12 +40,11 @@ payload_files = [f.name for f in TEST_DIR.iterdir() if f.is_file() and f.suffix 
 def test_generate_test(filename: str) -> None:
         payload = _get_payload(filename)
         config, runner = _setup(payload)
-        generation_completed = False
+        generation_completed_arr: list[bool] = []
         for model in USED_MODELS:
-            if generation_completed:
-                break
             config.setup_output_dir(0, model)
             generation_completed = runner.execute_runner(0, model)
+            generation_completed_arr.append(generation_completed)
 
         _teardown(payload, config, runner)
-        assert generation_completed is True
+        assert True in generation_completed_arr
