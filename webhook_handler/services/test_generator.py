@@ -129,10 +129,10 @@ class TestGenerator:
         if fail_2_pass:
             logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
             logger.marker("Running code coverage to verify usability of generated test") # type: ignore[attr-defined]
-            coverage_passed = self._determine_test_usability(filename, new_test, imports)
+            coverage_passed, line_coverage_before, line_coverage_after = self._determine_test_usability(filename, new_test, imports)
             if coverage_passed:
                 logger.marker("[*] Handling commenting on PR") # type: ignore[attr-defined]
-                self._handle_commenting(filename)
+                self._handle_commenting(filename, line_coverage_before, line_coverage_after)
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return True
         else:
@@ -260,7 +260,7 @@ class TestGenerator:
                 "Cannot run test in post-PR codebase without old file content"
             )
 
-    def _determine_test_usability(self, filename: str, new_test: str, imports: list[str]) -> bool:
+    def _determine_test_usability(self, filename: str, new_test: str, imports: list[str]) -> tuple[bool, float | None, float | None]:
         if not self._config.cloned_repo_dir:
             raise DataMissingError(
                 "cloned_repo_dir", "None", "Cloned repo dir should not be None"
@@ -295,32 +295,34 @@ class TestGenerator:
         augmented_line_coverage = self._docker_service.run_coverage_in_container(filename, golden_code_patch)
         if not non_augmented_line_coverage or not augmented_line_coverage:
             logger.error("Could not retrieve line coverage, marking test as non-usable")  # type: ignore[attr-defined]
-            return False
+            return False, None, None
         if augmented_line_coverage < non_augmented_line_coverage:
             logger.warning("Generated test does not improve line coverage, marking as non-usable")  # type: ignore[attr-defined]
-            return False
+            return False, non_augmented_line_coverage, augmented_line_coverage
         else:
             logger.success("Generated test improves line coverage, marking as usable")  # type: ignore[attr-defined]
-            return True
+            return True, non_augmented_line_coverage, augmented_line_coverage
         
 
     def _handle_commenting(
-        self, filename: str, no_test_gen_reason: str | None = None
+        self, filename: str, line_coverage_before: float| None ,line_coverage_after: float | None
     ) -> None:
         assert self._generation_dir is not None
+        comment = templates.COMMENT_TEMPLATE % (
+            f"{line_coverage_before:.2f}%",
+            f"{line_coverage_after:.2f}%",
+            (self._generation_dir / "generated_test.txt").read_text(
+                encoding="utf-8"
+            ),
+            filename,
+        )
+        (self._generation_dir / "comment_incl_coverage.txt").write_text(comment)
         if self._post_comment:
-            if no_test_gen_reason is None:
-                comment = templates.COMMENT_TEMPLATE % (
-                    (self._generation_dir / "generated_test.txt").read_text(
-                        encoding="utf-8"
-                    ),
-                    filename,
-                )
-                status_code, response_data = self._gh_service.add_comment_to_pr(comment)
-                if status_code == 201:
-                    logger.success("Comment added successfully:\n\n%s" % comment)  # type: ignore[attr-defined]
-                else:
-                    logger.error(f"Failed to add comment: {status_code}", response_data)
+            status_code, response_data = self._gh_service.add_comment_to_pr(comment)
+            if status_code == 201:
+                logger.success("Comment added successfully:\n\n%s" % comment)  # type: ignore[attr-defined]
+            else:
+                logger.error(f"Failed to add comment: {status_code}", response_data)
         return
 
     def _get_relevant_file(

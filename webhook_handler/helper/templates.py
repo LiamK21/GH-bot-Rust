@@ -1,6 +1,7 @@
 COMMENT_TEMPLATE = """Hi! 🤖 The test below is automatically generated and could serve as a regression test for this PR because it:
-- passes, and
-- fails in the codebase before the PR.
+- passes on the PR, 
+- fails in the codebase before the PR, and
+- increases line coverage from %s to %s.
 
 ```rust
 %s
