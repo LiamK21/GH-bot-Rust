@@ -36,6 +36,9 @@ def _setup_dirs(config: Config, runner: BotRunner, payload) -> None:
 TEST_DIR = Path(Path.cwd(), "webhook_handler", "test", "test_data", "neqo")
 payload_files = [f.name for f in TEST_DIR.iterdir() if f.is_file() and f.suffix == ".json"]
 
+payload_files = list(set(payload_files))
+payload_files.sort(key=lambda x: x.removeprefix("pr_").removesuffix(".json"))
+
 @pytest.mark.parametrize("filename", payload_files)
 def test_generate_test(filename: str) -> None:
         payload = _get_payload(filename)
