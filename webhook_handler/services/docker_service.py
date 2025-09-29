@@ -169,16 +169,18 @@ class DockerService:
             if is_golden_patch:
                 test_command: str = (
                 "/bin/sh -c 'cd /app/testbed && "
-                f"cargo llvm-cov --no-report -- --nocapture " + " ".join(tests_to_run) + "'"
+                "timeout 1200s cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
                 )
             else:
                 test_command = (
                     "/bin/sh -c 'cd /app/testbed && "
-                    "cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
+                    "timeout 1200s cargo test -- --nocapture " + " ".join(tests_to_run) + "'"
                 )
             exec_result = container.exec_run(test_command, stdout=True, stderr=True)
             stdout: str = exec_result.output.decode()
             test_result: bool = exec_result.exit_code == 0
+            if exec_result.exit_code == 124:
+                stdout = "errror[timeout]: Test execution exceeded the time limit of 1200 seconds.\n" + stdout
             stdout = "Exit Code:" + str(exec_result.exit_code) + "\n" + stdout
             logger.info(f"[+] Test result: {test_result}")
             return test_result, stdout
@@ -332,7 +334,7 @@ class DockerService:
             logger.marker("Running coverage generation...")  # type: ignore[attr-defined]
             coverage_generation_command: str = (
             "/bin/sh -c 'cd /app/testbed && "
-            "cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
+            "timeout 1200s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
             f"{"::".join(split_filename)}::tests '" 
             )
             exec_result = container.exec_run(coverage_generation_command, stdout=True, stderr=True)
