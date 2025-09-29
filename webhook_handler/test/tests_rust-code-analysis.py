@@ -41,13 +41,13 @@ payload_files.sort(key=lambda x: int(x.removeprefix("pr_").removesuffix(".json")
 
 @pytest.mark.parametrize("filename", payload_files)
 def test_generate_test(filename: str) -> None:
-        payload = _get_payload(filename)
-        config, runner = _setup(payload)
-        generation_completed_arr: list[bool] = []
-        for model in USED_MODELS:
-            config.setup_output_dir(0, model)
-            generation_completed = runner.execute_runner(0, model)
-            generation_completed_arr.append(generation_completed)
+    payload = _get_payload(filename)
+    config, runner = _setup(payload)
+    generation_completed_arr: list[bool] = []
+    for model in USED_MODELS:
+        config.setup_output_dir(0, model)
+        generation_completed = runner.execute_runner(0, model)
+        generation_completed_arr.append(generation_completed)
 
-        _teardown(payload, config, runner)
-        assert True in generation_completed_arr
+    _teardown(payload, config, runner)
+    assert True in generation_completed_arr
