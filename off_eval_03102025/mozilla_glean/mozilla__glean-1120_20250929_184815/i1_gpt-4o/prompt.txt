@@ -1,0 +1,280 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Limit retries for failed ping uploads
+This caused an issue in fenix, where the app would crash after entering an infinite loop of retries on "recoverable" errors.
+
+A quick fix was put in the android bindings to limit retries there, but this should really be on the Rust upload module.
+
+See: https://github.com/mozilla/glean/pull/953
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -490,7 +490,7 @@ impl Glean {
+     ///
+     /// * `Wait` - which means the requester should ask again later;
+     /// * `Upload(PingRequest)` - which means there is a ping to upload. This wraps the actual request object;
+-    /// * `Done` - which means there are no more pings queued right now.
++    /// * `Done` - which means requester should stop asking for now.
+     ///
+     /// # Return value
+     ///
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -11,7 +11,7 @@
+ 
+ use std::collections::VecDeque;
+ use std::path::PathBuf;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Arc, RwLock, RwLockWriteGuard};
+ use std::thread;
+ use std::time::{Duration, Instant};
+@@ -26,6 +26,11 @@ mod directory;
+ mod request;
+ mod result;
+ 
++/// The maximum recoverable failures allowed per uploading window.
++///
++/// Limiting this is necessary to avoid infinite loops on requesting upload tasks.
++const MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW: u32 = 3;
++
+ // The maximum size in bytes a ping body may have to be eligible for upload.
+ const PING_BODY_MAX_SIZE: usize = 1024 * 1024; // 1 MB
+ 
+@@ -112,7 +117,16 @@ pub enum PingUploadTask {
+     /// A flag signaling that the pending pings directories are not done being processed,
+     /// thus the requester should wait and come back later.
+     Wait,
+-    /// A flag signaling that the pending pings queue is empty and requester is done.
++    /// A flag signaling that requester doesn't need to request any more upload tasks at this moment.
++    ///
++    /// There are two possibilities for this scenario:
++    /// * Pending pings queue is empty, no more pings to request;
++    /// * Requester has reported more than MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW
++    ///   recoverable upload failures on the same uploading window[1]
++    ///   and should stop requesting at this moment.
++    ///
++    /// [1]: An "uploading window" starts when a requester gets a new `PingUploadTask::Upload(PingRequest)`
++    ///      response and finishes when they finally get a `PingUploadTask::Done` or `PingUploadTask::Wait` response.
+     Done,
+ }
+ 
+@@ -127,6 +141,8 @@ pub struct PingUploadManager {
+     processed_pending_pings: Arc<AtomicBool>,
+     /// A vector to store the pending pings processed off-thread.
+     pending_pings: Arc<RwLock<Vec<PingPayload>>>,
++    /// The number of upload failures for the current uploading window.
++    recoverable_failure_count: AtomicU32,
+     /// A ping counter to help rate limit the ping uploads.
+     ///
+     /// To keep resource usage in check,
+@@ -187,9 +203,10 @@ impl PingUploadManager {
+ 
+         Self {
+             queue,
++            directory_manager,
+             processed_pending_pings,
+             pending_pings,
+-            directory_manager,
++            recoverable_failure_count: AtomicU32::new(0),
+             rate_limiter: None,
+             language_binding_name: language_binding_name.into(),
+             upload_metrics: UploadMetrics::new(),
+@@ -200,11 +217,12 @@ impl PingUploadManager {
+         self.processed_pending_pings.load(Ordering::SeqCst)
+     }
+ 
+-    /// Checks if a ping with a certain `document_id` is already enqueued.
+-    fn is_enqueued(queue: &VecDeque<PingRequest>, document_id: &str) -> bool {
+-        queue
+-            .iter()
+-            .any(|request| request.document_id == document_id)
++    fn recoverable_failure_count(&self) -> u32 {
++        self.recoverable_failure_count.load(Ordering::SeqCst)
++    }
++
++    fn reset_recoverable_failure_count(&self) {
++        self.recoverable_failure_count.store(0, Ordering::SeqCst);
+     }
+ 
+     /// Attempts to build a ping request from a ping file payload.
+@@ -261,7 +279,10 @@ impl PingUploadManager {
+             .expect("Can't write to pending pings queue.");
+ 
+         // Checks if a ping with this `document_id` is already enqueued.
+-        if Self::is_enqueued(&queue, &document_id) {
++        if queue
++            .iter()
++            .any(|request| request.document_id == document_id)
++        {
+             log::trace!(
+                 "Attempted to enqueue a duplicate ping {} at {}.",
+                 document_id,
+@@ -326,17 +347,7 @@ impl PingUploadManager {
+         queue
+     }
+ 
+-    /// Gets the next `PingUploadTask`.
+-    ///
+-    /// ## Arguments
+-    ///
+-    /// * `glean` - The Glean object holding the database.
+-    /// * `log_ping` - Whether to log the ping before returning.
+-    ///
+-    /// # Return value
+-    ///
+-    /// `PingUploadTask` - see [`PingUploadTask`](enum.PingUploadTask.html) for more information.
+-    pub fn get_upload_task(&self, glean: &Glean, log_ping: bool) -> PingUploadTask {
++    fn get_upload_task_internal(&self, glean: &Glean, log_ping: bool) -> PingUploadTask {
+         if !self.has_processed_pings_dir() {
+             log::info!(
+                 "Tried getting an upload task, but processing is ongoing. Will come back later."
+@@ -352,6 +363,14 @@ impl PingUploadManager {
+             self.enqueue_ping(glean, &document_id, &path, &body, headers);
+         }
+ 
++        if self.recoverable_failure_count() >= MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW {
++            log::warn!(
++                "Reached maximum recoverable failures for the current uploading window. You are done."
++            );
++
++            return PingUploadTask::Done;
++        }
++
+         let mut queue = self
+             .queue
+             .write()
+@@ -393,6 +412,25 @@ impl PingUploadManager {
+         }
+     }
+ 
++    /// Gets the next `PingUploadTask`.
++    ///
++    /// ## Arguments
++    ///
++    /// * `glean` - The Glean object holding the database.
++    /// * `log_ping` - Whether to log the ping before returning.
++    ///
++    /// # Return value
++    ///
++    /// `PingUploadTask` - see [`PingUploadTask`](enum.PingUploadTask.html) for more information.
++    pub fn get_upload_task(&self, glean: &Glean, log_ping: bool) -> PingUploadTask {
++        let task = self.get_upload_task_internal(glean, log_ping);
++        if task == PingUploadTask::Done || task == PingUploadTask::Wait {
++            self.reset_recoverable_failure_count()
++        }
++
++        task
++    }
++
+     /// Processes the response from an attempt to upload a ping.
+     ///
+     /// Based on the HTTP status of said response,
+@@ -466,6 +504,8 @@ impl PingUploadManager {
+                     status
+                 );
+                 self.enqueue_ping_from_file(glean, &document_id);
++                self.recoverable_failure_count
++                    .fetch_add(1, Ordering::SeqCst);
+             }
+         };
+     }
+@@ -1054,4 +1094,46 @@ mod test {
+             PingUploadTask::Done
+         );
+     }
++
++    #[test]
++    fn maximum_of_recoverable_errors_is_enforced_for_uploading_window() {
++        let (mut glean, _) = new_glean(None);
++
++        // Wait for processing of pending pings directory to finish.
++        while glean.get_upload_task() == PingUploadTask::Wait {
++            thread::sleep(Duration::from_millis(10));
++        }
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping multiple times
++        let n = 5;
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        // Return the max recoverable error failures in a row
++        for _ in 0..MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW {
++            match glean.get_upload_task() {
++                PingUploadTask::Upload(req) => {
++                    glean.process_ping_upload_response(&req.document_id, RecoverableFailure)
++                }
++                _ => panic!("Expected upload manager to return the next request!"),
++            }
++        }
++
++        // Verify that after returning the max amount of recoverable failures,
++        // we are done even though we haven't gotten all the enqueued requests.
++        assert_eq!(glean.get_upload_task(), PingUploadTask::Done);
++
++        // Verify all requests are returned when we try again.
++        for _ in 0..n {
++            match glean.get_upload_task() {
++                PingUploadTask::Upload(_) => {}
++                _ => panic!("Expected upload manager to return the next request!"),
++            }
++        }
++    }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

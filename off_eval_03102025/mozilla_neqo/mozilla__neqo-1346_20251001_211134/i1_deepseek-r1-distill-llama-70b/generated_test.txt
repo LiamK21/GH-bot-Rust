@@ -1,0 +1,43 @@
+#[test]
+fn test_send_arbitrary_data() {
+    let (server_tx, client_rx) = mpsc::channel();
+    let (client_tx, server_rx) = mpsc::channel();
+
+    let server = Http3Server::new(
+        Instant::now(),
+        &["key".to_string()],
+        &["alpn".to_string()],
+        AntiReplay::new(),
+        Rc::new(RefCell::new(RandomConnectionIdGenerator::default())),
+        Http3Parameters::default(),
+    ).expect("Failed to create server");
+
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        while let Some(event) = server.next_event() {
+            match event {
+                Http3ServerEvent::Headers { mut stream, headers, fin } => {
+                    let response = ResponseData::from(vec![b'a'; 10000]);
+                    stream.send_headers(&[
+                        Header::new(":status", "200"),
+                        Header::new("content-length", response.remaining),
+                    ]).unwrap();
+                    response.send(&mut stream);
+                    if !response.done() {
+                        server_tx.send(response).unwrap();
+                    } else {
+                        stream.stream_close_send().unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut client = MockClient::new();
+    client.connect();
+    client.send_request();
+
+    let received = client_rx.recv().unwrap();
+    assert_eq!(received, 10000);
+}

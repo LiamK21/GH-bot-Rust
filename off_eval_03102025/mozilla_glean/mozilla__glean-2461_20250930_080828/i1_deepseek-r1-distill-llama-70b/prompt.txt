@@ -1,0 +1,216 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Crash in [@ shutdownhang | RtlpWaitOnAddressWithTimeout | RtlpWaitOnAddress | RtlWaitOnAddress | WaitOnAddress] in Glean
+Shutdown hang reported for Windows 10 and 11 which got more frequent with Firefox 111.0.x (6000 crash reports vs. 450 for 110.0.x).
+
+Crash report: https://crash-stats.mozilla.org/report/index/47e42dbc-f99c-474f-8154-bbf470230413
+
+MOZ_CRASH Reason: ```Shutdown hanging at step XPCOMShutdown. Something is blocking the main-thread.```
+
+Top 10 frames of crashing thread:
+```
+0  ntdll.dll  ZwWaitForAlertByThreadId  
+1  ntdll.dll  RtlpWaitOnAddressWithTimeout  
+2  ntdll.dll  RtlpWaitOnAddress  
+3  ntdll.dll  RtlWaitOnAddress  
+4  KERNELBASE.dll  WaitOnAddress  
+5  xul.dll  std::sys::windows::thread_parker::Parker::park  library/std/src/sys/windows/thread_parker.rs:117
+5  xul.dll  std::thread::park  library/std/src/thread/mod.rs:999
+6  xul.dll  crossbeam_channel::context::Context::wait_until  third_party/rust/crossbeam-channel/src/context.rs:177
+7  xul.dll  crossbeam_channel::flavors::zero::impl$3::recv::closure$1  third_party/rust/crossbeam-channel/src/flavors/zero.rs:323
+7  xul.dll  crossbeam_channel::context::impl$0::with::closure$0<crossbeam_channel::flavors::zero::impl$3::recv::closure_env$1<tuple$<> >, enum2$<core::result::Result<tuple$<>, crossbeam_channel::err::RecvTimeoutError> > >  third_party/rust/crossbeam-channel/src/context.rs:52
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/dispatcher/global.rs b/glean-core/src/dispatcher/global.rs
+--- a/glean-core/src/dispatcher/global.rs
++++ b/glean-core/src/dispatcher/global.rs
+@@ -6,8 +6,10 @@ use once_cell::sync::Lazy;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::RwLock;
+ use std::thread;
++use std::time::Duration;
+ 
+ use super::{DispatchError, DispatchGuard, Dispatcher};
++use crossbeam_channel::RecvTimeoutError;
+ 
+ #[cfg(feature = "preinit_million_queue")]
+ pub const GLOBAL_DISPATCHER_LIMIT: usize = 1000000;
+@@ -76,6 +78,11 @@ pub fn block_on_queue() {
+     guard().block_on_queue();
+ }
+ 
++/// Block until all tasks prior to this call are processed, with a timeout.
++pub fn block_on_queue_timeout(timeout: Duration) -> Result<(), RecvTimeoutError> {
++    guard().block_on_queue_timeout(timeout)
++}
++
+ /// Starts processing queued tasks in the global dispatch queue.
+ ///
+ /// This function blocks until queued tasks prior to this call are finished.
+
+diff --git a/glean-core/src/dispatcher/mod.rs b/glean-core/src/dispatcher/mod.rs
+--- a/glean-core/src/dispatcher/mod.rs
++++ b/glean-core/src/dispatcher/mod.rs
+@@ -29,9 +29,10 @@ use std::{
+         Arc,
+     },
+     thread::{self, JoinHandle},
++    time::Duration,
+ };
+ 
+-use crossbeam_channel::{bounded, unbounded, SendError, Sender};
++use crossbeam_channel::{bounded, unbounded, RecvTimeoutError, SendError, Sender};
+ use thiserror::Error;
+ 
+ pub use global::*;
+@@ -161,6 +162,26 @@ impl DispatchGuard {
+             .expect("Failed to receive message on single-use channel");
+     }
+ 
++    /// Block on the task queue emptying, with a timeout.
++    fn block_on_queue_timeout(&self, timeout: Duration) -> Result<(), RecvTimeoutError> {
++        let (tx, rx) = crossbeam_channel::bounded(0);
++
++        // We explicitly don't use `self.launch` here.
++        // We always put this task on the unbounded queue.
++        // The pre-init queue might be full before its flushed, in which case this would panic.
++        // Blocking on the queue can only work if it is eventually flushed anyway.
++
++        let task = Command::Task(Box::new(move || {
++            tx.send(())
++                .expect("(worker) Can't send message on single-use channel");
++        }));
++        self.sender
++            .send(task)
++            .expect("Failed to launch the blocking task");
++
++        rx.recv_timeout(timeout)
++    }
++
+     fn kill(&mut self) -> Result<(), DispatchError> {
+         // We immediately stop queueing in the pre-init buffer.
+         let old_val = self.queue_preinit.swap(false, Ordering::SeqCst);
+
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -24,6 +24,9 @@ pub struct AdditionalMetrics {
+ 
+     /// Time waited for the uploader at shutdown.
+     pub shutdown_wait: TimingDistributionMetric,
++
++    /// Time waited for the dispatcher to unblock during shutdown.
++    pub shutdown_dispatcher_wait: TimingDistributionMetric,
+ }
+ 
+ impl CoreMetrics {
+@@ -97,6 +100,18 @@ impl AdditionalMetrics {
+                 },
+                 TimeUnit::Millisecond,
+             ),
++
++            shutdown_dispatcher_wait: TimingDistributionMetric::new(
++                CommonMetricData {
++                    name: "shutdown_dispatcher_wait".into(),
++                    category: "glean.validation".into(),
++                    send_in_pings: vec!["metrics".into()],
++                    lifetime: Lifetime::Ping,
++                    disabled: false,
++                    dynamic_label: None,
++                },
++                TimeUnit::Millisecond,
++            ),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -565,8 +565,31 @@ pub fn shutdown() {
+         glean.set_dirty_flag(false);
+     });
+ 
+-    // We need to wait for above task to finish.
+-    dispatcher::block_on_queue();
++    // We need to wait for above task to finish,
++    // but we also don't wait around forever.
++    //
++    // TODO: Make the timeout configurable?
++    // The default hang watchdog on Firefox waits 60s,
++    // Glean's `uploader_shutdown` further below waits up to 30s.
++    let timer_id = core::with_glean(|glean| {
++        glean
++            .additional_metrics
++            .shutdown_dispatcher_wait
++            .start_sync()
++    });
++    if dispatcher::block_on_queue_timeout(Duration::from_secs(10)).is_err() {
++        log::error!(
++            "Timeout while blocking on the dispatcher. No further shutdown cleanup will happen."
++        );
++        return;
++    }
++    let stop_time = time::precise_time_ns();
++    core::with_glean(|glean| {
++        glean
++            .additional_metrics
++            .shutdown_dispatcher_wait
++            .set_stop_and_accumulate(glean, timer_id, stop_time);
++    });
+ 
+     if let Err(e) = dispatcher::shutdown() {
+         log::error!("Can't shutdown dispatcher thread: {:?}", e);
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn block_on_queue() -> ()
+
+fn shutdown(&self) -> Result<(), CallbackError>
+
+pub fn shutdown() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

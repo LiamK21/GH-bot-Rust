@@ -1,0 +1,79 @@
+<Filename> glean-core/rlb/src/test.rs </Filename>
+<imports> 
+use std::sync::{Arc, Mutex};
+use crossbeam_channel::bounded;
+use glean_core::rlb::PingType;
+use glean_core::metrics::CounterMetric;
+use glean_core::Configuration;
+use tempfile::tempdir;
+use glean_core::new_glean;
+use glean_core::block_on_dispatcher;
+use glean_core::Lifetime;
+use glean_core::CommonMetricData;
+</imports>
+<Rust>
+#[test]
+fn test_custom_ping_submission_callback() {
+    let _lock = std::sync::Mutex::new(());
+    let _lock = _lock.lock().unwrap();
+
+    let (s, r) = bounded::<String>(1);
+
+    struct FakeUploader {
+        sender: crossbeam_channel::Sender<String>,
+    }
+
+    impl glean_core::net::PingUploader for FakeUploader {
+        fn upload(
+            &self,
+            url: String,
+            _body: Vec<u8>,
+            _headers: Vec<(String, String)>,
+        ) -> glean_core::net::UploadResult {
+            self.sender.send(url).unwrap();
+            glean_core::net::UploadResult::HttpStatus(200)
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let cfg = Configuration {
+        data_path: tmpname,
+        application_id: "test".into(),
+        upload_enabled: true,
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: Some("testing".into()),
+        server_endpoint: Some("invalid-test-host".into()),
+        uploader: Some(Box::new(FakeUploader { sender: s })),
+    };
+
+    let _t = new_glean(Some(cfg), true);
+
+    let sample_ping = PingType::new("custom1", true, true, vec![]);
+
+    let metric = CounterMetric::new(CommonMetricData {
+        name: "counter_metric".into(),
+        category: "test".into(),
+        send_in_pings: vec!["custom1".into()],
+        lifetime: Lifetime::Application,
+        disabled: false,
+        dynamic_label: None,
+    });
+
+    block_on_dispatcher();
+
+    metric.add(1);
+
+    let was_called = Arc::new(Mutex::new(false));
+    let was_called_clone = Arc::clone(&was_called);
+    sample_ping.test_before_next_submit(move |_| {
+        *was_called_clone.lock().unwrap() = true;
+    });
+
+    sample_ping.submit(None);
+
+    assert!(*was_called.lock().unwrap());
+}
+</Rust>

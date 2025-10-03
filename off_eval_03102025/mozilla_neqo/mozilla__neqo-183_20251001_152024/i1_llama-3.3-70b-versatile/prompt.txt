@@ -1,0 +1,431 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+SendStreamWritable is not really useful
+I would say SendStreamWritable is wrong. It does not take the flow control into account, so neqo-transport will post SendStreamWritable if there is more space in buffer even if the flow control does not allow to send more data.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -8,7 +8,7 @@
+ 
+ #![allow(dead_code)]
+ use std::cell::RefCell;
+-use std::cmp::{max, min, Ordering};
++use std::cmp::{max, Ordering};
+ use std::collections::HashMap;
+ use std::convert::TryInto;
+ use std::fmt::{self, Debug};
+@@ -54,7 +54,12 @@ const CID_LENGTH: usize = 8;
+ 
+ pub const LOCAL_STREAM_LIMIT_BIDI: u64 = 16;
+ pub const LOCAL_STREAM_LIMIT_UNI: u64 = 16;
++
++#[cfg(not(test))]
+ const LOCAL_MAX_DATA: u64 = 0x3FFF_FFFF_FFFF_FFFE; // 2^62-1
++#[cfg(test)]
++const LOCAL_MAX_DATA: u64 = 0x3FFF; // 16,383
++
+ const LOCAL_IDLE_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
+ 
+ #[derive(Debug, PartialEq, Copy, Clone)]
+@@ -1157,6 +1162,24 @@ impl Connection {
+         Ok(())
+     }
+ 
++    fn handle_max_data(&mut self, maximum_data: u64) {
++        let conn_was_blocked = self.flow_mgr.borrow().conn_credit_avail() == 0;
++        let conn_credit_increased = self
++            .flow_mgr
++            .borrow_mut()
++            .conn_increase_max_credit(maximum_data);
++
++        if conn_was_blocked && conn_credit_increased {
++            for (id, ss) in &mut self.send_streams {
++                if ss.avail() > 0 {
++                    // These may not actually all be writable if one
++                    // uses up all the conn credit. Not our fault.
++                    self.events.send_stream_writable(*id)
++                }
++            }
++        }
++    }
++
+     fn input_frame(&mut self, epoch: Epoch, frame: Frame, now: Instant) -> Res<()> {
+         match frame {
+             Frame::Padding => {
+@@ -1228,10 +1251,7 @@ impl Connection {
+                     rs.inbound_stream_frame(fin, offset, data)?;
+                 }
+             }
+-            Frame::MaxData { maximum_data } => self
+-                .flow_mgr
+-                .borrow_mut()
+-                .conn_increase_max_credit(maximum_data),
++            Frame::MaxData { maximum_data } => self.handle_max_data(maximum_data),
+             Frame::MaxStreamData {
+                 stream_id,
+                 maximum_stream_data,
+@@ -1688,10 +1708,7 @@ impl Connection {
+     /// i.e. that will not be blocked by flow credits or send buffer max
+     /// capacity.
+     pub fn stream_avail_send_space(&self, stream_id: u64) -> Res<u64> {
+-        Ok(min(
+-            self.send_streams.get(stream_id.into())?.avail(),
+-            self.flow_mgr.borrow().conn_credit_avail(),
+-        ))
++        Ok(self.send_streams.get(stream_id.into())?.avail())
+     }
+ 
+     /// Close the stream. Enqueued data will be sent.
+@@ -1731,7 +1748,7 @@ impl Connection {
+ 
+     /// Get events that indicate state changes on the connection.
+     pub fn events(&mut self) -> impl Iterator<Item = ConnectionEvent> {
+-        self.events.events().into_iter()
++        self.events.events()
+     }
+ 
+     fn check_loss_detection_timeout(&mut self, now: Instant) {
+@@ -2559,4 +2576,41 @@ mod tests {
+         client.process_timer(now + Duration::from_secs(80));
+         assert!(matches!(client.state(), State::Closing{..}));
+     }
++
++    #[test]
++    fn max_data() {
++        let mut client = default_client();
++        let mut server = default_server();
++        connect(&mut client, &mut server);
++
++        let stream_id = client.stream_create(StreamType::UniDi).unwrap();
++        assert_eq!(stream_id, 2);
++        assert_eq!(
++            client.stream_avail_send_space(stream_id).unwrap(),
++            LOCAL_MAX_DATA // 16383, when cfg(test)
++        );
++        assert_eq!(
++            client
++                .stream_send(stream_id, &[b'a'; RX_STREAM_DATA_WINDOW as usize])
++                .unwrap(),
++            LOCAL_MAX_DATA as usize
++        );
++        let evts = client.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 2); // SendStreamWritable, StateChange(connected)
++        assert_eq!(client.stream_send(stream_id, b"hello").unwrap(), 0);
++        let ss = client.send_streams.get_mut(stream_id.into()).unwrap();
++        ss.mark_as_sent(0, 4096, false);
++        ss.mark_as_acked(0, 4096, false);
++
++        // no event because still limited by conn max data
++        let evts = client.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++
++        // increase max data
++        client.handle_max_data(100_000);
++        assert_eq!(client.stream_avail_send_space(stream_id).unwrap(), 49152);
++        let evts = client.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 1);
++        assert!(matches!(evts[0], ConnectionEvent::SendStreamWritable{..}));
++    }
+ }
+
+diff --git a/neqo-transport/src/events.rs b/neqo-transport/src/events.rs
+--- a/neqo-transport/src/events.rs
++++ b/neqo-transport/src/events.rs
+@@ -107,8 +107,8 @@ impl ConnectionEvents {
+         self.insert(ConnectionEvent::ZeroRttRejected);
+     }
+ 
+-    pub fn events(&self) -> BTreeSet<ConnectionEvent> {
+-        self.events.replace(BTreeSet::new())
++    pub fn events(&self) -> impl Iterator<Item = ConnectionEvent> {
++        self.events.replace(BTreeSet::new()).into_iter()
+     }
+ 
+     fn insert(&self, event: ConnectionEvent) {
+
+diff --git a/neqo-transport/src/flow_mgr.rs b/neqo-transport/src/flow_mgr.rs
+--- a/neqo-transport/src/flow_mgr.rs
++++ b/neqo-transport/src/flow_mgr.rs
+@@ -7,7 +7,6 @@
+ // Tracks possibly-redundant flow control signals from other code and converts
+ // into flow control frames needing to be sent to the remote.
+ 
+-use std::cmp::max;
+ use std::collections::HashMap;
+ use std::mem;
+ 
+@@ -52,8 +51,14 @@ impl FlowMgr {
+         assert!(self.used_data <= self.max_data)
+     }
+ 
+-    pub fn conn_increase_max_credit(&mut self, new: u64) {
+-        self.max_data = max(self.max_data, new)
++    /// Returns whether max credit was actually increased.
++    pub fn conn_increase_max_credit(&mut self, new: u64) -> bool {
++        if new > self.max_data {
++            self.max_data = new;
++            true
++        } else {
++            false
++        }
+     }
+ 
+     // -- frames scoped on connection --
+
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -412,6 +412,19 @@ impl SendStreamState {
+         }
+     }
+ 
++    fn tx_avail(&self) -> u64 {
++        match self {
++            // In Ready, TxBuffer not yet allocated but size is known
++            SendStreamState::Ready => TxBuffer::BUFFER_SIZE.try_into().unwrap(),
++            SendStreamState::Send { send_buf } | SendStreamState::DataSent { send_buf, .. } => {
++                send_buf.avail().try_into().unwrap()
++            }
++            SendStreamState::DataRecvd { .. }
++            | SendStreamState::ResetSent
++            | SendStreamState::ResetRecvd => 0,
++        }
++    }
++
+     fn final_size(&self) -> Option<u64> {
+         match self {
+             SendStreamState::DataSent { final_size, .. }
+@@ -457,16 +470,17 @@ impl SendStream {
+         flow_mgr: Rc<RefCell<FlowMgr>>,
+         conn_events: ConnectionEvents,
+     ) -> Self {
+-        if max_stream_data > 0 {
+-            conn_events.send_stream_writable(stream_id);
+-        }
+-        Self {
++        let ss = Self {
+             stream_id,
+             max_stream_data,
+             state: SendStreamState::Ready,
+             flow_mgr,
+             conn_events,
++        };
++        if ss.avail() > 0 {
++            ss.conn_events.send_stream_writable(stream_id);
+         }
++        ss
+     }
+ 
+     /// Return the next range to be sent, if any.
+@@ -520,7 +534,7 @@ impl SendStream {
+         match self.state {
+             SendStreamState::Send { ref mut send_buf } => {
+                 send_buf.mark_as_acked(offset, len);
+-                if send_buf.buffered() < TxBuffer::BUFFER_SIZE {
++                if self.avail() > 0 {
+                     self.conn_events.send_stream_writable(self.stream_id)
+                 }
+             }
+@@ -558,17 +572,22 @@ impl SendStream {
+ 
+     /// Stream credit available
+     pub fn credit_avail(&self) -> u64 {
+-        self.state
+-            .tx_buf()
+-            .map_or(0, |tx| self.max_stream_data - tx.data_limit())
++        if self.state == SendStreamState::Ready {
++            self.max_stream_data
++        } else {
++            self.state
++                .tx_buf()
++                .map_or(0, |tx| self.max_stream_data - tx.data_limit())
++        }
+     }
+ 
+-    /// Bytes sendable on stream. Constrained by both stream credit available
+-    /// and space in the tx buffer.
++    /// Bytes sendable on stream. Constrained by stream credit available,
++    /// connection credit available, and space in the tx buffer.
+     pub fn avail(&self) -> u64 {
+-        self.state
+-            .tx_buf()
+-            .map_or(0, |tx| min(self.credit_avail(), tx.avail() as u64))
++        min(
++            min(self.state.tx_avail(), self.credit_avail()),
++            self.flow_mgr.borrow().conn_credit_avail(),
++        )
+     }
+ 
+     pub fn max_stream_data(&self) -> u64 {
+@@ -576,7 +595,11 @@ impl SendStream {
+     }
+ 
+     pub fn set_max_stream_data(&mut self, value: u64) {
+-        self.max_stream_data = max(self.max_stream_data, value)
++        let stream_was_blocked = self.avail() == 0;
++        self.max_stream_data = max(self.max_stream_data, value);
++        if stream_was_blocked && self.avail() > 0 {
++            self.conn_events.send_stream_writable(self.stream_id)
++        }
+     }
+ 
+     pub fn reset_acked(&mut self) {
+@@ -611,12 +634,7 @@ impl SendStream {
+             });
+         }
+ 
+-        let stream_credit_avail = self.credit_avail();
+-        let conn_credit_avail = self.flow_mgr.borrow().conn_credit_avail();
+-        let credit_avail = min(stream_credit_avail, conn_credit_avail);
+-        let buff_avail = self.state.tx_buf().map_or(0, TxBuffer::avail);
+-        let space_avail = min(credit_avail, buff_avail as u64);
+-        let can_send_bytes = min(space_avail, buf.len() as u64);
++        let can_send_bytes = min(self.avail(), buf.len() as u64);
+ 
+         if can_send_bytes == 0 {
+             return Ok(0);
+@@ -823,6 +841,10 @@ pub(crate) struct StreamRecoveryToken {
+ mod tests {
+     use super::*;
+ 
++    use neqo_common::matches;
++
++    use crate::events::ConnectionEvent;
++
+     #[test]
+     fn test_mark_range() {
+         let mut rt = RangeTracker::default();
+@@ -933,4 +955,83 @@ mod tests {
+         let res = tx.next_bytes(TxMode::Normal);
+         assert_eq!(res, None);
+     }
++
++    #[test]
++    fn send_stream_writable_event_gen() {
++        let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
++        flow_mgr.borrow_mut().conn_increase_max_credit(2);
++        let conn_events = ConnectionEvents::default();
++
++        let mut s = SendStream::new(4.into(), 0, flow_mgr.clone(), conn_events.clone());
++
++        // Stream is initially blocked (conn:2, stream:0)
++        // and will not accept data.
++        assert_eq!(s.send(b"hi").unwrap(), 0);
++
++        // increasing to (conn:2, stream:2) will allow 2 bytes, and also
++        // generate a SendStreamWritable event.
++        s.set_max_stream_data(2);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 1);
++        assert!(matches!(evts[0], ConnectionEvent::SendStreamWritable{..}));
++        assert_eq!(s.send(b"hello").unwrap(), 2);
++
++        // increasing to (conn:2, stream:4) will not generate an event or allow
++        // sending anything.
++        s.set_max_stream_data(4);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++        assert_eq!(s.send(b"hello").unwrap(), 0);
++
++        // Increasing conn max (conn:4, stream:4) will unblock but not emit
++        // event b/c that happens in Connection::emit_frame() (tested in
++        // connection.rs)
++        assert_eq!(flow_mgr.borrow_mut().conn_increase_max_credit(4), true);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++        assert_eq!(s.avail(), 2);
++        assert_eq!(s.send(b"hello").unwrap(), 2);
++
++        // No event because still blocked by conn
++        s.set_max_stream_data(1_000_000_000);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++
++        // No event because happens in emit_frame()
++        flow_mgr
++            .borrow_mut()
++            .conn_increase_max_credit(1_000_000_000);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++
++        // Unblocking both by a large amount will cause avail() to be limited by
++        // tx buffer size.
++        assert_eq!(s.avail(), u64::try_from(TxBuffer::BUFFER_SIZE - 4).unwrap());
++
++        assert_eq!(
++            s.send(&[b'a'; TxBuffer::BUFFER_SIZE]).unwrap(),
++            TxBuffer::BUFFER_SIZE - 4
++        );
++
++        // No event because still blocked by tx buffer full
++        s.set_max_stream_data(2_000_000_000);
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 0);
++        assert_eq!(s.send(b"hello").unwrap(), 0);
++    }
++
++    #[test]
++    fn send_stream_writable_event_new_stream() {
++        let flow_mgr = Rc::new(RefCell::new(FlowMgr::default()));
++        flow_mgr.borrow_mut().conn_increase_max_credit(2);
++        let conn_events = ConnectionEvents::default();
++
++        let _s = SendStream::new(4.into(), 100, flow_mgr.clone(), conn_events.clone());
++
++        // Creating a new stream with conn and stream credits should result in
++        // an event.
++        let evts = conn_events.events().collect::<Vec<_>>();
++        assert_eq!(evts.len(), 1);
++        assert!(matches!(evts[0], ConnectionEvent::SendStreamWritable{..}));
++    }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,54 @@
+#[test]
+fn test_crash_recovery_ping_lifetime() {
+    let dir = TempDir::new("test").unwrap();
+    let str_dir = dir.path().display().to_string();
+
+    // Initialize database with delay_ping_lifetime_io enabled
+    let db = Database::new(&str_dir, true).unwrap();
+
+    // Record a test metric
+    let test_storage = "test-storage";
+    let test_metric_id = "test-metric";
+    let test_value = "test-value";
+
+    db.record_per_lifetime(
+        Lifetime::Ping,
+        test_storage,
+        test_metric_id,
+        &Metric::String(test_value.to_string()),
+    ).unwrap();
+
+    // Simulate a crash: metrics are in memory but not persisted
+    drop(db);
+
+    // Reopen the database to see if data was loaded from disk
+    let db = Database::new(&str_dir, true).unwrap();
+
+    // Check if the data is present in memory
+    let data = db.ping_lifetime_data
+        .as_ref()
+        .unwrap()
+        .read()
+        .unwrap();
+
+    assert!(data.contains_key(&format!("{}#{}", test_storage, test_metric_id)));
+
+    // Check if the data is present on disk
+    let store: SingleStore = db.rkv
+        .open_single(Lifetime::Ping.as_str(), StoreOptions::create())
+        .unwrap();
+    let reader = db.rkv.read().unwrap();
+
+    let key = format!("{}#{}", test_storage, test_metric_id);
+    let value = store.get(&reader, key).unwrap();
+
+    assert!(value.is_some());
+
+    // Verify the value
+    let blob = value.unwrap().as_blob().unwrap();
+    let metric: Metric = bincode::deserialize(blob).unwrap();
+    match metric {
+        Metric::String(s) => assert_eq!(test_value, s),
+        _ => panic!("Unexpected metric type"),
+    }
+}

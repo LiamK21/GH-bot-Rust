@@ -1,0 +1,187 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+GSO with PMTUD produces inconsistent segment sizes
+With GSO enabled, i.e. `max_datagrams` `> 1`, Neqo produces a `DatagramBatch`.
+
+https://github.com/mozilla/neqo/blob/ea6cde436bcf67e71deba0809978312fbf3ee734/neqo-transport/src/connection/mod.rs#L1193-L1197
+
+Each `Datagram` within the `DatagramBatch` is of size `DatagramBatch::datagram_size`. The last and only the last `Datagram` in the `DatagramBatch` is allowed to be smaller than `DatagramBatch::datagram_size`
+
+https://github.com/mozilla/neqo/blob/ea6cde436bcf67e71deba0809978312fbf3ee734/neqo-common/src/datagram.rs#L141-L147
+
+The above invariant is enforced in `Connection::output_dgram_batch_on_path`:
+
+https://github.com/mozilla/neqo/blob/ea6cde436bcf67e71deba0809978312fbf3ee734/neqo-transport/src/connection/mod.rs#L2558-L2568
+
+What the above code does not account for is the fact that the `path.borrow().plpmtu()` size might change between `Datagram`s when producing a `DatagramBatch` in `output_dgram_batch_on_path` when PMTUD is enabled. Thus a `Datagram` can be larger than its predecessor within a `DatagramBatch`.
+
+In such case, the OS will not correctly send out the `DatagramBatch`, and thus all `Datagram`s will be lost.
+
+In addition, in debug mode, the above can lead to an integer underflow in `DatagramBatch::MAX - send_buffer.len()`. In a previous iteration `plpmtud()` returned a datagram size that would barely fit into `send_buffer`, but while producing the `Datagram`, `Pmtud` would decide to increase the mtu and thus the datagram size, thus overfilling `send_buffer`. Thereby `send_buffer` would exceed `DatagramBatch::MAX` in the next iteration and thus the subtraction would underflow.
+
+https://github.com/mozilla/neqo/blob/ea6cde436bcf67e71deba0809978312fbf3ee734/neqo-transport/src/connection/mod.rs#L2565C36-L2565C74
+
+Panic reported by @valenting when testing MASQUE connect-udp Neqo server 🙏 
+
+Note that this is not an issue in Firefox today. Firefox does do GSO (on Android and Linux), but does not yet do PMTUD. See [Bugzilla Bug 1909910](https://bugzilla.mozilla.org/show_bug.cgi?id=1909910).
+
+https://github.com/mozilla/neqo/blob/ea6cde436bcf67e71deba0809978312fbf3ee734/neqo-transport/src/connection/params.rs#L126
+
+Easy way to reproduce:
+
+```` diff
+diff --git a/neqo-transport/src/connection/mod.rs b/neqo-transport/src/connection/mod.rs
+index 8b67801e..b0dc2d48 100644
+--- a/neqo-transport/src/connection/mod.rs
++++ b/neqo-transport/src/connection/mod.rs
+@@ -2560,6 +2560,9 @@ impl Connection {
+                 break;
+             }
+ 
++            let before = send_buffer.len();
++            let mtu = path.borrow().plpmtu();
++
+             // Check if we can fit another PMTUD sized datagram into the batch.
+             if datagram_size.is_some_and(|datagram_size| {
+                 min(datagram_size, DatagramBatch::MAX - send_buffer.len()) < path.borrow().plpmtu()
+@@ -2582,6 +2585,8 @@ impl Connection {
+                 SendOption::Yes => {
+                     num_datagrams += 1;
+                     let datagram_size = *datagram_size.get_or_insert(send_buffer.len());
++                    assert!(send_buffer.len() - before <= datagram_size);
++                    assert!(send_buffer.len() - before <= mtu);
+                     if ((send_buffer.len()) % datagram_size) > 0 {
+                         // GSO requires that all packets in a batch are of equal
+                         // size. Only the last packet can be smaller. This
+````
+
+```
+$ cargo test
+```
+
+I will think of a solution. For example moving `Pmtud::start` outside the `output_dgram_batch_on_path` loop.
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/connection/mod.rs b/neqo-transport/src/connection/mod.rs
+--- a/neqo-transport/src/connection/mod.rs
++++ b/neqo-transport/src/connection/mod.rs
+@@ -2551,22 +2551,31 @@ impl Connection {
+     ) -> Res<SendOptionBatch> {
+         let packet_tos = path.borrow().tos();
+         let mut send_buffer = Vec::new();
+-
+-        let mut datagram_size = None;
++        let mut max_datagram_size = None;
+         let mut num_datagrams = 0;
++        let mtu = path.borrow().plpmtu();
+ 
+         loop {
+             if max_datagrams.get() <= num_datagrams {
+                 break;
+             }
++            if path.borrow().pmtud().needs_probe() && num_datagrams != 0 {
++                // Next datagram will be larger due to PMTUD probing.  GSO
++                // requires that all datagrams in a batch are of equal size.
++                // Only the last datagram can be smaller. Given that this would
++                // not be the first datagram, close the batch early to uphold
++                // the above GSO requirement.
++                break;
++            }
++
++            let send_buffer_len_before = send_buffer.len();
+ 
+             // Check if we can fit another PMTUD sized datagram into the batch.
+-            if datagram_size.is_some_and(|datagram_size| {
+-                min(datagram_size, DatagramBatch::MAX - send_buffer.len()) < path.borrow().plpmtu()
++            if max_datagram_size.is_some_and(|datagram_size| {
++                min(datagram_size, DatagramBatch::MAX - send_buffer.len()) < mtu
+             }) {
+                 break;
+             }
+-
+             // Determine how we are sending packets (PTO, etc..).
+             let profile = self.loss_recovery.send_profile(&path.borrow(), now);
+             qdebug!("[{self}] output_path send_profile {profile:?}");
+@@ -2580,12 +2589,20 @@ impl Connection {
+                 packet_tos,
+             )? {
+                 SendOption::Yes => {
++                    debug_assert_eq!(
++                        mtu,
++                        path.borrow().plpmtu(),
++                        "MTU does not change within batch"
++                    );
+                     num_datagrams += 1;
+-                    let datagram_size = *datagram_size.get_or_insert(send_buffer.len());
+-                    if ((send_buffer.len()) % datagram_size) > 0 {
+-                        // GSO requires that all packets in a batch are of equal
+-                        // size. Only the last packet can be smaller. This
+-                        // packet was smaller. Make sure it was the last by
++                    let datagram_size = send_buffer.len() - send_buffer_len_before;
++                    let max_datagram_size = *max_datagram_size.get_or_insert(datagram_size);
++
++                    // GSO requires that all datagram in a batch are of equal
++                    // size. Only the last datagram can be smaller.
++                    debug_assert!(datagram_size <= max_datagram_size);
++                    if datagram_size < max_datagram_size {
++                        // This packet was smaller. Make sure it is the last by
+                         // breaking the loop.
+                         break;
+                     }
+@@ -2605,7 +2622,7 @@ impl Connection {
+             send_buffer,
+             packet_tos,
+             num_datagrams,
+-            datagram_size.expect("one or more datagrams"),
++            max_datagram_size.expect("one or more datagrams"),
+             &mut self.stats.borrow_mut(),
+         );
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

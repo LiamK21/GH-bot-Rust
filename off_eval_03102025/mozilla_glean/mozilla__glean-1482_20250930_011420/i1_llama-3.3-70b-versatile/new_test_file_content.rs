@@ -1,0 +1,20 @@
+#glean-core/src/coverage.rs
+#[cfg(test)]
+mod tests {
+use super::record_coverage;
+use std::env;
+use std::fs::File;
+use std::io::{Write, Read};
+use tempfile::NamedTempFile;
+
+#[test]
+fn test_record_coverage() {
+  let temp_file = NamedTempFile::new().unwrap();
+  env::set_var("GLEAN_TEST_COVERAGE", temp_file.path());
+  let metric_id = "test_metric_id";
+  record_coverage(metric_id);
+  let mut contents = String::new();
+  File::open(temp_file.path()).unwrap().read_to_string(&mut contents).unwrap();
+  assert_eq!(contents.trim(), metric_id);
+}
+}

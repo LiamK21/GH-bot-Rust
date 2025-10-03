@@ -1,0 +1,56 @@
+<think>
+Okay, I need to determine whether a unit test is needed for the provided patch. The issue is about inconsistent segment sizes when GSO is enabled with PMTUD, which can cause datagrams to exceed the send buffer and lead to panics or data loss.
+
+The patch modifies the `output_dgram_batch_on_path` function. It introduces a check to break the loop if PMTUD needs probing and num_datagrams isn't zero. This prevents adding datagrams of varying sizes beyond the first, which could violate GSO requirements.
+
+To verify this fix, a test should ensure that when PMTUD changes the MTU during batch creation, the batch doesn't include datagrams that would cause size inconsistencies. The test should simulate PMTUD probing and check that the batch is correctly closed early.
+
+I'll write a test that sets up a scenario where the MTU increases after the first datagram. The test will check if the batch is correctly formed without exceeding the initial MTU. This will confirm that the patch prevents the bug.
+
+The test will use mocks for the path to simulate PMTUD changes. It will call `output_dgram_batch_on_path` and verify the resulting batch's properties. This ensures that the patch behaves correctly under the problematic conditions.
+</think>
+
+<Filename>neqo-transport/src/connection/mod.rs</Filename>
+<imports>
+use super::connection::Connection;
+use super::path::Path;
+use super::pmtud::Pmtud;
+use super::send::SendOption;
+use std::borrow::Cow;
+</imports>
+<Rust>
+#[test]
+fn test_pmtud_batch_closing() {
+    let mut path = Path::default();
+    let mut pmtud = Pmtud::new();
+    pmtud.probe_sent = true;
+    path.borrow_mut().set_pmtud(pmtud);
+    
+    let initial_mtu = 100;
+    path.borrow_mut().set_plpmtu(initial_mtu);
+    
+    let mut connection = Connection::new();
+    
+    // Simulate data to send
+    let data = vec![1; 200];
+    
+    let send_option = connection.send(&data, &mut path, 0).unwrap();
+    
+    // Simulate PMTUD probing by increasing MTU after first datagram
+    let new_mtu = initial_mtu + 50;
+    path.borrow_mut().set_plpmtu(new_mtu);
+    
+    let result = connection.output_dgram_batch_on_path(
+        &data,
+        &path,
+        0,
+        1,
+        initial_mtu,
+        SendOption::Yes,
+        &mut connection.stats.borrow_mut(),
+    ).unwrap();
+    
+    // Verify that the batch was closed early due to PMTUD change
+    assert!(result.batch.len() < initial_mtu);
+    assert_eq!(result.batch.len() % result.datagram_size.unwrap(), 0);
+}</Rust>

@@ -1,0 +1,74 @@
+<think>
+Okay, so I'm trying to figure out how to write a regression test for this patch. The issue is that the server wasn't sending more data than the client's flow control limit, which is a problem. The patch seems to modify the server to handle sending arbitrary amounts of data correctly.
+
+Looking at the patch, I see that they introduced a new struct called ResponseData. This struct keeps track of the data to send, the current offset, and how much is remaining. The send method in this struct sends data in chunks, respecting the flow control limits by using min and tracking how much has been sent. They also added handling for when the stream is writable again, which means they can continue sending data that wasn't fully sent before.
+
+So, the key point is that before the patch, the server would stop sending once it hit the flow control limit. After the patch, it should resume sending the remaining data when the stream becomes writable again.
+
+To test this, I need to simulate a scenario where the server has to send more data than the client's initial flow control window. The test should check if all the data is eventually sent.
+
+I'll set up a test where the server sends a large response. I'll track how much data is actually sent. Before the patch, the server would only send up to the flow control limit and stop, so the test would fail because not all data was sent. After the patch, the server should send all the data, so the test should pass.
+
+I'll create a mock HTTP/3 server and a client. The client will request a large amount of data. The server will respond, and the client will acknowledge receiving data in parts. I'll use a channel to signal when the client is ready to receive more data. The server should send the initial chunk, wait for the client's ready signal, then send the next part.
+
+I'll measure how much data the client receives. If it's the same as the expected large size, the test passes. Otherwise, it fails.
+
+I also need to make sure the test only uses the standard library and doesn't require any external mocking libraries. I'll use threads and channels for communication between the server and client.
+
+So, the test will start the server, make a request, and then check if all the data is received. If the patch works, the test should pass after the patch is applied but fail before.
+</think>
+
+<Filename>neqo-http3/src/main.rs</Filename>
+<imports>
+use std::sync::mpsc;
+use std::thread;
+use neqo_common::Datagram;
+use neqo_transport::ConnectionId;
+use neqo_http3::Http3Server;
+use neqo_http3::Http3ServerEvent;
+</imports>
+<Rust>
+#[test]
+fn test_send_arbitrary_data() {
+    let (server_tx, client_rx) = mpsc::channel();
+    let (client_tx, server_rx) = mpsc::channel();
+    
+    let server = Http3Server::new(
+        Instant::now(),
+        &["key".to_string()],
+        &["alpn".to_string()],
+        AntiReplay::new(),
+        Rc::new(RefCell::new(RandomConnectionIdGenerator::default())),
+        Http3Parameters::default(),
+    ).expect("Failed to create server");
+    
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        while let Some(event) = server.next_event() {
+            match event {
+                Http3ServerEvent::Headers { mut stream, headers, fin } => {
+                    let response = ResponseData::from(vec![b'a'; 10000]);
+                    stream.send_headers(&[
+                        Header::new(":status", "200"),
+                        Header::new("content-length", response.remaining),
+                    ]).unwrap();
+                    response.send(&mut stream);
+                    if !response.done() {
+                        server_tx.send(response).unwrap();
+                    } else {
+                        stream.stream_close_send().unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut client = MockClient::new();
+    client.connect();
+    client.send_request();
+    
+    let received = client_rx.recv().unwrap();
+    assert_eq!(received, 10000);
+}
+</Rust>

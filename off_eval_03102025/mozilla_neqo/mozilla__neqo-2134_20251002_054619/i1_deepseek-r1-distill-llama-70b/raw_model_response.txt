@@ -1,0 +1,72 @@
+<think>
+Okay, I need to determine if a unit test is required for the given patch and issue. The issue is a crash in the Encoder::encode_uint function, which is related to the RTT (Round Trip Time) estimation in the Neqo library. 
+
+Looking at the patch, several changes are made. The first change removes the INITIAL_RTT import and modifies how the RTT is calculated in make_resumption_token. Previously, if the RTT was a guess and larger than INITIAL_RTT, it set it to 0. Now, it just uses the estimate regardless. 
+
+Another change is in the send_datagram function, which now takes a slice instead of a Vec. This could prevent unnecessary copies and might be related to the crash if the buffer was being handled incorrectly elsewhere.
+
+The third part is the removal of a function resend_0rtt and integrating its logic directly into client_0rtt_rejected. This might affect how 0-RTT packets are handled when rejected.
+
+Considering the crash, it's likely due to incorrect handling of RTT values, possibly leading to invalid encode_uint calls. The test needs to verify that after the patch, the RTT calculation doesn't cause such crashes.
+
+I should write a test that checks the behavior before and after the patch. The test should create a scenario where the RTT is just below and above the INITIAL_RTT, ensuring that the resumption token's RTT is correctly set to 0 when guessed and too high. 
+
+I'll set up a test where the primary path's RTT is set to just below and above INITIAL_RTT. Then, I'll call make_resumption_token and check if the RTT in the token is 0 in the appropriate cases.
+
+I'll need to mock the primary path and its RTT estimation. Since the test is in Rust, I can use mock objects or structs that implement the necessary traits. However, since the patch doesn't include tests, I'll have to create a test from scratch.
+
+The test will fail before the patch because the RTT might not be correctly clamped, leading to incorrect encode_uint calls. After the patch, it should pass as the RTT is handled properly.
+
+I'll structure the test by initializing the connection, setting up the primary path with specific RTT values, and then asserting the expected behavior when make_resumption_token is called.
+
+So, the test will:
+1. Create a connection with a primary path.
+2. Set the path's RTT to a value below INITIAL_RTT and check the token's RTT.
+3. Set the path's RTT to a value above INITIAL_RTT and check the token's RTT is 0.
+4. Ensure that when the RTT is not a guess, it's used as is.
+
+This should cover the scenarios where the crash could occur and validate the patch's correctness.
+</think>
+
+The patch modifies how RTT is handled in resumption tokens and 0-RTT packet resending. A test is needed to ensure the crash is resolved.
+
+<Filename>neqo-transport/src/connection/mod.rs</Filename>
+<imports>
+use neqo_common::codec::Encoder;
+use neqo_common::resumption::ResumptionToken;
+use neqo_common::rtt::RttEstimate;
+use std::time::Duration;
+use std::time::Instant;
+</imports>
+<Rust>
+#[test]
+fn test_resumption_token_rtt_handling() {
+    let mut conn = Connection::new(Role::Client);
+    let now = Instant::now();
+    
+    // Setup primary path with RTT just below INITIAL_RTT
+    let initial_rtt = Duration::from_millis(100);
+    let mut path = conn.paths.primary().unwrap().borrow_mut();
+    path.rtt_mut().update_estimate(initial_rtt);
+    path.rtt_mut().set_guesstimate(true);
+    
+    let token = conn.make_resumption_token(now);
+    assert_eq!(token.rtt(), Duration::from_millis(0));
+    
+    // Setup primary path with RTT above INITIAL_RTT
+    let high_rtt = Duration::from_millis(200);
+    path.rtt_mut().update_estimate(high_rtt);
+    path.rtt_mut().set_guesstimate(true);
+    
+    let token = conn.make_resumption_token(now);
+    assert_eq!(token.rtt(), Duration::from_millis(0));
+    
+    // Setup with actual RTT
+    path.rtt_mut().set_guesstimate(false);
+    let actual_rtt = Duration::from_millis(150);
+    path.rtt_mut().update_estimate(actual_rtt);
+    
+    let token = conn.make_resumption_token(now);
+    assert_eq!(token.rtt(), actual_rtt);
+}
+</Rust>

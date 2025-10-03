@@ -1,0 +1,65 @@
+<think>
+Okay, I need to determine if a unit test is necessary for the given patch. The issue is that the callback time becomes 0ms after the PTO timer expires, causing a busy wait. The patch modifies the connection handling to send ACK frames only when the PTO budget is exhausted.
+
+Looking at the patch, I see several changes in the `connection.rs` and `recovery.rs` files. The `connection.rs` now returns `(false, path.mtu(), PNSpace::Initial, true)` when the PTO budget runs out, which means it sends only ACK frames. Additionally, the `recovery.rs` makes `PTO_PACKET_COUNT` public, which is used in the test.
+
+The existing tests in the patch already include some changes to wait for `AT_LEAST_PTO` instead of 1 second. However, there's a new test `ack_after_pto` added to verify that after PTO, the client sends ACKs correctly. But I need to check if this covers the specific issue where the callback time becomes 0, leading to a busy wait.
+
+The issue is about the callback time staying 0 until a packet is received, causing a busy loop. The patch changes the behavior to send ACK frames when in PTO, which should prevent the busy wait by not sending unnecessary probe packets.
+
+I think a unit test is needed to ensure that after the PTO timer, the client correctly sends ACKs without entering a busy wait. The existing test `ack_after_pto` seems relevant, but I should verify if it covers the scenario where the callback time is 0 and whether it properly tests the ACK sending.
+
+Wait, in the patch, the test `ack_after_pto` is added. It sends something from the server after the client has entered PTO. It checks that the client sends an ACK. This should ensure that the client doesn't busy wait but instead processes the incoming packet by sending an ACK. So, this test should cover the scenario where the callback time is 0 after PTO and that the client responds correctly when a packet is received.
+
+Therefore, the test `ack_after_pto` should suffice to validate the fix. It tests the behavior after PTO, ensuring that ACKs are sent without causing a busy wait. So, no additional test is needed beyond what's already in the patch.
+</think>
+
+<Filename>neqo-transport/src/tests.rs</Filename>
+<imports>
+use super::connection::Connection;
+use super::recovery::PTO_PACKET_COUNT;
+use neqo_common::matches;
+use std::time::Duration;
+use test_fixture::{loopback, now};
+</imports>
+<Rust>
+#[test]
+fn ack_after_pto() {
+    let mut client = default_client();
+    let mut server = default_server();
+    connect_force_idle(&mut client, &mut server);
+
+    let mut now = now();
+
+    // The client sends and is forced into a PTO.
+    let _ = send_something(&mut client, now);
+
+    // Jump forward to the PTO and drain the PTO packets.
+    now += Duration::from_secs(1);
+    for _ in 0..PTO_PACKET_COUNT {
+        let dgram = client.process(None, now).dgram();
+        assert!(dgram.is_some());
+    }
+    assert!(client.process(None, now).dgram().is_none());
+
+    // The server now needs to send something that will cause the
+    // client to want to acknowledge it.  A little out of order
+    // delivery is just the thing.
+    // Note: The server can't ACK anything here, but none of what
+    // the client has sent so far has been transferred.
+    let _ = send_something(&mut server, now);
+    let dgram = send_something(&mut server, now);
+
+    // The client is now after a PTO, but if it receives something
+    // that demands acknowledgment, it will send just the ACK.
+    let ack = client.process(Some(dgram), now).dgram();
+    assert!(ack.is_some());
+
+    // Make sure that the packet only contained ACK frames.
+    let frames = server.test_process_input(ack.unwrap(), now);
+    assert_eq!(frames.len(), 1);
+    for (frame, space) in frames {
+        assert_eq!(space, PNSpace::ApplicationData);
+        assert!(matches!(frame, Frame::Ack { .. }));
+    }
+}</Rust>

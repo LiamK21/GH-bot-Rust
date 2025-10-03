@@ -1,0 +1,579 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Order of events in neqo-transport must be change
+With the current order of event is the enum NewStream event and some other will be put before StateChange events. We can get  NewStream event before StrateChange(Connected) event. http3 code has some assertions for example that quic transport must be connected if a new stream event is received, etc, therefore this assertion may be hit if the events are in order as above.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-client/src/main.rs b/neqo-client/src/main.rs
+--- a/neqo-client/src/main.rs
++++ b/neqo-client/src/main.rs
+@@ -357,7 +357,7 @@ mod old {
+     impl HandlerOld for PostConnectHandlerOld {
+         fn handle(&mut self, args: &Args, client: &mut Connection) -> bool {
+             let mut data = vec![0; 4000];
+-            for event in client.events() {
++            while let Some(event) = client.next_event() {
+                 match event {
+                     ConnectionEvent::RecvStreamReadable { stream_id } => {
+                         if !self.streams.contains(&stream_id) {
+
+diff --git a/neqo-http3/src/connection.rs b/neqo-http3/src/connection.rs
+--- a/neqo-http3/src/connection.rs
++++ b/neqo-http3/src/connection.rs
+@@ -395,8 +395,7 @@ impl Http3Connection {
+     // If this return an error the connection must be closed.
+     fn check_connection_events(&mut self) -> Res<()> {
+         qdebug!([self] "check_connection_events");
+-        let events = self.conn.events();
+-        for e in events {
++        while let Some(e) = self.conn.next_event() {
+             qdebug!([self] "check_connection_events - event {:?}.", e);
+             match e {
+                 ConnectionEvent::NewStream {
+@@ -1196,9 +1195,8 @@ mod tests {
+             neqo_trans_conn.process(out.dgram(), now());
+         }
+ 
+-        let events = neqo_trans_conn.events();
+         let mut connected = false;
+-        for e in events {
++        while let Some(e) = neqo_trans_conn.next_event() {
+             match e {
+                 ConnectionEvent::NewStream {
+                     stream_id,
+@@ -1245,7 +1243,7 @@ mod tests {
+                 }
+                 ConnectionEvent::StateChange(State::Connected) => connected = true,
+                 ConnectionEvent::StateChange(_) => (),
+-                _ => panic!("unexpected event"),
++                _ => panic!("unexpected event {:?}", e),
+             }
+         }
+         assert!(connected);
+@@ -1460,9 +1458,8 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // check for stop-sending with Error::UnknownStreamType.
+-        let events = peer_conn.conn.events();
+         let mut stop_sending_event_found = false;
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::SendStreamStopSending {
+                 stream_id,
+                 app_error,
+@@ -1493,9 +1490,8 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // check for stop-sending with Error::UnknownStreamType.
+-        let events = peer_conn.conn.events();
+         let mut stop_sending_event_found = false;
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::SendStreamStopSending {
+                 stream_id,
+                 app_error,
+@@ -1523,9 +1519,8 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // check for stop-sending with Error::Error::PushRefused.
+-        let events = peer_conn.conn.events();
+         let mut stop_sending_event_found = false;
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::SendStreamStopSending {
+                 stream_id,
+                 app_error,
+@@ -1553,9 +1548,8 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // check for stop-sending with Error::WrongStreamDirection.
+-        let events = peer_conn.conn.events();
+         let mut stop_sending_event_found = false;
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::SendStreamStopSending {
+                 stream_id,
+                 app_error,
+@@ -1583,8 +1577,7 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // find the new request/response stream and send frame v on it.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::NewStream {
+                 stream_id,
+                 stream_type,
+@@ -1602,7 +1595,7 @@ mod tests {
+         let out = peer_conn.conn.process(out.dgram(), now());
+ 
+         let mut stop_sending_event_found = false;
+-        for e in peer_conn.conn.events() {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::SendStreamStopSending {
+                 stream_id,
+                 app_error,
+@@ -1619,7 +1612,7 @@ mod tests {
+         // Process reset frame
+         hconn.conn.process(out.dgram(), now());
+         let mut reset_event_found = false;
+-        for e in hconn.conn.events() {
++        while let Some(e) = hconn.conn.next_event() {
+             if let ConnectionEvent::RecvStreamReset { app_error, .. } = e {
+                 reset_event_found = true;
+                 assert_eq!(app_error, err.code());
+@@ -1916,8 +1909,7 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // find the new request/response stream and send response on it.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             match e {
+                 ConnectionEvent::NewStream {
+                     stream_id,
+@@ -1986,8 +1978,7 @@ mod tests {
+         }
+ 
+         // find the new request/response stream, check received frames and send a response.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 if stream_id == request_stream_id {
+                     // Read only the HEADER frame
+@@ -2094,8 +2085,7 @@ mod tests {
+         }
+ 
+         // find the new request/response stream, check received frames and send a response.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 if stream_id == request_stream_id {
+                     // Read only the HEADER frame
+@@ -2239,8 +2229,7 @@ mod tests {
+ 
+     fn read_request(mut neqo_trans_conn: &mut Connection, request_stream_id: u64) {
+         // find the new request/response stream and check request data.
+-        let events = neqo_trans_conn.events();
+-        for e in events {
++        while let Some(e) = neqo_trans_conn.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 if stream_id == request_stream_id {
+                     // Read only header frame
+@@ -2792,8 +2781,7 @@ mod tests {
+             .stream_send(peer_conn.control_stream_id, &[0x7, 0x1, 0x8]);
+ 
+         // find the new request/response stream and send frame v on it.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             match e {
+                 ConnectionEvent::NewStream { .. } => {}
+                 ConnectionEvent::RecvStreamReadable { stream_id } => {
+@@ -2882,8 +2870,7 @@ mod tests {
+         peer_conn.conn.process(out.dgram(), now());
+ 
+         // find the new request/response stream and send frame v on it.
+-        let events = peer_conn.conn.events();
+-        for e in events {
++        while let Some(e) = peer_conn.conn.next_event() {
+             match e {
+                 ConnectionEvent::NewStream {
+                     stream_id,
+
+diff --git a/neqo-interop/src/main.rs b/neqo-interop/src/main.rs
+--- a/neqo-interop/src/main.rs
++++ b/neqo-interop/src/main.rs
+@@ -154,7 +154,7 @@ struct H9Handler {
+ impl Handler for H9Handler {
+     fn handle(&mut self, client: &mut Connection) -> bool {
+         let mut data = vec![0; 4000];
+-        for event in client.events() {
++        while let Some(event) = client.next_event() {
+             eprintln!("Event: {:?}", event);
+             match event {
+                 ConnectionEvent::RecvStreamReadable { stream_id } => {
+
+diff --git a/neqo-qpack/src/decoder.rs b/neqo-qpack/src/decoder.rs
+--- a/neqo-qpack/src/decoder.rs
++++ b/neqo-qpack/src/decoder.rs
+@@ -836,8 +836,7 @@ mod tests {
+         let out = conn_c.process(None, now());
+         conn_s.process(out.dgram(), now());
+         let mut found_instruction = false;
+-        let events = conn_s.events();
+-        for e in events {
++        while let Some(e) = conn_s.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 let mut buf = [0u8; 100];
+                 let (amount, fin) = conn_s.stream_recv(stream_id, &mut buf).unwrap();
+@@ -944,8 +943,7 @@ mod tests {
+         let out = conn_c.process(None, now());
+         conn_s.process(out.dgram(), now());
+         let mut found_instruction = false;
+-        let events = conn_s.events();
+-        for e in events {
++        while let Some(e) = conn_s.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 let mut buf = [0u8; 100];
+                 let (amount, fin) = conn_s.stream_recv(stream_id, &mut buf).unwrap();
+@@ -1047,8 +1045,7 @@ mod tests {
+         let out = conn_c.process(None, now());
+         conn_s.process(out.dgram(), now());
+         let mut found_instruction = false;
+-        let events = conn_s.events();
+-        for e in events {
++        while let Some(e) = conn_s.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 let mut buf = [0u8; 100];
+                 let (amount, fin) = conn_s.stream_recv(stream_id, &mut buf).unwrap();
+@@ -1143,8 +1140,7 @@ mod tests {
+         let out = conn_c.process(None, now());
+         conn_s.process(out.dgram(), now());
+         let mut found_instruction = false;
+-        let events = conn_s.events();
+-        for e in events {
++        while let Some(e) = conn_s.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 let mut buf = [0u8; 100];
+                 let (amount, fin) = conn_s.stream_recv(stream_id, &mut buf).unwrap();
+
+diff --git a/neqo-qpack/src/encoder.rs b/neqo-qpack/src/encoder.rs
+--- a/neqo-qpack/src/encoder.rs
++++ b/neqo-qpack/src/encoder.rs
+@@ -561,8 +561,7 @@ mod tests {
+         let out = conn_c.process(None, now());
+         conn_s.process(out.dgram(), now());
+         let mut found_instruction = false;
+-        let events = conn_s.events();
+-        for e in events {
++        while let Some(e) = conn_s.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = e {
+                 let mut buf = [0u8; 100];
+                 let (amount, fin) = conn_s.stream_recv(stream_id, &mut buf).unwrap();
+
+diff --git a/neqo-server/src/main.rs b/neqo-server/src/main.rs
+--- a/neqo-server/src/main.rs
++++ b/neqo-server/src/main.rs
+@@ -175,7 +175,7 @@ fn main() {
+             continue;
+         }
+         let mut streams = Vec::new();
+-        for event in server.events() {
++        while let Some(event) = server.next_event() {
+             if let ConnectionEvent::RecvStreamReadable { stream_id } = event {
+                 streams.push(stream_id)
+             }
+
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -1636,7 +1636,7 @@ impl Connection {
+                     );
+ 
+                     if next_stream_id.is_uni() {
+-                        self.events.new_stream(next_stream_id, StreamType::UniDi);
++                        self.events.new_stream(next_stream_id);
+                     } else {
+                         let send_initial_max_stream_data = self
+                             .tps
+@@ -1652,7 +1652,7 @@ impl Connection {
+                                 self.events.clone(),
+                             ),
+                         );
+-                        self.events.new_stream(next_stream_id, StreamType::BiDi);
++                        self.events.new_stream(next_stream_id);
+                     }
+ 
+                     *next_stream_idx += 1;
+@@ -1822,7 +1822,8 @@ impl Connection {
+         Ok(())
+     }
+ 
+-    /// Get events that indicate state changes on the connection.
++    /// Get all current events. Best used just in debug/testing code, use
++    /// next_event() instead.
+     pub fn events(&mut self) -> impl Iterator<Item = ConnectionEvent> {
+         self.events.events()
+     }
+@@ -1832,6 +1833,13 @@ impl Connection {
+         self.events.has_events()
+     }
+ 
++    /// Get events that indicate state changes on the connection. This method
++    /// correctly handles cases where handling one event can obsolete
++    /// previously-queued events, or cause new events to be generated.
++    pub fn next_event(&mut self) -> Option<ConnectionEvent> {
++        self.events.next_event()
++    }
++
+     fn check_loss_detection_timeout(&mut self, now: Instant) {
+         qdebug!([self] "check_loss_timeouts");
+
+diff --git a/neqo-transport/src/events.rs b/neqo-transport/src/events.rs
+--- a/neqo-transport/src/events.rs
++++ b/neqo-transport/src/events.rs
+@@ -7,9 +7,11 @@
+ // Collecting a list of events relevant to whoever is using the Connection.
+ 
+ use std::cell::RefCell;
+-use std::collections::BTreeSet;
++use std::collections::VecDeque;
+ use std::rc::Rc;
+ 
++use neqo_common::matches;
++
+ use crate::connection::State;
+ use crate::frame::StreamType;
+ use crate::stream_id::StreamId;
+@@ -47,7 +49,7 @@ pub enum ConnectionEvent {
+ #[derive(Debug, Default, Clone)]
+ #[allow(clippy::module_name_repetitions)]
+ pub struct ConnectionEvents {
+-    events: Rc<RefCell<BTreeSet<ConnectionEvent>>>,
++    events: Rc<RefCell<VecDeque<ConnectionEvent>>>,
+ }
+ 
+ impl ConnectionEvents {
+@@ -55,16 +57,10 @@ impl ConnectionEvents {
+         self.insert(ConnectionEvent::AuthenticationNeeded);
+     }
+ 
+-    pub fn new_stream(&self, stream_id: StreamId, stream_type: StreamType) {
++    pub fn new_stream(&self, stream_id: StreamId) {
+         self.insert(ConnectionEvent::NewStream {
+             stream_id: stream_id.as_u64(),
+-            stream_type,
+-        });
+-    }
+-
+-    pub fn send_stream_writable(&self, stream_id: StreamId) {
+-        self.insert(ConnectionEvent::SendStreamWritable {
+-            stream_id: stream_id.as_u64(),
++            stream_type: stream_id.stream_type(),
+         });
+     }
+ 
+@@ -75,13 +71,25 @@ impl ConnectionEvents {
+     }
+ 
+     pub fn recv_stream_reset(&self, stream_id: StreamId, app_error: AppError) {
++        // If reset, no longer readable.
++        self.remove(|evt| matches!(evt, ConnectionEvent::RecvStreamReadable { stream_id: x } if *x == stream_id.as_u64()));
++
+         self.insert(ConnectionEvent::RecvStreamReset {
+             stream_id: stream_id.as_u64(),
+             app_error,
+         });
+     }
+ 
++    pub fn send_stream_writable(&self, stream_id: StreamId) {
++        self.insert(ConnectionEvent::SendStreamWritable {
++            stream_id: stream_id.as_u64(),
++        });
++    }
++
+     pub fn send_stream_stop_sending(&self, stream_id: StreamId, app_error: AppError) {
++        // If stopped, no longer writable.
++        self.remove(|evt| matches!(evt, ConnectionEvent::SendStreamWritable { stream_id: x } if *x == stream_id.as_u64()));
++
+         self.insert(ConnectionEvent::SendStreamStopSending {
+             stream_id: stream_id.as_u64(),
+             app_error,
+@@ -89,6 +97,10 @@ impl ConnectionEvents {
+     }
+ 
+     pub fn send_stream_complete(&self, stream_id: StreamId) {
++        self.remove(|evt| matches!(evt, ConnectionEvent::SendStreamWritable { stream_id: x } if *x == stream_id.as_u64()));
++
++        self.remove(|evt| matches!(evt, ConnectionEvent::SendStreamStopSending { stream_id: x, .. } if *x == stream_id.as_u64()));
++
+         self.insert(ConnectionEvent::SendStreamComplete {
+             stream_id: stream_id.as_u64(),
+         });
+@@ -99,23 +111,131 @@ impl ConnectionEvents {
+     }
+ 
+     pub fn connection_state_change(&self, state: State) {
++        // If closing, existing events no longer relevant.
++        match state {
++            State::Closing { .. } | State::Closed(_) => self.events.borrow_mut().clear(),
++            _ => (),
++        }
+         self.insert(ConnectionEvent::StateChange(state));
+     }
+ 
+     pub fn client_0rtt_rejected(&self) {
++        // If 0rtt rejected, must start over and existing events are no longer
++        // relevant.
+         self.events.borrow_mut().clear();
+         self.insert(ConnectionEvent::ZeroRttRejected);
+     }
+ 
+     pub fn events(&self) -> impl Iterator<Item = ConnectionEvent> {
+-        self.events.replace(BTreeSet::new()).into_iter()
++        self.events.replace(VecDeque::new()).into_iter()
++    }
++
++    pub fn has_events(&self) -> bool {
++        !self.events.borrow().is_empty()
+     }
+ 
++    pub fn next_event(&self) -> Option<ConnectionEvent> {
++        self.events.borrow_mut().pop_front()
++    }
++
++    #[allow(clippy::block_in_if_condition_stmt)]
+     fn insert(&self, event: ConnectionEvent) {
+-        self.events.borrow_mut().insert(event);
++        let mut q = self.events.borrow_mut();
++
++        // Special-case two enums that are not strictly PartialEq equal but that
++        // we wish to avoid inserting duplicates.
++        if match &event {
++            ConnectionEvent::SendStreamStopSending { stream_id, .. } => q.iter().any(|evt| {
++                matches!(
++		    evt, ConnectionEvent::SendStreamStopSending { stream_id: x, .. }
++		    if *x == *stream_id)
++            }),
++            ConnectionEvent::RecvStreamReset { stream_id, .. } => q.iter().any(|evt| {
++                matches!(
++		    evt, ConnectionEvent::RecvStreamReset { stream_id: x, .. }
++		    if *x == *stream_id)
++            }),
++            _ => q.contains(&event),
++        } {
++            // Already in event list.
++            return;
++        }
++
++        q.push_back(event);
+     }
+ 
+-    pub fn has_events(&self) -> bool {
+-        !self.events.borrow().is_empty()
++    fn remove<F>(&self, f: F)
++    where
++        F: Fn(&ConnectionEvent) -> bool,
++    {
++        self.events.borrow_mut().retain(|evt| !f(evt))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{ConnectionError, Error};
++
++    #[test]
++    fn event_culling() {
++        let evts = ConnectionEvents::default();
++
++        evts.client_0rtt_rejected();
++        evts.client_0rtt_rejected();
++        assert_eq!(evts.events().count(), 1);
++        assert_eq!(evts.events().count(), 0);
++
++        evts.new_stream(4.into());
++        evts.new_stream(4.into());
++        assert_eq!(evts.events().count(), 1);
++
++        evts.recv_stream_readable(6.into());
++        evts.recv_stream_reset(6.into(), 66);
++        evts.recv_stream_reset(6.into(), 65);
++        assert_eq!(evts.events().count(), 1);
++
++        evts.send_stream_writable(8.into());
++        evts.send_stream_writable(8.into());
++        evts.send_stream_stop_sending(8.into(), 55);
++        evts.send_stream_stop_sending(8.into(), 56);
++        let events = evts.events().collect::<Vec<_>>();
++        assert_eq!(events.len(), 1);
++        assert_eq!(
++            events[0],
++            ConnectionEvent::SendStreamStopSending {
++                stream_id: 8,
++                app_error: 55
++            }
++        );
++
++        evts.send_stream_writable(8.into());
++        evts.send_stream_writable(8.into());
++        evts.send_stream_stop_sending(8.into(), 55);
++        evts.send_stream_stop_sending(8.into(), 56);
++        evts.send_stream_complete(8.into());
++        assert_eq!(evts.events().count(), 1);
++
++        evts.send_stream_writable(8.into());
++        evts.send_stream_writable(9.into());
++        evts.send_stream_stop_sending(10.into(), 55);
++        evts.send_stream_stop_sending(11.into(), 56);
++        evts.send_stream_complete(12.into());
++        assert_eq!(evts.events().count(), 5);
++
++        evts.send_stream_writable(8.into());
++        evts.send_stream_writable(9.into());
++        evts.send_stream_stop_sending(10.into(), 55);
++        evts.send_stream_stop_sending(11.into(), 56);
++        evts.send_stream_complete(12.into());
++        evts.client_0rtt_rejected();
++        assert_eq!(evts.events().count(), 1);
++
++        evts.send_stream_writable(9.into());
++        evts.send_stream_stop_sending(10.into(), 55);
++        evts.connection_state_change(State::Closed(ConnectionError::Transport(
++            Error::StreamStateError,
++        )));
++        assert_eq!(evts.events().count(), 1);
+     }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

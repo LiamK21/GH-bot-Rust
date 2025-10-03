@@ -1,0 +1,317 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+glean.time.invalid_timezone_offset expired on 2021-12-31
+The following metrics in glean-core will expire in the next 14 days or have already expired.
+
+- glean.time.invalid_timezone_offset on 2021-12-31
+
+
+---
+
+this is hard-coded as an internal metric in glean-core and thus _does not_ auto-expire properly. 
+It should be removed.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -20,14 +20,6 @@ pub struct AdditionalMetrics {
+ 
+     /// A count of the pings submitted, by ping type.
+     pub pings_submitted: LabeledMetric<CounterMetric>,
+-
+-    /// The number of times we encountered an invalid timezone offset
+-    /// (outside of [-24, +24] hours).
+-    ///
+-    /// **Note**: This metric has an expiration date set.
+-    /// However because it's statically defined here we can't specify that.
+-    /// Needs to be removed after 2021-06-30.
+-    pub invalid_timezone_offset: CounterMetric,
+ }
+ 
+ impl CoreMetrics {
+@@ -101,15 +93,6 @@ impl AdditionalMetrics {
+                 }),
+                 None,
+             ),
+-
+-            invalid_timezone_offset: CounterMetric::new(CommonMetricData {
+-                name: "invalid_timezone_offset".into(),
+-                category: "glean.time".into(),
+-                send_in_pings: vec!["metrics".into()],
+-                lifetime: Lifetime::Ping,
+-                disabled: false,
+-                dynamic_label: None,
+-            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -224,7 +224,7 @@ impl Glean {
+             let _scanning_thread = upload_manager.scan_pending_pings_directories();
+         }
+ 
+-        let (start_time, start_time_is_corrected) = local_now_with_offset();
++        let start_time = local_now_with_offset();
+         let this = Self {
+             upload_enabled: cfg.upload_enabled,
+             // In the subprocess, we want to avoid accessing the database entirely.
+@@ -248,13 +248,6 @@ impl Glean {
+             schedule_metrics_pings: false,
+         };
+ 
+-        // Can't use `local_now_with_offset_and_record` above, because we needed a valid `Glean` first.
+-        if start_time_is_corrected {
+-            this.additional_metrics
+-                .invalid_timezone_offset
+-                .add(&this, 1);
+-        }
+-
+         Ok(this)
+     }
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -401,7 +401,7 @@ fn correct_order() {
+         Counter(0),
+         CustomDistributionExponential(Histogram::exponential(1, 500, 10)),
+         CustomDistributionLinear(Histogram::linear(1, 500, 10)),
+-        Datetime(local_now_with_offset().0, TimeUnit::Second),
++        Datetime(local_now_with_offset(), TimeUnit::Second),
+         Experiment(RecordedExperimentData { branch: "branch".into(), extra: None, }),
+         Quantity(0),
+         String("glean".into()),
+@@ -931,20 +931,3 @@ fn test_activity_api() {
+     // Check that we set everything we needed for the 'inactuve' status.
+     assert!(!glean.is_dirty_flag_set());
+ }
+-
+-/// We explicitly test that NO invalid timezone offset was recorded.
+-/// If it _does_ happen and fails on a developer machine or CI, we better know about it.
+-#[test]
+-fn handles_local_now_gracefully() {
+-    let _ = env_logger::builder().is_test(true).try_init();
+-
+-    let dir = tempfile::tempdir().unwrap();
+-    let (glean, _) = new_glean(Some(dir));
+-
+-    let metric = &glean.additional_metrics.invalid_timezone_offset;
+-    assert_eq!(
+-        None,
+-        metric.test_get_value(&glean, "metrics"),
+-        "Timezones should be valid"
+-    );
+-}
+
+diff --git a/glean-core/src/metrics/datetime.rs b/glean-core/src/metrics/datetime.rs
+--- a/glean-core/src/metrics/datetime.rs
++++ b/glean-core/src/metrics/datetime.rs
+@@ -9,7 +9,7 @@ use crate::metrics::time_unit::TimeUnit;
+ use crate::metrics::Metric;
+ use crate::metrics::MetricType;
+ use crate::storage::StorageManager;
+-use crate::util::{get_iso_time_string, local_now_with_offset_and_record};
++use crate::util::{get_iso_time_string, local_now_with_offset};
+ use crate::CommonMetricData;
+ use crate::Glean;
+ 
+@@ -117,7 +117,7 @@ impl DatetimeMetric {
+             return;
+         }
+ 
+-        let value = value.unwrap_or_else(|| local_now_with_offset_and_record(glean));
++        let value = value.unwrap_or_else(local_now_with_offset);
+         let value = Metric::Datetime(value, self.time_unit);
+         glean.storage().record(glean, &self.meta, &value)
+     }
+
+diff --git a/glean-core/src/ping/mod.rs b/glean-core/src/ping/mod.rs
+--- a/glean-core/src/ping/mod.rs
++++ b/glean-core/src/ping/mod.rs
+@@ -15,7 +15,7 @@ use crate::common_metric_data::{CommonMetricData, Lifetime};
+ use crate::metrics::{CounterMetric, DatetimeMetric, Metric, MetricType, PingType, TimeUnit};
+ use crate::storage::StorageManager;
+ use crate::upload::HeaderMap;
+-use crate::util::{get_iso_time_string, local_now_with_offset_and_record};
++use crate::util::{get_iso_time_string, local_now_with_offset};
+ use crate::{
+     Glean, Result, DELETION_REQUEST_PINGS_DIRECTORY, INTERNAL_STORAGE, PENDING_PINGS_DIRECTORY,
+ };
+@@ -112,7 +112,7 @@ impl PingMaker {
+         let start_time_data = start_time
+             .get_value(glean, INTERNAL_STORAGE)
+             .unwrap_or_else(|| glean.start_time());
+-        let end_time_data = local_now_with_offset_and_record(glean);
++        let end_time_data = local_now_with_offset();
+ 
+         // Update the start time with the current time.
+         start_time.set(glean, Some(end_time_data));
+
+diff --git a/glean-core/src/scheduler.rs b/glean-core/src/scheduler.rs
+--- a/glean-core/src/scheduler.rs
++++ b/glean-core/src/scheduler.rs
+@@ -73,7 +73,7 @@ impl MetricsPingScheduler for GleanMetricsPingScheduler {
+ /// **Must** be called before draining the preinit queue.
+ /// (We're at the Language Bindings' mercy for that)
+ pub fn schedule(glean: &Glean) {
+-    let now = local_now_with_offset().0;
++    let now = local_now_with_offset();
+ 
+     let (cancelled_lock, _condvar) = &**TASK_CONDVAR;
+     if *cancelled_lock.lock().unwrap() {
+@@ -233,7 +233,7 @@ fn start_scheduler(
+                     submitter.submit_metrics_ping(&glean, Some(when.reason()), now);
+                     when = When::Reschedule;
+                 }
+-                now = local_now_with_offset().0;
++                now = local_now_with_offset();
+             }
+         }).expect("Unable to spawn Metrics Ping Scheduler thread.")
+ }
+@@ -337,7 +337,7 @@ mod test {
+             |_, when| assert_eq!(when, When::Reschedule),
+         );
+ 
+-        schedule_internal(&glean, submitter, scheduler, local_now_with_offset().0);
++        schedule_internal(&glean, submitter, scheduler, local_now_with_offset());
+         assert_eq!(1, submitter_count.swap(0, Ordering::Relaxed));
+         assert_eq!(1, scheduler_count.swap(0, Ordering::Relaxed));
+     }
+
+diff --git a/glean-core/src/util.rs b/glean-core/src/util.rs
+--- a/glean-core/src/util.rs
++++ b/glean-core/src/util.rs
+@@ -48,8 +48,7 @@ pub fn get_iso_time_string(datetime: DateTime<FixedOffset>, truncate_to: TimeUni
+ ///
+ /// This converts from the `Local` timezone into its fixed-offset equivalent.
+ /// If a timezone outside of [-24h, +24h] is detected it corrects the timezone offset to UTC (+0).
+-/// The return value will signal if the timezone offset was corrected.
+-pub(crate) fn local_now_with_offset() -> (DateTime<FixedOffset>, bool) {
++pub(crate) fn local_now_with_offset() -> DateTime<FixedOffset> {
+     #[cfg(target_os = "windows")]
+     {
+         // `Local::now` takes the user's timezone offset
+@@ -84,29 +83,12 @@ pub(crate) fn local_now_with_offset() -> (DateTime<FixedOffset>, bool) {
+             );
+             let now: DateTime<Utc> = Utc::now();
+             let utc_offset = FixedOffset::east(0);
+-            return (now.with_timezone(&utc_offset), true);
++            return now.with_timezone(&utc_offset);
+         }
+     }
+ 
+     let now: DateTime<Local> = Local::now();
+-    (now.with_timezone(now.offset()), false)
+-}
+-
+-/// Get the current date & time with a fixed-offset timezone.
+-///
+-/// This converts from the `Local` timezone into its fixed-offset equivalent.
+-/// If a timezone outside of [-24h, +24h] is detected it corrects the timezone offset to UTC (+0).
+-/// The corresponding error counter is incremented in this case.
+-pub(crate) fn local_now_with_offset_and_record(glean: &Glean) -> DateTime<FixedOffset> {
+-    let (now, is_corrected) = local_now_with_offset();
+-    if is_corrected {
+-        glean
+-            .additional_metrics
+-            .invalid_timezone_offset
+-            .add(glean, 1);
+-    }
+-
+-    now
++    now.with_timezone(now.offset())
+ }
+ 
+ /// Truncates a string, ensuring that it doesn't end in the middle of a codepoint.
+@@ -297,11 +279,7 @@ mod test {
+     #[test]
+     fn local_now_gets_the_time() {
+         let now = Local::now();
+-        let (fixed_now, is_corrected) = local_now_with_offset();
+-
+-        // We explicitly test that NO invalid timezone offset was recorded.
+-        // If it _does_ happen and fails on a developer machine or CI, we better know about it.
+-        assert!(!is_corrected, "Timezone offset should be valid.");
++        let fixed_now = local_now_with_offset();
+ 
+         // We can't compare across differing timezones, so we just compare the UTC timestamps.
+         // The second timestamp should be just a few nanoseconds later.
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn correct_order() -> ()
+
+fn start_scheduler(
+&self,
+submitter: impl MetricsPingSubmitter + Send + 'static,
+now: DateTime<FixedOffset>,
+when: When) -> ()
+
+fn start_scheduler(
+&self,
+submitter: impl MetricsPingSubmitter + Send + 'static,
+now: DateTime<FixedOffset>,
+when: When) -> ()
+
+fn start_scheduler(
+submitter: impl MetricsPingSubmitter + Send + 'static,
+now: DateTime<FixedOffset>,
+when: When) -> JoinHandle<()>
+
+fn start_scheduler(
+&self,
+_submitter: impl MetricsPingSubmitter + Send + 'static,
+now: DateTime<FixedOffset>,
+when: When) -> ()
+
+pub fn get_iso_time_string(datetime: DateTime<FixedOffset>, truncate_to: TimeUnit) -> String
+
+fn local_now_with_offset() -> DateTime<FixedOffset>
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

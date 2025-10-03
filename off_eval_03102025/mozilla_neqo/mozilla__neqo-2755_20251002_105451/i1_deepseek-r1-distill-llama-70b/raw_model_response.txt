@@ -1,0 +1,70 @@
+<think>
+Alright, I need to figure out how to approach this problem. The issue is that the `send_ignore_emsgsize` test is failing on BSD systems like FreeBSD. The error message indicates that when trying to send a large datagram, the system returns an "Os { code: 35, kind: WouldBlock, message: 'Resource temporarily unavailable' }" error. 
+
+Looking at the patch provided, it seems that the test was modified in two main places. First, a comment was added about sending an oversized datagram and expecting the `EMSGSIZE` error to be ignored. Second, the receiver's socket is set to non-blocking mode after sending a normal datagram. 
+
+Wait, actually, in the patch, the receiver's socket is set to non-blocking after sending the normal datagram. But I think that might be a mistake. Typically, when testing, you want the receiver to block until it receives data to avoid race conditions. So perhaps the original code had the receiver in non-blocking mode, which caused it to fail when it didn't receive data immediately. By setting it to blocking, the test should wait until data is received, allowing the test to pass.
+
+So, the problem before the patch was that the receiver socket was in non-blocking mode. When the sender tried to send a large datagram, it would fail with `EMSGSIZE`, but the receiver, being non-blocking, might not have been waiting properly, leading to the `WouldBlock` error. 
+
+The patch makes two changes: adds a comment explaining the intent and sets the receiver to non-blocking after sending the normal datagram. Wait, no, looking again, the patch adds `receiver.inner.set_nonblocking(false)?;` which actually sets it to blocking mode. So the receiver will now block until it receives data, which should prevent the `WouldBlock` error.
+
+To test this, I need to write a regression test that simulates the scenario. The test should check that sending an oversized datagram doesn't cause the socket to become unusable and that subsequent sends succeed.
+
+The test setup would involve creating a sender and receiver socket. The sender attempts to send an oversized datagram, which should fail with `EMSGSIZE`, but the socket should still be usable. Then, the sender sends a normal datagram, and the receiver should block until it receives it.
+
+I need to ensure that the test correctly models this scenario. The test should fail before the patch because the receiver might not be blocking, leading to the `WouldBlock` error. After the patch, the receiver should block, so the send should complete without error.
+
+So, the test will:
+
+1. Create a sender and receiver socket.
+2. Send an oversized datagram from sender to receiver, expecting it to fail with `EMSGSIZE`.
+3. Send a normal datagram from sender to receiver.
+4. Set the receiver to blocking mode.
+5. Receive the normal datagram and verify its contents.
+
+I should structure the test to perform these steps and assert that the normal datagram is received correctly after the oversized send.
+
+I also need to make sure that the test uses the correct imports and function signatures. Since the functions are part of the `neqo-udp` library, I'll need to import `Datagram`, `RecvBuf`, and `Socket` from `super::*`.
+
+Putting it all together, the test will create the necessary sockets, attempt the oversized send, then the normal send, and ensure the receiver gets the data. This should validate that the patch fixes the issue on BSD systems.
+</think>
+
+The test `test_send_ignore_emsgsize` will verify that sending an oversized datagram does not break the socket and that subsequent sends work correctly.
+
+<Filename>neqo-udp/src/lib.rs</Filename>
+<imports>
+use super::Datagram;
+use super::RecvBuf;
+use super::Socket;
+</imports>
+<Rust>
+#[test]
+fn test_send_ignore_emsgsize() {
+    let sender = Socket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())?;
+    let receiver = Socket::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())?;
+    let receiver_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Send an oversized datagram and expect EMSIZE error to be ignored.
+    let oversized_datagram = Datagram::new(
+        sender.inner.local_addr().unwrap(),
+        receiver.inner.local_addr().unwrap(),
+    ).unwrap();
+    // The send should fail with EMSIZE, but the socket remains usable.
+    let result = sender.send(&oversized_datagram);
+    assert!(result.is_err(), "Expected send to fail with EMSIZE");
+
+    // Now send a normal datagram to ensure the socket is still usable.
+    let normal_datagram = Datagram::new(
+        sender.inner.local_addr().unwrap(),
+        receiver.inner.local_addr().unwrap(),
+    ).unwrap();
+    sender.send(&normal_datagram).unwrap();
+
+    // Block until "Hello World!" is received.
+    receiver.inner.set_nonblocking(false).unwrap();
+    let mut recv_buf = RecvBuf::new();
+    let received_datagram = receiver.recv(receiver_addr, &mut recv_buf).unwrap();
+    let message = received_datagram.next().unwrap().as_ref().unwrap();
+    assert_eq!(message, b"Hello World!");
+}</Rust>

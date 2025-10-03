@@ -1,0 +1,1161 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Packet with Initial should be padded to initial path MTU, not 1200
+https://github.com/mozilla/neqo/pull/280#discussion_r344560825 @martinthomson:
+> IMPORTANT: we should be padding to the path MTU that we have decided to start at. If we're not probing to increase the MTU, then we might find that this gets through, but nothing else does. That's a nasty failure mode to debug.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -321,6 +321,7 @@ pub struct Connection {
+     events: ConnectionEvents,
+     token: Option<Vec<u8>>,
+     stats: Stats,
++    tx_mode: TxMode,
+ }
+ 
+ impl Debug for Connection {
+@@ -445,6 +446,7 @@ impl Connection {
+             events: ConnectionEvents::default(),
+             token: None,
+             stats: Stats::default(),
++            tx_mode: TxMode::Normal,
+         }
+     }
+ 
+@@ -885,7 +887,11 @@ impl Connection {
+         let largest_acknowledged = self
+             .loss_recovery
+             .largest_acknowledged_pn(PNSpace::from(hdr.epoch));
+-        match self.crypto.obtain_crypto_state(self.role, hdr.epoch) {
++        match self
++            .crypto
++            .states
++            .obtain(self.role, hdr.epoch, &self.crypto.tls)
++        {
+             Ok(CryptoState { rx: Some(rx), .. }) => {
+                 if (self.state == State::Handshaking) && (hdr.epoch == 3) {
+                     // We got a packet for epoch 3 but it is still in state Handshaking ->
+@@ -1021,6 +1027,7 @@ impl Connection {
+     }
+ 
+     #[allow(clippy::cognitive_complexity)]
++    #[allow(clippy::useless_let_if_seq)]
+     /// Build a datagram, possibly from multiple packets (for different PN
+     /// spaces) and each containing 1+ frames.
+     fn output_pkt_for_path(&mut self, now: Instant) -> Res<Option<Datagram>> {
+@@ -1039,41 +1046,90 @@ impl Connection {
+             let mut tokens = Vec::new();
+ 
+             // Ensure we have tx crypto state for this epoch, or skip it.
+-            if !matches!(
+-                self.crypto.obtain_crypto_state(self.role, epoch),
+-                Ok(CryptoState { tx: Some(_), .. })
+-            ) {
+-                continue;
+-            }
++            let tx = match self
++                .crypto
++                .states
++                .obtain(self.role, epoch, &self.crypto.tls)
++            {
++                Ok(CryptoState { tx: Some(tx), .. }) => tx,
++                _ => continue,
++            };
++
++            let hdr = PacketHdr::new(
++                0,
++                match epoch {
++                    0 => {
++                        let token = match &self.retry_info {
++                            Some(v) => v.token.clone(),
++                            _ => Vec::new(),
++                        };
++                        PacketType::Initial(token)
++                    }
++                    1 => {
++                        if self.zero_rtt_state == ZeroRttState::Rejected {
++                            continue;
++                        }
++                        self.zero_rtt_state = ZeroRttState::Sending;
++                        PacketType::ZeroRTT
++                    }
++                    2 => PacketType::Handshake,
++                    3 => PacketType::Short,
++                    _ => unimplemented!(), // TODO(ekr@rtfm.com): Key Update.
++                },
++                Some(self.version),
++                path.remote_cid.clone(),
++                path.local_cids.first().cloned(),
++                self.loss_recovery.next_pn(space),
++                epoch,
++            );
+ 
+             let mut ack_eliciting = false;
++            let tx_mode = self.tx_mode;
++
+             match &self.state {
+                 State::Init | State::WaitInitial | State::Handshaking | State::Connected => {
+                     loop {
+-                        let remaining = path.mtu() - out_bytes.len() - encoder.len();
+-
+-                        // Check sources in turn for available frames
+-                        if let Some((frame, token)) = self
+-                            .acks
+-                            .get_frame(now, epoch)
+-                            .or_else(|| self.crypto.get_frame(epoch, TxMode::Normal, remaining))
+-                            .or_else(|| self.flow_mgr.borrow_mut().get_frame(epoch, remaining))
+-                            .or_else(|| {
+-                                self.send_streams
+-                                    .get_frame(epoch, TxMode::Normal, remaining)
+-                            })
+-                        {
++                        let used =
++                            out_bytes.len() + encoder.len() + hdr.overhead(&tx.aead, path.mtu());
++                        let remaining = path.mtu() - used;
++                        if remaining < 2 {
++                            // All useful frames are at least 2 bytes.
++                            break;
++                        }
++
++                        // Try to get a frame from frame sources
++                        let mut frame = None;
++                        if self.tx_mode == TxMode::Normal {
++                            frame = self.acks.get_frame(now, epoch);
++                        }
++                        if frame.is_none() {
++                            frame = self.crypto.streams.get_frame(epoch, tx_mode, remaining)
++                        }
++                        if frame.is_none() && self.tx_mode == TxMode::Normal {
++                            frame = self.flow_mgr.borrow_mut().get_frame(epoch, remaining);
++                        }
++                        if frame.is_none() {
++                            frame = self.send_streams.get_frame(epoch, tx_mode, remaining)
++                        }
++                        if frame.is_none() && self.tx_mode == TxMode::Pto {
++                            frame = Some((Frame::Ping, None));
++                        }
++
++                        if let Some((frame, token)) = frame {
+                             ack_eliciting |= frame.ack_eliciting();
+                             frame.marshal(&mut encoder);
+                             if let Some(t) = token {
+                                 tokens.push(t);
+                             }
+-                            if out_bytes.len() + encoder.len() == path.mtu() {
+-                                // No more space for frames.
++
++                            // Pto only ever sends one frame, but it ALWAYS
++                            // sends one
++                            if self.tx_mode == TxMode::Pto {
+                                 break;
+                             }
+                         } else {
+                             // No more frames to send.
++                            assert_eq!(self.tx_mode, TxMode::Normal);
+                             break;
+                         }
+                     }
+@@ -1101,11 +1157,12 @@ impl Connection {
+                 State::Closed { .. } => unimplemented!(),
+             }
+ 
++            assert!(encoder.len() <= path.mtu());
+             if encoder.len() == 0 {
+                 continue;
+             }
+ 
+-            qdebug!([self], "Need to send a packet");
++            qdebug!("Need to send a packet");
+             match epoch {
+                 // Packets containing Initial packets need padding.
+                 0 => needs_padding = true,
+@@ -1113,65 +1170,48 @@ impl Connection {
+                 // ...unless they include higher epochs.
+                 _ => needs_padding = false,
+             }
+-            let hdr = PacketHdr::new(
+-                0,
+-                match epoch {
+-                    0 => {
+-                        let token = match &self.retry_info {
+-                            Some(v) => v.token.clone(),
+-                            _ => Vec::new(),
+-                        };
+-                        PacketType::Initial(token)
+-                    }
+-                    1 => {
+-                        assert!(self.zero_rtt_state != ZeroRttState::Rejected);
+-                        self.zero_rtt_state = ZeroRttState::Sending;
+-                        PacketType::ZeroRTT
+-                    }
+-                    2 => PacketType::Handshake,
+-                    3 => PacketType::Short,
+-                    _ => unimplemented!(), // TODO(ekr@rtfm.com): Key Update.
+-                },
+-                Some(self.version),
+-                path.remote_cid.clone(),
+-                path.local_cids.first().cloned(),
+-                self.loss_recovery.next_pn(space),
+-                epoch,
+-            );
++
+             self.stats.packets_tx += 1;
++            self.loss_recovery.inc_pn(space);
+ 
+-            if ack_eliciting {
+-                self.idle_timeout.on_packet_sent(now);
++            let mut packet = encode_packet(tx, &hdr, &encoder);
++
++            if self.tx_mode != TxMode::Pto {
++                if ack_eliciting {
++                    self.idle_timeout.on_packet_sent(now);
++                }
++                self.loss_recovery
++                    .on_packet_sent(space, hdr.pn, ack_eliciting, tokens, now);
+             }
+-            self.loss_recovery
+-                .on_packet_sent(space, hdr.pn, ack_eliciting, tokens, now);
+ 
+-            let cs = self
+-                .crypto
+-                .obtain_crypto_state(self.role, hdr.epoch)
+-                .unwrap();
+-            let tx = cs.tx.as_ref().unwrap();
+-            let mut packet = encode_packet(tx, &hdr, &encoder);
+             dump_packet(self, "TX ->", &hdr, &encoder);
++
+             out_bytes.append(&mut packet);
+             if out_bytes.len() >= path.mtu() {
+                 break;
+             }
+         }
+ 
+-        if out_bytes.is_empty() {
+-            self.path = Some(path);
+-            return Ok(None);
++        // Sent a probe pkt. Another timeout will re-engage ProbeTimeout mode,
++        // but otherwise return to honoring CC.
++        if self.tx_mode == TxMode::Pto {
++            self.tx_mode = TxMode::Normal;
+         }
+ 
+-        // Pad Initial packets sent by the client to 1200 bytes.
+-        if self.role == Role::Client && needs_padding {
+-            qdebug!([self], "pad Initial to 1200");
+-            out_bytes.resize(1200, 0);
++        if out_bytes.is_empty() {
++            assert!(self.tx_mode != TxMode::Pto);
++            self.path = Some(path);
++            Ok(None)
++        } else {
++            // Pad Initial packets sent by the client to mtu bytes.
++            if self.role == Role::Client && needs_padding {
++                qdebug!([self], "pad Initial to max_datagram_size");
++                out_bytes.resize(path.mtu(), 0);
++            }
++            let ret = Ok(Some(Datagram::new(path.local, path.remote, out_bytes)));
++            self.path = Some(path);
++            ret
+         }
+-        let dgram = Some(Datagram::new(path.local, path.remote, out_bytes));
+-        self.path = Some(path);
+-        Ok(dgram)
+     }
+ 
+     fn client_start(&mut self, now: Instant) -> Res<()> {
+@@ -1323,7 +1363,7 @@ impl Connection {
+                 ..
+             } => {
+                 // TODO(agrover@mozilla.com): use final_size for connection MaxData calc
+-                if let (_, Some(rs)) = self.obtain_stream(stream_id.into())? {
++                if let (_, Some(rs)) = self.obtain_stream(stream_id)? {
+                     rs.reset(application_error_code);
+                 }
+             }
+@@ -1332,8 +1372,8 @@ impl Connection {
+                 application_error_code,
+             } => {
+                 self.events
+-                    .send_stream_stop_sending(stream_id.into(), application_error_code);
+-                if let (Some(ss), _) = self.obtain_stream(stream_id.into())? {
++                    .send_stream_stop_sending(stream_id, application_error_code);
++                if let (Some(ss), _) = self.obtain_stream(stream_id)? {
+                     ss.reset(application_error_code);
+                 }
+             }
+@@ -1345,11 +1385,10 @@ impl Connection {
+                     offset,
+                     &data
+                 );
+-                let rx = &mut self.crypto.streams[epoch as usize].rx;
+-                rx.inbound_frame(offset, data)?;
+-                if rx.data_ready() {
++                self.crypto.streams.inbound_frame(epoch, offset, data)?;
++                if self.crypto.streams.data_ready(epoch) {
+                     let mut buf = Vec::new();
+-                    let read = rx.read_to_end(&mut buf)?;
++                    let read = self.crypto.streams.read_to_end(epoch, &mut buf)?;
+                     qdebug!("Read {} bytes", read);
+                     self.handshake(now, epoch, Some(&buf))?;
+                 }
+@@ -1362,7 +1401,7 @@ impl Connection {
+                 data,
+                 ..
+             } => {
+-                if let (_, Some(rs)) = self.obtain_stream(stream_id.into())? {
++                if let (_, Some(rs)) = self.obtain_stream(stream_id)? {
+                     rs.inbound_stream_frame(fin, offset, data)?;
+                 }
+             }
+@@ -1371,7 +1410,7 @@ impl Connection {
+                 stream_id,
+                 maximum_stream_data,
+             } => {
+-                if let (Some(ss), _) = self.obtain_stream(stream_id.into())? {
++                if let (Some(ss), _) = self.obtain_stream(stream_id)? {
+                     ss.set_max_stream_data(maximum_stream_data);
+                 }
+             }
+@@ -1401,8 +1440,6 @@ impl Connection {
+                 // TODO(agrover@mozilla.com): how should we be using
+                 // currently-unused stream_data_limit?
+ 
+-                let stream_id: StreamId = stream_id.into();
+-
+                 // Terminate connection with STREAM_STATE_ERROR if send-only
+                 // stream (-transport 19.13)
+                 if stream_id.is_send_only(self.role()) {
+@@ -1471,7 +1508,7 @@ impl Connection {
+                 match token {
+                     RecoveryToken::Ack(_) => {}
+                     RecoveryToken::Stream(st) => self.send_streams.lost(&st),
+-                    RecoveryToken::Crypto(ct) => self.crypto.lost(ct),
++                    RecoveryToken::Crypto(ct) => self.crypto.lost(&ct),
+                     RecoveryToken::Flow(ft) => self.flow_mgr.borrow_mut().lost(
+                         &ft,
+                         &mut self.send_streams,
+@@ -1540,7 +1577,7 @@ impl Connection {
+                 match token {
+                     RecoveryToken::Ack(_) => {}
+                     RecoveryToken::Stream(st) => self.send_streams.lost(&st),
+-                    RecoveryToken::Crypto(ct) => self.crypto.lost(ct),
++                    RecoveryToken::Crypto(ct) => self.crypto.lost(&ct),
+                     RecoveryToken::Flow(ft) => self.flow_mgr.borrow_mut().lost(
+                         &ft,
+                         &mut self.send_streams,
+@@ -1953,7 +1990,7 @@ impl Connection {
+                         match token {
+                             RecoveryToken::Ack(_) => {} // Do nothing
+                             RecoveryToken::Stream(st) => self.send_streams.lost(&st),
+-                            RecoveryToken::Crypto(ct) => self.crypto.lost(ct),
++                            RecoveryToken::Crypto(ct) => self.crypto.lost(&ct),
+                             RecoveryToken::Flow(ft) => self.flow_mgr.borrow_mut().lost(
+                                 &ft,
+                                 &mut self.send_streams,
+@@ -1983,6 +2020,16 @@ impl Connection {
+                 //      SendOnePaddedInitialPacket()
+                 // TODO
+                 // SendOneOrTwoPackets()
++                // PTO. Send new data if available, else retransmit old data.
++                // If neither is available, send a single PING frame.
++
++                // TODO(agrover): determine if new data is available and if so
++                // send 2 packets worth
++                // TODO(agrover): else determine if old data is available and if
++                // so send 2 packets worth
++                // TODO(agrover): else send a single PING frame
++
++                self.tx_mode = TxMode::Pto;
+             }
+         }
+     }
+@@ -2110,7 +2157,7 @@ mod tests {
+         let mut client = default_client();
+         let out = client.process(None, now());
+         assert!(out.as_dgram_ref().is_some());
+-        assert_eq!(out.as_dgram_ref().unwrap().len(), 1200);
++        assert_eq!(out.as_dgram_ref().unwrap().len(), 1232);
+         qdebug!("Output={:0x?}", out.as_dgram_ref());
+ 
+         qdebug!("---- server: CH -> SH, EE, CERT, CV, FIN");
+@@ -2351,7 +2398,7 @@ mod tests {
+         let mut client = default_client();
+         let out = client.process(None, now());
+         assert!(out.as_dgram_ref().is_some());
+-        assert_eq!(out.as_dgram_ref().unwrap().len(), 1200);
++        assert_eq!(out.as_dgram_ref().unwrap().len(), 1232);
+         qdebug!("Output={:0x?}", out.as_dgram_ref());
+ 
+         qdebug!("---- server: CH -> SH, EE, CERT, CV, FIN");
+
+diff --git a/neqo-transport/src/crypto.rs b/neqo-transport/src/crypto.rs
+--- a/neqo-transport/src/crypto.rs
++++ b/neqo-transport/src/crypto.rs
+@@ -29,8 +29,8 @@ const MAX_AUTH_TAG: usize = 32;
+ #[derive(Debug)]
+ pub struct Crypto {
+     pub(crate) tls: Agent,
+-    pub(crate) streams: [CryptoStream; 4],
+-    pub(crate) states: [Option<CryptoState>; 4],
++    pub(crate) streams: CryptoStreams,
++    pub(crate) states: CryptoStates,
+ }
+ 
+ impl Crypto {
+@@ -77,8 +77,7 @@ impl Crypto {
+             Role::Server => (SERVER_INITIAL_LABEL, CLIENT_INITIAL_LABEL),
+         };
+ 
+-        self.states[0] = Some(CryptoState {
+-            epoch: 0,
++        self.states.states[0] = Some(CryptoState {
+             tx: CryptoDxState::new_initial(CryptoDxDirection::Write, write_label, dcid),
+             rx: CryptoDxState::new_initial(CryptoDxDirection::Read, read_label, dcid),
+         });
+@@ -89,60 +88,10 @@ impl Crypto {
+         for r in records {
+             assert_eq!(r.ct, 22);
+             qdebug!([self], "Adding CRYPTO data {:?}", r);
+-            self.streams[r.epoch as usize].tx.send(&r.data);
++            self.streams.send(r.epoch, &r.data);
+         }
+     }
+ 
+-    // Get a crypto state, making it if necessary, otherwise return an error.
+-    pub fn obtain_crypto_state(&mut self, role: Role, epoch: Epoch) -> Res<&mut CryptoState> {
+-        #[cfg(debug_assertions)]
+-        let label = format!("{}", self);
+-        #[cfg(not(debug_assertions))]
+-        let label = "";
+-
+-        let cs = &mut self.states[epoch as usize];
+-        if cs.is_none() {
+-            qtrace!([label], "Build crypto state for epoch {}", epoch);
+-            assert!(epoch != 0); // This state is made directly.
+-
+-            let cipher = match (epoch, self.tls.info()) {
+-                (1, _) => self.tls.preinfo()?.early_data_cipher(),
+-                (_, None) => self.tls.preinfo()?.cipher_suite(),
+-                (_, Some(info)) => Some(info.cipher_suite()),
+-            };
+-            if cipher.is_none() {
+-                qdebug!([label], "cipher info not available yet");
+-                return Err(Error::KeysNotFound);
+-            }
+-            let cipher = cipher.unwrap();
+-
+-            let rx = self
+-                .tls
+-                .read_secret(epoch)
+-                .map(|rs| CryptoDxState::new(CryptoDxDirection::Read, epoch, rs, cipher));
+-            let tx = self
+-                .tls
+-                .write_secret(epoch)
+-                .map(|ws| CryptoDxState::new(CryptoDxDirection::Write, epoch, ws, cipher));
+-
+-            // Validate the key setup.
+-            match (&rx, &tx, role, epoch) {
+-                (None, Some(_), Role::Client, 1)
+-                | (Some(_), None, Role::Server, 1)
+-                | (Some(_), Some(_), _, _) => {}
+-                (None, None, _, _) => {
+-                    qdebug!([label], "Keying material not available for epoch {}", epoch);
+-                    return Err(Error::KeysNotFound);
+-                }
+-                _ => panic!("bad configuration of keys"),
+-            }
+-
+-            *cs = Some(CryptoState { epoch, rx, tx });
+-        }
+-
+-        Ok(cs.as_mut().unwrap())
+-    }
+-
+     pub fn acked(&mut self, token: CryptoRecoveryToken) {
+         qinfo!(
+             "Acked crypto frame epoch={} offset={} length={}",
+@@ -150,51 +99,17 @@ impl Crypto {
+             token.offset,
+             token.length
+         );
+-        self.streams[token.epoch as usize]
+-            .tx
+-            .mark_as_acked(token.offset, token.length);
++        self.streams.acked(token);
+     }
+ 
+-    pub fn lost(&mut self, token: CryptoRecoveryToken) {
++    pub fn lost(&mut self, token: &CryptoRecoveryToken) {
+         qinfo!(
+             "Lost crypto frame epoch={} offset={} length={}",
+             token.epoch,
+             token.offset,
+             token.length
+         );
+-        self.streams[token.epoch as usize]
+-            .tx
+-            .mark_as_lost(token.offset, token.length);
+-    }
+-
+-    pub fn get_frame(
+-        &mut self,
+-        epoch: u16,
+-        mode: TxMode,
+-        remaining: usize,
+-    ) -> Option<(Frame, Option<RecoveryToken>)> {
+-        let tx_stream = &mut self.streams[epoch as usize].tx;
+-        if let Some((offset, data)) = tx_stream.next_bytes(mode) {
+-            let (frame, length) = Frame::new_crypto(offset, data, remaining);
+-            tx_stream.mark_as_sent(offset, length);
+-
+-            qdebug!(
+-                "Emitting crypto frame epoch={}, offset={}, len={}",
+-                epoch,
+-                offset,
+-                length
+-            );
+-            Some((
+-                frame,
+-                Some(RecoveryToken::Crypto(CryptoRecoveryToken {
+-                    epoch,
+-                    offset,
+-                    length,
+-                })),
+-            ))
+-        } else {
+-            None
+-        }
++        self.streams.lost(token);
+     }
+ }
+ 
+@@ -315,19 +230,150 @@ impl std::fmt::Display for CryptoDxState {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Default)]
+ pub struct CryptoState {
+-    pub epoch: Epoch,
+     pub tx: Option<CryptoDxState>,
+     pub rx: Option<CryptoDxState>,
+ }
+ 
++#[derive(Debug, Default)]
++pub struct CryptoStates {
++    pub states: [Option<CryptoState>; 4],
++}
++
++impl std::fmt::Display for CryptoStates {
++    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
++        write!(f, "CryptoStates")
++    }
++}
++
++impl CryptoStates {
++    // Get a crypto state, making it if necessary, otherwise return an error.
++    pub fn obtain(&mut self, role: Role, epoch: Epoch, tls: &Agent) -> Res<&mut CryptoState> {
++        #[cfg(debug_assertions)]
++        let label = format!("{}", self);
++        #[cfg(not(debug_assertions))]
++        let label = "";
++
++        let cs = &mut self.states[epoch as usize];
++        if cs.is_none() {
++            qtrace!([label], "Build crypto state for epoch {}", epoch);
++            assert!(epoch != 0); // This state is made directly.
++
++            let cipher = match (epoch, tls.info()) {
++                (1, _) => tls.preinfo()?.early_data_cipher(),
++                (_, None) => tls.preinfo()?.cipher_suite(),
++                (_, Some(info)) => Some(info.cipher_suite()),
++            }
++            .ok_or_else(|| {
++                qdebug!([label], "cipher info not available yet");
++                Error::KeysNotFound
++            })?;
++
++            let rx = tls
++                .read_secret(epoch)
++                .map(|rs| CryptoDxState::new(CryptoDxDirection::Read, epoch, rs, cipher));
++            let tx = tls
++                .write_secret(epoch)
++                .map(|ws| CryptoDxState::new(CryptoDxDirection::Write, epoch, ws, cipher));
++
++            // Validate the key setup.
++            match (&rx, &tx, role, epoch) {
++                (None, Some(_), Role::Client, 1)
++                | (Some(_), None, Role::Server, 1)
++                | (Some(_), Some(_), _, _) => {}
++                (None, None, _, _) => {
++                    qdebug!([label], "Keying material not available for epoch {}", epoch);
++                    return Err(Error::KeysNotFound);
++                }
++                _ => panic!("bad configuration of keys"),
++            }
++
++            *cs = Some(CryptoState { rx, tx });
++        }
++
++        Ok(cs.as_mut().unwrap())
++    }
++}
++
+ #[derive(Debug, Default)]
+ pub struct CryptoStream {
+     pub tx: TxBuffer,
+     pub rx: RxStreamOrderer,
+ }
+ 
++#[derive(Debug, Default)]
++pub struct CryptoStreams {
++    streams: [CryptoStream; 4],
++}
++
++impl CryptoStreams {
++    pub fn send(&mut self, epoch: u16, data: &[u8]) {
++        self.streams[epoch as usize].tx.send(data);
++    }
++
++    pub fn inbound_frame(&mut self, epoch: u16, offset: u64, data: Vec<u8>) -> Res<()> {
++        self.streams[epoch as usize].rx.inbound_frame(offset, data)
++    }
++
++    pub fn data_ready(&self, epoch: u16) -> bool {
++        self.streams[epoch as usize].rx.data_ready()
++    }
++
++    pub fn read_to_end(&mut self, epoch: u16, buf: &mut Vec<u8>) -> Res<u64> {
++        self.streams[epoch as usize].rx.read_to_end(buf)
++    }
++
++    pub fn acked(&mut self, token: CryptoRecoveryToken) {
++        self.streams[token.epoch as usize]
++            .tx
++            .mark_as_acked(token.offset, token.length)
++    }
++
++    pub fn lost(&mut self, token: &CryptoRecoveryToken) {
++        self.streams[token.epoch as usize]
++            .tx
++            .mark_as_lost(token.offset, token.length)
++    }
++
++    pub fn sent(&mut self, epoch: u16, offset: u64, length: usize) {
++        self.streams[epoch as usize].tx.mark_as_sent(offset, length)
++    }
++
++    pub fn next_bytes(&self, epoch: u16, mode: TxMode) -> Option<(u64, &[u8])> {
++        self.streams[epoch as usize].tx.next_bytes(mode)
++    }
++
++    pub fn get_frame(
++        &mut self,
++        epoch: u16,
++        mode: TxMode,
++        remaining: usize,
++    ) -> Option<(Frame, Option<RecoveryToken>)> {
++        if let Some((offset, data)) = self.next_bytes(epoch, mode) {
++            let (frame, length) = Frame::new_crypto(offset, data, remaining);
++            self.sent(epoch, offset, length);
++
++            qdebug!(
++                "Emitting crypto frame epoch={}, offset={}, len={}",
++                epoch,
++                offset,
++                length
++            );
++            Some((
++                frame,
++                Some(RecoveryToken::Crypto(CryptoRecoveryToken {
++                    epoch,
++                    offset,
++                    length,
++                })),
++            ))
++        } else {
++            None
++        }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct CryptoRecoveryToken {
+     epoch: u16,
+
+diff --git a/neqo-transport/src/flow_mgr.rs b/neqo-transport/src/flow_mgr.rs
+--- a/neqo-transport/src/flow_mgr.rs
++++ b/neqo-transport/src/flow_mgr.rs
+@@ -96,7 +96,7 @@ impl FlowMgr {
+         final_size: u64,
+     ) {
+         let frame = Frame::ResetStream {
+-            stream_id: stream_id.as_u64(),
++            stream_id,
+             application_error_code,
+             final_size,
+         };
+@@ -107,7 +107,7 @@ impl FlowMgr {
+     /// Indicate to sending remote we are no longer interested in the stream
+     pub fn stop_sending(&mut self, stream_id: StreamId, application_error_code: AppError) {
+         let frame = Frame::StopSending {
+-            stream_id: stream_id.as_u64(),
++            stream_id,
+             application_error_code,
+         };
+         self.from_streams
+@@ -117,7 +117,7 @@ impl FlowMgr {
+     /// Update sending remote with more credits
+     pub fn max_stream_data(&mut self, stream_id: StreamId, maximum_stream_data: u64) {
+         let frame = Frame::MaxStreamData {
+-            stream_id: stream_id.as_u64(),
++            stream_id,
+             maximum_stream_data,
+         };
+         self.from_streams
+@@ -127,7 +127,7 @@ impl FlowMgr {
+     /// Indicate to receiving remote we need more credits
+     pub fn stream_data_blocked(&mut self, stream_id: StreamId, stream_data_limit: u64) {
+         let frame = Frame::StreamDataBlocked {
+-            stream_id: stream_id.as_u64(),
++            stream_id,
+             stream_data_limit,
+         };
+         self.from_streams
+@@ -187,7 +187,7 @@ impl FlowMgr {
+         {
+             qinfo!(
+                 "Reset received stream={} err={} final_size={}",
+-                stream_id,
++                stream_id.as_u64(),
+                 application_error_code,
+                 final_size
+             );
+@@ -195,7 +195,7 @@ impl FlowMgr {
+             if self
+                 .from_streams
+                 .remove(&(
+-                    stream_id.into(),
++                    stream_id,
+                     mem::discriminant(&Frame::ResetStream {
+                         stream_id,
+                         application_error_code,
+@@ -206,11 +206,11 @@ impl FlowMgr {
+             {
+                 qinfo!(
+                     "Queued ResetStream for {} removed because previous ResetStream was acked",
+-                    stream_id
++                    stream_id.as_u64()
+                 );
+             }
+ 
+-            send_streams.reset_acked(stream_id.into());
++            send_streams.reset_acked(stream_id);
+         }
+     }
+ 
+@@ -230,12 +230,12 @@ impl FlowMgr {
+             } => {
+                 qinfo!(
+                     "Reset lost stream={} err={} final_size={}",
+-                    stream_id,
++                    stream_id.as_u64(),
+                     application_error_code,
+                     final_size
+                 );
+-                if send_streams.get(stream_id.into()).is_ok() {
+-                    self.stream_reset(stream_id.into(), application_error_code, final_size);
++                if send_streams.get(stream_id).is_ok() {
++                    self.stream_reset(stream_id, application_error_code, final_size);
+                 }
+             }
+             // Resend MaxStreams if lost (with updated value)
+@@ -254,9 +254,9 @@ impl FlowMgr {
+                 }
+             }
+             Frame::StreamDataBlocked { stream_id, .. } => {
+-                if let Ok(ss) = send_streams.get(stream_id.into()) {
++                if let Ok(ss) = send_streams.get(stream_id) {
+                     if ss.credit_avail() == 0 {
+-                        self.stream_data_blocked(stream_id.into(), ss.max_stream_data())
++                        self.stream_data_blocked(stream_id, ss.max_stream_data())
+                     }
+                 }
+             }
+@@ -276,11 +276,11 @@ impl FlowMgr {
+             Frame::StopSending {
+                 stream_id,
+                 application_error_code,
+-            } => self.stop_sending(stream_id.into(), application_error_code),
++            } => self.stop_sending(stream_id, application_error_code),
+             // Resend MaxStreamData if not SizeKnown
+             // (maybe_send_flowc_update() checks this.)
+             Frame::MaxStreamData { stream_id, .. } => {
+-                if let Some(rs) = recv_streams.get_mut(&stream_id.into()) {
++                if let Some(rs) = recv_streams.get_mut(&stream_id) {
+                     rs.maybe_send_flowc_update()
+                 }
+             }
+
+diff --git a/neqo-transport/src/frame.rs b/neqo-transport/src/frame.rs
+--- a/neqo-transport/src/frame.rs
++++ b/neqo-transport/src/frame.rs
+@@ -9,7 +9,7 @@
+ use neqo_common::{matches, qdebug, Decoder, Encoder};
+ use neqo_crypto::Epoch;
+ 
+-use crate::stream_id::StreamIndex;
++use crate::stream_id::{StreamId, StreamIndex};
+ use crate::{AppError, TransportError};
+ use crate::{ConnectionError, Error, Res};
+ 
+@@ -126,12 +126,12 @@ pub enum Frame {
+         ack_ranges: Vec<AckRange>,
+     },
+     ResetStream {
+-        stream_id: u64,
++        stream_id: StreamId,
+         application_error_code: AppError,
+         final_size: u64,
+     },
+     StopSending {
+-        stream_id: u64,
++        stream_id: StreamId,
+         application_error_code: AppError,
+     },
+     Crypto {
+@@ -143,7 +143,7 @@ pub enum Frame {
+     },
+     Stream {
+         fin: bool,
+-        stream_id: u64,
++        stream_id: StreamId,
+         offset: u64,
+         data: Vec<u8>,
+         fill: bool,
+@@ -152,7 +152,7 @@ pub enum Frame {
+         maximum_data: u64,
+     },
+     MaxStreamData {
+-        stream_id: u64,
++        stream_id: StreamId,
+         maximum_stream_data: u64,
+     },
+     MaxStreams {
+@@ -163,7 +163,7 @@ pub enum Frame {
+         data_limit: u64,
+     },
+     StreamDataBlocked {
+-        stream_id: u64,
++        stream_id: StreamId,
+         stream_data_limit: u64,
+     },
+     StreamsBlocked {
+@@ -289,7 +289,7 @@ impl Frame {
+         );
+         (
+             Frame::Stream {
+-                stream_id,
++                stream_id: stream_id.into(),
+                 offset,
+                 data: data[..remaining].to_vec(),
+                 fin,
+@@ -324,7 +324,7 @@ impl Frame {
+                 application_error_code,
+                 final_size,
+             } => {
+-                enc.encode_varint(*stream_id);
++                enc.encode_varint(stream_id.as_u64());
+                 enc.encode_varint(*application_error_code);
+                 enc.encode_varint(*final_size);
+             }
+@@ -332,7 +332,7 @@ impl Frame {
+                 stream_id,
+                 application_error_code,
+             } => {
+-                enc.encode_varint(*stream_id);
++                enc.encode_varint(stream_id.as_u64());
+                 enc.encode_varint(*application_error_code);
+             }
+             Frame::Crypto { offset, data } => {
+@@ -349,7 +349,7 @@ impl Frame {
+                 fill,
+                 ..
+             } => {
+-                enc.encode_varint(*stream_id);
++                enc.encode_varint(stream_id.as_u64());
+                 if *offset > 0 {
+                     enc.encode_varint(*offset);
+                 }
+@@ -366,7 +366,7 @@ impl Frame {
+                 stream_id,
+                 maximum_stream_data,
+             } => {
+-                enc.encode_varint(*stream_id);
++                enc.encode_varint(stream_id.as_u64());
+                 enc.encode_varint(*maximum_stream_data);
+             }
+             Frame::MaxStreams {
+@@ -381,7 +381,7 @@ impl Frame {
+                 stream_id,
+                 stream_data_limit,
+             } => {
+-                enc.encode_varint(*stream_id);
++                enc.encode_varint(stream_id.as_u64());
+                 enc.encode_varint(*stream_data_limit);
+             }
+             Frame::StreamsBlocked { stream_limit, .. } => {
+@@ -482,7 +482,7 @@ impl Frame {
+                 fin,
+             } => Some(format!(
+                 "Stream {{ stream_id: {}, offset: {}, len: {}{} fin: {} }}",
+-                stream_id,
++                stream_id.as_u64(),
+                 offset,
+                 if *fill { ">>" } else { "" },
+                 data.len(),
+@@ -531,7 +531,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+         FRAME_TYPE_PADDING => Ok(Frame::Padding),
+         FRAME_TYPE_PING => Ok(Frame::Ping),
+         FRAME_TYPE_RST_STREAM => Ok(Frame::ResetStream {
+-            stream_id: dv!(dec),
++            stream_id: dv!(dec).into(),
+             application_error_code: d!(dec.decode_varint()),
+             final_size: match dec.decode_varint() {
+                 Some(v) => v,
+@@ -567,7 +567,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+             })
+         }
+         FRAME_TYPE_STOP_SENDING => Ok(Frame::StopSending {
+-            stream_id: dv!(dec),
++            stream_id: dv!(dec).into(),
+             application_error_code: d!(dec.decode_varint()),
+         }),
+         FRAME_TYPE_CRYPTO => {
+@@ -600,7 +600,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+             };
+             Ok(Frame::Stream {
+                 fin: (t & STREAM_FRAME_BIT_FIN) != 0,
+-                stream_id: s,
++                stream_id: s.into(),
+                 offset: o,
+                 data: data.to_vec(), // TODO(mt) unnecessary copy.
+                 fill,
+@@ -610,7 +610,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+             maximum_data: dv!(dec),
+         }),
+         FRAME_TYPE_MAX_STREAM_DATA => Ok(Frame::MaxStreamData {
+-            stream_id: dv!(dec),
++            stream_id: dv!(dec).into(),
+             maximum_stream_data: dv!(dec),
+         }),
+         FRAME_TYPE_MAX_STREAMS_BIDI | FRAME_TYPE_MAX_STREAMS_UNIDI => Ok(Frame::MaxStreams {
+@@ -622,7 +622,7 @@ pub fn decode_frame(dec: &mut Decoder) -> Res<Frame> {
+             data_limit: dv!(dec),
+         }),
+         FRAME_TYPE_STREAM_DATA_BLOCKED => Ok(Frame::StreamDataBlocked {
+-            stream_id: dv!(dec),
++            stream_id: dv!(dec).into(),
+             stream_data_limit: dv!(dec),
+         }),
+         FRAME_TYPE_STREAMS_BLOCKED_BIDI | FRAME_TYPE_STREAMS_BLOCKED_UNIDI => {
+@@ -732,7 +732,7 @@ mod tests {
+     #[test]
+     fn test_reset_stream() {
+         let f = Frame::ResetStream {
+-            stream_id: 0x1234,
++            stream_id: 0x1234.into(),
+             application_error_code: 0x77,
+             final_size: 0x3456,
+         };
+@@ -743,7 +743,7 @@ mod tests {
+     #[test]
+     fn test_stop_sending() {
+         let f = Frame::StopSending {
+-            stream_id: 63,
++            stream_id: 63.into(),
+             application_error_code: 0x77,
+         };
+ 
+@@ -774,7 +774,7 @@ mod tests {
+         // First, just set the length bit.
+         let f = Frame::Stream {
+             fin: false,
+-            stream_id: 5,
++            stream_id: 5.into(),
+             offset: 0,
+             data: vec![1, 2, 3],
+             fill: false,
+@@ -785,7 +785,7 @@ mod tests {
+         // Now with offset != 0 and FIN
+         let f = Frame::Stream {
+             fin: true,
+-            stream_id: 5,
++            stream_id: 5.into(),
+             offset: 1,
+             data: vec![1, 2, 3],
+             fill: false,
+@@ -795,7 +795,7 @@ mod tests {
+         // Now to fill the packet.
+         let f = Frame::Stream {
+             fin: true,
+-            stream_id: 5,
++            stream_id: 5.into(),
+             offset: 0,
+             data: vec![1, 2, 3],
+             fill: true,
+@@ -815,7 +815,7 @@ mod tests {
+     #[test]
+     fn test_max_stream_data() {
+         let f = Frame::MaxStreamData {
+-            stream_id: 5,
++            stream_id: 5.into(),
+             maximum_stream_data: 0x1234,
+         };
+ 
+@@ -849,7 +849,7 @@ mod tests {
+     #[test]
+     fn test_stream_data_blocked() {
+         let f = Frame::StreamDataBlocked {
+-            stream_id: 5,
++            stream_id: 5.into(),
+             stream_data_limit: 0x1234,
+         };
+
+diff --git a/neqo-transport/src/packet.rs b/neqo-transport/src/packet.rs
+--- a/neqo-transport/src/packet.rs
++++ b/neqo-transport/src/packet.rs
+@@ -12,9 +12,10 @@
+ use rand::Rng;
+ 
+ use neqo_common::{hex, matches, qtrace, Decoder, Encoder};
++use neqo_crypto::aead::Aead;
+ use neqo_crypto::Epoch;
+ 
+-use std::convert::TryFrom;
++use std::convert::{TryFrom, TryInto};
+ 
+ use crate::{Error, Res};
+ 
+@@ -156,6 +157,41 @@ impl PacketHdr {
+     pub fn body_len(&self) -> usize {
+         self.body_len
+     }
++
++    // header length plus auth tag
++    pub fn overhead(&self, aead: &Aead, pmtu: usize) -> usize {
++        match &self.tipe {
++            PacketType::Short => {
++                // Leading byte.
++                let mut len = 1;
++                len += self.dcid.0.len();
++                len += pn_length(self.pn);
++                len + aead.expansion()
++            }
++            PacketType::VN(_) => unimplemented!("Can't get overhead for VN"),
++            PacketType::Retry { .. } => unimplemented!("Can't get overhead for Retry"),
++            PacketType::Initial(..) | PacketType::ZeroRTT | PacketType::Handshake => {
++                let pnl = pn_length(self.pn);
++
++                // Leading byte.
++                let mut len = 1;
++                len += 4; // Version
++                len += 1; // DCID length
++                len += self.dcid.len();
++                len += 1; // SCID length
++                len += self.scid.as_ref().unwrap().len();
++
++                if let PacketType::Initial(token) = &self.tipe {
++                    len += Encoder::varint_len(token.len().try_into().unwrap());
++                    len += token.len();
++                }
++
++                len += Encoder::varint_len((pnl + pmtu + aead.expansion()) as u64);
++                len += pnl;
++                len + aead.expansion()
++            }
++        }
++    }
+ }
+ 
+ pub trait CryptoCtx {
+
+diff --git a/neqo-transport/src/recovery.rs b/neqo-transport/src/recovery.rs
+--- a/neqo-transport/src/recovery.rs
++++ b/neqo-transport/src/recovery.rs
+@@ -234,9 +234,11 @@ impl LossRecovery {
+     }
+ 
+     pub fn next_pn(&mut self, pn_space: PNSpace) -> u64 {
+-        let val = self.spaces[pn_space].tx_pn;
++        self.spaces[pn_space].tx_pn
++    }
++
++    pub fn inc_pn(&mut self, pn_space: PNSpace) {
+         self.spaces[pn_space].tx_pn += 1;
+-        val
+     }
+ 
+     pub fn increment_pto_count(&mut self) {
+
+diff --git a/neqo-transport/src/tracking.rs b/neqo-transport/src/tracking.rs
+--- a/neqo-transport/src/tracking.rs
++++ b/neqo-transport/src/tracking.rs
+@@ -201,7 +201,7 @@ impl RecvdPackets {
+ 
+     /// Add the packet to the tracked set.
+     pub fn set_received(&mut self, now: Instant, pn: u64, ack_eliciting: bool) {
+-        let next_in_order_pn = self.ranges.get(0).map(|pr| pr.largest + 1).unwrap_or(0);
++        let next_in_order_pn = self.ranges.front().map_or(0, |pr| pr.largest + 1);
+         qdebug!("next in order pn: {}", next_in_order_pn);
+         let i = self.add(pn);
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn decode_frame(dec: &mut Decoder) -> Res<Frame>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

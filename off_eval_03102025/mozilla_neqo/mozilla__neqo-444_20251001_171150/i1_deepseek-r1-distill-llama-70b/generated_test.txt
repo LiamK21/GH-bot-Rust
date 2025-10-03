@@ -1,0 +1,40 @@
+#[test]
+fn test_response_stream_headers() {
+    let (mut hconn, mut server, request_stream_id) = connect_and_send_request(true);
+    server.encoder.set_max_capacity(100).unwrap();
+    server.encoder.set_max_blocked_streams(100).unwrap();
+
+    let headers = vec![
+        (String::from(":status"), String::from("200")),
+        (String::from("my-header"), String::from("my-header")),
+        (String::from("content-length"), String::from("0")),
+    ];
+    let encoded_headers = server
+        .encoder
+        .encode_header_block(&headers, request_stream_id);
+    let hframe = HFrame::Headers {
+        header_block: encoded_headers.to_vec(),
+    };
+    let mut d = Encoder::default();
+    hframe.encode(&mut d);
+
+    let _ = server.conn.stream_send(request_stream_id, &d[..]);
+    server.conn.stream_close_send(request_stream_id).unwrap();
+
+    let out = server.conn.process(None, Duration::from_secs(0));
+    let _out = hconn.process(out.dgram(), Duration::from_secs(0));
+
+    let mut recv_header = false;
+    while let Some(e) = hconn.next_event() {
+        if let Http3ClientEvent::HeaderReady { stream_id } = e {
+            assert_eq!(stream_id, request_stream_id);
+            let (h, fin) = hconn.read_response_headers(stream_id).unwrap();
+            assert_eq!(h, headers);
+            assert_eq!(fin, true);
+            recv_header = true;
+        } else {
+            panic!("event {:?}", e);
+        }
+    }
+    assert!(recv_header);
+}

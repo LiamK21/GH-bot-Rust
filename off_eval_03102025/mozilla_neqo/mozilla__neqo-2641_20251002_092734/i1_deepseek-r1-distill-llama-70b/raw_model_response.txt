@@ -1,0 +1,62 @@
+<think>
+Okay, I need to figure out how to approach this problem. The issue is that the `hrtime::test::update_multi` test is failing occasionally in CI on Ubuntu. The provided patch modifies the `check_delays` function to run multiple times and adds a new test `slip` that's expected to panic. 
+
+First, I should understand what the patch is doing. The original `check_delays` function runs `validate_delays` twice, but the patch changes it to run up to a certain number of times based on `max_lag`. This is to make the test more reliable in CI by retrying if it fails. 
+
+The new `slip` test is designed to fail by checking a very small duration, which should cause the `check_delays` to panic because the timers can't meet that resolution. This test is marked with `#[should_panic]`, so it's expected to fail.
+
+Now, the question is whether a unit test is needed. Since the patch introduces changes to `check_delays` and adds a new test, I think a test is necessary to ensure that `check_delays` behaves correctly under different conditions.
+
+Looking at the existing tests, there's `one_ms`, `update`, and `update_multi`. The `update_multi` test was flaky before the patch, so after the patch, it should be more reliable. 
+
+I need to write a test that checks the `check_delays` function. The test should pass when `check_delays` works correctly and fail when it doesn't. Since the patch adds retry logic, the test should simulate scenarios where `validate_delays` might fail once but pass on retry.
+
+I'll create a test that calls `check_delays` with a `max_lag` that's small enough to potentially fail on the first try but pass on subsequent tries. I'll use `Duration::from_millis(10)` as `max_lag` and simulate a failure on the first `validate_delays` call.
+
+In the test, I'll use `std::sync::mpsc` to control the behavior of `validate_delays`. The first call will return `Err(())`, triggering a retry, and the second call will return `Ok(())`, allowing `check_delays` to pass.
+
+I'll structure the test by sending a message through a channel to control when `validate_delays` should fail. This way, the test can accurately simulate the retry scenario.
+
+I'll also make sure to import only the necessary modules and keep the test self-contained. The test will be named `test_check_delays_retries` to clearly indicate its purpose.
+
+Finally, I'll write the test function, ensuring that it properly initializes the necessary variables, sets up the channel for communication, and asserts that `check_delays` behaves as expected with retries.
+</think>
+
+The patch modifies the test to make it more reliable by retrying up to a certain number of times. The new test `slip` is added to verify that when an unachievable timer resolution is requested, the test correctly panics. We need a test that verifies the retry logic in `check_delays`.
+
+<Filename>neqo-common/src/hrtime.rs</Filename>
+<Imports>
+use std::sync::mpsc;
+use std::time::Duration;
+use super::Time;
+</Imports>
+<Rust>
+#[test]
+fn test_check_delays_retries() {
+    let (sender, receiver) = mpsc::channel();
+    
+    // Mock the first validate_delays call to fail, then pass on retry
+    let mut validate_delays = move || {
+        if sender.send(()).unwrap() {
+            Err(())
+        } else {
+            Ok(())
+        }
+    };
+
+    let max_lag = Duration::from_millis(10);
+    let handle = std::thread::spawn({
+        let receiver = receiver.clone();
+        move || {
+            let result = check_delays(max_lag);
+            receiver.send(result).unwrap();
+        }
+    });
+
+    // First call fails, second call passes
+    assert_eq!(validate_delays(), Err(()));
+    assert_eq!(validate_delays(), Ok(()));
+    
+    handle.join().unwrap();
+}
+</Rust>

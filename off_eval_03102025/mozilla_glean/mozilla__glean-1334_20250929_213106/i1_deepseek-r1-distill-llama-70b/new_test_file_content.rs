@@ -1,0 +1,23 @@
+#glean-core/rlb/src/private/quantity.rs
+#[cfg(test)]
+mod tests {
+use super::quantity::QuantityMetric;
+use glean_core::ErrorType;
+
+#[test]
+fn test_quantity_metric_records_error() {
+    let meta = glean_core::CommonMetricData {
+        name: "test_metric".into(),
+        send_in_pings: vec!["test_ping".into()],
+        ..Default::default()
+    };
+    let metric = QuantityMetric::new(meta);
+
+    // Set a negative value to trigger an error
+    metric.set(-1);
+
+    // Check that the error was recorded
+    let error_count = metric.test_get_num_recorded_errors(ErrorType::InvalidValue, None);
+    assert!(error_count > 0);
+}
+}

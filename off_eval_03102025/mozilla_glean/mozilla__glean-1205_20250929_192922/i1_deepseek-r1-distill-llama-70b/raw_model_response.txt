@@ -1,0 +1,66 @@
+<think>
+Okay, I need to figure out how to approach this problem. The issue is that the test `non-deletion-pings are not uploaded when upload disabled` is failing intermittently. The patch provided makes several changes to the Rust code, particularly around how the `PingUploadManager` is initialized and how pending pings are scanned.
+
+First, I should understand what the patch does. It looks like the `new_for_subprocess` function now takes an additional `scan_directories` boolean parameter. This parameter controls whether the upload manager scans pending pings directories. The idea is that when creating a Glean instance for a subprocess, we might not want to scan directories immediately, whereas in the main process, we do.
+
+Looking at the changes, in `lib.rs`, the `new` function now calls `new_for_subprocess` with `false`, meaning it doesn't scan directories at that point. Instead, after handling upload state, it scans the directories asynchronously. This change aims to ensure that pending pings are handled correctly when upload is disabled.
+
+The problem in the test seems to be related to the timing of when pending pings are scanned. If the test expects that no pings are uploaded when upload is disabled, but sometimes they are, it might be because the scan is happening too early or too late.
+
+So, to test this, I need to write a unit test that verifies that when upload is disabled, no pings are uploaded, and the pending pings are handled correctly.
+
+I should focus on the `DeletionPingTest` since that's where the failure is occurring. The test probably creates some pings, disables upload, and then checks that those pings aren't sent. The patch should fix the timing issue causing the intermittent failure.
+
+I'll need to set up a test where upload is disabled and then trigger the conditions where pings would normally be uploaded. Then, I'll check if the upload manager correctly avoids sending any pings.
+
+In the test, I'll create a Glean instance with upload disabled, generate some pings, and then simulate the upload process. After that, I'll assert that no pings were actually sent. This should catch whether the patch correctly prevents uploads when disabled.
+
+I also need to make sure that the test doesn't rely on any external factors, like the system clock or network, to avoid flakiness. It should be deterministic.
+
+So, putting it all together, the test will:
+
+1. Initialize Glean with upload disabled.
+2. Create a test ping.
+3. Simulate the upload process.
+4. Check that no pings were uploaded.
+
+This should validate that the patch fixes the issue by ensuring that when upload is disabled, pings aren't sent, and the test no longer fails intermittently.
+</think>
+
+The patch modifies how `PingUploadManager` handles scanning of pending pings directories. The test `non-deletion-pings are not uploaded when upload disabled` was failing because of incorrect timing in directory scanning. The new behavior ensures scanning happens only when appropriate, fixing the intermittent failure.
+
+<Filename> glean-core/src/lib.rs </Filename>
+<imports>
+use std::sync::Arc;
+use std::time::Duration;
+use std::thread;
+</imports>
+<Rust>
+#[test]
+fn test_non_deletion_pings_not_uploaded_when_upload_disabled() {
+    let (mut glean, _) = new_glean(None);
+    
+    // Disable upload
+    glean.set_upload_enabled(false);
+    
+    // Create a test ping
+    let ping_id = Uuid::new_v4().to_string();
+    let ping = Ping::new(
+        "test-ping".into(),
+        "1".into(),
+        ping_id,
+    );
+    
+    // Enqueue the ping
+    glean.submit_ping(&ping, None).unwrap();
+    
+    // Simulate upload process
+    let upload_manager = PingUploadManager::no_policy(glean.data_path());
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+    
+    // Verify no pings were uploaded
+    assert_eq!(PingUploadTask::Done, upload_manager.get_upload_task(&glean, false));
+}
+</Rust>

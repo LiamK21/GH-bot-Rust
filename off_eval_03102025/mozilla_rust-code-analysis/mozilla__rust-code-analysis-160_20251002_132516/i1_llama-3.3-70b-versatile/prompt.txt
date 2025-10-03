@@ -1,0 +1,1012 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Dump json to stdout
+It would be helpful to dump json function spaces to `stdout`
+</issue>
+
+Patch:
+<patch>
+diff --git a/rust-code-analysis-cli/src/main.rs b/rust-code-analysis-cli/src/main.rs
+--- a/rust-code-analysis-cli/src/main.rs
++++ b/rust-code-analysis-cli/src/main.rs
+@@ -9,7 +9,9 @@ use crossbeam::channel::{Receiver, Sender};
+ use crossbeam::crossbeam_channel::unbounded;
+ use globset::{Glob, GlobSet, GlobSetBuilder};
+ use std::collections::{hash_map, HashMap};
++use std::fmt;
+ use std::path::PathBuf;
++use std::str::FromStr;
+ use std::sync::{Arc, Mutex};
+ use std::{process, thread};
+ use walkdir::{DirEntry, WalkDir};
+@@ -26,6 +28,7 @@ struct Config {
+     count_filter: Vec<String>,
+     function: bool,
+     metrics: bool,
++    output_format: Option<Format>,
+     output: String,
+     pretty: bool,
+     line_start: Option<usize>,
+@@ -80,6 +83,7 @@ fn act_on_file(language: Option<LANG>, path: PathBuf, cfg: &Config) -> std::io::
+     } else if cfg.metrics {
+         let cfg = MetricsCfg {
+             path,
++            output_format: cfg.output_format.clone(),
+             pretty: cfg.pretty,
+             output_path: if cfg.output.is_empty() {
+                 None
+@@ -217,6 +221,17 @@ fn explore(
+     all_files
+ }
+ 
++fn parse_or_exit<T>(s: &str) -> T
++where
++    T: FromStr,
++    T::Err: fmt::Display,
++{
++    T::from_str(s).unwrap_or_else(|e| {
++        eprintln!("Error:\n{}", e);
++        process::exit(1);
++    })
++}
++
+ fn main() {
+     let matches = App::new("code-analysis")
+         .version(crate_version!())
+@@ -303,13 +318,21 @@ fn main() {
+                 .takes_value(true),
+         )
+         .arg(
+-            Arg::with_name("type")
++            Arg::with_name("language_type")
+                 .help("Language type")
+-                .short("t")
+-                .long("type")
++                .short("l")
++                .long("language-type")
+                 .default_value("")
+                 .takes_value(true),
+         )
++        .arg(
++            Arg::with_name("output_format")
++                .help("Output metrics as different formats")
++                .short("O")
++                .long("output-format")
++                .possible_values(Format::all())
++                .takes_value(true),
++        )
+         .arg(
+             Arg::with_name("pretty")
+                 .help("Dump a pretty json file")
+@@ -416,7 +439,7 @@ fn main() {
+         None
+     };
+     let metrics = matches.is_present("metrics");
+-    let typ = matches.value_of("type").unwrap();
++    let typ = matches.value_of("language_type").unwrap();
+     let preproc_value = matches.value_of("preproc").unwrap();
+     let (preproc_lock, preproc) = if !preproc_value.is_empty() {
+         let path = PathBuf::from(preproc_value);
+@@ -436,6 +459,9 @@ fn main() {
+         (None, None)
+     };
+ 
++    let output_format = matches
++        .value_of("output_format")
++        .map(parse_or_exit::<Format>);
+     let pretty = matches.is_present("pretty");
+     let output = matches.value_of("output").unwrap().to_string();
+     let output_is_dir = PathBuf::from(output.clone()).is_dir();
+@@ -475,6 +501,7 @@ fn main() {
+         count_filter,
+         function,
+         metrics,
++        output_format,
+         pretty,
+         output: output.clone(),
+         line_start,
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,8 +5,11 @@
+ extern crate lazy_static;
+ #[macro_use]
+ extern crate serde;
++extern crate serde_cbor;
+ #[cfg_attr(test, macro_use)]
+ extern crate serde_json;
++extern crate serde_yaml;
++extern crate toml;
+ 
+ #[macro_use]
+ mod macros;
+
+diff --git a/src/output/dump_formats.rs b/src/output/dump_formats.rs
+--- a/src/output/dump_formats.rs
++++ b/src/output/dump_formats.rs
+@@ -0,0 +1,122 @@
++use regex::Regex;
++use std::fs::File;
++use std::io::Write;
++use std::io::{Error, ErrorKind};
++use std::path::PathBuf;
++use std::str::FromStr;
++
++use crate::spaces::FuncSpace;
++
++#[derive(Debug, Clone)]
++pub enum Format {
++    Cbor,
++    Json,
++    Toml,
++    Yaml,
++}
++
++impl Format {
++    pub fn all() -> &'static [&'static str] {
++        &["cbor", "json", "toml", "yaml"]
++    }
++}
++
++impl FromStr for Format {
++    type Err = String;
++
++    fn from_str(format: &str) -> Result<Self, Self::Err> {
++        match format {
++            "cbor" => Ok(Format::Cbor),
++            "json" => Ok(Format::Json),
++            "toml" => Ok(Format::Toml),
++            "yaml" => Ok(Format::Yaml),
++            format => Err(format!("{:?} is not a supported format", format)),
++        }
++    }
++}
++
++pub(crate) fn dump_formats(
++    space: &FuncSpace,
++    path: &PathBuf,
++    output_path: &Option<PathBuf>,
++    output_format: Format,
++    pretty: bool,
++) -> std::io::Result<()> {
++    if output_path.is_none() {
++        let stdout = std::io::stdout();
++        let mut stdout = stdout.lock();
++
++        match output_format {
++            Format::Cbor => Err(Error::new(
++                ErrorKind::Other,
++                "Cbor format cannot be printed to stdout",
++            )),
++            Format::Json => {
++                let json_data = if pretty {
++                    serde_json::to_string_pretty(&space).unwrap()
++                } else {
++                    serde_json::to_string(&space).unwrap()
++                };
++                write!(stdout, "{}", json_data)
++            }
++            Format::Toml => {
++                let toml_data = if pretty {
++                    toml::to_string_pretty(&space).unwrap()
++                } else {
++                    toml::to_string(&space).unwrap()
++                };
++                write!(stdout, "{}", toml_data)
++            }
++            Format::Yaml => write!(stdout, "{}", serde_yaml::to_string(&space).unwrap()),
++        }
++    } else {
++        let format_ext = match output_format {
++            Format::Cbor => ".cbor",
++            Format::Json => ".json",
++            Format::Toml => ".toml",
++            Format::Yaml => ".yml",
++        };
++
++        let output_path = output_path.as_ref().unwrap();
++
++        let mut file = path.as_path().file_name().unwrap().to_os_string();
++        file.push(format_ext);
++
++        let mut format_path = output_path.clone();
++        format_path.push(file);
++
++        if format_path.as_path().exists() {
++            let mut new_filename = path.to_str().unwrap().to_string();
++            let re = Regex::new(r"[\\:/]").unwrap();
++            new_filename = re.replace_all(&new_filename, "_").to_string();
++            new_filename.push_str(format_ext);
++            format_path.pop();
++            format_path.push(new_filename);
++        }
++
++        let mut format_file = File::create(format_path)?;
++        match output_format {
++            Format::Cbor => serde_cbor::to_writer(format_file, &space)
++                .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
++            Format::Json => {
++                if pretty {
++                    serde_json::to_writer_pretty(format_file, &space)
++                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
++                } else {
++                    serde_json::to_writer(format_file, &space)
++                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
++                }
++            }
++            Format::Toml => {
++                let toml_data = if pretty {
++                    toml::to_string_pretty(&space).unwrap()
++                } else {
++                    toml::to_string(&space).unwrap()
++                };
++                format_file.write_all(toml_data.as_bytes())
++            }
++            Format::Yaml => serde_yaml::to_writer(format_file, &space)
++                .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
++        }
++    }
++}
+
+diff --git a/src/output/dump_metrics.rs b/src/output/dump_metrics.rs
+--- a/src/output/dump_metrics.rs
++++ b/src/output/dump_metrics.rs
+@@ -0,0 +1,258 @@
++use std::io::Write;
++use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, StandardStreamLock, WriteColor};
++
++use crate::cyclomatic;
++use crate::exit;
++use crate::fn_args;
++use crate::halstead;
++use crate::loc;
++use crate::mi;
++use crate::nom;
++
++use crate::spaces::{CodeMetrics, FuncSpace};
++
++pub(crate) fn dump_root(space: &FuncSpace) -> std::io::Result<()> {
++    let stdout = StandardStream::stdout(ColorChoice::Always);
++    let mut stdout = stdout.lock();
++    dump_space(&space, "", true, &mut stdout)?;
++    color!(stdout, White);
++
++    Ok(())
++}
++
++fn dump_space(
++    space: &FuncSpace,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Yellow, true);
++    write!(stdout, "{}: ", space.kind)?;
++
++    color!(stdout, Cyan, true);
++    write!(stdout, "{}", space.name.map_or("", |name| name))?;
++
++    color!(stdout, Red, true);
++    writeln!(stdout, " (@{})", space.start_line)?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++    dump_metrics(&space.metrics, &prefix, space.spaces.is_empty(), stdout)?;
++
++    if let Some((last, spaces)) = space.spaces.split_last() {
++        for space in spaces {
++            dump_space(space, &prefix, false, stdout)?;
++        }
++        dump_space(last, &prefix, true, stdout)?;
++    }
++
++    Ok(())
++}
++
++fn dump_metrics(
++    metrics: &CodeMetrics,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Yellow, true);
++    writeln!(stdout, "metrics")?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++    dump_cyclomatic(&metrics.cyclomatic, &prefix, false, stdout)?;
++    dump_nargs(&metrics.nargs, &prefix, false, stdout)?;
++    dump_nexits(&metrics.nexits, &prefix, false, stdout)?;
++    dump_halstead(&metrics.halstead, &prefix, false, stdout)?;
++    dump_loc(&metrics.loc, &prefix, false, stdout)?;
++    dump_nom(&metrics.nom, &prefix, false, stdout)?;
++    dump_mi(&metrics.mi, &prefix, true, stdout)
++}
++
++fn dump_cyclomatic(
++    stats: &cyclomatic::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let pref = if last { "`- " } else { "|- " };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    write!(stdout, "cyclomatic: ")?;
++
++    color!(stdout, White);
++    writeln!(stdout, "{}", stats.cyclomatic())
++}
++
++fn dump_halstead(
++    stats: &halstead::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    writeln!(stdout, "halstead")?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++
++    dump_value("n1", stats.u_operators(), &prefix, false, stdout)?;
++    dump_value("N1", stats.operators(), &prefix, false, stdout)?;
++    dump_value("n2", stats.u_operands(), &prefix, false, stdout)?;
++    dump_value("N2", stats.operands(), &prefix, false, stdout)?;
++
++    dump_value("length", stats.length(), &prefix, false, stdout)?;
++    dump_value(
++        "estimated program length",
++        stats.estimated_program_length(),
++        &prefix,
++        false,
++        stdout,
++    )?;
++    dump_value("purity ratio", stats.purity_ratio(), &prefix, false, stdout)?;
++    dump_value("vocabulary", stats.vocabulary(), &prefix, false, stdout)?;
++    dump_value("volume", stats.volume(), &prefix, false, stdout)?;
++    dump_value("difficulty", stats.difficulty(), &prefix, false, stdout)?;
++    dump_value("level", stats.level(), &prefix, false, stdout)?;
++    dump_value("effort", stats.effort(), &prefix, false, stdout)?;
++    dump_value("time", stats.time(), &prefix, false, stdout)?;
++    dump_value("bugs", stats.bugs(), &prefix, true, stdout)
++}
++
++fn dump_loc(
++    stats: &loc::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    writeln!(stdout, "loc")?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++    dump_value("sloc", stats.sloc(), &prefix, false, stdout)?;
++    dump_value("ploc", stats.ploc(), &prefix, false, stdout)?;
++    dump_value("lloc", stats.lloc(), &prefix, false, stdout)?;
++    dump_value("cloc", stats.cloc(), &prefix, false, stdout)?;
++    dump_value("blank", stats.blank(), &prefix, true, stdout)
++}
++
++fn dump_nom(
++    stats: &nom::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    writeln!(stdout, "nom")?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++    dump_value("functions", stats.functions(), &prefix, false, stdout)?;
++    dump_value("closures", stats.closures(), &prefix, false, stdout)?;
++    dump_value("total", stats.total(), &prefix, true, stdout)
++}
++
++fn dump_mi(
++    stats: &mi::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    writeln!(stdout, "mi")?;
++
++    let prefix = format!("{}{}", prefix, pref_child);
++    dump_value("mi_original", stats.mi_original(), &prefix, false, stdout)?;
++    dump_value("mi_sei", stats.mi_sei(), &prefix, false, stdout)?;
++    dump_value(
++        "mi_visual_studio",
++        stats.mi_visual_studio(),
++        &prefix,
++        true,
++        stdout,
++    )
++}
++
++fn dump_nargs(
++    stats: &fn_args::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let pref = if last { "`- " } else { "|- " };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    write!(stdout, "n_args: ")?;
++
++    color!(stdout, White);
++    writeln!(stdout, "{}", stats.n_args())
++}
++
++fn dump_nexits(
++    stats: &exit::Stats,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let pref = if last { "`- " } else { "|- " };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Green, true);
++    write!(stdout, "n_exits: ")?;
++
++    color!(stdout, White);
++    writeln!(stdout, "{}", stats.exit())
++}
++
++fn dump_value(
++    name: &str,
++    val: f64,
++    prefix: &str,
++    last: bool,
++    stdout: &mut StandardStreamLock,
++) -> std::io::Result<()> {
++    let pref = if last { "`- " } else { "|- " };
++
++    color!(stdout, Blue);
++    write!(stdout, "{}{}", prefix, pref)?;
++
++    color!(stdout, Magenta, true);
++    write!(stdout, "{}: ", name)?;
++
++    color!(stdout, White);
++    writeln!(stdout, "{}", val)
++}
+
+diff --git a/src/output/mod.rs b/src/output/mod.rs
+--- a/src/output/mod.rs
++++ b/src/output/mod.rs
+@@ -1,2 +1,7 @@
+ pub mod dump;
+ pub use dump::*;
++
++pub mod dump_formats;
++pub use dump_formats::*;
++
++pub mod dump_metrics;
+
+diff --git a/src/spaces.rs b/src/spaces.rs
+--- a/src/spaces.rs
++++ b/src/spaces.rs
+@@ -1,10 +1,6 @@
+-use regex::Regex;
+-use serde::ser::{SerializeStruct, Serializer};
+ use serde::Serialize;
+ use std::fmt;
+-use std::io::Write;
+ use std::path::PathBuf;
+-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, StandardStreamLock, WriteColor};
+ use tree_sitter::Node;
+ 
+ use crate::checker::Checker;
+@@ -16,10 +12,13 @@ use crate::halstead::{self, Halstead};
+ use crate::loc::{self, Loc};
+ use crate::mi::{self, Mi};
+ use crate::nom::{self, Nom};
+-use crate::tools::write_file;
++
++use crate::dump_formats::*;
++use crate::dump_metrics::*;
+ use crate::traits::*;
+ 
+-#[derive(Clone, Copy, Debug, PartialEq)]
++#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
++#[serde(rename_all = "lowercase")]
+ pub enum SpaceKind {
+     Unknown,
+     Function,
+@@ -47,32 +46,15 @@ impl fmt::Display for SpaceKind {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Serialize)]
+ pub struct CodeMetrics<'a> {
++    pub nargs: fn_args::Stats,
++    pub nexits: exit::Stats,
+     pub cyclomatic: cyclomatic::Stats,
+     pub halstead: halstead::Stats<'a>,
+     pub loc: loc::Stats,
+     pub nom: nom::Stats,
+     pub mi: mi::Stats,
+-    pub nargs: fn_args::Stats,
+-    pub nexits: exit::Stats,
+-}
+-
+-impl<'a> Serialize for CodeMetrics<'a> {
+-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+-    where
+-        S: Serializer,
+-    {
+-        let mut st = serializer.serialize_struct("metrics", 3)?;
+-        st.serialize_field("cyclomatic", &self.cyclomatic)?;
+-        st.serialize_field("halstead", &self.halstead)?;
+-        st.serialize_field("loc", &self.loc)?;
+-        st.serialize_field("nom", &self.nom)?;
+-        st.serialize_field("mi", &self.mi)?;
+-        st.serialize_field("nargs", &self.nargs)?;
+-        st.serialize_field("nexits", &self.nexits)?;
+-        st.end()
+-    }
+ }
+ 
+ impl<'a> Default for CodeMetrics<'a> {
+@@ -91,13 +73,13 @@ impl<'a> Default for CodeMetrics<'a> {
+ 
+ impl<'a> fmt::Display for CodeMetrics<'a> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        writeln!(f, "{}", self.nargs)?;
++        writeln!(f, "{}", self.nexits)?;
+         writeln!(f, "{}", self.cyclomatic)?;
+         writeln!(f, "{}", self.halstead)?;
+         writeln!(f, "{}", self.loc)?;
+         writeln!(f, "{}", self.nom)?;
+-        writeln!(f, "{}", self.mi)?;
+-        writeln!(f, "{}", self.nargs)?;
+-        write!(f, "{}", self.nexits)
++        write!(f, "{}", self.mi)
+     }
+ }
+ 
+@@ -113,30 +95,14 @@ impl<'a> CodeMetrics<'a> {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Serialize)]
+ pub struct FuncSpace<'a> {
+     pub name: Option<&'a str>,
+-    pub spaces: Vec<FuncSpace<'a>>,
+-    pub metrics: CodeMetrics<'a>,
+-    pub kind: SpaceKind,
+     pub start_line: usize,
+     pub end_line: usize,
+-}
+-
+-impl<'a> Serialize for FuncSpace<'a> {
+-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+-    where
+-        S: Serializer,
+-    {
+-        let mut st = serializer.serialize_struct("metrics", 5)?;
+-        st.serialize_field("name", self.name.map_or("", |name| name))?;
+-        st.serialize_field("start_line", &self.start_line)?;
+-        st.serialize_field("end_line", &self.end_line)?;
+-        st.serialize_field("metrics", &self.metrics)?;
+-        st.serialize_field("kind", &format!("{}", self.kind))?;
+-        st.serialize_field("spaces", &self.spaces)?;
+-        st.end()
+-    }
++    pub kind: SpaceKind,
++    pub spaces: Vec<FuncSpace<'a>>,
++    pub metrics: CodeMetrics<'a>,
+ }
+ 
+ impl<'a> FuncSpace<'a> {
+@@ -160,281 +126,6 @@ impl<'a> FuncSpace<'a> {
+             end_line: end_position,
+         }
+     }
+-
+-    fn dump_root(&self) -> std::io::Result<()> {
+-        let stdout = StandardStream::stdout(ColorChoice::Always);
+-        let mut stdout = stdout.lock();
+-        Self::dump_space(&self, "", true, &mut stdout)?;
+-        color!(stdout, White);
+-
+-        Ok(())
+-    }
+-
+-    fn dump_space(
+-        space: &FuncSpace,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Yellow, true);
+-        write!(stdout, "{}: ", space.kind)?;
+-
+-        color!(stdout, Cyan, true);
+-        write!(stdout, "{}", space.name.map_or("", |name| name))?;
+-
+-        color!(stdout, Red, true);
+-        writeln!(stdout, " (@{})", space.start_line)?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-        Self::dump_metrics(&space.metrics, &prefix, space.spaces.is_empty(), stdout)?;
+-
+-        if let Some((last, spaces)) = space.spaces.split_last() {
+-            for space in spaces {
+-                Self::dump_space(space, &prefix, false, stdout)?;
+-            }
+-            Self::dump_space(last, &prefix, true, stdout)?;
+-        }
+-
+-        Ok(())
+-    }
+-
+-    fn dump_metrics(
+-        metrics: &CodeMetrics,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Yellow, true);
+-        writeln!(stdout, "metrics")?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-        Self::dump_cyclomatic(&metrics.cyclomatic, &prefix, false, stdout)?;
+-        Self::dump_nargs(&metrics.nargs, &prefix, false, stdout)?;
+-        Self::dump_nexits(&metrics.nexits, &prefix, false, stdout)?;
+-        Self::dump_halstead(&metrics.halstead, &prefix, false, stdout)?;
+-        Self::dump_loc(&metrics.loc, &prefix, false, stdout)?;
+-        Self::dump_nom(&metrics.nom, &prefix, false, stdout)?;
+-        Self::dump_mi(&metrics.mi, &prefix, true, stdout)
+-    }
+-
+-    fn dump_cyclomatic(
+-        stats: &cyclomatic::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let pref = if last { "`- " } else { "|- " };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        write!(stdout, "cyclomatic: ")?;
+-
+-        color!(stdout, White);
+-        writeln!(stdout, "{}", stats.cyclomatic())
+-    }
+-
+-    fn dump_halstead(
+-        stats: &halstead::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        writeln!(stdout, "halstead")?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-
+-        Self::dump_value("n1", stats.u_operators(), &prefix, false, stdout)?;
+-        Self::dump_value("N1", stats.operators(), &prefix, false, stdout)?;
+-        Self::dump_value("n2", stats.u_operands(), &prefix, false, stdout)?;
+-        Self::dump_value("N2", stats.operands(), &prefix, false, stdout)?;
+-
+-        Self::dump_value("length", stats.length(), &prefix, false, stdout)?;
+-        Self::dump_value(
+-            "estimated program length",
+-            stats.estimated_program_length(),
+-            &prefix,
+-            false,
+-            stdout,
+-        )?;
+-        Self::dump_value("purity ratio", stats.purity_ratio(), &prefix, false, stdout)?;
+-        Self::dump_value("vocabulary", stats.vocabulary(), &prefix, false, stdout)?;
+-        Self::dump_value("volume", stats.volume(), &prefix, false, stdout)?;
+-        Self::dump_value("difficulty", stats.difficulty(), &prefix, false, stdout)?;
+-        Self::dump_value("level", stats.level(), &prefix, false, stdout)?;
+-        Self::dump_value("effort", stats.effort(), &prefix, false, stdout)?;
+-        Self::dump_value("time", stats.time(), &prefix, false, stdout)?;
+-        Self::dump_value("bugs", stats.bugs(), &prefix, true, stdout)
+-    }
+-
+-    fn dump_loc(
+-        stats: &loc::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        writeln!(stdout, "loc")?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-        Self::dump_value("sloc", stats.sloc(), &prefix, false, stdout)?;
+-        Self::dump_value("ploc", stats.ploc(), &prefix, false, stdout)?;
+-        Self::dump_value("lloc", stats.lloc(), &prefix, false, stdout)?;
+-        Self::dump_value("cloc", stats.cloc(), &prefix, false, stdout)?;
+-        Self::dump_value("blank", stats.blank(), &prefix, true, stdout)
+-    }
+-
+-    fn dump_nom(
+-        stats: &nom::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        writeln!(stdout, "nom")?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-        Self::dump_value("functions", stats.functions(), &prefix, false, stdout)?;
+-        Self::dump_value("closures", stats.closures(), &prefix, false, stdout)?;
+-        Self::dump_value("total", stats.total(), &prefix, true, stdout)
+-    }
+-
+-    fn dump_mi(
+-        stats: &mi::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let (pref_child, pref) = if last { ("   ", "`- ") } else { ("|  ", "|- ") };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        writeln!(stdout, "mi")?;
+-
+-        let prefix = format!("{}{}", prefix, pref_child);
+-        Self::dump_value("mi_original", stats.mi_original(), &prefix, false, stdout)?;
+-        Self::dump_value("mi_sei", stats.mi_sei(), &prefix, false, stdout)?;
+-        Self::dump_value(
+-            "mi_visual_studio",
+-            stats.mi_visual_studio(),
+-            &prefix,
+-            true,
+-            stdout,
+-        )
+-    }
+-
+-    fn dump_nargs(
+-        stats: &fn_args::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let pref = if last { "`- " } else { "|- " };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        write!(stdout, "n_args: ")?;
+-
+-        color!(stdout, White);
+-        writeln!(stdout, "{}", stats.n_args())
+-    }
+-
+-    fn dump_nexits(
+-        stats: &exit::Stats,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let pref = if last { "`- " } else { "|- " };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Green, true);
+-        write!(stdout, "n_exits: ")?;
+-
+-        color!(stdout, White);
+-        writeln!(stdout, "{}", stats.exit())
+-    }
+-
+-    fn dump_value(
+-        name: &str,
+-        val: f64,
+-        prefix: &str,
+-        last: bool,
+-        stdout: &mut StandardStreamLock,
+-    ) -> std::io::Result<()> {
+-        let pref = if last { "`- " } else { "|- " };
+-
+-        color!(stdout, Blue);
+-        write!(stdout, "{}{}", prefix, pref)?;
+-
+-        color!(stdout, Magenta, true);
+-        write!(stdout, "{}: ", name)?;
+-
+-        color!(stdout, White);
+-        writeln!(stdout, "{}", val)
+-    }
+-
+-    fn dump_json(
+-        &self,
+-        path: &PathBuf,
+-        output_path: &PathBuf,
+-        pretty: bool,
+-    ) -> std::io::Result<()> {
+-        let json_data = if pretty {
+-            serde_json::to_string_pretty(&self).unwrap()
+-        } else {
+-            serde_json::to_string(&self).unwrap()
+-        };
+-
+-        let mut file = path.as_path().file_name().unwrap().to_os_string();
+-        file.push(".json");
+-
+-        let mut json_path = output_path.clone();
+-        json_path.push(file);
+-
+-        if json_path.as_path().exists() {
+-            let mut new_filename = path.to_str().unwrap().to_string();
+-            let re = Regex::new(r"[\\:/]").unwrap();
+-            new_filename = re.replace_all(&new_filename, "_").to_string();
+-            new_filename.push_str(".json");
+-            json_path.pop();
+-            json_path.push(new_filename);
+-        }
+-        write_file(&json_path, json_data.as_bytes())
+-    }
+ }
+ 
+ fn finalize<'a>(space_stack: &mut Vec<FuncSpace<'a>>, diff_level: usize) {
+@@ -519,6 +210,7 @@ pub fn metrics<'a, T: TSParserTrait>(parser: &'a T, path: &'a PathBuf) -> Option
+ 
+ pub struct MetricsCfg {
+     pub path: PathBuf,
++    pub output_format: Option<Format>,
+     pub pretty: bool,
+     pub output_path: Option<PathBuf>,
+ }
+@@ -531,10 +223,16 @@ impl Callback for Metrics {
+ 
+     fn call<T: TSParserTrait>(cfg: Self::Cfg, parser: &T) -> Self::Res {
+         if let Some(space) = metrics(parser, &cfg.path) {
+-            if let Some(output_path) = cfg.output_path {
+-                space.dump_json(&cfg.path, &output_path, cfg.pretty)
++            if let Some(output_format) = cfg.output_format {
++                dump_formats(
++                    &space,
++                    &cfg.path,
++                    &cfg.output_path,
++                    output_format,
++                    cfg.pretty,
++                )
+             } else {
+-                space.dump_root()
++                dump_root(&space)
+             }
+         } else {
+             Ok(())
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+fn explore(
+mut paths: Vec<String>,
+cfg: &Arc<Config>,
+include: GlobSet,
+exclude: GlobSet,
+language: Option<LANG>,
+sender: &JobSender) -> HashMap<String, Vec<PathBuf>>
+
+fn act_on_file(language: Option<LANG>, path: PathBuf, cfg: &Config) -> std::io::Result<()>
+
+pub fn metrics<'a, T: TSParserTrait>(parser: &'a T, path: &'a PathBuf) -> Option<FuncSpace<'a>>
+</Signatures>
+
+You are a software tester at rust-code-analysis and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

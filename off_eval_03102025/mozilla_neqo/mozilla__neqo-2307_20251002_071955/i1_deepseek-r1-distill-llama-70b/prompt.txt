@@ -1,0 +1,204 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Potential Infinite loop in evict_to_internal function
+See [bug 1939690 comment 4](https://bugzilla.mozilla.org/show_bug.cgi?id=1939690#c4).
+
+I've asked the reporter to provide STR. It's still not clear how easy this can be triggered.
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-qpack/src/encoder.rs b/neqo-qpack/src/encoder.rs
+--- a/neqo-qpack/src/encoder.rs
++++ b/neqo-qpack/src/encoder.rs
+@@ -290,7 +290,7 @@ impl QPackEncoder {
+         stream_id: StreamId,
+     ) -> Res<()> {
+         if let Some(cap) = self.next_capacity {
+-            // Check if it is possible to reduce the capacity, e.g. if enough space can be make free
++            // Check if it is possible to reduce the capacity, e.g. if enough space can be made free
+             // for the reduction.
+             if cap < self.table.capacity() && !self.table.can_evict_to(cap) {
+                 return Err(Error::DynamicTableFull);
+
+diff --git a/neqo-qpack/src/table.rs b/neqo-qpack/src/table.rs
+--- a/neqo-qpack/src/table.rs
++++ b/neqo-qpack/src/table.rs
+@@ -73,7 +73,7 @@ pub struct HeaderTable {
+     /// The total number of inserts thus far.
+     base: u64,
+     /// This is number of inserts that are acked. this correspond to index of the first not acked.
+-    /// This is only used by thee encoder.
++    /// This is only used by the encoder.
+     acked_inserts_cnt: u64,
+ }
+ 
+@@ -112,9 +112,9 @@ impl HeaderTable {
+     ///
+     /// # Errors
+     ///
+-    /// `ChangeCapacity` if table capacity cannot be reduced.
+-    /// The table cannot be reduce if there are entries that are referred at the moment or their
+-    /// inserts are unacked.
++    /// [`Error::ChangeCapacity`] if table capacity cannot be reduced.
++    /// The table cannot be reduced if there are entries that are referred to at
++    /// the moment, or whose inserts are unacked.
+     pub fn set_capacity(&mut self, cap: u64) -> Res<()> {
+         qtrace!([self], "set capacity to {}", cap);
+         if !self.evict_to(cap) {
+@@ -253,20 +253,11 @@ impl HeaderTable {
+     }
+ 
+     fn evict_to(&mut self, reduce: u64) -> bool {
+-        self.evict_to_internal(reduce, false)
+-    }
+-
+-    pub fn can_evict_to(&mut self, reduce: u64) -> bool {
+-        self.evict_to_internal(reduce, true)
+-    }
+-
+-    pub fn evict_to_internal(&mut self, reduce: u64, only_check: bool) -> bool {
+         qtrace!(
+             [self],
+-            "reduce table to {}, currently used:{} only_check:{}",
++            "reduce table to {}, currently used:{}",
+             reduce,
+             self.used,
+-            only_check
+         );
+         let mut used = self.used;
+         while (!self.dynamic.is_empty()) && used > reduce {
+@@ -275,16 +266,26 @@ impl HeaderTable {
+                     return false;
+                 }
+                 used -= u64::try_from(e.size()).unwrap();
+-                if !only_check {
+-                    self.used -= u64::try_from(e.size()).unwrap();
+-                    self.dynamic.pop_back();
+-                }
++                self.used -= u64::try_from(e.size()).unwrap();
++                self.dynamic.pop_back();
+             }
+         }
+         true
+     }
+ 
+-    pub fn insert_possible(&mut self, size: usize) -> bool {
++    pub fn can_evict_to(&self, reduce: u64) -> bool {
++        let evictable_size: usize = self
++            .dynamic
++            .iter()
++            .rev()
++            .take_while(|e| e.can_reduce(self.acked_inserts_cnt))
++            .map(DynamicTableEntry::size)
++            .sum();
++
++        self.used - u64::try_from(evictable_size).unwrap() <= reduce
++    }
++
++    pub fn insert_possible(&self, size: usize) -> bool {
+         u64::try_from(size).unwrap() <= self.capacity
+             && self.can_evict_to(self.capacity - u64::try_from(size).unwrap())
+     }
+@@ -389,3 +390,54 @@ impl HeaderTable {
+         self.acked_inserts_cnt
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Due to a bug in [`HeaderTable::can_evict_to`], the function would
++    /// continuously subtract the size of the last entry instead of the size of
++    /// each entry starting from the back.
++    ///
++    /// See <https://github.com/mozilla/neqo/issues/2306> for details.
++    mod issue_2306 {
++        use super::*;
++
++        const VALUE: &[u8; 2] = b"42";
++
++        /// Given two entries where the first is smaller than the second,
++        /// subtracting the size of the second from the overall size twice leads
++        /// to an underflow.
++        #[test]
++        fn can_evict_to_no_underflow() {
++            let mut table = HeaderTable::new(true);
++            table.set_capacity(10000).unwrap();
++
++            table.insert(b"header1", VALUE).unwrap();
++            table.insert(b"larger-header1", VALUE).unwrap();
++
++            table.increment_acked(2).unwrap();
++
++            assert!(table.can_evict_to(0));
++        }
++
++        /// Given two entries where only the first is acked, continuously
++        /// subtracting the size of the last entry would give a false-positive
++        /// on whether both entries can be evicted.
++        #[test]
++        fn can_evict_to_false() {
++            let mut table = HeaderTable::new(true);
++            table.set_capacity(10000).unwrap();
++
++            table.insert(b"header1", VALUE).unwrap();
++            table.insert(b"header2", VALUE).unwrap();
++
++            table.increment_acked(1).unwrap();
++
++            let first_entry_size = table.get_dynamic_with_abs_index(0).unwrap().size() as u64;
++
++            assert!(table.can_evict_to(first_entry_size));
++            assert!(!table.can_evict_to(0));
++        }
++    }
++}
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

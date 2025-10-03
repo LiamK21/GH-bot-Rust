@@ -1,0 +1,63 @@
+#src/bin/cargo-grcov.rs
+#[cfg(test)]
+mod tests {
+use super::parse_args;
+use super::acts;
+use super::Context;
+use std::ffi::OsString;
+use tempfile::tempdir;
+use std::fs;
+
+#[test]
+fn test_cargo_grcov_command() {
+    let temp_dir = tempdir().expect("couldn't create temp dir");
+    let dir = temp_dir.path();
+    fs::write(
+        dir.join("Cargo.toml"),
+        r#"[package]
+        name="testy"
+        version="0.0.1"
+        "#,
+    )
+    .expect("write Cargo.toml");
+    let src_dir = dir.join("src");
+    fs::create_dir(&src_dir).expect("mkdir src");
+    fs::write(
+        src_dir.join("main.rs"),
+        r#"
+        fn main() {
+            println!("cover me");
+        }
+
+        #[test]
+        fn test() {
+            main();
+        }
+        "#,
+    )
+    .expect("write main.rs");
+
+    let args = vec![
+        OsString::from("cargo-grcov"),
+        OsString::from("cargo"),
+        OsString::from("report"),
+    ];
+    let context = Context {
+        pwd: temp_dir.path().to_path_buf(),
+        args,
+        env: std::collections::HashMap::new(),
+    };
+    let actions = parse_args(context).unwrap();
+    acts(&actions).unwrap();
+
+    assert!(std::fs::metadata(
+        temp_dir
+            .path()
+            .join("target")
+            .join("coverage-report")
+            .join("index.html")
+    )
+    .unwrap()
+    .is_file());
+}
+}

@@ -1,0 +1,35 @@
+#glean-core/rlb/src/private/custom_distribution.rs
+#[cfg(test)]
+mod tests {
+use glean_core::metrics::{DistributionData, MetricType};
+use glean_core::{CommonMetricData, ErrorType, Glean, HistogramType, Lifetime, Result};
+use super::CustomDistributionMetric;
+
+#[test]
+fn test_custom_distribution_metric() {
+  let meta = CommonMetricData {
+    name: "test_custom_distribution".to_string(),
+    lifetime: Lifetime::Application,
+    send_in_pings: vec!["testPing".to_string()],
+    ..Default::default()
+  };
+  let metric = CustomDistributionMetric::new(
+    meta.clone(),
+    0,
+    100,
+    10,
+    HistogramType::Custom,
+  );
+  let samples = vec![10, 20, 30];
+  metric.accumulate_samples_signed(samples.clone());
+  let result = metric.test_get_value(Some("testPing"));
+  let expected = Some(DistributionData {
+    values: samples,
+    range_min: 0,
+    range_max: 100,
+    bucket_count: 10,
+    histogram_type: HistogramType::Custom,
+  });
+  assert_eq!(result, expected);
+}
+}

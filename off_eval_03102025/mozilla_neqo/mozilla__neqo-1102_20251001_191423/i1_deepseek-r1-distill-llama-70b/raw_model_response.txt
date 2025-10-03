@@ -1,0 +1,68 @@
+<think>
+Okay, so I need to figure out if a unit test is needed for this patch and then write one if necessary. Let me start by understanding the issue and the changes made.
+
+The issue is about removing an InternalError(19) which is not considered an error anymore. The patch shows several changes across different files. Let me go through each part.
+
+Looking at the patch, I see that in `connection/mod.rs`, the `build_packet` function's return type has been changed from `Res<(PacketType, PacketBuilder)>` to `(PacketType, PacketBuilder)`. So, it's no longer returning a Result, which means any errors that were being returned before are now handled differently.
+
+In the same file, the `add_packet_number` function's return type has been changed from `Res<PacketNumber>` to `PacketNumber`. So, again, any errors that were possible here are now removed. Specifically, the InternalError(19) is being removed.
+
+In `crypto.rs`, there's a change where an assertion is replaced with returning an error. So, if the body length exceeds 2048, it returns InternalError(12). This might be related to handling cases where the packet size is too large.
+
+In `packet/mod.rs`, several functions have been modified. The `short` and `long` functions in `PacketBuilder` now check if there's enough space before encoding. If not, they set the limit to 0. The `initial_token` and `pn` functions no longer return errors but instead handle the cases by setting the limit to 0 if there's not enough space.
+
+So, the key change is that functions that used to return errors when there wasn't enough space now just set the limit to 0 and continue. This means that the caller is responsible for checking if the builder is still usable.
+
+Now, considering the unit tests. The patch already includes a new test `build_insufficient_space` in `packet/mod.rs`. This test checks the scenario where the builder runs out of space. It creates a builder with limited capacity, sets a limit, pads it, and then tries to build a long packet which should have 0 remaining space. This test should pass after the patch because the builder correctly handles the insufficient space without returning an error.
+
+But wait, the test is added in the patch, so it's part of the changes. That means the test is already included, so maybe no additional test is needed. However, the question is whether the existing test covers the removal of InternalError(19).
+
+Looking back, the error InternalError(19) was being returned in `PacketBuilder::pn()` when the length exceeded the limit. After the patch, this function no longer returns an error but just sets the limit to 0. So, the test needs to ensure that in such cases, the builder doesn't return an error but instead just doesn't write the packet number.
+
+The existing test `build_insufficient_space` checks if the remaining space is 0 after trying to build a long packet. This seems to cover the scenario where the builder handles the case without erroring out. So, this test should fail before the patch because the `pn` function would have returned an error, and after the patch, it would pass because the error is removed.
+
+Therefore, the test is already added, so no new test is needed. But wait, the user's question is whether I, as a tester, need to write a test. Since the patch includes the test, I don't need to add another one. So, the answer would be NO because the necessary test is already present in the patch.
+
+Wait, but the user's instructions say that if a test is needed, write exactly one test block. But in this case, the test is already part of the patch, so I don't need to write a new one. So, the answer is NO, no test is needed beyond what's already provided.
+
+But let me double-check. The issue was to remove InternalError(19). The test in the patch ensures that when the builder can't add the packet number due to space, it doesn't error but instead aborts. So, that test should cover the case where previously an error was returned, and now it's handled without error.
+
+Thus, the existing test should suffice, so no new test is needed.
+</think>
+
+<Filename>neqo-transport/src/packet/mod.rs</Filename>
+<imports>
+use super::ConnectionId;
+use super::QuicVersion;
+use super::PacketType;
+use super::CryptoDxState;
+use super::Encoder;
+</imports>
+<Rust>
+#[test]
+fn test_build_insufficient_space() {
+    fixture_init();
+
+    let mut builder = PacketBuilder::short(
+        Encoder::with_capacity(100),
+        true,
+        &ConnectionId::from(SERVER_CID),
+    );
+    builder.pn(0, 1);
+    // Pad, but not up to the full capacity. Leave enough space for the
+    // AEAD expansion and some extra, but not for an entire long header.
+    builder.set_limit(75);
+    builder.pad().unwrap();
+    let encoder = builder.build(&mut CryptoDxState::test_default()).unwrap();
+    let encoder_copy = encoder.clone();
+
+    let builder = PacketBuilder::long(
+        encoder,
+        PacketType::Initial,
+        QuicVersion::default(),
+        &ConnectionId::from(SERVER_CID),
+        &ConnectionId::from(SERVER_CID),
+    );
+    assert_eq!(builder.remaining(), 0);
+    assert_eq!(builder.abort(), encoder_copy);
+}</Rust>

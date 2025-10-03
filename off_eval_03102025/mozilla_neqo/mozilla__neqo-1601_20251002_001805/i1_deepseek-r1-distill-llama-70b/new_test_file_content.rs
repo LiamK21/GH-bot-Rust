@@ -1,0 +1,24 @@
+#neqo-transport/src/connection/dump.rs
+#[cfg(test)]
+mod tests {
+use log::Level;
+use log::set_max_level;
+
+#[test]
+fn test_dump_packet_logging() {
+    // Test case 1: log level is Info, dump_packet should not format
+    set_max_level(Level::Info);
+    let conn = &Connection::default();
+    let path = &PathRef::default();
+    let dir = "recv";
+    let pt = PacketType::Initial;
+    let pn = PacketNumber(1);
+    let payload = b"test_payload";
+
+    dump_packet(conn, path, dir, pt, pn, payload);
+
+    // Test case 2: log level is Debug, dump_packet should format
+    set_max_level(Level::Debug);
+    dump_packet(conn, path, dir, pt, pn, payload);
+}
+}
