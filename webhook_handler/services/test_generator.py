@@ -260,7 +260,7 @@ class TestGenerator:
                 "Cannot run test in post-PR codebase without old file content"
             )
 
-    def _determine_test_usability(self, filename: str, new_test: str, imports: list[str]) -> tuple[bool, float | None, float | None]:
+    def _determine_test_usability(self, filename: str, new_test: str, imports: list[str]) -> tuple[bool, float, float]:
         if not self._config.cloned_repo_dir:
             raise DataMissingError(
                 "cloned_repo_dir", "None", "Cloned repo dir should not be None"
@@ -293,16 +293,20 @@ class TestGenerator:
                 filename, new_file_content
             )
         augmented_line_coverage = self._docker_service.run_coverage_in_container(filename, golden_code_patch)
-        if not non_augmented_line_coverage or not augmented_line_coverage:
-            logger.error("Could not retrieve line coverage, marking test as non-usable")  # type: ignore[attr-defined]
-            return False, None, None
-        if augmented_line_coverage < non_augmented_line_coverage:
+        
+        if augmented_line_coverage is None:
+            logger.error("Could not retrieve line coverage, marking test as non-usable")
+            return False, 0.0, 0.0
+        
+        elif non_augmented_line_coverage is None:
+            logger.success("Generated test increases line coverage, marking as usable")  # type: ignore[attr-defined]
+            return True, 0.0, augmented_line_coverage
+        
+        elif augmented_line_coverage <= non_augmented_line_coverage:
             logger.warning("Generated test does not improve line coverage, marking as non-usable")  # type: ignore[attr-defined]
             return False, non_augmented_line_coverage, augmented_line_coverage
         else:
-            logger.success("Generated test improves line coverage, marking as usable")  # type: ignore[attr-defined]
             return True, non_augmented_line_coverage, augmented_line_coverage
-        
 
     def _handle_commenting(
         self, filename: str, line_coverage_before: float| None ,line_coverage_after: float | None

@@ -180,7 +180,7 @@ class DockerService:
             stdout: str = exec_result.output.decode()
             test_result: bool = exec_result.exit_code == 0
             if exec_result.exit_code == 124:
-                stdout = "errror[timeout]: Test execution exceeded the time limit of 300 seconds.\n" + stdout
+                stdout = "error[timeout]: Test execution exceeded the time limit of 300 seconds.\n" + stdout
             stdout = "Exit Code:" + str(exec_result.exit_code) + "\n" + stdout
             logger.info(f"[+] Test result: {test_result}")
             return test_result, stdout
@@ -329,20 +329,21 @@ class DockerService:
             self._add_file_and_apply_patch_in_container(
                 container, patch, True
             )
-            split_filename = filename.removeprefix("src/").removesuffix(".rs").split("/")
+            file_path_prefix, file_basename = "/".join(filename.split("/")[: -1]), filename.split("/")[-1].removesuffix(".rs")
+            path_to_file = "/app/testbed/" + file_path_prefix
 
             logger.marker("Running coverage generation...")  # type: ignore[attr-defined]
             coverage_generation_command: str = (
-            "/bin/sh -c 'cd /app/testbed && "
-            "timeout 1200s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
-            f"{"::".join(split_filename)}::tests '" 
+            f"/bin/sh -c 'cd {path_to_file} && "
+            "timeout 300s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
+            f"{file_basename}::tests '" 
             )
             exec_result = container.exec_run(coverage_generation_command, stdout=True, stderr=True)
             
             logger.marker("Retrieving line coverage...")  # type: ignore[attr-defined]
             coverage_retrieval_command: str = (
                 "/bin/sh -c 'cd /app/testbed && "
-                f"python3 /app/retrieve_line_coverage.py {"/".join(split_filename)}.rs'"
+                f"python3 /app/retrieve_line_coverage.py {filename}'"
             )
             exec_result = container.exec_run(coverage_retrieval_command, stdout=True, stderr=True)
             stdout = exec_result.output.decode()
