@@ -132,7 +132,7 @@ class TestGenerator:
             coverage_passed, line_coverage_before, line_coverage_after = self._determine_test_usability(filename, new_test, imports)
             if coverage_passed:
                 logger.marker("[*] Handling commenting on PR") # type: ignore[attr-defined]
-                self._handle_commenting(filename, line_coverage_before, line_coverage_after)
+                self._handle_commenting(filename, imports, line_coverage_before, line_coverage_after)
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             return True
         else:
@@ -309,12 +309,13 @@ class TestGenerator:
             return True, non_augmented_line_coverage, augmented_line_coverage
 
     def _handle_commenting(
-        self, filename: str, line_coverage_before: float| None ,line_coverage_after: float | None
+        self, filename: str, imports: list[str],  line_coverage_before: float, line_coverage_after: float
     ) -> None:
         assert self._generation_dir is not None
         comment = templates.COMMENT_TEMPLATE % (
             f"{line_coverage_before:.2f}%",
             f"{line_coverage_after:.2f}%",
+            "\n".join(imports),
             (self._generation_dir / "generated_test.txt").read_text(
                 encoding="utf-8"
             ),

@@ -5,6 +5,8 @@ COMMENT_TEMPLATE = """Hi! 🤖 The test below is automatically generated and cou
 
 ```rust
 %s
+
+%s
 ```
 
 If you find this regression test useful, feel free to insert it to your test suite.
