@@ -133,7 +133,12 @@ def _plot_horizontal_bar_chart(data: HorizontalBarChartData, plot_dir: Path):
         ax.set_yticks(y_pos, labels=labels)
         ax.set_yticklabels(labels)
         ax.invert_yaxis()  # labels read top-to-bottom
-        ax.title.set_text(f"Failure Types for {identifier}")
+        repo = ""
+        if identifier == "total":
+            repo = "All Repositories"
+        else:
+            repo = identifier.capitalize()
+        ax.title.set_text(f"Failure Types for {repo}")
         fig.savefig(
             fname=plot_dir / f"horizontal_bar_chart_{identifier}.png",
         )
