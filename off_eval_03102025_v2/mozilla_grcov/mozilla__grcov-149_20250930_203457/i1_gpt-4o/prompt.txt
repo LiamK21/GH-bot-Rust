@@ -1,0 +1,555 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Option to prepend a path prefix
+A command line argument to prepend a prefix to all file paths.
+
+This is useful for getting the full relative paths of the source files referenced in the JaCoCo XML reports.
+
+The JaCoCo XML reports only store the java package information, like `org/mozilla/gecko/browserid/DSACryptoImplementation.java`, but full paths are required: `mobile/android/app/src/test/java/org/mozilla/gecko/browserid/DSACryptoImplementation.java`.
+
+Any preference on the option name? `--add-prefix`?
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -19,7 +19,7 @@ use tempdir::TempDir;
+ use grcov::*;
+ 
+ fn print_usage(program: &str) {
+-    println!("Usage: {} DIRECTORY_OR_ZIP_FILE[...] [-t OUTPUT_TYPE] [-s SOURCE_ROOT] [-p PREFIX_PATH] [--token COVERALLS_REPO_TOKEN] [--commit-sha COVERALLS_COMMIT_SHA] [--keep-global-includes] [--ignore-not-existing] [--ignore-dir DIRECTORY] [--llvm] [--path-mapping PATH_MAPPING_FILE] [--branch] [--filter]", program);
++    println!("Usage: {} DIRECTORY_OR_ZIP_FILE[...] [-t OUTPUT_TYPE] [-s SOURCE_ROOT] [-p PREFIX_PATH] [--token COVERALLS_REPO_TOKEN] [--commit-sha COVERALLS_COMMIT_SHA] [--keep-global-includes] [--ignore-not-existing] [--ignore-dir DIRECTORY] [--llvm] [--path-mapping PATH_MAPPING_FILE] [--branch] [--filter] [--add-prefix ADDED_PREFIX_PATH]", program);
+     println!("You can specify one or more directories, separated by a space.");
+     println!("OUTPUT_TYPE can be one of:");
+     println!(" - (DEFAULT) ade for the ActiveData-ETL specific format;");
+@@ -28,6 +28,7 @@ fn print_usage(program: &str) {
+     println!(" - coveralls+ for the Coveralls specific format with function information.");
+     println!("SOURCE_ROOT is the root directory of the source files.");
+     println!("PREFIX_PATH is a prefix to remove from the paths (e.g. if grcov is run on a different machine than the one that generated the code coverage information).");
++    println!("ADDED_PREFIX_PATH is a prefix to add to the paths.");
+     println!("COVERALLS_REPO_TOKEN is the repository token from Coveralls, required for the 'coveralls' and 'coveralls+' format.");
+     println!(
+         "COVERALLS_COMMIT_SHA is the SHA of the commit used to generate the code coverage data."
+@@ -50,6 +51,7 @@ fn main() {
+     let mut output_type = "ade";
+     let mut source_dir = "";
+     let mut prefix_dir = "";
++    let mut added_prefix_dir = "";
+     let mut repo_token = "";
+     let mut commit_sha = "";
+     let mut service_name = "";
+@@ -93,6 +95,15 @@ fn main() {
+ 
+             prefix_dir = &args[i + 1];
+             i += 1;
++        } else if args[i] == "--add-prefix" {
++            if args.len() <= i + 1 {
++                eprintln!("[ERROR]: Added prefix path not specified.\n");
++                print_usage(&args[0]);
++                process::exit(1);
++            }
++
++            added_prefix_dir = &args[i + 1];
++            i += 1;
+         } else if args[i] == "--token" {
+             if args.len() <= i + 1 {
+                 eprintln!("[ERROR]: Repository token not specified.\n");
+@@ -248,6 +259,12 @@ fn main() {
+         Some(PathBuf::from(prefix_dir))
+     };
+ 
++    let added_prefix_dir = if added_prefix_dir == "" {
++        None
++    } else {
++        Some(PathBuf::from(added_prefix_dir))
++    };
++
+     let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+     let tmp_path = tmp_dir.path().to_owned();
+ 
+@@ -327,6 +344,7 @@ fn main() {
+         path_mapping,
+         source_root,
+         prefix_dir,
++        added_prefix_dir,
+         ignore_global,
+         ignore_not_existing,
+         to_ignore_dirs,
+
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -1,7 +1,7 @@
+ use globset::{Glob, GlobSetBuilder};
+ use serde_json::Value;
+ use std::fs;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ 
+ use defs::*;
+ use filter::*;
+@@ -21,6 +21,7 @@ pub fn rewrite_paths(
+     path_mapping: Option<Value>,
+     source_dir: Option<PathBuf>,
+     prefix_dir: Option<PathBuf>,
++    prepend_prefix_dir: Option<PathBuf>,
+     ignore_global: bool,
+     ignore_not_existing: bool,
+     to_ignore_dirs: Vec<String>,
+@@ -57,7 +58,13 @@ pub fn rewrite_paths(
+             path
+         };
+ 
+-        let path = PathBuf::from(path.replace("\\", "/"));
++        let path = if let Some(prepend_path) = &prepend_prefix_dir {
++            prepend_path.join(Path::new(&path))
++        } else {
++            PathBuf::from(path)
++        };
++
++        let path = PathBuf::from(path.to_str().unwrap().replace("\\", "/"));
+ 
+         // Get path from the mapping, or remove prefix from path.
+         let (rel_path, found_in_mapping) =
+@@ -190,7 +197,17 @@ mod tests {
+     fn test_rewrite_paths_basic() {
+         let mut result_map: CovResultMap = HashMap::new();
+         result_map.insert("main.cpp".to_string(), empty_result!());
+-        let results = rewrite_paths(result_map, None, None, None, false, false, Vec::new(), None);
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            None,
++            false,
++            false,
++            Vec::new(),
++            None,
++        );
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+@@ -207,7 +224,17 @@ mod tests {
+         let mut result_map: CovResultMap = HashMap::new();
+         result_map.insert("main.cpp".to_string(), empty_result!());
+         result_map.insert("/usr/include/prova.h".to_string(), empty_result!());
+-        let results = rewrite_paths(result_map, None, None, None, true, false, Vec::new(), None);
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            None,
++            true,
++            false,
++            Vec::new(),
++            None,
++        );
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+@@ -224,7 +251,17 @@ mod tests {
+         let mut result_map: CovResultMap = HashMap::new();
+         result_map.insert("main.cpp".to_string(), empty_result!());
+         result_map.insert("C:\\usr\\include\\prova.h".to_string(), empty_result!());
+-        let results = rewrite_paths(result_map, None, None, None, true, false, Vec::new(), None);
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            None,
++            true,
++            false,
++            Vec::new(),
++            None,
++        );
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+@@ -248,6 +285,7 @@ mod tests {
+             None,
+             None,
+             Some(PathBuf::from("/home/worker/src/workspace/")),
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -276,6 +314,7 @@ mod tests {
+             None,
+             None,
+             Some(PathBuf::from("C:\\Users\\worker\\src\\workspace\\")),
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -304,6 +343,7 @@ mod tests {
+             None,
+             None,
+             Some(PathBuf::from("C:/Users/worker/src/workspace/")),
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -332,6 +372,7 @@ mod tests {
+             None,
+             None,
+             Some(PathBuf::from("C:/Users/worker/src/")),
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -347,13 +388,87 @@ mod tests {
+         assert_eq!(count, 1);
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn test_rewrite_paths_add_prefix() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("org/example/Hello.java".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            Some(PathBuf::from("mobile/android/app/src/java")),
++            false,
++            false,
++            Vec::new(),
++            None,
++        );
++        let mut count = 0;
++        for (abs_path, rel_path, result) in results {
++            count += 1;
++            assert_eq!(
++                abs_path,
++                PathBuf::from("mobile/android/app/src/java/org/example/Hello.java")
++            );
++            assert_eq!(
++                rel_path,
++                PathBuf::from("mobile/android/app/src/java/org/example/Hello.java")
++            );
++            assert_eq!(result, empty_result!());
++        }
++        assert_eq!(count, 1);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn test_rewrite_paths_add_prefix_remove_prefix() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("org/example/Hello.java".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            Some(PathBuf::from("mobile/android")),
++            Some(PathBuf::from("mobile/android/app/src/java")),
++            false,
++            false,
++            Vec::new(),
++            None,
++        );
++        let mut count = 0;
++        for (abs_path, rel_path, result) in results {
++            count += 1;
++            assert_eq!(
++                abs_path,
++                PathBuf::from("app/src/java/org/example/Hello.java")
++            );
++            assert_eq!(
++                rel_path,
++                PathBuf::from("app/src/java/org/example/Hello.java")
++            );
++            assert_eq!(result, empty_result!());
++        }
++        assert_eq!(count, 1);
++    }
++
+     #[cfg(unix)]
+     #[test]
+     fn test_rewrite_paths_ignore_non_existing_files() {
+         let mut result_map: CovResultMap = HashMap::new();
+         result_map.insert("tests/class/main.cpp".to_string(), empty_result!());
+         result_map.insert("tests/class/doesntexist.cpp".to_string(), empty_result!());
+-        let results = rewrite_paths(result_map, None, None, None, false, true, Vec::new(), None);
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            None,
++            false,
++            true,
++            Vec::new(),
++            None,
++        );
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+@@ -371,7 +486,17 @@ mod tests {
+         let mut result_map: CovResultMap = HashMap::new();
+         result_map.insert("tests\\class\\main.cpp".to_string(), empty_result!());
+         result_map.insert("tests\\class\\doesntexist.cpp".to_string(), empty_result!());
+-        let results = rewrite_paths(result_map, None, None, None, false, true, Vec::new(), None);
++        let results = rewrite_paths(
++            result_map,
++            None,
++            None,
++            None,
++            None,
++            false,
++            true,
++            Vec::new(),
++            None,
++        );
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+@@ -394,6 +519,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             vec!["mydir/*".to_string()],
+@@ -420,6 +546,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             vec!["mydir/*".to_string()],
+@@ -447,6 +574,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             vec!["mydir/*".to_string(), "mydir2/*".to_string()],
+@@ -474,6 +602,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             vec!["mydir/*".to_string(), "mydir2/*".to_string()],
+@@ -499,6 +628,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -525,6 +655,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -551,6 +682,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -577,6 +709,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -606,6 +739,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             Some(PathBuf::from("/home/worker/src/workspace")),
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -636,6 +770,7 @@ mod tests {
+             None,
+             Some(fs::canonicalize("tests").unwrap()),
+             Some(PathBuf::from("C:\\Users\\worker\\src\\workspace")),
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -662,6 +797,7 @@ mod tests {
+             Some(json!({"class/main.cpp": "rewritten/main.cpp"})),
+             None,
+             None,
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -687,6 +823,7 @@ mod tests {
+             Some(json!({"class/main.cpp": "rewritten/main.cpp"})),
+             None,
+             None,
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -715,6 +852,7 @@ mod tests {
+             ),
+             None,
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -744,6 +882,7 @@ mod tests {
+             ),
+             None,
+             None,
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -773,6 +912,7 @@ mod tests {
+             Some(json!({"/home/worker/src/workspace/rewritten/main.cpp": "tests/class/main.cpp"})),
+             None,
+             Some(PathBuf::from("/home/worker/src/workspace")),
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -804,6 +944,7 @@ mod tests {
+                 json!({"C:/Users/worker/src/workspace/rewritten/main.cpp": "tests/class/main.cpp"}),
+             ),
+             None,
++            None,
+             Some(PathBuf::from("C:\\Users\\worker\\src\\workspace")),
+             false,
+             true,
+@@ -832,6 +973,7 @@ mod tests {
+                 json!({"c:/Users/worker/src/workspace/rewritten/main.cpp": "tests/class/main.cpp"}),
+             ),
+             None,
++            None,
+             Some(PathBuf::from("C:\\Users\\worker\\src\\workspace")),
+             false,
+             true,
+@@ -860,6 +1002,7 @@ mod tests {
+                 json!({"C:/Users/worker/src/workspace/rewritten/main.cpp": "tests/class/main.cpp"}),
+             ),
+             None,
++            None,
+             Some(PathBuf::from("c:\\Users\\worker\\src\\workspace")),
+             false,
+             true,
+@@ -888,6 +1031,7 @@ mod tests {
+                 json!({"c:/Users/worker/src/workspace/rewritten/main.cpp": "tests/class/main.cpp"}),
+             ),
+             None,
++            None,
+             Some(PathBuf::from("c:\\Users\\worker\\src\\workspace")),
+             false,
+             true,
+@@ -918,6 +1062,7 @@ mod tests {
+             Some(json!({"/home/worker/src/workspace/rewritten/main.cpp": "class/main.cpp"})),
+             Some(fs::canonicalize("tests").unwrap()),
+             Some(PathBuf::from("/home/worker/src/workspace")),
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -947,6 +1092,7 @@ mod tests {
+             Some(json!({"C:/Users/worker/src/workspace/rewritten/main.cpp": "class/main.cpp"})),
+             Some(fs::canonicalize("tests").unwrap()),
+             Some(PathBuf::from("C:\\Users\\worker\\src\\workspace")),
++            None,
+             false,
+             true,
+             Vec::new(),
+@@ -973,6 +1119,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             Vec::new(),
+@@ -998,6 +1145,7 @@ mod tests {
+             None,
+             None,
+             None,
++            None,
+             false,
+             false,
+             Vec::new(),
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+fn print_usage(program: &str) -> ()
+
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<PathBuf>,
+prefix_dir: Option<PathBuf>,
+prepend_prefix_dir: Option<PathBuf>,
+ignore_global: bool,
+ignore_not_existing: bool,
+to_ignore_dirs: Vec<String>,
+filter_option: Option<bool>) -> CovResultIter
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,44 @@
+#glean-core/src/coverage.rs
+#[cfg(test)]
+mod tests {
+use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+use super::record_coverage;
+
+#[test]
+fn test_record_coverage() {
+    let filename = "test_coverage_output.txt";
+    env::set_var("GLEAN_TEST_COVERAGE", filename);
+
+    // Initialize the coverage file
+    let _ = Lazy::new(|| {
+        if let Some(filename) = env::var_os("GLEAN_TEST_COVERAGE") {
+            match OpenOptions::new().append(true).create(true).open(&filename) {
+                Ok(file) => {
+                    return Some(Mutex::new(file));
+                }
+                Err(err) => {
+                    panic!("Couldn't open file for coverage results: {:?}", err);
+                }
+            }
+        }
+        None
+    });
+
+    // Record a metric
+    record_coverage("test_metric_id");
+
+    // Read the file and check the content
+    let mut file = File::open(filename).expect("Unable to open file");
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).expect("Unable to read file");
+
+    assert!(contents.contains("test_metric_id"));
+
+    // Clean up
+    std::fs::remove_file(filename).expect("Unable to delete test file");
+}
+}

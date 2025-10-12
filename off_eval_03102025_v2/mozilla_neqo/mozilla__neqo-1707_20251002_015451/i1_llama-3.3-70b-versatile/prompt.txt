@@ -1,0 +1,255 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Explore multi-packet I/O (aka. fast UDP I/O)
+### Summary
+
+Explore multi-packet at (a) the I/O layer (`sendmmsg`, `recvmmsg`, GSO, GRO) and (b) within the Neqo state machines.
+
+### Very early draft
+
+Have a fixed sized send and fixed sized receive buffer.
+
+``` rust
+write: [Box<[u8; MAX_MTU * MAX_GSO_SEGMENTS]>; MAX_SENDMMSG_BATCH_SIZE],
+read: [Box<[u8; MAX_MTU * MAX_GRO_SEGMENTS]>; MAX_RECVMMSG_BATCH_SIZE],
+```
+
+- can be used across multiple connections, e.g. one pair per process
+- would this be too much per Firefox tab?
+
+Have `fn process` take a set of input `Datagram`'s and a set of to-be-written-to output `Datagrams`.
+
+``` rust
+fn process<'a>(&mut self, input: impl Iterator<Item = &'a Datagram>, output: impl Iterator<Item = &'a mut Datagram>, now: Instant) -> Option<Duration>
+```
+
+- process datagrams in batches
+- `input` `Datagram`s are a view into the `read` buffer and `output` `Datagram`s are a view into the  `write` buffer thus **no allocation**
+- we can as well wrap the iterators in separate types, offering stricter access methods to prevent misuse
+
+Have `Socket::send` and `Socket::recv` take `write` and `read` buffer respectively.
+
+Have `Datagram` carry a `segment_size` (taken from `quinn-udp`).
+
+``` diff
+  #[derive(Clone, PartialEq, Eq)]
+  pub struct Datagram {
+      src: SocketAddr,
+      dst: SocketAddr,
+      tos: IpTos,
+      ttl: Option<u8>,
+      d: Vec<u8>,
++     /// The segment size if this transmission contains multiple datagrams.
++     /// This is `None` if the [`Datagram`] only contains a single datagram
++     segment_size: Option<usize>,
+  }
+```
+
+- a single `process` call can write one or more (same size) datagrams for a single destination into a _single_ `Datagram`
+
+### Next steps
+
+- [ ] Write benchmarks
+    - [x] https://github.com/mozilla/neqo/pull/1758
+    - [ ] More is always good
+- [ ] Expose `quinn-udp`s multi-packet APIs through `neqo_common::udp`
+    - [ ] https://github.com/mozilla/neqo/pull/1741
+- [ ] Pass multiple packets to and accept from `neqo-http3` / `neqo-transport` `process` method.
+    - [ ] changing the function signature and simply iterating over the datagrams like [`process_multiple_input`](https://github.com/mozilla/neqo/blob/aca1352b6bf93d8fe2cf0f627dc2fdf83a0bf95d/neqo-transport/src/connection/mod.rs#L984-L1000) is easy, taking actual advantage of accessing the whole batch at once is hard
+
+### Past discussions
+
+- https://github.com/mozilla/neqo/pull/1530/
+- Would close https://github.com/mozilla/neqo/issues/1206.
+
+
+
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-client/src/main.rs b/neqo-client/src/main.rs
+--- a/neqo-client/src/main.rs
++++ b/neqo-client/src/main.rs
+@@ -763,7 +763,7 @@ fn to_headers(values: &[impl AsRef<str>]) -> Vec<Header> {
+ 
+ struct ClientRunner<'a> {
+     local_addr: SocketAddr,
+-    socket: &'a udp::Socket,
++    socket: &'a mut udp::Socket,
+     client: Http3Client,
+     handler: Handler<'a>,
+     timeout: Option<Pin<Box<Sleep>>>,
+@@ -773,7 +773,7 @@ struct ClientRunner<'a> {
+ impl<'a> ClientRunner<'a> {
+     fn new(
+         args: &'a mut Args,
+-        socket: &'a udp::Socket,
++        socket: &'a mut udp::Socket,
+         local_addr: SocketAddr,
+         remote_addr: SocketAddr,
+         hostname: &str,
+@@ -998,7 +998,7 @@ async fn main() -> Res<()> {
+             SocketAddr::V6(..) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from([0; 16])), 0),
+         };
+ 
+-        let socket = udp::Socket::bind(local_addr)?;
++        let mut socket = udp::Socket::bind(local_addr)?;
+         let real_local = socket.local_addr().unwrap();
+         println!(
+             "{} Client connecting: {:?} -> {:?}",
+@@ -1022,7 +1022,7 @@ async fn main() -> Res<()> {
+             token = if args.use_old_http {
+                 old::ClientRunner::new(
+                     &args,
+-                    &socket,
++                    &mut socket,
+                     real_local,
+                     remote_addr,
+                     &hostname,
+@@ -1034,7 +1034,7 @@ async fn main() -> Res<()> {
+             } else {
+                 ClientRunner::new(
+                     &mut args,
+-                    &socket,
++                    &mut socket,
+                     real_local,
+                     remote_addr,
+                     &hostname,
+@@ -1249,7 +1249,7 @@ mod old {
+ 
+     pub struct ClientRunner<'a> {
+         local_addr: SocketAddr,
+-        socket: &'a udp::Socket,
++        socket: &'a mut udp::Socket,
+         client: Connection,
+         handler: HandlerOld<'a>,
+         timeout: Option<Pin<Box<Sleep>>>,
+@@ -1259,7 +1259,7 @@ mod old {
+     impl<'a> ClientRunner<'a> {
+         pub fn new(
+             args: &'a Args,
+-            socket: &'a udp::Socket,
++            socket: &'a mut udp::Socket,
+             local_addr: SocketAddr,
+             remote_addr: SocketAddr,
+             origin: &str,
+
+diff --git a/neqo-common/src/udp.rs b/neqo-common/src/udp.rs
+--- a/neqo-common/src/udp.rs
++++ b/neqo-common/src/udp.rs
+@@ -21,6 +21,7 @@ use crate::{Datagram, IpTos};
+ pub struct Socket {
+     socket: tokio::net::UdpSocket,
+     state: UdpSocketState,
++    recv_buf: Vec<u8>,
+ }
+ 
+ impl Socket {
+@@ -31,6 +32,7 @@ impl Socket {
+         Ok(Self {
+             state: quinn_udp::UdpSocketState::new((&socket).into())?,
+             socket: tokio::net::UdpSocket::from_std(socket)?,
++            recv_buf: vec![0; u16::MAX as usize],
+         })
+     }
+ 
+@@ -70,15 +72,13 @@ impl Socket {
+     }
+ 
+     /// Receive a UDP datagram on the specified socket.
+-    pub fn recv(&self, local_address: &SocketAddr) -> Result<Option<Datagram>, io::Error> {
+-        let mut buf = [0; u16::MAX as usize];
+-
++    pub fn recv(&mut self, local_address: &SocketAddr) -> Result<Option<Datagram>, io::Error> {
+         let mut meta = RecvMeta::default();
+ 
+         match self.socket.try_io(Interest::READABLE, || {
+             self.state.recv(
+                 (&self.socket).into(),
+-                &mut [IoSliceMut::new(&mut buf)],
++                &mut [IoSliceMut::new(&mut self.recv_buf)],
+                 slice::from_mut(&mut meta),
+             )
+         }) {
+@@ -101,8 +101,11 @@ impl Socket {
+             return Ok(None);
+         }
+ 
+-        if meta.len == buf.len() {
+-            eprintln!("Might have received more than {} bytes", buf.len());
++        if meta.len == self.recv_buf.len() {
++            eprintln!(
++                "Might have received more than {} bytes",
++                self.recv_buf.len()
++            );
+         }
+ 
+         Ok(Some(Datagram::new(
+@@ -110,7 +113,7 @@ impl Socket {
+             *local_address,
+             meta.ecn.map(|n| IpTos::from(n as u8)).unwrap_or_default(),
+             None, // TODO: get the real TTL https://github.com/quinn-rs/quinn/issues/1749
+-            &buf[..meta.len],
++            &self.recv_buf[..meta.len],
+         )))
+     }
+ }
+@@ -124,7 +127,7 @@ mod tests {
+     async fn datagram_tos() -> Result<(), io::Error> {
+         let sender = Socket::bind("127.0.0.1:0")?;
+         let receiver_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+-        let receiver = Socket::bind(receiver_addr)?;
++        let mut receiver = Socket::bind(receiver_addr)?;
+ 
+         let datagram = Datagram::new(
+             sender.local_addr()?,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn to_headers(values: &[impl AsRef<str>]) -> Vec<Header>
+
+fn main() -> Res<()>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

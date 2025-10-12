@@ -1,0 +1,489 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+ACK_FREQUENCY update
+This is changing, we should follow.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/ackrate.rs b/neqo-transport/src/ackrate.rs
+--- a/neqo-transport/src/ackrate.rs
++++ b/neqo-transport/src/ackrate.rs
+@@ -4,7 +4,14 @@
+ // option. This file may not be copied, modified, or distributed
+ // except according to those terms.
+ 
+-// Management of the peer's ack rate.
++//! Local node (i.e. data sender and ack receiver) managing the remote node's
++//! (i.e.  data receiver and ack sender) ack rate.
++//!
++//! Implementation of QUIC Acknowledgment Frequency draft 10.
++//!
++//! <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html>
++//!
++//! See [`crate::tracking::RecvdPackets`] for data receiver side.
+ 
+ use std::{cmp::max, time::Duration};
+ 
+@@ -47,7 +54,14 @@ impl AckRate {
+             seqno,
+             u64::try_from(self.packets + 1).unwrap(),
+             u64::try_from(self.delay.as_micros()).unwrap(),
+-            0,
++            // > If no ACK_FREQUENCY frames have been received, the data receiver
++            // > immediately acknowledges any subsequent packets that are received
++            // > out-of-order, as specified in Section 13.2 of [QUIC-TRANSPORT],
++            // > corresponding to a default value of 1. A value of 0 indicates
++            // > out-of-order packets do not elicit an immediate ACK.
++            //
++            // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
++            1,
+         ])
+     }
+ 
+@@ -134,6 +148,7 @@ impl FlexibleAckRate {
+     }
+ }
+ 
++// TODO: Rename to PeerAckFrequency
+ #[derive(Debug, Clone)]
+ pub enum PeerAckDelay {
+     Fixed(Duration),
+
+diff --git a/neqo-transport/src/connection/mod.rs b/neqo-transport/src/connection/mod.rs
+--- a/neqo-transport/src/connection/mod.rs
++++ b/neqo-transport/src/connection/mod.rs
+@@ -2896,6 +2896,13 @@ impl Connection {
+                 self.stats.borrow_mut().frame_rx.ping += 1;
+                 self.crypto.resend_unacked(space);
+                 // Send an ACK immediately if we might not otherwise do so.
++                //
++                // TODO: Ackording to ack frequency draft, only
++                // IMMEDIATE_ACK_FRAME will send immediate ack, not ping frame.
++                // Maybe do so anyways? Or only if peer did not advertise
++                // support via transport parameter?
++                //
++                // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-5>
+                 self.acks.immediate_ack(space, now);
+             }
+             Frame::Ack {
+@@ -3029,17 +3036,31 @@ impl Connection {
+             }
+             Frame::AckFrequency {
+                 seqno,
+-                tolerance,
++                ack_eliciting_threshold: tolerance,
+                 delay,
+-                ignore_order,
++                reordering_threshold,
+             } => {
+                 self.stats.borrow_mut().frame_rx.ack_frequency += 1;
++                // > The value of this field is in microseconds, unlike the
++                // > max_ack_delay transport parameter, which is in milliseconds.
++                //
++                // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
+                 let delay = Duration::from_micros(delay);
+                 if delay < GRANULARITY {
++                    // > A value smaller than the min_ack_delay advertised by
++                    // > the peer is also invalid. Receipt of an invalid value
++                    // > MUST be treated as a connection error of type
++                    // > PROTOCOL_VIOLATION.
++                    //
++                    // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
+                     return Err(Error::ProtocolViolation);
+                 }
+                 self.acks
+-                    .ack_freq(seqno, tolerance - 1, delay, ignore_order);
++                    .ack_freq(seqno, tolerance - 1, delay, reordering_threshold);
++            }
++            Frame::ImmediateAck {} => {
++                self.stats.borrow_mut().frame_rx.immediate_ack += 1;
++                self.acks.immediate_ack(space, now);
+             }
+             Frame::Datagram { data, .. } => {
+                 self.stats.borrow_mut().frame_rx.datagram += 1;
+
+diff --git a/neqo-transport/src/frame.rs b/neqo-transport/src/frame.rs
+--- a/neqo-transport/src/frame.rs
++++ b/neqo-transport/src/frame.rs
+@@ -48,8 +48,14 @@ pub const FRAME_TYPE_PATH_RESPONSE: FrameType = 0x1b;
+ pub const FRAME_TYPE_CONNECTION_CLOSE_TRANSPORT: FrameType = 0x1c;
+ pub const FRAME_TYPE_CONNECTION_CLOSE_APPLICATION: FrameType = 0x1d;
+ pub const FRAME_TYPE_HANDSHAKE_DONE: FrameType = 0x1e;
+-// draft-ietf-quic-ack-delay
++/// > A data sender signals the conditions under which it wants to receive ACK
++/// > frames using an ACK_FREQUENCY frame
++///
++/// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
+ pub const FRAME_TYPE_ACK_FREQUENCY: FrameType = 0xaf;
++// TODO: Use
++/// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
++pub const FRAME_IMMEDIATE_ACK: FrameType = 0x1f;
+ // draft-ietf-quic-datagram
+ pub const FRAME_TYPE_DATAGRAM: FrameType = 0x30;
+ pub const FRAME_TYPE_DATAGRAM_WITH_LEN: FrameType = 0x31;
+@@ -189,18 +195,30 @@ pub enum Frame<'a> {
+         reason_phrase: String,
+     },
+     HandshakeDone,
++    /// > A data sender signals the conditions under which it wants to receive
++    /// > ACK frames using an ACK_FREQUENCY frame
++    ///
++    /// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
+     AckFrequency {
+-        /// The current ACK frequency sequence number.
++        /// > the sequence number assigned to the ACK_FREQUENCY frame by the
++        /// > sender so receivers ignore obsolete frames.
+         seqno: u64,
+-        /// The number of contiguous packets that can be received without
+-        /// acknowledging immediately.
+-        tolerance: u64,
+-        /// The time to delay after receiving the first packet that is
+-        /// not immediately acknowledged.
++        /// > the maximum number of ack-eliciting packets the recipient of this
++        /// > frame receives before sending an acknowledgment.
++        ack_eliciting_threshold: u64,
++        /// > the value to which the data sender requests the data receiver
++        /// > update its max_ack_delay
+         delay: u64,
+-        /// Ignore reordering when deciding to immediately acknowledge.
+-        ignore_order: bool,
++        /// > the maximum packet reordering before eliciting an immediate ACK, as
++        /// > specified in Section 6.2. If no ACK_FREQUENCY frames have been
++        /// > received, the data receiver immediately acknowledges any subsequent
++        /// > packets that are received out-of-order, as specified in Section 13.2
++        /// > of [QUIC-TRANSPORT], corresponding to a default value of 1. A value
++        /// > of 0 indicates out-of-order packets do not elicit an immediate ACK.
++        reordering_threshold: u64,
+     },
++    /// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-5>
++    ImmediateAck,
+     Datagram {
+         data: &'a [u8],
+         fill: bool,
+@@ -255,6 +273,7 @@ impl<'a> Frame<'a> {
+             }
+             Self::HandshakeDone => FRAME_TYPE_HANDSHAKE_DONE,
+             Self::AckFrequency { .. } => FRAME_TYPE_ACK_FREQUENCY,
++            Self::ImmediateAck {} => FRAME_IMMEDIATE_ACK,
+             Self::Datagram { fill, .. } => {
+                 if *fill {
+                     FRAME_TYPE_DATAGRAM
+@@ -622,6 +641,7 @@ impl<'a> Frame<'a> {
+                 })
+             }
+             FRAME_TYPE_HANDSHAKE_DONE => Ok(Self::HandshakeDone),
++            // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
+             FRAME_TYPE_ACK_FREQUENCY => {
+                 let seqno = dv(dec)?;
+                 let tolerance = dv(dec)?;
+@@ -629,18 +649,16 @@ impl<'a> Frame<'a> {
+                     return Err(Error::FrameEncodingError);
+                 }
+                 let delay = dv(dec)?;
+-                let ignore_order = match d(dec.decode_uint::<u8>())? {
+-                    0 => false,
+-                    1 => true,
+-                    _ => return Err(Error::FrameEncodingError),
+-                };
++                let reordering_threshold = dv(dec)?;
+                 Ok(Self::AckFrequency {
+                     seqno,
+-                    tolerance,
++                    ack_eliciting_threshold: tolerance,
+                     delay,
+-                    ignore_order,
++                    reordering_threshold,
+                 })
+             }
++            // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-5>
++            FRAME_IMMEDIATE_ACK => Ok(Self::ImmediateAck {}),
+             FRAME_TYPE_DATAGRAM | FRAME_TYPE_DATAGRAM_WITH_LEN => {
+                 let fill = (t & DATAGRAM_FRAME_BIT_LEN) == 0;
+                 let data = if fill {
+@@ -981,9 +999,9 @@ mod tests {
+     fn ack_frequency() {
+         let f = Frame::AckFrequency {
+             seqno: 10,
+-            tolerance: 5,
++            ack_eliciting_threshold: 5,
+             delay: 2000,
+-            ignore_order: true,
++            reordering_threshold: 1,
+         };
+         just_dec(&f, "40af0a0547d001");
+     }
+
+diff --git a/neqo-transport/src/qlog.rs b/neqo-transport/src/qlog.rs
+--- a/neqo-transport/src/qlog.rs
++++ b/neqo-transport/src/qlog.rs
+@@ -582,7 +582,7 @@ impl From<Frame<'_>> for QuicFrame {
+                 trigger_frame_type: Some(frame_type),
+             },
+             Frame::HandshakeDone => Self::HandshakeDone,
+-            Frame::AckFrequency { .. } => Self::Unknown {
++            Frame::AckFrequency { .. } | Frame::ImmediateAck { .. } => Self::Unknown {
+                 frame_type_value: None,
+                 raw_frame_type: frame.get_type(),
+                 raw: None,
+
+diff --git a/neqo-transport/src/stats.rs b/neqo-transport/src/stats.rs
+--- a/neqo-transport/src/stats.rs
++++ b/neqo-transport/src/stats.rs
+@@ -53,6 +53,7 @@ pub struct FrameStats {
+     pub new_token: usize,
+ 
+     pub ack_frequency: usize,
++    pub immediate_ack: usize,
+     pub datagram: usize,
+ }
+ 
+@@ -92,7 +93,11 @@ impl Debug for FrameStats {
+             self.path_challenge,
+             self.path_response,
+         )?;
+-        writeln!(f, "    ack_frequency {}", self.ack_frequency)
++        writeln!(
++            f,
++            "    ack_frequency {}, immediate_ack {}",
++            self.ack_frequency, self.immediate_ack
++        )
+     }
+ }
+
+diff --git a/neqo-transport/src/tparams.rs b/neqo-transport/src/tparams.rs
+--- a/neqo-transport/src/tparams.rs
++++ b/neqo-transport/src/tparams.rs
+@@ -47,7 +47,17 @@ pub const INITIAL_SOURCE_CONNECTION_ID: TransportParameterId = 0x0f;
+ pub const RETRY_SOURCE_CONNECTION_ID: TransportParameterId = 0x10;
+ pub const VERSION_INFORMATION: TransportParameterId = 0x11;
+ pub const GREASE_QUIC_BIT: TransportParameterId = 0x2ab2;
+-pub const MIN_ACK_DELAY: TransportParameterId = 0xff02_de1a;
++/// QUIC Ack Frequency draft 10
++///
++/// > A variable-length integer representing the minimum amount of time, in
++/// > microseconds, that the endpoint sending this value is willing to delay an
++/// > acknowledgment. This limit could be based on the data receiver's clock or
++/// > timer granularity. min_ack_delay is used by the data sender to avoid
++/// > requesting too small a value in the Requested Max Ack Delay field of the
++/// > ACK_FREQUENCY frame.
++///
++/// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-3>
++pub const MIN_ACK_DELAY: TransportParameterId = 0xff04_de1b;
+ pub const MAX_DATAGRAM_FRAME_SIZE: TransportParameterId = 0x0020;
+ 
+ #[derive(Clone, Debug)]
+
+diff --git a/neqo-transport/src/tracking.rs b/neqo-transport/src/tracking.rs
+--- a/neqo-transport/src/tracking.rs
++++ b/neqo-transport/src/tracking.rs
+@@ -266,10 +266,11 @@ pub struct RecvdPackets {
+     unacknowledged_count: PacketNumber,
+     /// The number of contiguous packets that can be received without
+     /// acknowledging immediately.
+-    unacknowledged_tolerance: PacketNumber,
+-    /// Whether we are ignoring packets that arrive out of order
+-    /// for the purposes of generating immediate acknowledgment.
+-    ignore_order: bool,
++    ack_eliciting_threshold: PacketNumber,
++    /// > the maximum packet reordering before eliciting an immediate ACK
++    ///
++    /// <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
++    reordering_threshold: u64,
+     // The counts of different ECN marks that have been received.
+     ecn_count: ecn::Count,
+ }
+@@ -287,13 +288,19 @@ impl RecvdPackets {
+             ack_frequency_seqno: 0,
+             ack_delay: DEFAULT_ACK_DELAY,
+             unacknowledged_count: 0,
+-            unacknowledged_tolerance: if space == PacketNumberSpace::ApplicationData {
++            ack_eliciting_threshold: if space == PacketNumberSpace::ApplicationData {
+                 DEFAULT_ACK_PACKET_TOLERANCE
+             } else {
+                 // ACK more aggressively
+                 0
+             },
+-            ignore_order: false,
++            // > If no ACK_FREQUENCY frames have been received, the data receiver
++            // > immediately acknowledges any subsequent packets that are received
++            // > out-of-order, as specified in Section 13.2 of [QUIC-TRANSPORT],
++            // > corresponding to a default value of 1.
++            //
++            // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
++            reordering_threshold: 1,
+             ecn_count: ecn::Count::default(),
+         }
+     }
+@@ -312,18 +319,18 @@ impl RecvdPackets {
+     pub fn ack_freq(
+         &mut self,
+         seqno: u64,
+-        tolerance: PacketNumber,
++        ack_eliciting_threshold: PacketNumber,
+         delay: Duration,
+-        ignore_order: bool,
++        reordering_threshold: u64,
+     ) {
+         // Yes, this means that we will overwrite values if a sequence number is
+         // reused, but that is better than using an `Option<PacketNumber>`
+         // when it will always be `Some`.
+         if seqno >= self.ack_frequency_seqno {
+             self.ack_frequency_seqno = seqno;
+-            self.unacknowledged_tolerance = tolerance;
++            self.ack_eliciting_threshold = ack_eliciting_threshold;
+             self.ack_delay = delay;
+-            self.ignore_order = ignore_order;
++            self.reordering_threshold = reordering_threshold;
+         }
+     }
+ 
+@@ -378,6 +385,8 @@ impl RecvdPackets {
+         }
+     }
+ 
++    // TODO: Do we need to handle "long idle timeouts"? https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-6.1
++    //
+     /// Add the packet to the tracked set.
+     /// Return true if the packet was the largest received so far.
+     pub fn set_received(&mut self, now: Instant, pn: PacketNumber, ack_eliciting: bool) -> bool {
+@@ -399,8 +408,20 @@ impl RecvdPackets {
+             self.unacknowledged_count += 1;
+ 
+             let immediate_ack = self.space != PacketNumberSpace::ApplicationData
+-                || (pn != next_in_order_pn && !self.ignore_order)
+-                || self.unacknowledged_count > self.unacknowledged_tolerance;
++            // > If no ACK_FREQUENCY frames have been received, the data
++            // > receiver immediately acknowledges any subsequent packets that are
++            // > received out-of-order, as specified in Section 13.2 of
++            // > [QUIC-TRANSPORT], corresponding to a default value of 1. A value
++            // > of 0 indicates out-of-order packets do not elicit an immediate
++            // > ACK.
++            //
++            // <https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-4>
++            //
++            // TODO: Does not correspond to https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-10.html#section-6.2.1
++            // TODO: Re-ordering also applies to non-ack eliciting packets.
++            // TODO: Implement the tables as tests. The sending of 10 and 7 is tricky!
++                || (self.reordering_threshold != 0 && dbg!(pn).saturating_sub(dbg!(next_in_order_pn)) >= dbg!(self.reordering_threshold))
++                || self.unacknowledged_count > self.ack_eliciting_threshold;
+ 
+             let ack_time = if immediate_ack {
+                 now
+@@ -579,13 +600,13 @@ impl AckTracker {
+     pub fn ack_freq(
+         &mut self,
+         seqno: u64,
+-        tolerance: PacketNumber,
++        ack_eliciting_threshold: PacketNumber,
+         delay: Duration,
+-        ignore_order: bool,
++        reordering_threshold: u64,
+     ) {
+         // Only ApplicationData ever delays ACK.
+         if let Some(space) = self.get_mut(PacketNumberSpace::ApplicationData) {
+-            space.ack_freq(seqno, tolerance, delay, ignore_order);
++            space.ack_freq(seqno, ack_eliciting_threshold, delay, reordering_threshold);
+         }
+     }
+ 
+@@ -758,7 +779,7 @@ mod tests {
+         assert!(rp.ack_time().is_none());
+         assert!(!rp.ack_now(now(), RTT));
+ 
+-        rp.ack_freq(0, COUNT, DELAY, false);
++        rp.ack_freq(0, COUNT, DELAY, 1);
+ 
+         // Some packets won't cause an ACK to be needed.
+         for i in 0..COUNT {
+@@ -848,7 +869,7 @@ mod tests {
+         let mut rp = RecvdPackets::new(PacketNumberSpace::ApplicationData);
+ 
+         // Set tolerance to 2 and then it takes three packets.
+-        rp.ack_freq(0, 2, Duration::from_millis(10), true);
++        rp.ack_freq(0, 2, Duration::from_millis(10), 0);
+ 
+         rp.set_received(now(), 1, true);
+         assert_ne!(Some(now()), rp.ack_time());
+@@ -865,7 +886,7 @@ mod tests {
+         write_frame(&mut rp);
+ 
+         // Set tolerance to 2 and then it takes three packets.
+-        rp.ack_freq(0, 2, Duration::from_millis(10), true);
++        rp.ack_freq(0, 2, Duration::from_millis(10), 0);
+ 
+         rp.set_received(now(), 3, true);
+         assert_ne!(Some(now()), rp.ack_time());
+@@ -880,7 +901,7 @@ mod tests {
+     #[test]
+     fn non_ack_eliciting_skip() {
+         let mut rp = RecvdPackets::new(PacketNumberSpace::ApplicationData);
+-        rp.ack_freq(0, 1, Duration::from_millis(10), true);
++        rp.ack_freq(0, 1, Duration::from_millis(10), 0);
+ 
+         // This should be ignored.
+         rp.set_received(now(), 0, false);
+@@ -896,7 +917,7 @@ mod tests {
+     #[test]
+     fn non_ack_eliciting_reorder() {
+         let mut rp = RecvdPackets::new(PacketNumberSpace::ApplicationData);
+-        rp.ack_freq(0, 1, Duration::from_millis(10), false);
++        rp.ack_freq(0, 1, Duration::from_millis(10), 1);
+ 
+         // These are out of order, but they are not ack-eliciting.
+         rp.set_received(now(), 1, false);
+@@ -915,7 +936,7 @@ mod tests {
+     fn aggregate_ack_time() {
+         const DELAY: Duration = Duration::from_millis(17);
+         let mut tracker = AckTracker::default();
+-        tracker.ack_freq(0, 1, DELAY, false);
++        tracker.ack_freq(0, 1, DELAY, 1);
+         // This packet won't trigger an ACK.
+         tracker
+             .get_mut(PacketNumberSpace::Handshake)
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

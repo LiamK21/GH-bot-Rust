@@ -1,0 +1,646 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement idle timeout
+see -transport 10.2. 
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-client/src/main.rs b/neqo-client/src/main.rs
+--- a/neqo-client/src/main.rs
++++ b/neqo-client/src/main.rs
+@@ -7,7 +7,7 @@
+ #![deny(warnings)]
+ use neqo_common::{matches, Datagram};
+ use neqo_crypto::init;
+-use neqo_http3::{Header, Http3Connection, Http3Event, Http3State};
++use neqo_http3::{Header, Http3Connection, Http3Event, Http3State, Output};
+ use neqo_transport::Connection;
+ use std::collections::HashSet;
+ use std::io::{self, ErrorKind};
+@@ -146,32 +146,51 @@ fn process_loop(
+             return client.state();
+         }
+ 
+-        let exiting = !handler.handle(args, client);
++        let mut exiting = !handler.handle(args, client);
+ 
+-        let out_dgram = client.process_output(Instant::now());
+-        emit_datagram(&socket, out_dgram.dgram());
++        loop {
++            let output = client.process_output(Instant::now());
++            match output {
++                Output::Datagram(dgram) => emit_datagram(&socket, Some(dgram)),
++                Output::Callback(duration) => {
++                    socket.set_read_timeout(Some(duration)).unwrap();
++                    break;
++                }
++                Output::None => {
++                    // Not strictly necessary, since we're about to exit
++                    socket.set_read_timeout(None).unwrap();
++                    exiting = true;
++                    break;
++                }
++            }
++        }
+         client.process_http3(Instant::now());
+ 
+         if exiting {
+             return client.state();
+         }
+ 
+-        let sz = match socket.recv(&mut buf[..]) {
++        match socket.recv(&mut buf[..]) {
++            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
++                // timer expired
++                client.process_timer(Instant::now());
++            }
+             Err(err) => {
+                 eprintln!("UDP error: {}", err);
+                 exit(1)
+             }
+-            Ok(sz) => sz,
++            Ok(sz) => {
++                if sz == buf.len() {
++                    eprintln!("Received more than {} bytes", buf.len());
++                    continue;
++                }
++                if sz > 0 {
++                    let d = Datagram::new(*remote_addr, *local_addr, &buf[..sz]);
++                    client.process_input(d, Instant::now());
++                    client.process_http3(Instant::now());
++                }
++            }
+         };
+-        if sz == buf.len() {
+-            eprintln!("Received more than {} bytes", buf.len());
+-            continue;
+-        }
+-        if sz > 0 {
+-            let d = Datagram::new(*remote_addr, *local_addr, &buf[..sz]);
+-            client.process_input(d, Instant::now());
+-            client.process_http3(Instant::now());
+-        }
+     }
+ }
+ 
+@@ -263,18 +282,21 @@ fn client(args: Args, socket: UdpSocket, local_addr: SocketAddr, remote_addr: So
+         &args,
+     );
+ 
+-    let client_stream_id = client
+-        .fetch(
+-            &args.method,
+-            &args.url.scheme(),
+-            &args.url.host_str().unwrap(),
+-            &args.url.path(),
+-            &args.headers.h,
+-        )
+-        .unwrap();
++    let client_stream_id = client.fetch(
++        &args.method,
++        &args.url.scheme(),
++        &args.url.host_str().unwrap(),
++        &args.url.path(),
++        &args.headers.h,
++    );
++
++    if let Err(err) = client_stream_id {
++        eprintln!("Could not connect: {:?}", err);
++        return;
++    }
+ 
+     let mut h2 = PostConnectHandler::default();
+-    h2.streams.insert(client_stream_id);
++    h2.streams.insert(client_stream_id.unwrap());
+     process_loop(
+         &local_addr,
+         &remote_addr,
+
+diff --git a/neqo-http3-server/src/main.rs b/neqo-http3-server/src/main.rs
+--- a/neqo-http3-server/src/main.rs
++++ b/neqo-http3-server/src/main.rs
+@@ -231,8 +231,13 @@ fn main() -> Result<(), io::Error> {
+                 )
+             });
+ 
+-            for dgram in dgrams {
+-                server.process_input(dgram, Instant::now());
++            if dgrams.is_empty() {
++                // timer expired
++                server.process_timer(Instant::now())
++            } else {
++                for dgram in dgrams {
++                    server.process_input(dgram, Instant::now());
++                }
+             }
+             if let Http3State::Closed(e) = server.state() {
+                 println!("Closed connection from {:?}: {:?}", remote_addr, e);
+
+diff --git a/neqo-http3/src/connection.rs b/neqo-http3/src/connection.rs
+--- a/neqo-http3/src/connection.rs
++++ b/neqo-http3/src/connection.rs
+@@ -313,6 +313,11 @@ impl Http3Connection {
+         self.conn.process_input(dgram, now);
+     }
+ 
++    pub fn process_timer(&mut self, now: Instant) {
++        qdebug!([self] "Process timer.");
++        self.conn.process_timer(now);
++    }
++
+     pub fn conn(&mut self) -> &mut Connection {
+         &mut self.conn
+     }
+
+diff --git a/neqo-http3/src/lib.rs b/neqo-http3/src/lib.rs
+--- a/neqo-http3/src/lib.rs
++++ b/neqo-http3/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod transaction_server;
+ 
+ use neqo_qpack;
+ use neqo_transport;
++pub use neqo_transport::Output;
+ 
+ use self::hframe::HFrameType;
+
+diff --git a/neqo-transport/src/connection.rs b/neqo-transport/src/connection.rs
+--- a/neqo-transport/src/connection.rs
++++ b/neqo-transport/src/connection.rs
+@@ -10,12 +10,15 @@
+ use std::cell::RefCell;
+ use std::cmp::{max, min, Ordering};
+ use std::collections::HashMap;
++use std::convert::TryInto;
+ use std::fmt::{self, Debug};
+ use std::mem;
+ use std::net::SocketAddr;
+ use std::rc::Rc;
+ use std::time::{Duration, Instant};
+ 
++use smallvec::SmallVec;
++
+ use neqo_common::{hex, matches, qdebug, qerror, qinfo, qtrace, qwarn, Datagram, Decoder, Encoder};
+ use neqo_crypto::agent::CertificateInfo;
+ use neqo_crypto::{
+@@ -52,6 +55,7 @@ const CID_LENGTH: usize = 8;
+ pub const LOCAL_STREAM_LIMIT_BIDI: u64 = 16;
+ pub const LOCAL_STREAM_LIMIT_UNI: u64 = 16;
+ const LOCAL_MAX_DATA: u64 = 0x3FFF_FFFF_FFFF_FFFE; // 2^62-1
++const LOCAL_IDLE_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
+ 
+ #[derive(Debug, PartialEq, Copy, Clone)]
+ /// Client or Server.
+@@ -177,6 +181,53 @@ impl Output {
+     }
+ }
+ 
++#[derive(Debug, Clone)]
++/// There's a little bit of different behavior for resetting idle timeout. See
++/// -transport 10.2 ("Idle Timeout").
++enum IdleTimeout {
++    Init,
++    PacketReceived(Instant),
++    AckElicitingPacketSent(Instant),
++}
++
++impl Default for IdleTimeout {
++    fn default() -> Self {
++        IdleTimeout::Init
++    }
++}
++
++impl IdleTimeout {
++    pub fn as_instant(&self) -> Option<Instant> {
++        match self {
++            IdleTimeout::Init => None,
++            IdleTimeout::PacketReceived(t) | IdleTimeout::AckElicitingPacketSent(t) => Some(*t),
++        }
++    }
++
++    fn on_packet_sent(&mut self, now: Instant) {
++        // Only reset idle timeout if we've received a packet since the last
++        // time we reset the timeout here.
++        match self {
++            IdleTimeout::AckElicitingPacketSent(_) => {}
++            IdleTimeout::Init | IdleTimeout::PacketReceived(_) => {
++                *self = IdleTimeout::AckElicitingPacketSent(now + LOCAL_IDLE_TIMEOUT);
++            }
++        }
++    }
++
++    fn on_packet_received(&mut self, now: Instant) {
++        *self = IdleTimeout::PacketReceived(now + LOCAL_IDLE_TIMEOUT);
++    }
++
++    pub fn expired(&self, now: Instant) -> bool {
++        if let Some(timeout) = self.as_instant() {
++            now >= timeout
++        } else {
++            false
++        }
++    }
++}
++
+ /// A QUIC Connection
+ ///
+ /// First, create a new connection using `new_client()` or `new_server()`.
+@@ -208,7 +259,7 @@ pub struct Connection {
+     retry_token: Option<Vec<u8>>,
+     pub(crate) crypto: Crypto,
+     pub(crate) acks: AckTracker,
+-    idle_timeout: Option<Instant>, // TODO(#38)
++    idle_timeout: IdleTimeout,
+     pub(crate) indexes: StreamIndexes,
+     connection_ids: HashMap<u64, (Vec<u8>, [u8; 16])>, // (sequence number, (connection id, reset token))
+     pub(crate) send_streams: SendStreams,
+@@ -286,6 +337,10 @@ impl Connection {
+         tps.set_integer(tp_const::INITIAL_MAX_STREAMS_BIDI, LOCAL_STREAM_LIMIT_BIDI);
+         tps.set_integer(tp_const::INITIAL_MAX_STREAMS_UNI, LOCAL_STREAM_LIMIT_UNI);
+         tps.set_integer(tp_const::INITIAL_MAX_DATA, LOCAL_MAX_DATA);
++        tps.set_integer(
++            tp_const::IDLE_TIMEOUT,
++            LOCAL_IDLE_TIMEOUT.as_millis().try_into().unwrap(),
++        );
+         tps.set_empty(tp_const::DISABLE_MIGRATION);
+     }
+ 
+@@ -315,7 +370,7 @@ impl Connection {
+             retry_token: None,
+             crypto,
+             acks: AckTracker::default(),
+-            idle_timeout: None,
++            idle_timeout: IdleTimeout::default(),
+             indexes: StreamIndexes::new(),
+             connection_ids: HashMap::new(),
+             send_streams: SendStreams::default(),
+@@ -478,6 +533,25 @@ impl Connection {
+         let _ = self.capture_error(now, 0, res);
+     }
+ 
++    pub fn process_timer(&mut self, now: Instant) {
++        if let State::Closing { error, .. } = self.state().clone() {
++            self.set_state(State::Closed(error));
++            return;
++        }
++
++        if self.idle_timeout.expired(now) {
++            qinfo!("idle timeout expired");
++            self.set_state(State::Closing {
++                error: ConnectionError::Transport(Error::IdleTimeout),
++                frame_type: 0,
++                msg: "Idle timeout".into(),
++                timeout: self.get_closing_period_time(now),
++            });
++        }
++
++        self.check_loss_detection_timeout(now);
++    }
++
+     /// Call in to process activity on the connection. Either new packets have
+     /// arrived or a timeout has expired (or both).
+     pub fn process_input(&mut self, dgram: Datagram, now: Instant) {
+@@ -488,18 +562,30 @@ impl Connection {
+     }
+ 
+     /// Get the time that we next need to be called back, relative to `now`.
+-    fn next_delay(&mut self, now: Instant) -> Option<Duration> {
++    fn next_delay(&mut self, now: Instant) -> Duration {
+         self.loss_recovery_state = self.loss_recovery.get_timer(&self.state);
+ 
+-        let time = match (self.loss_recovery_state.callback_time, self.acks.ack_time()) {
+-            (Some(t_lr), Some(t_ack)) => Some(min(t_lr, t_ack)),
+-            (Some(t), _) | (_, Some(t)) => Some(t),
+-            _ => None,
+-        };
++        let mut delays = SmallVec::<[_; 4]>::new();
++
++        if let Some(lr_time) = self.loss_recovery_state.callback_time() {
++            delays.push(lr_time);
++        }
++
++        if let Some(ack_time) = self.acks.ack_time() {
++            delays.push(ack_time);
++        }
++
++        if let Some(idle_time) = self.idle_timeout.as_instant() {
++            delays.push(idle_time);
++        }
++
++        // Should always at least have idle timeout, once connected
++        assert!(!delays.is_empty());
++        let earliest = delays.into_iter().min().unwrap();
+ 
+         // TODO(agrover, mt) - need to analyze and fix #47
+         // rather than just clamping to zero here.
+-        time.map(|t| max(now, t).duration_since(now))
++        max(now, earliest).duration_since(now)
+     }
+ 
+     /// Get output packets, as a result of receiving packets, or actions taken
+@@ -531,18 +617,16 @@ impl Connection {
+             Some(pkt) => Output::Datagram(pkt),
+             None => match self.state {
+                 State::Closed(_) => Output::None,
+-                _ => match self.next_delay(now) {
+-                    Some(delay) => Output::Callback(delay),
+-                    None => Output::None,
+-                },
++                State::Closing { timeout, .. } => Output::Callback(timeout - now),
++                _ => Output::Callback(self.next_delay(now)),
+             },
+         }
+     }
+ 
+     /// Process input and generate output.
+     pub fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output {
+-        if let Some(d) = dgram {
+-            self.process_input(d, now);
++        if let Some(dgram) = dgram {
++            self.process_input(dgram, now);
+         }
+         self.process_output(now)
+     }
+@@ -682,6 +766,7 @@ impl Connection {
+             // crypto state if this fails? Otherwise, we will get a panic
+             // on the assert for doesn't exist.
+             // OK, we have a valid packet.
++            self.idle_timeout.on_packet_received(now);
+ 
+             // TODO(ekr@rtfm.com): Filter for valid for this epoch.
+ 
+@@ -929,6 +1014,10 @@ impl Connection {
+                 epoch,
+             );
+             self.stats.packets_tx += 1;
++
++            if ack_eliciting {
++                self.idle_timeout.on_packet_sent(now);
++            }
+             self.loss_recovery
+                 .on_packet_sent(space, hdr.pn, ack_eliciting, tokens, now);
+ 
+@@ -1628,18 +1717,18 @@ impl Connection {
+     fn check_loss_detection_timeout(&mut self, now: Instant) {
+         qdebug!([self] "check_loss_timeouts");
+ 
+-        if matches!(self.loss_recovery_state.mode, LossRecoveryMode::None) {
++        if matches!(self.loss_recovery_state.mode(), LossRecoveryMode::None) {
+             // LR not the active timer
+             return;
+         }
+ 
+-        if self.loss_recovery_state.callback_time > Some(now) {
++        if self.loss_recovery_state.callback_time() > Some(now) {
+             // LR timer, but hasn't expired.
+             return;
+         }
+ 
+         // Timer expired and LR was active timer.
+-        match &mut self.loss_recovery_state.mode {
++        match &mut self.loss_recovery_state.mode() {
+             LossRecoveryMode::None => unreachable!(),
+             LossRecoveryMode::LostPackets => {
+                 // Time threshold loss detection
+@@ -2012,6 +2101,7 @@ mod tests {
+             datagram = d.dgram();
+             mem::swap(&mut a, &mut b);
+         }
++        a.process(datagram, now());
+     }
+ 
+     fn connect(client: &mut Connection, server: &mut Connection) {
+@@ -2337,4 +2427,116 @@ mod tests {
+         let stream_readable = |e| matches!(e, ConnectionEvent::RecvStreamReadable {..});
+         assert!(client.events().any(stream_readable));
+     }
++
++    #[test]
++    fn idle_timeout() {
++        let mut client = default_client();
++        let mut server = default_server();
++        connect(&mut client, &mut server);
++
++        let now = now();
++
++        let res = client.process(None, now);
++        assert_eq!(res, Output::Callback(Duration::from_secs(60)));
++
++        // Still connected after 59 seconds. Idle timer not reset
++        client.process(None, now + Duration::from_secs(59));
++        assert!(matches!(client.state(), State::Connected));
++
++        client.process_timer(now + Duration::from_secs(60));
++
++        // Not connected after 60 seconds.
++        assert!(matches!(client.state(), State::Closing{..}));
++    }
++
++    #[test]
++    fn idle_send_packet1() {
++        let mut client = default_client();
++        let mut server = default_server();
++        connect(&mut client, &mut server);
++
++        let now = now();
++
++        let res = client.process(None, now);
++        assert_eq!(res, Output::Callback(Duration::from_secs(60)));
++
++        assert_eq!(client.stream_create(StreamType::UniDi).unwrap(), 2);
++        assert_eq!(client.stream_send(2, b"hello").unwrap(), 5);;
++
++        let out = client.process(None, now + Duration::from_secs(10));
++        let out = server.process(out.dgram(), now + Duration::from_secs(10));
++
++        // Still connected after 69 seconds because idle timer reset by outgoing
++        // packet
++        client.process(out.dgram(), now + Duration::from_secs(69));
++        assert!(matches!(client.state(), State::Connected));
++
++        // Not connected after 70 seconds.
++        client.process_timer(now + Duration::from_secs(70));
++        assert!(matches!(client.state(), State::Closing{..}));
++    }
++
++    #[test]
++    fn idle_send_packet2() {
++        let mut client = default_client();
++        let mut server = default_server();
++        connect(&mut client, &mut server);
++
++        let now = now();
++
++        let res = client.process(None, now);
++        assert_eq!(res, Output::Callback(Duration::from_secs(60)));
++
++        assert_eq!(client.stream_create(StreamType::UniDi).unwrap(), 2);
++        assert_eq!(client.stream_send(2, b"hello").unwrap(), 5);;
++
++        let _out = client.process(None, now + Duration::from_secs(10));
++
++        assert_eq!(client.stream_send(2, b"there").unwrap(), 5);;
++        let _out = client.process(None, now + Duration::from_secs(20));
++
++        // Still connected after 69 seconds.
++        client.process(None, now + Duration::from_secs(69));
++        assert!(matches!(client.state(), State::Connected));
++
++        // Not connected after 70 seconds because timer not reset by second
++        // outgoing packet
++        client.process_timer(now + Duration::from_secs(70));
++        assert!(matches!(client.state(), State::Closing{..}));
++    }
++
++    #[test]
++    fn idle_recv_packet() {
++        let mut client = default_client();
++        let mut server = default_server();
++        connect(&mut client, &mut server);
++
++        let now = now();
++
++        let res = client.process(None, now);
++        assert_eq!(res, Output::Callback(Duration::from_secs(60)));
++
++        assert_eq!(client.stream_create(StreamType::BiDi).unwrap(), 0);
++        assert_eq!(client.stream_send(0, b"hello").unwrap(), 5);
++
++        // Respond with another packet
++        let out = client.process(None, now + Duration::from_secs(10));
++        server.process_input(out.dgram().unwrap(), now + Duration::from_secs(10));
++        assert_eq!(server.stream_send(0, b"world").unwrap(), 5);
++        let out = server.process_output(now + Duration::from_secs(10));
++        assert_ne!(out.as_dgram_ref(), None);
++
++        // Still connected after 79 seconds because idle timer reset by received
++        // packet
++        client.process(out.dgram(), now + Duration::from_secs(20));
++        assert!(matches!(client.state(), State::Connected));
++
++        // Still connected after 79 seconds.
++        client.process_timer(now + Duration::from_secs(79));
++        assert!(matches!(client.state(), State::Connected));
++
++        // Not connected after 80 seconds.
++        client.process_timer(now + Duration::from_secs(80));
++        assert!(matches!(client.state(), State::Closing{..}));
++    }
+ }
+
+diff --git a/neqo-transport/src/lib.rs b/neqo-transport/src/lib.rs
+--- a/neqo-transport/src/lib.rs
++++ b/neqo-transport/src/lib.rs
+@@ -66,6 +66,7 @@ pub enum Error {
+     InvalidResumptionToken,
+     WrongRole,
+     InvalidInput,
++    IdleTimeout,
+     PeerError(TransportError),
+ }
+ 
+@@ -102,7 +103,8 @@ impl Error {
+             | Error::VersionNegotiation
+             | Error::WrongRole
+             | Error::InvalidResumptionToken
+-            | Error::InvalidInput => 1,
++            | Error::InvalidInput
++            | Error::IdleTimeout => 1,
+         }
+     }
+ }
+
+diff --git a/neqo-transport/src/recovery.rs b/neqo-transport/src/recovery.rs
+--- a/neqo-transport/src/recovery.rs
++++ b/neqo-transport/src/recovery.rs
+@@ -95,8 +95,8 @@ impl RttVals {
+ 
+ #[derive(Debug)]
+ pub(crate) struct LossRecoveryState {
+-    pub(crate) mode: LossRecoveryMode,
+-    pub(crate) callback_time: Option<Instant>,
++    mode: LossRecoveryMode,
++    callback_time: Option<Instant>,
+ }
+ 
+ impl LossRecoveryState {
+@@ -106,6 +106,14 @@ impl LossRecoveryState {
+             callback_time,
+         }
+     }
++
++    pub fn callback_time(&self) -> Option<Instant> {
++        self.callback_time
++    }
++
++    pub fn mode(&self) -> LossRecoveryMode {
++        self.mode
++    }
+ }
+ 
+ impl Default for LossRecoveryState {
+@@ -117,7 +125,7 @@ impl Default for LossRecoveryState {
+     }
+ }
+ 
+-#[derive(Debug, PartialEq)]
++#[derive(Debug, PartialEq, Clone, Copy)]
+ pub(crate) enum LossRecoveryMode {
+     None,
+     LostPackets,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn client(args: Args, socket: UdpSocket, local_addr: SocketAddr, remote_addr: SocketAddr) -> ()
+
+fn process_loop(
+local_addr: &SocketAddr,
+remote_addr: &SocketAddr,
+socket: &UdpSocket,
+client: &mut Http3Connection,
+handler: &mut Handler,
+args: &Args) -> neqo_http3::connection::Http3State
+
+fn main() -> Result<(), io::Error>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

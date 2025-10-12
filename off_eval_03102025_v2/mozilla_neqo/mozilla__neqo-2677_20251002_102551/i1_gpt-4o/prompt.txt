@@ -1,0 +1,892 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Make an encoder that does not require ownership of the underlying buffer
+See [neqo-transport/src/tparams.rs:690](https://github.com/mozilla/neqo/blob/165fff6c11f1c863ec0b2ae978dd572f65155383/neqo-transport/src/tparams.rs#L690):
+
+```rust
+    // TODO: Modify to avoid a copy.
+    let mut enc = Encoder::default();
+    self.local.encode(&mut enc);
+    assert!(enc.len() <= d.len());
+    d[..enc.len()].copy_from_slice(enc.as_ref());
+```
+
+It should be possible to create a codec that doesn't require ownership of the underlying buffer. My underlying long-term goal would be something akin to what we had for [smoltcp](https://github.com/smoltcp-rs/smoltcp), where the packet structure was able to abstract over mutability (e.g. [the ipv6 Packet structure](https://github.com/smoltcp-rs/smoltcp/blob/8e3ea5c7f09a76f0a4988fda20cadc74eacdc0d8/src/wire/ipv6.rs#L537)).
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-common/src/codec.rs b/neqo-common/src/codec.rs
+--- a/neqo-common/src/codec.rs
++++ b/neqo-common/src/codec.rs
+@@ -4,7 +4,10 @@
+ // option. This file may not be copied, modified, or distributed
+ // except according to those terms.
+ 
+-use std::fmt::{self, Debug, Formatter, Write};
++use std::{
++    fmt::{self, Debug, Formatter, Write},
++    io::{self, Cursor},
++};
+ 
+ use crate::hex_with_len;
+ 
+@@ -197,110 +200,58 @@ impl<'b> PartialEq<Decoder<'b>> for Decoder<'_> {
+ }
+ 
+ /// Encoder is good for building data structures.
+-#[derive(Clone, Default, PartialEq, Eq)]
+-pub struct Encoder {
+-    buf: Vec<u8>,
++#[derive(Clone, PartialEq, Eq)]
++pub struct Encoder<B = Vec<u8>> {
++    buf: B,
++    /// Tracks the starting position of the buffer when the [`Encoder`] is created.
++    /// This allows distinguishing between bytes that existed in the buffer before
++    /// encoding began and those written by the [`Encoder`] itself.
++    start: usize,
+ }
+ 
+-impl Encoder {
+-    /// Static helper function for previewing the results of encoding without doing it.
+-    ///
+-    /// # Panics
+-    ///
+-    /// When `v` is too large.
+-    #[must_use]
+-    pub const fn varint_len(v: u64) -> usize {
+-        match () {
+-            () if v < (1 << 6) => 1,
+-            () if v < (1 << 14) => 2,
+-            () if v < (1 << 30) => 4,
+-            () if v < (1 << 62) => 8,
+-            () => panic!("Varint value too large"),
+-        }
+-    }
+-
+-    /// Static helper to determine how long a varint-prefixed array encodes to.
+-    ///
+-    /// # Panics
++impl<B: Buffer> Encoder<B> {
++    /// Get the length of the [`Encoder`].
+     ///
+-    /// When `len` doesn't fit in a `u64`.
+-    #[must_use]
+-    pub fn vvec_len(len: usize) -> usize {
+-        Self::varint_len(u64::try_from(len).expect("usize should fit into u64")) + len
+-    }
+-
+-    /// Default construction of an empty buffer.
+-    #[must_use]
+-    pub fn new() -> Self {
+-        Self::default()
+-    }
+-
+-    /// Construction of a buffer with a predetermined capacity.
+-    #[must_use]
+-    pub fn with_capacity(capacity: usize) -> Self {
+-        Self {
+-            buf: Vec::with_capacity(capacity),
+-        }
+-    }
+-
+-    /// Get the capacity of the underlying buffer: the number of bytes that can be
+-    /// written without causing an allocation to occur.
+-    #[must_use]
+-    pub fn capacity(&self) -> usize {
+-        self.buf.capacity()
+-    }
+-
+-    /// Get the length of the underlying buffer: the number of bytes that have
+-    /// been written to the buffer.
++    /// Note that the length of the underlying buffer might be larger.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        self.buf.len()
++        self.buf.position() - self.start
+     }
+ 
+     /// Returns true if the encoder buffer contains no elements.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        self.buf.is_empty()
++        self.len() == 0
+     }
+ 
+     /// Create a view of the current contents of the buffer.
+     /// Note: for a view of a slice, use `Decoder::new(&enc[s..e])`
+     #[must_use]
+     pub fn as_decoder(&self) -> Decoder<'_> {
+-        Decoder::new(self.as_ref())
++        Decoder::new(self.buf.as_slice())
+     }
+ 
+-    /// Don't use this except in testing.
++    /// Generic encode routine for arbitrary data.
+     ///
+     /// # Panics
+     ///
+-    /// When `s` contains non-hex values or an odd number of values.
+-    #[cfg(any(test, feature = "test-fixture"))]
+-    #[must_use]
+-    pub fn from_hex<A: AsRef<str>>(s: A) -> Self {
+-        let s = s.as_ref();
+-        assert_eq!(s.len() % 2, 0, "Needs to be even length");
+-
+-        let cap = s.len() / 2;
+-        let mut enc = Self::with_capacity(cap);
+-
+-        for i in 0..cap {
+-            #[expect(clippy::unwrap_used, reason = "Only used in tests.")]
+-            let v = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+-            enc.encode_byte(v);
+-        }
+-        enc
+-    }
+-
+-    /// Generic encode routine for arbitrary data.
++    /// When writing to the underlying buffer fails.
+     pub fn encode(&mut self, data: &[u8]) -> &mut Self {
+-        self.buf.extend_from_slice(data.as_ref());
++        self.buf
++            .write_all(data)
++            .expect("Buffer has enough capacity.");
+         self
+     }
+ 
+     /// Encode a single byte.
++    ///
++    /// # Panics
++    ///
++    /// When writing to the underlying buffer fails.
+     pub fn encode_byte(&mut self, data: u8) -> &mut Self {
+-        self.buf.push(data);
++        self.buf
++            .write_all(&[data])
++            .expect("Buffer has enough capacity.");
+         self
+     }
+ 
+@@ -358,13 +309,14 @@ impl Encoder {
+         reason = "AND'ing with 0xff makes this OK."
+     )]
+     pub fn encode_vec_with<F: FnOnce(&mut Self)>(&mut self, n: usize, f: F) -> &mut Self {
+-        let start = self.buf.len();
+-        self.buf.resize(self.buf.len() + n, 0);
++        let start = self.buf.position();
++        self.buf.write_zeroes(n);
+         f(self);
+-        let len = self.buf.len() - start - n;
++        let len = self.buf.position() - start - n;
+         assert!(len < (1 << (n * 8)));
+         for i in 0..n {
+-            self.buf[start + i] = ((len >> (8 * (n - i - 1))) & 0xff) as u8;
++            self.buf
++                .write_at(start + i, ((len >> (8 * (n - i - 1))) & 0xff) as u8);
+         }
+         self
+     }
+@@ -385,11 +337,13 @@ impl Encoder {
+     ///
+     /// When `f()` writes more than 2^62 bytes.
+     pub fn encode_vvec_with<F: FnOnce(&mut Self)>(&mut self, f: F) -> &mut Self {
+-        let start = self.buf.len();
++        let start = self.buf.position();
+         // Optimize for short buffers, reserve a single byte for the length.
+-        self.buf.resize(self.buf.len() + 1, 0);
++        self.buf
++            .write_all(&[0])
++            .expect("Buffer has enough capacity.");
+         f(self);
+-        let len = self.buf.len() - start - 1;
++        let len = self.buf.position() - start - 1;
+ 
+         // Now to insert a varint for `len` before the encoded block.
+         //
+@@ -405,7 +359,7 @@ impl Encoder {
+ 
+         let v = u64::try_from(len).expect("encoded value fits in a u64");
+         // The lower order byte fits before the inserted block of bytes.
+-        self.buf[start] = (v & 0xff) as u8;
++        self.buf.write_at(start, (v & 0xff) as u8);
+         let (count, bits) = match () {
+             // Great.  The byte we have is enough.
+             () if v < (1 << 6) => return self,
+@@ -417,19 +371,94 @@ impl Encoder {
+         // Now, we need to encode the high bits after the main block, ...
+         self.encode_uint(count, (v >> 8) | bits);
+         // ..., then rotate the entire thing right by the same amount.
+-        self.buf[start..].rotate_right(count);
++        self.buf.rotate_right(start, count);
+         self
+     }
++}
++
++impl Encoder<Vec<u8>> {
++    /// Default construction of an empty buffer.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Static helper function for previewing the results of encoding without doing it.
++    ///
++    /// # Panics
++    ///
++    /// When `v` is too large.
++    #[must_use]
++    pub const fn varint_len(v: u64) -> usize {
++        match () {
++            () if v < (1 << 6) => 1,
++            () if v < (1 << 14) => 2,
++            () if v < (1 << 30) => 4,
++            () if v < (1 << 62) => 8,
++            () => panic!("Varint value too large"),
++        }
++    }
++
++    /// Static helper to determine how long a varint-prefixed array encodes to.
++    ///
++    /// # Panics
++    ///
++    /// When `len` doesn't fit in a `u64`.
++    #[must_use]
++    pub fn vvec_len(len: usize) -> usize {
++        Self::varint_len(u64::try_from(len).expect("usize should fit into u64")) + len
++    }
++
++    /// Construction of a buffer with a predetermined capacity.
++    #[must_use]
++    pub fn with_capacity(capacity: usize) -> Self {
++        Self {
++            buf: Vec::with_capacity(capacity),
++            start: 0,
++        }
++    }
++
++    /// Don't use this except in testing.
++    ///
++    /// # Panics
++    ///
++    /// When `s` contains non-hex values or an odd number of values.
++    #[cfg(any(test, feature = "test-fixture"))]
++    #[must_use]
++    pub fn from_hex<A: AsRef<str>>(s: A) -> Self {
++        let s = s.as_ref();
++        assert_eq!(s.len() % 2, 0, "Needs to be even length");
++
++        let cap = s.len() / 2;
++        let mut enc = Self::with_capacity(cap);
++
++        for i in 0..cap {
++            #[expect(clippy::unwrap_used, reason = "Only used in tests.")]
++            let v = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
++            enc.encode_byte(v);
++        }
++        enc
++    }
+ 
+     /// Truncate the encoder to the given size.
+     pub fn truncate(&mut self, len: usize) {
+         self.buf.truncate(len);
+     }
+ 
+-    /// Pad the buffer to `len` with bytes set to `v`.
++    /// Pad the [`Encoder`] to `len` with bytes set to `v`.
+     pub fn pad_to(&mut self, len: usize, v: u8) {
+-        if len > self.buf.len() {
+-            self.buf.resize(len, v);
++        let buffer_len = len + self.start;
++        if buffer_len > self.buf.len() {
++            self.buf.resize(buffer_len, v);
++        }
++    }
++}
++
++impl Default for Encoder {
++    fn default() -> Self {
++        Self {
++            buf: Vec::new(),
++            start: 0,
+         }
+     }
+ }
+@@ -440,15 +469,15 @@ impl Debug for Encoder {
+     }
+ }
+ 
+-impl AsRef<[u8]> for Encoder {
++impl<B: Buffer> AsRef<[u8]> for Encoder<B> {
+     fn as_ref(&self) -> &[u8] {
+-        self.buf.as_ref()
++        &self.buf.as_slice()[self.start..]
+     }
+ }
+ 
+-impl AsMut<[u8]> for Encoder {
++impl<B: Buffer> AsMut<[u8]> for Encoder<B> {
+     fn as_mut(&mut self) -> &mut [u8] {
+-        self.buf.as_mut()
++        &mut self.buf.as_mut()[self.start..]
+     }
+ }
+ 
+@@ -462,6 +491,7 @@ impl From<&[u8]> for Encoder {
+     fn from(buf: &[u8]) -> Self {
+         Self {
+             buf: Vec::from(buf),
++            start: 0,
+         }
+     }
+ }
+@@ -472,16 +502,160 @@ impl From<Encoder> for Vec<u8> {
+     }
+ }
+ 
+-impl Write for Encoder {
++#[expect(
++    clippy::unwrap_in_result,
++    reason = "successful writing to buffer needs to be guaranteed by caller"
++)]
++impl<B: io::Write> Write for Encoder<B> {
+     fn write_str(&mut self, s: &str) -> fmt::Result {
+-        self.buf.extend_from_slice(s.as_bytes());
++        self.buf
++            .write_all(s.as_bytes())
++            .expect("Buffer has enough capacity.");
+         Ok(())
+     }
+ }
+ 
++#[expect(clippy::unnecessary_safety_doc, reason = "relevant for created object")]
++impl<'a> Encoder<Cursor<&'a mut [u8]>> {
++    /// # Safety
++    ///
++    /// Any mutable method on [`Encoder<Cursor<&mut [u8]>>`] assumes the
++    /// underlying buffer has enough capacity for the called operation. This
++    /// invariant needs to be upheld by the caller.
++    #[must_use]
++    pub fn new_borrowed_slice(buf: &'a mut [u8]) -> Self {
++        Encoder {
++            buf: Cursor::new(buf),
++            start: 0,
++        }
++    }
++}
++
++impl<'a> Encoder<&'a mut Vec<u8>> {
++    #[must_use]
++    pub fn new_borrowed_vec(buf: &'a mut Vec<u8>) -> Self {
++        Encoder {
++            start: buf.position(),
++            buf,
++        }
++    }
++}
++
++/// Extends a memory buffer with methods beyond [`std::io::Write`]. Needed for
++/// [`Encoder`].
++///
++/// Note that each method operates on the bytes written, not the entire buffer.
++/// E.g. [`Buffer::as_slice`] returns the bytes written, not all bytes of the
++/// underlying buffer.
++pub trait Buffer: io::Write {
++    fn position(&self) -> usize;
++
++    fn is_empty(&self) -> bool {
++        self.position() == 0
++    }
++
++    fn as_slice(&self) -> &[u8];
++
++    fn as_mut(&mut self) -> &mut [u8];
++
++    // Functions needed for `Encoder::encode_vvec_with` and `Encoder::encode_vec_with`.
++
++    fn write_zeroes(&mut self, n: usize);
++
++    fn write_at(&mut self, pos: usize, data: u8);
++
++    fn rotate_right(&mut self, start: usize, count: usize);
++}
++
++impl Buffer for Vec<u8> {
++    fn position(&self) -> usize {
++        self.len()
++    }
++
++    fn as_slice(&self) -> &[u8] {
++        self.as_ref()
++    }
++
++    fn as_mut(&mut self) -> &mut [u8] {
++        self.as_mut_slice()
++    }
++
++    fn write_zeroes(&mut self, n: usize) {
++        self.resize(self.position() + n, 0);
++    }
++
++    fn write_at(&mut self, pos: usize, data: u8) {
++        self[pos] = data;
++    }
++
++    fn rotate_right(&mut self, start: usize, count: usize) {
++        self[start..].rotate_right(count);
++    }
++}
++
++impl Buffer for &mut Vec<u8> {
++    fn position(&self) -> usize {
++        Vec::len(self)
++    }
++
++    fn as_slice(&self) -> &[u8] {
++        self.as_ref()
++    }
++
++    fn as_mut(&mut self) -> &mut [u8] {
++        self.as_mut_slice()
++    }
++
++    fn write_zeroes(&mut self, n: usize) {
++        self.resize(self.position() + n, 0);
++    }
++
++    fn write_at(&mut self, pos: usize, data: u8) {
++        self[pos] = data;
++    }
++
++    fn rotate_right(&mut self, start: usize, count: usize) {
++        self[start..].rotate_right(count);
++    }
++}
++
++impl Buffer for Cursor<&mut [u8]> {
++    fn position(&self) -> usize {
++        usize::try_from(self.position()).expect("memory allocation not to exceed usize")
++    }
++
++    fn as_slice(&self) -> &[u8] {
++        &self.get_ref()[..Buffer::position(self)]
++    }
++
++    fn as_mut(&mut self) -> &mut [u8] {
++        let len = Buffer::position(self);
++        &mut self.get_mut()[..len]
++    }
++
++    fn write_zeroes(&mut self, n: usize) {
++        let start = usize::try_from(self.position()).expect("Buffer length does not exceed usize");
++        let end = start + n;
++
++        self.get_mut()[start..end].fill(0);
++        self.set_position(u64::try_from(end).expect("Position cannot exceed u64"));
++    }
++
++    fn write_at(&mut self, pos: usize, data: u8) {
++        self.get_mut()[pos] = data;
++    }
++
++    fn rotate_right(&mut self, start: usize, count: usize) {
++        let len = Buffer::position(self);
++        self.get_mut()[start..len].rotate_right(count);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+-    use super::{Decoder, Encoder};
++    use std::io::Cursor;
++
++    use super::{Buffer, Decoder, Encoder};
+ 
+     #[test]
+     fn decode() {
+@@ -869,4 +1043,96 @@ mod tests {
+         enc.pad_to(7, 0xc2);
+         assert_eq!(enc, Encoder::from_hex("0102340000c2c2"));
+     }
++
++    #[test]
++    fn buffer_write_zeroes() {
++        fn check_write_zeroes<B: Buffer>(mut buf: B) {
++            const NUM_BYTES: usize = 5;
++
++            assert!(buf.is_empty());
++
++            buf.write_zeroes(NUM_BYTES);
++
++            assert_eq!(buf.position(), NUM_BYTES);
++            let written = &buf.as_slice()[..NUM_BYTES];
++            assert!(written.iter().all(|&b| b == 0));
++        }
++
++        check_write_zeroes(Vec::<u8>::new());
++
++        let mut buf = Vec::<u8>::new();
++        check_write_zeroes(&mut buf);
++
++        let mut buf = [0; 16];
++        check_write_zeroes(Cursor::new(&mut buf[..]));
++    }
++
++    #[test]
++    fn buffer_rotate_right() {
++        fn check_rotate_right<B: Buffer>(mut buf: B) {
++            const DATA: [u8; 5] = [1, 2, 3, 4, 5];
++            const EXPECTED: [u8; 5] = [1, 4, 5, 2, 3];
++            const START: usize = 1;
++            const COUNT: usize = 2;
++
++            buf.write_all(&DATA).expect("Buffer has enough capacity.");
++
++            buf.rotate_right(START, COUNT);
++
++            assert_eq!(&buf.as_slice()[..EXPECTED.len()], EXPECTED);
++        }
++
++        check_rotate_right(Vec::<u8>::new());
++
++        let mut buf = Vec::<u8>::new();
++        check_rotate_right(&mut buf);
++
++        let mut buf = [0; 16];
++        check_rotate_right(Cursor::new(&mut buf[..]));
++    }
++
++    #[test]
++    fn encoder_as_mut() {
++        fn check_as_mut<B: Buffer>(mut enc: Encoder<B>) {
++            enc.encode_byte(41);
++            enc.as_mut()[0] = 42;
++            assert_eq!(enc.as_ref(), &[42]);
++        }
++
++        check_as_mut(Encoder::default());
++
++        let mut buf = Vec::<u8>::new();
++        check_as_mut(Encoder::new_borrowed_vec(&mut buf));
++
++        let mut buf = [0; 16];
++        check_as_mut(Encoder::new_borrowed_slice(&mut buf[..]));
++    }
++
++    /// When reusing one [`Buffer`] across [`Encoder`]s, [`Buffer::position`]
++    /// can be larger than [`Encoder::len`].
++    #[test]
++    fn buffer_vs_encoder_len() {
++        let mut non_empty_vec = vec![1, 2, 3, 4];
++        assert_eq!(non_empty_vec.len(), Buffer::position(&non_empty_vec));
++
++        let mut enc = Encoder::new_borrowed_vec(&mut non_empty_vec);
++        assert!(enc.is_empty());
++        enc.encode_byte(5);
++        assert_eq!(enc.len(), 1);
++
++        assert_eq!(non_empty_vec.len(), 5);
++        assert_eq!(non_empty_vec.len(), Buffer::position(&non_empty_vec));
++    }
++
++    /// [`Buffer::position`] returns the number of bytes written to and not the
++    /// length of the underyling buffer.
++    ///
++    /// When using [`Vec<u8>`] length and position are equal. When using
++    /// [`Cursor<&mut [u8]>`] they are not.
++    #[test]
++    fn buffer_position() {
++        let mut a = [0; 16];
++        let buf = Cursor::new(&mut a[..]);
++        assert_eq!(Buffer::position(&buf), 0);
++    }
+ }
+
+diff --git a/neqo-common/src/lib.rs b/neqo-common/src/lib.rs
+--- a/neqo-common/src/lib.rs
++++ b/neqo-common/src/lib.rs
+@@ -24,7 +24,7 @@ use strum::Display;
+ #[cfg(feature = "build-fuzzing-corpus")]
+ pub use self::fuzz::write_item_to_fuzzing_corpus;
+ pub use self::{
+-    codec::{Decoder, Encoder, MAX_VARINT},
++    codec::{Buffer, Decoder, Encoder, MAX_VARINT},
+     datagram::Datagram,
+     header::Header,
+     incrdecoder::{IncrementalDecoderBuffer, IncrementalDecoderIgnore, IncrementalDecoderUint},
+
+diff --git a/neqo-http3/src/buffered_send_stream.rs b/neqo-http3/src/buffered_send_stream.rs
+--- a/neqo-http3/src/buffered_send_stream.rs
++++ b/neqo-http3/src/buffered_send_stream.rs
+@@ -6,6 +6,7 @@
+ 
+ use std::fmt::{self, Display, Formatter};
+ 
++use neqo_common::Encoder;
+ use neqo_transport::{Connection, StreamId};
+ 
+ use crate::{qlog, Res};
+@@ -46,6 +47,14 @@ impl BufferedStream {
+         };
+     }
+ 
++    pub fn encode_with<F: FnOnce(&mut Encoder<&mut Vec<u8>>)>(&mut self, f: F) {
++        if let Self::Initialized { buf, .. } = self {
++            f(&mut Encoder::new_borrowed_vec(buf));
++        } else {
++            debug_assert!(false, "Do not encode data before the stream is initialized");
++        }
++    }
++
+     /// # Panics
+     ///
+     /// This function cannot be called before the `BufferedStream` is initialized.
+@@ -53,7 +62,7 @@ impl BufferedStream {
+         if let Self::Initialized { buf, .. } = self {
+             buf.extend_from_slice(to_buf);
+         } else {
+-            debug_assert!(false, "Do not buffer date before the stream is initialized");
++            debug_assert!(false, "Do not buffer data before the stream is initialized");
+         }
+     }
+
+diff --git a/neqo-http3/src/control_stream_local.rs b/neqo-http3/src/control_stream_local.rs
+--- a/neqo-http3/src/control_stream_local.rs
++++ b/neqo-http3/src/control_stream_local.rs
+@@ -41,9 +41,7 @@ impl ControlStreamLocal {
+ 
+     /// Add a new frame that needs to be send.
+     pub fn queue_frame(&mut self, f: &HFrame) {
+-        let mut enc = Encoder::default();
+-        f.encode(&mut enc);
+-        self.stream.buffer(enc.as_ref());
++        self.stream.encode_with(|e| f.encode(e));
+     }
+ 
+     pub fn queue_update_priority(&mut self, stream_id: StreamId) {
+
+diff --git a/neqo-http3/src/frames/hframe.rs b/neqo-http3/src/frames/hframe.rs
+--- a/neqo-http3/src/frames/hframe.rs
++++ b/neqo-http3/src/frames/hframe.rs
+@@ -6,7 +6,7 @@
+ 
+ use std::fmt::{Debug, Write as _};
+ 
+-use neqo_common::{Decoder, Encoder};
++use neqo_common::{Buffer, Decoder, Encoder};
+ use neqo_crypto::random;
+ use neqo_transport::StreamId;
+ 
+@@ -94,7 +94,7 @@ impl HFrame {
+         }
+     }
+ 
+-    pub fn encode(&self, enc: &mut Encoder) {
++    pub fn encode<B: Buffer>(&self, enc: &mut Encoder<B>) {
+         enc.encode_varint(self.get_type());
+ 
+         match self {
+
+diff --git a/neqo-http3/src/send_message.rs b/neqo-http3/src/send_message.rs
+--- a/neqo-http3/src/send_message.rs
++++ b/neqo-http3/src/send_message.rs
+@@ -12,7 +12,7 @@ use std::{
+     rc::Rc,
+ };
+ 
+-use neqo_common::{qdebug, qtrace, Encoder, Header, MessageType};
++use neqo_common::{qdebug, qtrace, Buffer, Encoder, Header, MessageType};
+ use neqo_qpack::encoder::QPackEncoder;
+ use neqo_transport::{Connection, StreamId};
+ 
+@@ -142,20 +142,19 @@ impl SendMessage {
+     ///
+     /// `ClosedCriticalStream` if the encoder stream is closed.
+     /// `InternalError` if an unexpected error occurred.
+-    fn encode(
+-        encoder: &mut QPackEncoder,
++    fn encode<B: Buffer>(
++        encoder: &mut Encoder<B>,
++        qpack_encoder: &mut QPackEncoder,
+         headers: &[Header],
+         conn: &mut Connection,
+         stream_id: StreamId,
+-    ) -> Vec<u8> {
++    ) {
+         qdebug!("Encoding headers");
+-        let header_block = encoder.encode_header_block(conn, headers, stream_id);
++        let header_block = qpack_encoder.encode_header_block(conn, headers, stream_id);
+         let hframe = HFrame::Headers {
+             header_block: header_block.to_vec(),
+         };
+-        let mut d = Encoder::default();
+-        hframe.encode(&mut d);
+-        d.into()
++        hframe.encode(encoder);
+     }
+ 
+     fn stream_id(&self) -> StreamId {
+@@ -299,9 +298,7 @@ impl SendStream for SendMessage {
+         let data_frame = HFrame::Data {
+             len: buf.len() as u64,
+         };
+-        let mut enc = Encoder::default();
+-        data_frame.encode(&mut enc);
+-        self.stream.buffer(enc.as_ref());
++        self.stream.encode_with(|e| data_frame.encode(e));
+         self.stream.buffer(buf);
+         _ = self.stream.send_buffer(conn)?;
+         Ok(())
+@@ -311,13 +308,10 @@ impl SendStream for SendMessage {
+ impl HttpSendStream for SendMessage {
+     fn send_headers(&mut self, headers: &[Header], conn: &mut Connection) -> Res<()> {
+         self.state.new_headers(headers, self.message_type)?;
+-        let buf = Self::encode(
+-            &mut self.encoder.borrow_mut(),
+-            headers,
+-            conn,
+-            self.stream_id(),
+-        );
+-        self.stream.buffer(&buf);
++        let stream_id = self.stream_id();
++        self.stream.encode_with(|e| {
++            Self::encode(e, &mut self.encoder.borrow_mut(), headers, conn, stream_id);
++        });
+         Ok(())
+     }
+
+diff --git a/neqo-http3/src/settings.rs b/neqo-http3/src/settings.rs
+--- a/neqo-http3/src/settings.rs
++++ b/neqo-http3/src/settings.rs
+@@ -6,7 +6,7 @@
+ 
+ use std::ops::Deref;
+ 
+-use neqo_common::{Decoder, Encoder};
++use neqo_common::{Buffer, Decoder, Encoder};
+ use neqo_crypto::{ZeroRttCheckResult, ZeroRttChecker};
+ 
+ use crate::{Error, Http3Parameters, Res};
+@@ -86,7 +86,7 @@ impl HSettings {
+             .map_or_else(|| hsetting_default(setting), |v| v.value)
+     }
+ 
+-    pub fn encode_frame_contents(&self, enc: &mut Encoder) {
++    pub fn encode_frame_contents<B: Buffer>(&self, enc: &mut Encoder<B>) {
+         enc.encode_vvec_with(|enc_inner| {
+             for iter in &self.settings {
+                 match iter.setting_type {
+
+diff --git a/neqo-qpack/src/qpack_send_buf.rs b/neqo-qpack/src/qpack_send_buf.rs
+--- a/neqo-qpack/src/qpack_send_buf.rs
++++ b/neqo-qpack/src/qpack_send_buf.rs
+@@ -25,9 +25,7 @@ impl QpackData {
+     }
+ 
+     pub fn encode_varint(&mut self, i: u64) {
+-        let mut enc = Encoder::default();
+-        enc.encode_varint(i);
+-        self.buf.append(&mut enc.into());
++        Encoder::new_borrowed_vec(&mut self.buf).encode_varint(i);
+     }
+ 
+     pub(crate) fn encode_prefixed_encoded_int(&mut self, prefix: Prefix, mut val: u64) -> usize {
+
+diff --git a/neqo-transport/src/tparams.rs b/neqo-transport/src/tparams.rs
+--- a/neqo-transport/src/tparams.rs
++++ b/neqo-transport/src/tparams.rs
+@@ -14,7 +14,7 @@ use std::{
+ };
+ 
+ use enum_map::{Enum, EnumMap};
+-use neqo_common::{hex, qdebug, qinfo, qtrace, Decoder, Encoder, Role};
++use neqo_common::{hex, qdebug, qinfo, qtrace, Buffer, Decoder, Encoder, Role};
+ use neqo_crypto::{
+     constants::{TLS_HS_CLIENT_HELLO, TLS_HS_ENCRYPTED_EXTENSIONS},
+     ext::{ExtensionHandler, ExtensionHandlerResult, ExtensionWriterResult},
+@@ -155,7 +155,7 @@ pub enum TransportParameter {
+ }
+ 
+ impl TransportParameter {
+-    fn encode(&self, enc: &mut Encoder, tp: TransportParameterId) {
++    fn encode<B: Buffer>(&self, enc: &mut Encoder<B>, tp: TransportParameterId) {
+         qtrace!("TP encoded; type {tp}) val {self:?}");
+         enc.encode_varint(tp);
+         match self {
+@@ -373,11 +373,11 @@ impl TransportParameters {
+         true
+     }
+ 
+-    pub(crate) fn encode(&self, enc: &mut Encoder) {
++    pub(crate) fn encode<B: Buffer>(&self, enc: &mut Encoder<B>) {
+         self.encode_filtered(Self::retain_all, enc);
+     }
+ 
+-    fn encode_filtered<F>(&self, f: F, enc: &mut Encoder)
++    fn encode_filtered<F, B: Buffer>(&self, f: F, enc: &mut Encoder<B>)
+     where
+         F: Fn(TransportParameterId, Option<&TransportParameter>) -> bool,
+     {
+@@ -782,8 +782,7 @@ impl ExtensionHandler for TransportParametersHandler {
+ 
+         qdebug!("Writing transport parameters, msg={msg:?}");
+ 
+-        // TODO(ekr@rtfm.com): Modify to avoid a copy.
+-        let mut enc = Encoder::default();
++        let mut enc = Encoder::new_borrowed_slice(d);
+         let f = if ch_outer {
+             debug_assert_eq!(msg, TLS_HS_CLIENT_HELLO);
+             Self::filter_ch_outer
+@@ -791,8 +790,6 @@ impl ExtensionHandler for TransportParametersHandler {
+             TransportParameters::retain_all
+         };
+         self.local.encode_filtered(f, &mut enc);
+-        assert!(enc.len() <= d.len());
+-        d[..enc.len()].copy_from_slice(enc.as_ref());
+         ExtensionWriterResult::Write(enc.len())
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

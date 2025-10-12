@@ -1,0 +1,37 @@
+#src/summary.rs
+#[cfg(test)]
+mod tests {
+use std::path::PathBuf;
+use rustc_hash::FxHashMap;
+use crate::CovResult;
+
+#[test]
+fn test_get_coverage_stats() {
+    let results = vec![(
+        PathBuf::from("test.rs"),
+        PathBuf::from("test.rs"),
+        CovResult {
+            lines: [1, 2, 0, 1].iter().cloned().collect(),
+            branches: {
+                let mut map = BTreeMap::new();
+                map.insert(2, vec![true, false]);
+                map
+            },
+            functions: {
+                let mut map = FxHashMap::default();
+                map.insert("test_fn".to_string(), Function {
+                    start: 1,
+                    executed: true,
+                });
+                map
+            },
+        },
+    )];
+
+    let stats = get_coverage_stats(&results);
+    assert_eq!(stats.lines_covered, 3);
+    assert_eq!(stats.lines_valid, 4);
+    assert_eq!(stats.branches_covered, 1);
+    assert_eq!(stats.branches_valid, 2);
+}
+}

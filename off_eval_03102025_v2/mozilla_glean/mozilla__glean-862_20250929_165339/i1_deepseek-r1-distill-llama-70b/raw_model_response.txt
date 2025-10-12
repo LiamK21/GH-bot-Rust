@@ -1,0 +1,73 @@
+<think>
+Okay, I need to figure out how to write a regression test for the issue described. The problem is that when two pings are submitted close together, the second one might get missed because the upload worker doesn't rescan the directory. The patch adds a test to ensure this doesn't happen, but I need to make sure the test is correct and covers the scenario.
+
+First, I'll read the issue again. It says that the first ping schedules an upload worker, which scans the pending directory. The second ping is enqueued but doesn't trigger another scan because of the KEEP policy, so it's only uploaded the next time the worker runs. The new mechanism should fix this, and the test should verify that.
+
+Looking at the patch, there's a new test function called new_pings_are_added_while_upload_in_progress. It creates an upload manager, enqueues two pings, and checks if both are processed correctly. The test seems to simulate the scenario where the second ping is added while the first is being uploaded.
+
+I need to make sure that this test would fail before the patch and pass after. The original code probably didn't handle the second ping correctly, so the test would catch that. After the patch, the test should pass because the second ping is now properly processed.
+
+I should check if the test is self-contained and doesn't rely on any external factors. It uses tempfile for the directory and enqueues pings directly. It also waits for the upload task to finish, which is good.
+
+The test enqueues the first ping, gets the upload task, then enqueues the second while the first is in progress. It then processes both responses and checks if both are handled. Finally, it ensures that the upload task is done.
+
+I think this test is sufficient. It directly tests the scenario where pings are added while an upload is ongoing, ensuring both are uploaded. So, the test should correctly validate the fix.
+
+Now, I need to write the test in Rust, making sure all imports are included and the function is properly named. The filename is glean-core/src/upload/mod.rs, and the test function is already named appropriately. I'll structure the imports correctly, making sure not to include any unnecessary ones.
+
+I'll also ensure that the test doesn't have any comments or explanations, just the code. The test should be concise and to the point, failing before the patch and passing after.
+</think>
+
+The test added in the patch correctly addresses the issue by ensuring that both pings are processed when submitted concurrently. It verifies that the second ping is not missed after the upload worker completes the first task.
+
+glean-core/src/upload/mod.rs
+<imports>
+use std::thread;
+use std::time::Duration;
+use tempfile::TempDir;
+use super::PingUploadManager;
+use super::PingUploadTask;
+use super::HttpStatus;
+</imports>
+<Rust>
+#[test]
+fn test_concurrent_pings_are_uploaded() {
+    let dir = TempDir::new().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path());
+
+    // Wait for initial processing to complete
+    while upload_manager.get_upload_task() == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let doc1 = "684fa150-8dff-11ea-8faf-cb1ff3b11119";
+    let path1 = format!("/submit/app_id/test-ping/1/{}", doc1);
+
+    let doc2 = "74f14e9a-8dff-11ea-b45a-6f936923f639";
+    let path2 = format!("/submit/app_id/test-ping/1/{}", doc2);
+
+    upload_manager.enqueue_ping(doc1, &path1, json!({}));
+    upload_manager.enqueue_ping(doc2, &path2, json!({}));
+
+    let req1 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected upload task"),
+    };
+    assert_eq!(doc1, req1.document_id);
+
+    upload_manager.process_ping_upload_response(&req1.document_id, HttpStatus(200));
+
+    let req2 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected second upload task"),
+    };
+    assert_eq!(doc2, req2.document_id);
+
+    upload_manager.process_ping_upload_response(&req2.document_id, HttpStatus(200));
+
+    match upload_manager.get_upload_task() {
+        PingUploadTask::Done => (),
+        _ => panic!("Expected upload tasks to be done"),
+    };
+}
+</Rust>

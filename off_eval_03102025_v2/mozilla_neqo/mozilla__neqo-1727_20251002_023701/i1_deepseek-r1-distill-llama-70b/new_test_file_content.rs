@@ -1,0 +1,12 @@
+#neqo-bin/src/bin/client/main.rs
+#[cfg(test)]
+mod tests {
+
+
+#[test]
+fn test_max_push_stream_args() {
+    let mut args = Args::parse_from(["neqo-client", "--max-push", "5"]);
+    let max_push = args.max_concurrent_push_streams;
+    assert_eq!(max_push, 5);
+}
+}

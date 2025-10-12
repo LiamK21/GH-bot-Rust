@@ -1,0 +1,55 @@
+<Filename> neqo-http3/src/connection.rs </Filename>
+<imports> 
+use neqo_http3::connection::Http3Connection;
+use neqo_http3::connection::Role;
+use neqo_http3::frame::HFrame;
+use neqo_http3::qpack::QPackDecoder;
+use neqo_http3::qpack::QPackEncoder;
+use neqo_http3::transaction_client::TransactionClient;
+use neqo_http3::transaction_server::TransactionServer;
+use neqo_common::datagram::Datagram;
+use neqo_common::event::Http3Event;
+use neqo_common::event::ConnectionEvent;
+use neqo_common::stream::StreamType;
+use neqo_common::timer::Now;
+use std::mem;
+</imports>
+<Rust>
+#[test]
+fn test_read_frames_header_blocked_after_unblock() {
+    let mut hconn = Http3Connection::new(Role::Client);
+    let mut neqo_trans_conn = super::connect(false).1;
+    let control_stream = neqo_trans_conn.stream_create(StreamType::UniDi).unwrap();
+    let mut sent = neqo_trans_conn.stream_send(control_stream, &[0x0, 0x4, 0x6, 0x1, 0x40, 0x64, 0x7, 0x40, 0x64]);
+    assert_eq!(sent, Ok(9));
+    let mut encoder = QPackEncoder::new(true);
+    encoder.add_send_stream(neqo_trans_conn.stream_create(StreamType::UniDi).unwrap());
+    encoder.send(&mut neqo_trans_conn).unwrap();
+    let decoder_stream = neqo_trans_conn.stream_create(StreamType::UniDi).unwrap();
+    sent = neqo_trans_conn.stream_send(decoder_stream, &[0x3]);
+    assert_eq!(sent, Ok(1));
+    let request_stream_id = hconn.fetch("GET", "https", "something.com", "/", &[]).unwrap();
+    assert_eq!(request_stream_id, 0);
+    let _ = hconn.stream_close_send(request_stream_id);
+    let out = hconn.process(None, Now::now());
+    neqo_trans_conn.process(out.dgram(), Now::now());
+    let events = neqo_trans_conn.events();
+    for e in events {
+        match e {
+            ConnectionEvent::NewStream {
+                stream_id,
+                stream_type,
+            } => {
+                assert_eq!(stream_id, request_stream_id);
+                assert_eq!(stream_type, StreamType::BiDi);
+            }
+            ConnectionEvent::RecvStreamReadable { stream_id } => {
+                assert_eq!(stream_id, request_stream_id);
+                let mut buf = [0u8; 100];
+                let (amount, fin) = neqo_trans_conn.stream_recv(stream_id, &mut buf).unwrap();
+                assert_eq!(fin, true);
+                assert_eq!(amount, 18);
+                assert_eq!(
+                    buf[..18],
+                    [
+                        0x01, 0x10, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x89, 0x41, 0xe9, 0x2a, 0x67,

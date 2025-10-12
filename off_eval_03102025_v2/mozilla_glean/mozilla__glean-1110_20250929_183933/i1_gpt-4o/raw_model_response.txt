@@ -1,0 +1,68 @@
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use super::PingUploadManager;
+use crate::Glean;
+use crate::PingType;
+use crate::upload::PingUploadTask;
+use std::time::Duration;
+use std::thread;
+</imports>
+<Rust>
+#[test]
+fn test_quota_is_enforced_when_enqueueing_cached_pings() {
+    let (mut glean, tmpdir) = new_glean(None);
+
+    // Register a ping for testing
+    let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
+    glean.register_ping_type(&ping_type);
+
+    // Submit the ping multiple times
+    let n = 10;
+    for _ in 0..n {
+        glean.submit_ping(&ping_type, None).unwrap();
+    }
+
+    let directory_manager = PingDirectoryManager::new(tmpdir.path());
+    let pending_pings = directory_manager.process_dirs().pending_pings;
+    // The pending pings array is sorted by date in ascending order,
+    // the newest element is the last one.
+    let (_, newest_ping) = &pending_pings.last().unwrap();
+    let (newest_ping_id, _, _, _) = &newest_ping;
+
+    // Create a new upload manager pointing to the same data_path as the glean instance.
+    let upload_manager = PingUploadManager::new(tmpdir.path(), "Rust", true);
+
+    // Enqueue cached pings and set the quota to just a little over the size on an empty ping file.
+    // This way we can check that one ping is kept and all others are deleted.
+    //
+    // From manual testing I figured out an empty ping file is 324bytes,
+    // I am setting this a little over just so that minor changes to the ping structure
+    // don't immediatelly break this.
+    upload_manager.enqueue_cached_pings(&glean, 500);
+
+    // Get a task once
+    // One ping should have been enqueued.
+    // Make sure it is the newest ping.
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Upload(request) => assert_eq!(&request.document_id, newest_ping_id),
+        _ => panic!("Expected upload manager to return the next request!"),
+    }
+
+    // Verify that no other requests were returned,
+    // they should all have been deleted because pending pings quota was hit.
+    assert_eq!(
+        upload_manager.get_upload_task(&glean, false),
+        PingUploadTask::Done
+    );
+
+    // Verify that the correct number of deleted pings was recorded
+    assert_eq!(
+        n - 1,
+        upload_manager
+            .upload_metrics
+            .deleted_pings_after_quota_hit
+            .test_get_value(&glean, "metrics")
+            .unwrap()
+    )
+}
+</Rust>

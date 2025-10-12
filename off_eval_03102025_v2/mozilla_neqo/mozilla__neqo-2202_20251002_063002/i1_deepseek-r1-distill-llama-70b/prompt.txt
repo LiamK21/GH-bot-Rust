@@ -1,0 +1,218 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Make server UDP receive path not allocate
+              Server allocates for now. In other words, only client UDP receive path doesn't allocate. Given that it is a test server only, I suggest we fix in a follow-up pull request.
+
+_Originally posted by @mxinden in https://github.com/mozilla/neqo/pull/2189#discussion_r1805021560_
+            
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-bin/src/server/http09.rs b/neqo-bin/src/server/http09.rs
+--- a/neqo-bin/src/server/http09.rs
++++ b/neqo-bin/src/server/http09.rs
+@@ -185,7 +185,7 @@ impl HttpServer {
+ }
+ 
+ impl super::HttpServer for HttpServer {
+-    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output {
++    fn process(&mut self, dgram: Option<Datagram<&[u8]>>, now: Instant) -> Output {
+         self.server.process(dgram, now)
+     }
+
+diff --git a/neqo-bin/src/server/http3.rs b/neqo-bin/src/server/http3.rs
+--- a/neqo-bin/src/server/http3.rs
++++ b/neqo-bin/src/server/http3.rs
+@@ -79,7 +79,7 @@ impl Display for HttpServer {
+ }
+ 
+ impl super::HttpServer for HttpServer {
+-    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> neqo_http3::Output {
++    fn process(&mut self, dgram: Option<Datagram<&[u8]>>, now: Instant) -> neqo_http3::Output {
+         self.server.process(dgram, now)
+     }
+
+diff --git a/neqo-bin/src/server/mod.rs b/neqo-bin/src/server/mod.rs
+--- a/neqo-bin/src/server/mod.rs
++++ b/neqo-bin/src/server/mod.rs
+@@ -194,7 +194,7 @@ fn qns_read_response(filename: &str) -> Result<Vec<u8>, io::Error> {
+ 
+ #[allow(clippy::module_name_repetitions)]
+ pub trait HttpServer: Display {
+-    fn process(&mut self, dgram: Option<Datagram>, now: Instant) -> Output;
++    fn process(&mut self, dgram: Option<Datagram<&[u8]>>, now: Instant) -> Output;
+     fn process_events(&mut self, now: Instant);
+     fn has_events(&self) -> bool;
+ }
+@@ -225,8 +225,11 @@ impl ServerRunner {
+     }
+ 
+     /// Tries to find a socket, but then just falls back to sending from the first.
+-    fn find_socket(&mut self, addr: SocketAddr) -> &mut crate::udp::Socket {
+-        let ((_host, first_socket), rest) = self.sockets.split_first_mut().unwrap();
++    fn find_socket(
++        sockets: &mut [(SocketAddr, crate::udp::Socket)],
++        addr: SocketAddr,
++    ) -> &mut crate::udp::Socket {
++        let ((_host, first_socket), rest) = sockets.split_first_mut().unwrap();
+         rest.iter_mut()
+             .map(|(_host, socket)| socket)
+             .find(|socket| {
+@@ -238,27 +241,67 @@ impl ServerRunner {
+             .unwrap_or(first_socket)
+     }
+ 
+-    async fn process(&mut self, mut dgram: Option<Datagram>) -> Result<(), io::Error> {
++    // Free function (i.e. not taking `&mut self: ServerRunner`) to be callable by
++    // `ServerRunner::read_and_process` while holding a reference to
++    // `ServerRunner::recv_buf`.
++    async fn process_inner(
++        server: &mut Box<dyn HttpServer>,
++        timeout: &mut Option<Pin<Box<Sleep>>>,
++        sockets: &mut [(SocketAddr, crate::udp::Socket)],
++        now: &dyn Fn() -> Instant,
++        mut input_dgram: Option<Datagram<&[u8]>>,
++    ) -> Result<(), io::Error> {
+         loop {
+-            match self.server.process(dgram.take(), (self.now)()) {
++            match server.process(input_dgram.take(), now()) {
+                 Output::Datagram(dgram) => {
+-                    let socket = self.find_socket(dgram.source());
++                    let socket = Self::find_socket(sockets, dgram.source());
+                     socket.writable().await?;
+                     socket.send(&dgram)?;
+                 }
+                 Output::Callback(new_timeout) => {
+                     qdebug!("Setting timeout of {:?}", new_timeout);
+-                    self.timeout = Some(Box::pin(tokio::time::sleep(new_timeout)));
+-                    break;
+-                }
+-                Output::None => {
++                    *timeout = Some(Box::pin(tokio::time::sleep(new_timeout)));
+                     break;
+                 }
++                Output::None => break,
+             }
+         }
+         Ok(())
+     }
+ 
++    async fn read_and_process(&mut self, sockets_index: usize) -> Result<(), io::Error> {
++        loop {
++            let (host, socket) = self.sockets.get_mut(sockets_index).unwrap();
++            let Some(input_dgrams) = socket.recv(*host, &mut self.recv_buf)? else {
++                break;
++            };
++
++            for input_dgram in input_dgrams {
++                Self::process_inner(
++                    &mut self.server,
++                    &mut self.timeout,
++                    &mut self.sockets,
++                    &self.now,
++                    Some(input_dgram),
++                )
++                .await?;
++            }
++        }
++
++        Ok(())
++    }
++
++    async fn process(&mut self) -> Result<(), io::Error> {
++        Self::process_inner(
++            &mut self.server,
++            &mut self.timeout,
++            &mut self.sockets,
++            &self.now,
++            None,
++        )
++        .await
++    }
++
+     // Wait for any of the sockets to be readable or the timeout to fire.
+     async fn ready(&mut self) -> Result<Ready, io::Error> {
+         let sockets_ready = select_all(
+@@ -281,30 +324,19 @@ impl ServerRunner {
+     pub async fn run(mut self) -> Res<()> {
+         loop {
+             self.server.process_events((self.now)());
+-
+-            self.process(None).await?;
++            self.process().await?;
+ 
+             if self.server.has_events() {
+                 continue;
+             }
+ 
+             match self.ready().await? {
+-                Ready::Socket(inx) => loop {
+-                    let (host, socket) = self.sockets.get_mut(inx).unwrap();
+-                    let Some(dgrams) = socket.recv(*host, &mut self.recv_buf)? else {
+-                        break;
+-                    };
+-                    if dgrams.len() == 0 {
+-                        break;
+-                    }
+-                    let dgrams: Vec<Datagram> = dgrams.map(|d| d.to_owned()).collect();
+-                    for dgram in dgrams {
+-                        self.process(Some(dgram)).await?;
+-                    }
+-                },
++                Ready::Socket(sockets_index) => {
++                    self.read_and_process(sockets_index).await?;
++                }
+                 Ready::Timeout => {
+                     self.timeout = None;
+-                    self.process(None).await?;
++                    self.process().await?;
+                 }
+             }
+         }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn qns_read_response(filename: &str) -> Result<Vec<u8>, io::Error>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

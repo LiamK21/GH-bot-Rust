@@ -1,0 +1,336 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Be able to skip errors and produce a report 
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/gcov.rs b/src/gcov.rs
+--- a/src/gcov.rs
++++ b/src/gcov.rs
+@@ -1,8 +1,28 @@
+ use semver::Version;
+ use std::env;
++use std::fmt;
+ use std::path::PathBuf;
+ use std::process::Command;
+ 
++#[derive(Debug)]
++pub enum GcovError {
++    ProcessFailure,
++    Failure((String, String, String)),
++}
++
++impl fmt::Display for GcovError {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match *self {
++            GcovError::ProcessFailure => write!(f, "Failed to execute gcov process"),
++            GcovError::Failure((ref path, ref stdout, ref stderr)) => {
++                writeln!(f, "gcov execution failed on {}", path)?;
++                writeln!(f, "gcov stdout: {}", stdout)?;
++                writeln!(f, "gcov stderr: {}", stderr)
++            }
++        }
++    }
++}
++
+ fn get_gcov() -> String {
+     if let Ok(s) = env::var("GCOV") {
+         s
+@@ -11,7 +31,7 @@ fn get_gcov() -> String {
+     }
+ }
+ 
+-pub fn run_gcov(gcno_path: &PathBuf, branch_enabled: bool, working_dir: &PathBuf) {
++pub fn run_gcov(gcno_path: &PathBuf, branch_enabled: bool, working_dir: &PathBuf) -> Result<(), GcovError> {
+     let mut command = Command::new(&get_gcov());
+     let command = if branch_enabled {
+         command.arg("-b").arg("-c")
+@@ -23,14 +43,21 @@ pub fn run_gcov(gcno_path: &PathBuf, branch_enabled: bool, working_dir: &PathBuf
+         .arg("-i") // Generate intermediate gcov format, faster to parse.
+         .current_dir(working_dir);
+ 
+-    let output = status.output().expect("Failed to execute gcov process");
++    let output = if let Ok(output) = status.output() {
++        output
++    } else {
++        return Err(GcovError::ProcessFailure);
++    };
+ 
+     if !output.status.success() {
+-        eprintln!("gcov stdout: {}", String::from_utf8_lossy(&output.stdout));
+-        eprintln!("gcov stderr: {}", String::from_utf8_lossy(&output.stderr));
+-
+-        panic!("gcov execution failed on {}", gcno_path.display());
++        return Err(GcovError::Failure((
++            gcno_path.to_str().unwrap().to_string(),
++            String::from_utf8_lossy(&output.stdout).to_string(),
++            String::from_utf8_lossy(&output.stderr).to_string(),
++        )));
+     }
++
++    Ok(())
+ }
+ 
+ fn is_recent_version(gcov_output: &str) -> bool {
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,6 +6,8 @@ extern crate crossbeam;
+ #[macro_use]
+ extern crate fomat_macros;
+ extern crate globset;
++#[macro_use]
++extern crate log;
+ extern crate semver;
+ extern crate smallvec;
+ extern crate tempfile;
+@@ -148,9 +150,8 @@ macro_rules! try_parse {
+         match $v {
+             Ok(val) => val,
+             Err(err) => {
+-                eprintln!("Error parsing file {}:", $f);
+-                eprintln!("{}", err);
+-                std::process::exit(1);
++                error!("Error parsing file {}: {}", $f, err);
++                continue;
+             }
+         }
+     };
+@@ -176,7 +177,10 @@ pub fn consumer(
+                 match work_item.item {
+                     ItemType::Path((stem, gcno_path)) => {
+                         // GCC
+-                        run_gcov(&gcno_path, branch_enabled, working_dir);
++                        if let Err(e) = run_gcov(&gcno_path, branch_enabled, working_dir) {
++                            error!("Error when running gcov: {}", e);
++                            continue;
++                        };
+                         let gcov_path =
+                             gcno_path.file_name().unwrap().to_str().unwrap().to_string() + ".gcov";
+                         let gcov_path = working_dir.join(gcov_path);
+@@ -231,13 +235,14 @@ pub fn consumer(
+                             },
+                             Err(e) => {
+                                 // Just print the error, don't panic and continue
+-                                eprintln!("Error in computing counters:\n{}", e);
++                                error!("Error in computing counters: {}", e);
+                                 Vec::new()
+                             }
+                         }
+                     }
+                     ItemType::Content(_) => {
+-                        panic!("Invalid content type");
++                        error!("Invalid content type");
++                        continue;
+                     }
+                 }
+             }
+@@ -250,7 +255,8 @@ pub fn consumer(
+                         try_parse!(parse_jacoco_xml_report(buffer), work_item.name)
+                     }
+                 } else {
+-                    panic!("Invalid content type")
++                    error!("Invalid content type");
++                    continue;
+                 }
+             }
+         };
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -5,13 +5,18 @@ extern crate grcov;
+ extern crate num_cpus;
+ extern crate rustc_hash;
+ extern crate serde_json;
++extern crate simplelog;
+ extern crate tempfile;
+ 
+ use clap::{App, Arg};
+ use crossbeam::crossbeam_channel::unbounded;
++use log::error;
+ use rustc_hash::FxHashMap;
+ use serde_json::Value;
++use simplelog::{Config, LevelFilter, TerminalMode, TermLogger, WriteLogger};
+ use std::fs::{self, File};
++use std::ops::Deref;
++use std::panic;
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ use std::{process, thread};
+@@ -155,6 +160,13 @@ fn main() {
+                                .value_name("VCS BRANCH")
+                                .takes_value(true))
+ 
++                          .arg(Arg::with_name("log")
++                               .help("Set the file where to log (or stderr or stdout). Defaults to 'stderr'")
++                               .long("log")
++                               .default_value("stderr")
++                               .value_name("LOG")
++                               .takes_value(true))
++
+                           .get_matches();
+ 
+     let paths: Vec<_> = matches.values_of("paths").unwrap().collect();
+@@ -187,6 +199,36 @@ fn main() {
+     let service_number = matches.value_of("service_number").unwrap_or("");
+     let service_job_number = matches.value_of("service_job_number").unwrap_or("");
+     let vcs_branch = matches.value_of("vcs_branch").unwrap_or("");
++    let log = matches.value_of("log").unwrap_or("");
++    match log {
++        "stdout" => {
++            let _ = TermLogger::init(LevelFilter::Error, Config::default(), TerminalMode::Stdout);
++        },
++        "stderr" => {
++            let _ = TermLogger::init(LevelFilter::Error, Config::default(), TerminalMode::Stderr);
++        },
++        log => {
++            if let Ok(file) = File::create(log) {
++                let _ = WriteLogger::init(LevelFilter::Error, Config::default(), file);
++            } else {
++                let _ = TermLogger::init(LevelFilter::Error, Config::default(), TerminalMode::Stderr);
++                error!("Enable to create log file: {}. Swtich to stderr", log);
++            }
++        }
++    };
++
++    panic::set_hook(Box::new(|panic_info| {
++        let (filename, line) =
++            panic_info.location().map(|loc| (loc.file(), loc.line()))
++            .unwrap_or(("<unknown>", 0));
++        let cause = panic_info.payload().downcast_ref::<String>().map(String::deref);
++        let cause = cause.unwrap_or_else(||
++                                         panic_info.payload().downcast_ref::<&str>().map(|s| *s)
++                                         .unwrap_or("<cause unknown>")
++        );
++        error!("A panic occurred at {}:{}: {}", filename, line, cause);
++    }));
++
+     let num_threads: usize = matches
+         .value_of("threads")
+         .unwrap()
+
+diff --git a/src/parser.rs b/src/parser.rs
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -18,6 +18,7 @@ pub enum ParserError {
+     Io(io::Error),
+     Parse(String),
+     InvalidRecord(String),
++    InvalidData(String),
+ }
+ 
+ impl From<io::Error> for ParserError {
+@@ -38,6 +39,7 @@ impl fmt::Display for ParserError {
+             ParserError::Io(ref err) => write!(f, "IO error: {}", err),
+             ParserError::Parse(ref s) => write!(f, "Record containing invalid integer: '{}'", s),
+             ParserError::InvalidRecord(ref s) => write!(f, "Invalid record: '{}'", s),
++            ParserError::InvalidData(ref s) => write!(f, "Invalid data: '{}'", s),
+         }
+     }
+ }
+@@ -196,10 +198,11 @@ pub fn parse_lcov<T: Read>(
+                     let mut f_splits = value.splitn(2, ',');
+                     let executed = try_next!(f_splits, l) != "0";
+                     let f_name = try_next!(f_splits, l);
+-                    let f = cur_functions
+-                        .get_mut(f_name)
+-                        .unwrap_or_else(|| panic!("FN record missing for function {}", f_name));
+-                    f.executed |= executed;
++                    if let Some(f) = cur_functions.get_mut(f_name) {
++                        f.executed |= executed;
++                    } else {
++                        return Err(ParserError::Parse(format!("FN record missing for function {}", f_name)));
++                    }
+                 }
+                 "BRDA" => {
+                     if branch_enabled {
+@@ -228,6 +231,7 @@ pub fn parse_gcov(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserEr
+ 
+     let f = File::open(&gcov_path)
+         .unwrap_or_else(|_| panic!("Failed to open gcov file {}", gcov_path.display()));
++
+     let mut file = BufReader::new(&f);
+     let mut l = vec![];
+ 
+@@ -504,10 +508,7 @@ fn parse_jacoco_report_package<T: Read>(
+ 
+     for (class, result) in &results_map {
+         if result.lines.is_empty() && result.branches.is_empty() {
+-            panic!(
+-                "Class {}/{} is not the top class in its file.",
+-                package, class
+-            );
++            return Err(ParserError::InvalidData(format!("Class {}/{} is not the top class in its file.", package, class)));
+         }
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn get_gcov() -> String
+
+pub fn run_gcov(gcno_path: &PathBuf, branch_enabled: bool, working_dir: &PathBuf) -> Result<(), GcovError>
+
+pub fn consumer(
+working_dir: &PathBuf,
+source_dir: &Option<PathBuf>,
+result_map: &SyncCovResultMap,
+receiver: JobReceiver,
+branch_enabled: bool,
+guess_directory: bool) -> ()
+
+fn main() -> ()
+
+pub fn parse_gcov(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserError>
+
+fn parse_jacoco_report_package<T: Read>(
+parser: &mut EventReader<T>,
+package: &str) -> Result<Vec<(String, CovResult)>, ParserError>
+
+pub fn parse_lcov<T: Read>(
+mut lcov_reader: BufReader<T>,
+branch_enabled: bool) -> Result<Vec<(String, CovResult)>, ParserError>
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

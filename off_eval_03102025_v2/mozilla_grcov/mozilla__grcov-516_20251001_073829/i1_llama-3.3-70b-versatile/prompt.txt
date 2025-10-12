@@ -1,0 +1,240 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Use source-based code coverage in our CI
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -38,6 +38,7 @@ pub struct GcnoBuffers {
+ #[derive(Debug)]
+ pub enum ItemType {
+     Path((String, PathBuf)),
++    Paths(Vec<PathBuf>),
+     Content(Vec<u8>),
+     Buffers(GcnoBuffers),
+ }
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -249,6 +249,10 @@ pub fn consumer(
+                         error!("Invalid content type");
+                         continue;
+                     }
++                    ItemType::Paths(_) => {
++                        error!("Invalid content type");
++                        continue;
++                    }
+                 }
+             }
+             ItemFormat::PROFRAW => {
+@@ -257,9 +261,9 @@ pub fn consumer(
+                     continue;
+                 }
+ 
+-                if let ItemType::Path((_stem, profraw_path)) = work_item.item {
+-                    match llvm_tools::profraw_to_lcov(
+-                        &profraw_path,
++                if let ItemType::Paths(profraw_paths) = work_item.item {
++                    match llvm_tools::profraws_to_lcov(
++                        profraw_paths.as_slice(),
+                         binary_path.as_ref().unwrap(),
+                         working_dir,
+                     ) {
+
+diff --git a/src/llvm_tools.rs b/src/llvm_tools.rs
+--- a/src/llvm_tools.rs
++++ b/src/llvm_tools.rs
+@@ -2,28 +2,15 @@ use cargo_binutils::Tool;
+ use std::path::PathBuf;
+ use std::process::Command;
+ 
+-pub fn profraw_to_lcov(
+-    profraw_path: &PathBuf,
++pub fn profraws_to_lcov(
++    profraw_paths: &[PathBuf],
+     binary_path: &String,
+     working_dir: &PathBuf,
+ ) -> Result<Vec<u8>, String> {
+-    let profdata_path = working_dir.join(
+-        profraw_path
+-            .file_name()
+-            .unwrap()
+-            .to_str()
+-            .unwrap()
+-            .to_string()
+-            + ".profdata",
+-    );
++    let profdata_path = working_dir.join("grcov.profdata");
+ 
+-    let args = [
+-        "merge",
+-        "-sparse",
+-        profraw_path.to_str().unwrap(),
+-        "-o",
+-        profdata_path.to_str().unwrap(),
+-    ];
++    let mut args = vec!["merge", "-sparse", "-o", profdata_path.to_str().unwrap()];
++    args.splice(2..2, profraw_paths.into_iter().map(|x| x.to_str().unwrap()));
+     let output = match Command::new(&Tool::Profdata.path().unwrap())
+         .args(&args)
+         .output()
+@@ -69,7 +56,7 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn test_profraw_to_lcov() {
++    fn test_profraws_to_lcov() {
+         let output = Command::new("rustc").arg("--version").output().unwrap();
+         if !String::from_utf8_lossy(&output.stdout).contains("nightly") {
+             return;
+@@ -79,8 +66,8 @@ mod tests {
+         let tmp_path = tmp_dir.path().to_owned();
+ 
+         assert_eq!(
+-            profraw_to_lcov(
+-                &PathBuf::from("test/default.profraw"),
++            profraws_to_lcov(
++                &[PathBuf::from("test/default.profraw")],
+                 &"".to_string(),
+                 &tmp_path
+             ),
+@@ -90,8 +77,8 @@ No filenames specified!
+             .to_string())
+         );
+ 
+-        let lcov = profraw_to_lcov(
+-            &PathBuf::from("test/default.profraw"),
++        let lcov = profraws_to_lcov(
++            &[PathBuf::from("test/default.profraw")],
+             &"test/rust-code-coverage-sample".to_string(),
+             &tmp_path,
+         );
+
+diff --git a/src/producer.rs b/src/producer.rs
+--- a/src/producer.rs
++++ b/src/producer.rs
+@@ -401,6 +401,12 @@ fn profraw_producer(
+     profraws: &FxHashMap<String, Vec<&Archive>>,
+     sender: &JobSender,
+ ) {
++    if profraws.len() == 0 {
++        return;
++    }
++
++    let mut profraw_paths = Vec::new();
++
+     for (name, archives) in profraws {
+         let path = PathBuf::from(name);
+         let stem = clean_path(&path.with_extension(""));
+@@ -422,15 +428,17 @@ fn profraw_producer(
+                 tmp_path
+             };
+ 
+-            sender
+-                .send(Some(WorkItem {
+-                    format: ItemFormat::PROFRAW,
+-                    item: ItemType::Path((stem.clone(), profraw_path)),
+-                    name: archive.get_name().to_string(),
+-                }))
+-                .unwrap()
++            profraw_paths.push(profraw_path);
+         }
+     }
++
++    sender
++        .send(Some(WorkItem {
++            format: ItemFormat::PROFRAW,
++            item: ItemType::Paths(profraw_paths),
++            name: "profraws".to_string(),
++        }))
++        .unwrap()
+ }
+ 
+ fn file_content_producer(
+@@ -598,6 +606,7 @@ mod tests {
+                     match x.item {
+                         ItemType::Content(_) => !elem.1,
+                         ItemType::Path((_, ref p)) => elem.1 && p.ends_with(elem.2),
++                        ItemType::Paths(ref paths) => paths.iter().any(|p| p.ends_with(elem.2)),
+                         ItemType::Buffers(ref b) => b.stem.replace("\\", "/").ends_with(elem.2),
+                     }
+                 }),
+@@ -617,6 +626,7 @@ mod tests {
+                     match v.item {
+                         ItemType::Content(_) => !x.1,
+                         ItemType::Path((_, ref p)) => x.1 && p.ends_with(x.2),
++                        ItemType::Paths(ref paths) => paths.iter().any(|p| p.ends_with(x.2)),
+                         ItemType::Buffers(ref b) => b.stem.replace("\\", "/").ends_with(x.2),
+                     }
+                 }),
+@@ -626,7 +636,7 @@ mod tests {
+         }
+ 
+         // Make sure we haven't generated duplicated entries.
+-        assert_eq!(vec.len(), expected.len());
++        assert!(vec.len() <= expected.len());
+ 
+         // Assert file exists and file with the same name but with extension .gcda exists.
+         for x in expected.iter() {
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn consumer(
+working_dir: &PathBuf,
+source_dir: &Option<PathBuf>,
+result_map: &SyncCovResultMap,
+receiver: JobReceiver,
+branch_enabled: bool,
+guess_directory: bool,
+binary_path: &Option<String>) -> ()
+
+fn profraw_producer(
+tmp_dir: &Path,
+profraws: &FxHashMap<String, Vec<&Archive>>,
+sender: &JobSender) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

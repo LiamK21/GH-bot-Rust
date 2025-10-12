@@ -1,0 +1,60 @@
+#[test]
+fn maximum_wait_attemps_is_enforced() {
+    let (glean, dir) = new_glean(None);
+
+    // Create a new upload manager so that we have access to its functions directly,
+    // make it synchronous so we don't have to manually wait for the scanning to finish.
+    let mut upload_manager =
+        PingUploadManager::new(dir.path(), "Testing", /* sync */ true);
+
+    // Add a rate limiter to the upload mangager with max of 1 ping 5secs.
+    //
+    // We arbitrarily set the maximum pings per interval to a very low number,
+    // when the rate limiter reaches it's limit get_upload_task returns a PingUploadTask::Wait,
+    // which will allow us to test the limitations around returning too many of those in a row.
+    let secs_per_interval = 5;
+    let max_pings_per_interval = 1;
+    upload_manager.set_rate_limiter(secs_per_interval, max_pings_per_interval);
+
+    // Enqueue two pings
+    upload_manager.enqueue_ping(&glean, &Uuid::new_v4().to_string(), PATH, "", None);
+    upload_manager.enqueue_ping(&glean, &Uuid::new_v4().to_string(), PATH, "", None);
+
+    // Get the first ping, it should be returned normally.
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Upload(_) => {}
+        _ => panic!("Expected upload manager to return the next request!"),
+    }
+
+    // Try to get the next ping,
+    // we should be throttled and thus get a PingUploadTask::Wait.
+    // Check that we are indeed allowed to get this response as many times as expected.
+    for _ in 0..MAX_WAIT_ATTEMPTS {
+        assert_eq!(
+            upload_manager.get_upload_task(&glean, false),
+            PingUploadTask::Wait
+        );
+    }
+
+    // Check that after we get PingUploadTask::Wait the allowed number of times,
+    // we then get PingUploadTask::Done.
+    assert_eq!(
+        upload_manager.get_upload_task(&glean, false),
+        PingUploadTask::Done
+    );
+
+    // Wait for the rate limiter to allow upload tasks again.
+    thread::sleep(Duration::from_secs(secs_per_interval));
+
+    // Check that we are allowed again to get pings.
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Upload(_) => {}
+        _ => panic!("Expected upload manager to return the next request!"),
+    }
+
+    // And once we are done we don't need to wait anymore.
+    assert_eq!(
+        upload_manager.get_upload_task(&glean, false),
+        PingUploadTask::Done
+    );
+}

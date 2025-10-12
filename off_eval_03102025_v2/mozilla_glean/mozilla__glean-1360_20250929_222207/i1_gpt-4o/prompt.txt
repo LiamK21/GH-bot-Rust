@@ -1,0 +1,490 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add names to threads spawned by Glean in Rust
+As found in bug 1662868, it's quite hard to understand what's going if threads don't have names :) We should add meaningful names to thread, so that tools like TSAN can report meaningful error messages to us.
+
+We should ideally do this before we tackle the TSAN problem in bug 1680474.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/dispatcher/mod.rs b/glean-core/rlb/src/dispatcher/mod.rs
+--- a/glean-core/rlb/src/dispatcher/mod.rs
++++ b/glean-core/rlb/src/dispatcher/mod.rs
+@@ -199,52 +199,57 @@ impl Dispatcher {
+ 
+         let queue_preinit = Arc::new(AtomicBool::new(true));
+ 
+-        let worker = thread::spawn(move || {
+-            if block_receiver.recv().is_err() {
+-                // The other side was disconnected.
+-                // There's nothing the worker thread can do.
+-                log::error!("The task producer was disconnected. Worker thread will exit.");
+-                return;
+-            }
+-
+-            let mut receiver = preinit_receiver;
+-            loop {
+-                use Command::*;
+-
+-                match receiver.recv() {
+-                    Ok(Shutdown) => {
+-                        break;
+-                    }
+-
+-                    Ok(Task(f)) => {
+-                        (f)();
+-                    }
+-
+-                    Ok(Swap(swap_done)) => {
+-                        // A swap should only occur exactly once.
+-                        // This is upheld by `flush_init`, which errors out if the preinit buffer
+-                        // was already flushed.
+-
+-                        // We swap the channels we listen on for new tasks.
+-                        // The next iteration will continue with the unbounded queue.
+-                        mem::swap(&mut receiver, &mut unbounded_receiver);
+-
+-                        // The swap command MUST be the last one received on the preinit buffer,
+-                        // so by the time we run this we know all preinit tasks were processed.
+-                        // We can notify the other side.
+-                        swap_done
+-                            .send(())
+-                            .expect("The caller of `flush_init` has gone missing");
+-                    }
++        let worker = thread::Builder::new()
++            .name("glean.dispatcher".into())
++            .spawn(move || {
++                if block_receiver.recv().is_err() {
++                    // The other side was disconnected.
++                    // There's nothing the worker thread can do.
++                    log::error!("The task producer was disconnected. Worker thread will exit.");
++                    return;
++                }
+ 
+-                    // Other side was disconnected.
+-                    Err(_) => {
+-                        log::error!("The task producer was disconnected. Worker thread will exit.");
+-                        return;
++                let mut receiver = preinit_receiver;
++                loop {
++                    use Command::*;
++
++                    match receiver.recv() {
++                        Ok(Shutdown) => {
++                            break;
++                        }
++
++                        Ok(Task(f)) => {
++                            (f)();
++                        }
++
++                        Ok(Swap(swap_done)) => {
++                            // A swap should only occur exactly once.
++                            // This is upheld by `flush_init`, which errors out if the preinit buffer
++                            // was already flushed.
++
++                            // We swap the channels we listen on for new tasks.
++                            // The next iteration will continue with the unbounded queue.
++                            mem::swap(&mut receiver, &mut unbounded_receiver);
++
++                            // The swap command MUST be the last one received on the preinit buffer,
++                            // so by the time we run this we know all preinit tasks were processed.
++                            // We can notify the other side.
++                            swap_done
++                                .send(())
++                                .expect("The caller of `flush_init` has gone missing");
++                        }
++
++                        // Other side was disconnected.
++                        Err(_) => {
++                            log::error!(
++                                "The task producer was disconnected. Worker thread will exit."
++                            );
++                            return;
++                        }
+                     }
+                 }
+-            }
+-        });
++            })
++            .expect("Failed to spawn Glean's dispatcher thread");
+ 
+         let guard = DispatchGuard {
+             queue_preinit,
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -185,139 +185,142 @@ pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) {
+         return;
+     }
+ 
+-    std::thread::spawn(move || {
+-        let core_cfg = glean_core::Configuration {
+-            upload_enabled: cfg.upload_enabled,
+-            data_path: cfg.data_path.clone(),
+-            application_id: cfg.application_id.clone(),
+-            language_binding_name: LANGUAGE_BINDING_NAME.into(),
+-            max_events: cfg.max_events,
+-            delay_ping_lifetime_io: cfg.delay_ping_lifetime_io,
+-        };
+-
+-        let glean = match Glean::new(core_cfg) {
+-            Ok(glean) => glean,
+-            Err(err) => {
+-                log::error!("Failed to initialize Glean: {}", err);
++    std::thread::Builder::new()
++        .name("glean.init".into())
++        .spawn(move || {
++            let core_cfg = glean_core::Configuration {
++                upload_enabled: cfg.upload_enabled,
++                data_path: cfg.data_path.clone(),
++                application_id: cfg.application_id.clone(),
++                language_binding_name: LANGUAGE_BINDING_NAME.into(),
++                max_events: cfg.max_events,
++                delay_ping_lifetime_io: cfg.delay_ping_lifetime_io,
++            };
++
++            let glean = match Glean::new(core_cfg) {
++                Ok(glean) => glean,
++                Err(err) => {
++                    log::error!("Failed to initialize Glean: {}", err);
++                    return;
++                }
++            };
++
++            // glean-core already takes care of logging errors: other bindings
++            // simply do early returns, as we're doing.
++            if glean_core::setup_glean(glean).is_err() {
+                 return;
+             }
+-        };
+-
+-        // glean-core already takes care of logging errors: other bindings
+-        // simply do early returns, as we're doing.
+-        if glean_core::setup_glean(glean).is_err() {
+-            return;
+-        }
+ 
+-        log::info!("Glean initialized");
++            log::info!("Glean initialized");
+ 
+-        // Now make this the global object available to others.
+-        setup_state(RustBindingsState {
+-            channel: cfg.channel,
+-            client_info,
+-        });
+-
+-        // Initialize the ping uploader.
+-        setup_upload_manager(net::UploadManager::new(
+-            cfg.server_endpoint
+-                .unwrap_or_else(|| DEFAULT_GLEAN_ENDPOINT.to_string()),
+-            cfg.uploader
+-                .unwrap_or_else(|| Box::new(net::HttpUploader) as Box<dyn net::PingUploader>),
+-        ));
++            // Now make this the global object available to others.
++            setup_state(RustBindingsState {
++                channel: cfg.channel,
++                client_info,
++            });
+ 
+-        let upload_enabled = cfg.upload_enabled;
++            // Initialize the ping uploader.
++            setup_upload_manager(net::UploadManager::new(
++                cfg.server_endpoint
++                    .unwrap_or_else(|| DEFAULT_GLEAN_ENDPOINT.to_string()),
++                cfg.uploader
++                    .unwrap_or_else(|| Box::new(net::HttpUploader) as Box<dyn net::PingUploader>),
++            ));
+ 
+-        with_glean_mut(|glean| {
+-            let state = global_state().lock().unwrap();
++            let upload_enabled = cfg.upload_enabled;
+ 
+-            // The debug view tag might have been set before initialize,
+-            // get the cached value and set it.
+-            if let Some(tag) = PRE_INIT_DEBUG_VIEW_TAG.get() {
+-                let lock = tag.try_lock();
+-                if let Ok(ref debug_tag) = lock {
+-                    glean.set_debug_view_tag(debug_tag);
++            with_glean_mut(|glean| {
++                let state = global_state().lock().unwrap();
++
++                // The debug view tag might have been set before initialize,
++                // get the cached value and set it.
++                if let Some(tag) = PRE_INIT_DEBUG_VIEW_TAG.get() {
++                    let lock = tag.try_lock();
++                    if let Ok(ref debug_tag) = lock {
++                        glean.set_debug_view_tag(debug_tag);
++                    }
+                 }
+-            }
+-            // The log pings debug option might have been set before initialize,
+-            // get the cached value and set it.
+-            let log_pigs = PRE_INIT_LOG_PINGS.load(Ordering::SeqCst);
+-            if log_pigs {
+-                glean.set_log_pings(log_pigs);
+-            }
+-            // The source tags might have been set before initialize,
+-            // get the cached value and set them.
+-            if let Some(tags) = PRE_INIT_SOURCE_TAGS.get() {
+-                let lock = tags.try_lock();
+-                if let Ok(ref source_tags) = lock {
+-                    glean.set_source_tags(source_tags.to_vec());
++                // The log pings debug option might have been set before initialize,
++                // get the cached value and set it.
++                let log_pigs = PRE_INIT_LOG_PINGS.load(Ordering::SeqCst);
++                if log_pigs {
++                    glean.set_log_pings(log_pigs);
++                }
++                // The source tags might have been set before initialize,
++                // get the cached value and set them.
++                if let Some(tags) = PRE_INIT_SOURCE_TAGS.get() {
++                    let lock = tags.try_lock();
++                    if let Ok(ref source_tags) = lock {
++                        glean.set_source_tags(source_tags.to_vec());
++                    }
+                 }
+-            }
+ 
+-            // Get the current value of the dirty flag so we know whether to
+-            // send a dirty startup baseline ping below.  Immediately set it to
+-            // `false` so that dirty startup pings won't be sent if Glean
+-            // initialization does not complete successfully.
+-            // TODO Bug 1672956 will decide where to set this flag again.
+-            let dirty_flag = glean.is_dirty_flag_set();
+-            glean.set_dirty_flag(false);
+-
+-            // Register builtin pings.
+-            // Unfortunately we need to manually list them here to guarantee
+-            // they are registered synchronously before we need them.
+-            // We don't need to handle the deletion-request ping. It's never touched
+-            // from the language implementation.
+-            glean.register_ping_type(&glean_metrics::pings::baseline.ping_type);
+-            glean.register_ping_type(&glean_metrics::pings::metrics.ping_type);
+-            glean.register_ping_type(&glean_metrics::pings::events.ping_type);
+-
+-            // TODO: perform registration of pings that were attempted to be
+-            // registered before init. See bug 1673850.
+-
+-            // If this is the first time ever the Glean SDK runs, make sure to set
+-            // some initial core metrics in case we need to generate early pings.
+-            // The next times we start, we would have them around already.
+-            let is_first_run = glean.is_first_run();
+-            if is_first_run {
+-                initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
+-            }
++                // Get the current value of the dirty flag so we know whether to
++                // send a dirty startup baseline ping below.  Immediately set it to
++                // `false` so that dirty startup pings won't be sent if Glean
++                // initialization does not complete successfully.
++                // TODO Bug 1672956 will decide where to set this flag again.
++                let dirty_flag = glean.is_dirty_flag_set();
++                glean.set_dirty_flag(false);
++
++                // Register builtin pings.
++                // Unfortunately we need to manually list them here to guarantee
++                // they are registered synchronously before we need them.
++                // We don't need to handle the deletion-request ping. It's never touched
++                // from the language implementation.
++                glean.register_ping_type(&glean_metrics::pings::baseline.ping_type);
++                glean.register_ping_type(&glean_metrics::pings::metrics.ping_type);
++                glean.register_ping_type(&glean_metrics::pings::events.ping_type);
++
++                // TODO: perform registration of pings that were attempted to be
++                // registered before init. See bug 1673850.
++
++                // If this is the first time ever the Glean SDK runs, make sure to set
++                // some initial core metrics in case we need to generate early pings.
++                // The next times we start, we would have them around already.
++                let is_first_run = glean.is_first_run();
++                if is_first_run {
++                    initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
++                }
+ 
+-            // Deal with any pending events so we can start recording new ones
+-            let pings_submitted = glean.on_ready_to_submit_pings();
++                // Deal with any pending events so we can start recording new ones
++                let pings_submitted = glean.on_ready_to_submit_pings();
+ 
+-            // We need to kick off upload in these cases:
+-            // 1. Pings were submitted through Glean and it is ready to upload those pings;
+-            // 2. Upload is disabled, to upload a possible deletion-request ping.
+-            if pings_submitted || !upload_enabled {
+-                let uploader = get_upload_manager().lock().unwrap();
+-                uploader.trigger_upload();
+-            }
++                // We need to kick off upload in these cases:
++                // 1. Pings were submitted through Glean and it is ready to upload those pings;
++                // 2. Upload is disabled, to upload a possible deletion-request ping.
++                if pings_submitted || !upload_enabled {
++                    let uploader = get_upload_manager().lock().unwrap();
++                    uploader.trigger_upload();
++                }
+ 
+-            // Set up information and scheduling for Glean owned pings. Ideally, the "metrics"
+-            // ping startup check should be performed before any other ping, since it relies
+-            // on being dispatched to the API context before any other metric.
+-            // TODO: start the metrics ping scheduler, will happen in bug 1672951.
++                // Set up information and scheduling for Glean owned pings. Ideally, the "metrics"
++                // ping startup check should be performed before any other ping, since it relies
++                // on being dispatched to the API context before any other metric.
++                // TODO: start the metrics ping scheduler, will happen in bug 1672951.
+ 
+-            // Check if the "dirty flag" is set. That means the product was probably
+-            // force-closed. If that's the case, submit a 'baseline' ping with the
+-            // reason "dirty_startup". We only do that from the second run.
+-            if !is_first_run && dirty_flag {
+-                // TODO: bug 1672956 - submit_ping_by_name_sync("baseline", "dirty_startup");
+-            }
++                // Check if the "dirty flag" is set. That means the product was probably
++                // force-closed. If that's the case, submit a 'baseline' ping with the
++                // reason "dirty_startup". We only do that from the second run.
++                if !is_first_run && dirty_flag {
++                    // TODO: bug 1672956 - submit_ping_by_name_sync("baseline", "dirty_startup");
++                }
+ 
+-            // From the second time we run, after all startup pings are generated,
+-            // make sure to clear `lifetime: application` metrics and set them again.
+-            // Any new value will be sent in newly generated pings after startup.
+-            if !is_first_run {
+-                glean.clear_application_lifetime_metrics();
+-                initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
+-            }
+-        });
++                // From the second time we run, after all startup pings are generated,
++                // make sure to clear `lifetime: application` metrics and set them again.
++                // Any new value will be sent in newly generated pings after startup.
++                if !is_first_run {
++                    glean.clear_application_lifetime_metrics();
++                    initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
++                }
++            });
+ 
+-        // Signal Dispatcher that init is complete
+-        if let Err(err) = dispatcher::flush_init() {
+-            log::error!("Unable to flush the preinit queue: {}", err);
+-        }
+-    });
++            // Signal Dispatcher that init is complete
++            if let Err(err) = dispatcher::flush_init() {
++                log::error!("Unable to flush the preinit queue: {}", err);
++            }
++        })
++        .expect("Failed to spawn Glean's init thread");
+ 
+     // Mark the initialization as called: this needs to happen outside of the
+     // dispatched block!
+
+diff --git a/glean-core/rlb/src/net/mod.rs b/glean-core/rlb/src/net/mod.rs
+--- a/glean-core/rlb/src/net/mod.rs
++++ b/glean-core/rlb/src/net/mod.rs
+@@ -79,33 +79,37 @@ impl UploadManager {
+ 
+         let inner = Arc::clone(&self.inner);
+ 
+-        thread::spawn(move || {
+-            // Mark the uploader as running.
+-            inner.thread_running.store(true, Ordering::SeqCst);
++        thread::Builder::new()
++            .name("glean.upload".into())
++            .spawn(move || {
++                // Mark the uploader as running.
++                inner.thread_running.store(true, Ordering::SeqCst);
+ 
+-            loop {
+-                let incoming_task = with_glean(|glean| glean.get_upload_task());
++                loop {
++                    let incoming_task = with_glean(|glean| glean.get_upload_task());
+ 
+-                match incoming_task {
+-                    PingUploadTask::Upload(request) => {
+-                        let doc_id = request.document_id.clone();
+-                        let upload_url = format!("{}{}", inner.server_endpoint, request.path);
+-                        let headers: Vec<(String, String)> = request.headers.into_iter().collect();
+-                        let result = inner.uploader.upload(upload_url, request.body, headers);
+-                        // Process the upload response.
+-                        with_glean(|glean| glean.process_ping_upload_response(&doc_id, result));
+-                    }
+-                    PingUploadTask::Wait => {
+-                        thread::sleep(THROTTLE_BACKOFF_TIME);
+-                    }
+-                    PingUploadTask::Done => {
+-                        // Nothing to do here, break out of the loop and clear the
+-                        // running flag.
+-                        inner.thread_running.store(false, Ordering::SeqCst);
+-                        return;
++                    match incoming_task {
++                        PingUploadTask::Upload(request) => {
++                            let doc_id = request.document_id.clone();
++                            let upload_url = format!("{}{}", inner.server_endpoint, request.path);
++                            let headers: Vec<(String, String)> =
++                                request.headers.into_iter().collect();
++                            let result = inner.uploader.upload(upload_url, request.body, headers);
++                            // Process the upload response.
++                            with_glean(|glean| glean.process_ping_upload_response(&doc_id, result));
++                        }
++                        PingUploadTask::Wait => {
++                            thread::sleep(THROTTLE_BACKOFF_TIME);
++                        }
++                        PingUploadTask::Done => {
++                            // Nothing to do here, break out of the loop and clear the
++                            // running flag.
++                            inner.thread_running.store(false, Ordering::SeqCst);
++                            return;
++                        }
+                     }
+                 }
+-            }
+-        });
++            })
++            .expect("Failed to spawn Glean's uploader thread");
+     }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

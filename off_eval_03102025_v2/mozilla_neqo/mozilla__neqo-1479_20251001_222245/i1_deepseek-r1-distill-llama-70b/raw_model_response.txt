@@ -1,0 +1,81 @@
+<think>
+Okay, I need to figure out how to write a unit test for the patch provided. The issue is about multiple ACK ranges not counting towards the congestion window (cwnd) because of app_limited. The patch introduces a new field first_app_limited to track when the application might be underutilizing the congestion window.
+
+First, I should understand what the patch does. It adds first_app_limited to the ClassicCongestionControl struct. This field helps determine whether packets sent before it should count towards increasing the cwnd. The on_packet_sent function now sets first_app_limited when the app isn't limited, and on_packets_acked adjusts is_app_limited based on this field.
+
+The existing tests in the patch, like app_limited_slow_start and app_limited_congestion_avoidance, simulate sending packets and check if the cwnd grows correctly when not app limited. But I think there's a gap: the tests might not cover scenarios where multiple ACK ranges are received, which was the original problem.
+
+So, I need a test that specifically checks if multiple ACKs correctly update the cwnd. The test should simulate sending packets, receiving multiple ACKs, and ensuring that the cwnd increases only when not app limited.
+
+I'll structure the test as follows:
+
+1. Initialize the congestion control with the appropriate state.
+2. Send a burst of packets to fill the cwnd.
+3. Receive multiple ACKs in ranges, checking each time if the cwnd increases correctly.
+4. Ensure that when the app isn't limited, all packets contribute to cwnd growth, and when it is limited, they don't.
+
+I'll name the test test_multiple_ack_ranges to clearly indicate its purpose. I'll use the SentPacket struct to create packets, track their PN, and simulate sending and acknowledging them.
+
+In the test, I'll set up a scenario where the first ACK range is not app limited, and subsequent ones should correctly update the cwnd. I'll also check the acked_bytes and cwnd after each ACK to ensure they behave as expected.
+
+I need to make sure all necessary imports are included, like SentPacket, PacketNumber, and Instant. I'll also need to use the ClassicCongestionControl struct and its methods.
+
+Finally, I'll write assertions to verify that the cwnd increases correctly when not app limited and doesn't when it is. This will confirm that the patch resolves the issue with multiple ACK ranges.
+</think>
+
+<Filename>neqo-transport/src/cc/classic_cc.rs</Filename>
+<imports>
+use neqo_common::qinfo;
+use std::time::Duration;
+use std::time::Instant;
+use super::SentPacket;
+use super::PacketNumber;
+use super::MAX_DATAGRAM_SIZE;
+use super::RTT;
+use super::PTO;
+use super::CWND_INITIAL_PKTS;
+use super::cwnd_is_default;
+use super::cwnd_is_halved;
+use super::ClassicCongestionControl;
+use super::NewReno;
+</imports>
+<Rust>
+#[test]
+fn test_multiple_ack_ranges() {
+    let mut cc = ClassicCongestionControl::new(NewReno::default());
+    let mut now = now();
+    let mut next_pn = 0;
+    
+    // Simulate sending initial packets to fill the congestion window
+    let mut sent_packets = Vec::new();
+    for _ in 0..CWND_INITIAL_PKTS {
+        let p = SentPacket::new(
+            PacketType::Short,
+            next_pn,
+            now,
+            true,
+            Vec::new(),
+            MAX_DATAGRAM_SIZE,
+        );
+        next_pn += 1;
+        cc.on_packet_sent(&p);
+        sent_packets.push(p);
+    }
+    
+    // Receive multiple ACK ranges
+    for i in 0..3 {
+        let acked_range = &sent_packets[i..i+1];
+        now += RTT;
+        cc.on_packets_acked(acked_range, RTT, now);
+        
+        assert_eq!(cc.bytes_in_flight(), (CWND_INITIAL_PKTS - i - 1) * MAX_DATAGRAM_SIZE);
+        assert_eq!(cc.acked_bytes, (i + 1) * MAX_DATAGRAM_SIZE);
+        assert_eq!(cc.congestion_window, (CWND_INITIAL_PKTS + i + 1) * MAX_DATAGRAM_SIZE);
+    }
+    
+    // Verify final state after all ACKs
+    assert_eq!(cc.bytes_in_flight(), 0);
+    assert_eq!(cc.acked_bytes, CWND_INITIAL_PKTS * MAX_DATAGRAM_SIZE);
+    assert_eq!(cc.congestion_window, (CWND_INITIAL_PKTS + CWND_INITIAL_PKTS) * MAX_DATAGRAM_SIZE);
+}
+</Rust>

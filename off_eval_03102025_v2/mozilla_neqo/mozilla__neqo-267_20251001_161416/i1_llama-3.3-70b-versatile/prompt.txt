@@ -1,0 +1,265 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Remembering sent packets after they're deemed lost
+It's not the case that just because we deem a packet lost (and thus worthy of its contents being re-sent) we want to forget about it immediately. If the original packet is subsequently ACKed, having forgotten about it means we have to keep state around until the retransmitted parts are ACKed.
+
+Remembering sent packets longer then raises the question of when exactly we *can* forget them. Somebody on Slack (Nick?) said:
+
+> If you ever declare a packet as lost or acknowledged, you remove it from your sent packets list. If you want, you can maintain a "suspected lost" packets list for a little while (2 RTT or so) in case you incorrectly marked it as lost, and you get an ACK for it later. But generally, once you remove a packet from the sent packets list you don't care about it any more.
+
+That would give us one answer for when it's safe to drop SentPackets: when current time is 2*RTT after when they were deemed lost.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/crypto.rs b/neqo-transport/src/crypto.rs
+--- a/neqo-transport/src/crypto.rs
++++ b/neqo-transport/src/crypto.rs
+@@ -325,7 +325,7 @@ pub struct CryptoStream {
+     pub rx: RxStreamOrderer,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct CryptoRecoveryToken {
+     epoch: u16,
+     offset: u64,
+
+diff --git a/neqo-transport/src/flow_mgr.rs b/neqo-transport/src/flow_mgr.rs
+--- a/neqo-transport/src/flow_mgr.rs
++++ b/neqo-transport/src/flow_mgr.rs
+@@ -180,6 +180,25 @@ impl FlowMgr {
+                 application_error_code,
+                 final_size
+             );
++
++            if self
++                .from_streams
++                .remove(&(
++                    stream_id.into(),
++                    mem::discriminant(&Frame::ResetStream {
++                        stream_id,
++                        application_error_code,
++                        final_size,
++                    }),
++                ))
++                .is_some()
++            {
++                qinfo!(
++                    "Queued ResetStream for {} removed because previous ResetStream was acked",
++                    stream_id
++                );
++            }
++
+             send_streams.reset_acked(stream_id.into());
+         }
+     }
+
+diff --git a/neqo-transport/src/recovery.rs b/neqo-transport/src/recovery.rs
+--- a/neqo-transport/src/recovery.rs
++++ b/neqo-transport/src/recovery.rs
+@@ -28,7 +28,7 @@ const INITIAL_RTT: Duration = Duration::from_millis(100);
+ 
+ const PACKET_THRESHOLD: u64 = 3;
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub enum RecoveryToken {
+     Ack(AckToken),
+     Stream(StreamRecoveryToken),
+@@ -36,13 +36,15 @@ pub enum RecoveryToken {
+     Flow(FlowControlRecoveryToken),
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct SentPacket {
+     ack_eliciting: bool,
+     //in_flight: bool, // TODO needed only for cc
+     //size: u64, // TODO needed only for cc
+     time_sent: Instant,
+     pub(crate) tokens: Vec<RecoveryToken>,
++
++    time_declared_lost: Option<Instant>,
+ }
+ 
+ #[derive(Debug, Default)]
+@@ -269,6 +271,7 @@ impl LossRecovery {
+                 time_sent: now,
+                 ack_eliciting,
+                 tokens,
++                time_declared_lost: None,
+             },
+         );
+         if ack_eliciting {
+@@ -344,6 +347,7 @@ impl LossRecovery {
+             .collect()
+     }
+ 
++    /// Detect packets whose contents may need to be retransmitted.
+     pub fn detect_lost_packets(&mut self, pn_space: PNSpace, now: Instant) -> Vec<SentPacket> {
+         self.enable_timed_loss_detection = false;
+         let loss_delay = self.loss_delay();
+@@ -357,49 +361,78 @@ impl LossRecovery {
+ 
+         let packet_space = &mut self.spaces[pn_space];
+ 
++        // Lost for retrans/CC purposes
+         let mut lost_pns = SmallVec::<[_; 8]>::new();
++
++        // Lost for we-can-actually-forget-about-it purposes
++        let mut really_lost_pns = SmallVec::<[_; 8]>::new();
++
++        let largest_acked = packet_space.largest_acked;
++        let current_rtt = self.rtt_vals.rtt();
+         for (pn, packet) in packet_space
+             .sent_packets
+-            .iter()
++            .iter_mut()
+             // BTreeMap iterates in order of ascending PN
+-            .take_while(|(&k, _)| Some(k) < packet_space.largest_acked)
++            .take_while(|(&k, _)| Some(k) < largest_acked)
+         {
+-            if packet.time_sent <= lost_deadline {
++            let lost = if packet.time_sent <= lost_deadline {
+                 qdebug!(
+                     "lost={}, time sent {:?} is before lost_deadline {:?}",
+                     pn,
+                     packet.time_sent,
+                     lost_deadline
+                 );
+-                lost_pns.push(*pn);
+-            } else if packet_space.largest_acked >= Some(*pn + PACKET_THRESHOLD) {
+-                // Packets with packet numbers more than PACKET_THRESHOLD
+-                // before largest acked are deemed lost.
++                true
++            } else if largest_acked >= Some(*pn + PACKET_THRESHOLD) {
+                 qdebug!(
+                     "lost={}, is >= {} from largest acked {:?}",
+                     pn,
+                     PACKET_THRESHOLD,
+-                    packet_space.largest_acked
++                    largest_acked
+                 );
++                true
++            } else {
++                false
++            };
++
++            if lost && packet.time_declared_lost.is_none() {
++                // TODO
++                // Inform the congestion controller of lost packets.
++
++                // Track declared-lost packets for a little while, maybe they
++                // will still show up?
++                packet.time_declared_lost = Some(now);
++
+                 lost_pns.push(*pn);
++            } else if packet
++                .time_declared_lost
++                .map(|tdl| tdl + (current_rtt * 2) < now)
++                .unwrap_or(false)
++            {
++                really_lost_pns.push(*pn);
+             } else {
+                 // OOO but not quite lost yet. Set the timed loss detect timer
+                 self.enable_timed_loss_detection = true;
+             }
+         }
+ 
++        for pn in really_lost_pns {
++            packet_space
++                .sent_packets
++                .remove(&pn)
++                .expect("PN must be in sent_packets");
++        }
++
+         let mut lost_packets = Vec::with_capacity(lost_pns.len());
+         for pn in lost_pns {
+             let lost_packet = packet_space
+                 .sent_packets
+-                .remove(&pn)
+-                .expect("PN must be in sent_packets");
++                .get(&pn)
++                .expect("PN must be in sent_packets")
++                .clone();
+             lost_packets.push(lost_packet);
+         }
+ 
+-        // TODO
+-        // Inform the congestion controller of lost packets.
+-
+         lost_packets
+     }
+
+diff --git a/neqo-transport/src/send_stream.rs b/neqo-transport/src/send_stream.rs
+--- a/neqo-transport/src/send_stream.rs
++++ b/neqo-transport/src/send_stream.rs
+@@ -819,7 +819,7 @@ fn stream_frame_hdr_len(stream_id: StreamId, offset: u64, remaining: usize) -> u
+     hdr_len + Encoder::varint_len(remaining as u64)
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct StreamRecoveryToken {
+     pub(crate) id: StreamId,
+     offset: u64,
+
+diff --git a/neqo-transport/src/tracking.rs b/neqo-transport/src/tracking.rs
+--- a/neqo-transport/src/tracking.rs
++++ b/neqo-transport/src/tracking.rs
+@@ -131,7 +131,7 @@ const MAX_TRACKED_RANGES: usize = 100;
+ const MAX_ACKS_PER_FRAME: usize = 32;
+ 
+ /// A structure that tracks what was included in an ACK.
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct AckToken {
+     space: PNSpace,
+     ranges: Vec<PacketRange>,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn stream_frame_hdr_len(stream_id: StreamId, offset: u64, remaining: usize) -> usize
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

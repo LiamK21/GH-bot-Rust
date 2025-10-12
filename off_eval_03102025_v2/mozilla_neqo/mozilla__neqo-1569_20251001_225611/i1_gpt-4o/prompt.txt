@@ -1,0 +1,218 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+consider building and pushing Interop Runner Docker image in CI
+I noticed that the neqo interop runner image is now 3 years (!) old: https://hub.docker.com/r/neqoquic/neqo-qns/tags. I assume that building / pushing was done manually using [this script](https://github.com/mozilla/neqo/blob/main/qns/update.sh) so far.
+
+May I suggest to push a new interop runner on every push to master, or on a daily (?) cron job? GitHub Actions has some predefined workflows that should make building and pushing Docker images pretty straightforward. For inspiration, [here](https://github.com/quic-go/quic-go/blob/master/.github/workflows/build-interop-docker.yml) is quic-go's workflow, and Quinn has [one](https://github.com/quinn-rs/quinn-interop/blob/main/.github/workflows/dockerhub.yml) as well.
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-client/src/main.rs b/neqo-client/src/main.rs
+--- a/neqo-client/src/main.rs
++++ b/neqo-client/src/main.rs
+@@ -829,7 +829,7 @@ fn handle_test(
+     local_addr: SocketAddr,
+     remote_addr: SocketAddr,
+     hostname: &str,
+-    urls: &[Url],
++    url_queue: VecDeque<Url>,
+     resumption_token: Option<ResumptionToken>,
+ ) -> Res<Option<ResumptionToken>> {
+     let key_update = KeyUpdateState(args.key_update);
+@@ -839,7 +839,7 @@ fn handle_test(
+                 .expect("failed to create client");
+         args.method = String::from("POST");
+         let url_handler = URLHandler {
+-            url_queue: VecDeque::from(urls.to_vec()),
++            url_queue,
+             stream_handlers: HashMap::new(),
+             all_paths: Vec::new(),
+             handler_type: StreamHandlerType::Upload,
+@@ -906,7 +906,7 @@ fn client(
+     local_addr: SocketAddr,
+     remote_addr: SocketAddr,
+     hostname: &str,
+-    urls: &[Url],
++    url_queue: VecDeque<Url>,
+     resumption_token: Option<ResumptionToken>,
+ ) -> Res<Option<ResumptionToken>> {
+     let testcase = args.test.clone();
+@@ -919,7 +919,7 @@ fn client(
+             local_addr,
+             remote_addr,
+             hostname,
+-            urls,
++            url_queue,
+             resumption_token,
+         );
+     }
+@@ -928,7 +928,7 @@ fn client(
+         .expect("failed to create client");
+     let key_update = KeyUpdateState(args.key_update);
+     let url_handler = URLHandler {
+-        url_queue: VecDeque::from(urls.to_vec()),
++        url_queue,
+         stream_handlers: HashMap::new(),
+         all_paths: Vec::new(),
+         handler_type: StreamHandlerType::Download,
+@@ -1019,19 +1019,29 @@ fn main() -> Res<()> {
+         }
+     }
+ 
+-    let mut urls_by_origin: HashMap<Origin, Vec<Url>> = HashMap::new();
+-    for url in &args.urls {
+-        let entry = urls_by_origin.entry(url.origin()).or_default();
+-        entry.push(url.clone());
+-    }
++    let urls_by_origin = args
++        .urls
++        .clone()
++        .into_iter()
++        .fold(HashMap::<Origin, VecDeque<Url>>::new(), |mut urls, url| {
++            urls.entry(url.origin()).or_default().push_back(url);
++            urls
++        })
++        .into_iter()
++        .filter_map(|(origin, urls)| match origin {
++            Origin::Tuple(_scheme, h, p) => Some(((h, p), urls)),
++            Origin::Opaque(x) => {
++                eprintln!("Opaque origin {x:?}");
++                None
++            }
++        });
+ 
+-    for ((_scheme, host, port), urls) in urls_by_origin.into_iter().filter_map(|(k, v)| match k {
+-        Origin::Tuple(s, h, p) => Some(((s, h, p), v)),
+-        Origin::Opaque(x) => {
+-            eprintln!("Opaque origin {x:?}");
+-            None
++    for ((host, port), mut urls) in urls_by_origin {
++        if args.resume && urls.len() < 2 {
++            eprintln!("Resumption to {host} cannot work without at least 2 URLs.");
++            exit(127);
+         }
+-    }) {
++
+         let remote_addr = format!("{host}:{port}").to_socket_addrs()?.find(|addr| {
+             !matches!(
+                 (addr, args.ipv4_only, args.ipv6_only),
+@@ -1074,28 +1084,13 @@ fn main() -> Res<()> {
+ 
+         let hostname = format!("{host}");
+         let mut token: Option<ResumptionToken> = None;
+-        let mut remaining = &urls[..];
+-        let mut first = true;
+-        loop {
+-            let to_request;
+-            if (args.resume && first) || args.download_in_series {
+-                to_request = &remaining[..1];
+-                remaining = &remaining[1..];
+-                if args.resume && first && remaining.is_empty() {
+-                    println!(
+-                        "Error: resumption to {hostname} cannot work without at least 2 URLs."
+-                    );
+-                    exit(127);
+-                }
++        while !urls.is_empty() {
++            let to_request = if args.resume || args.download_in_series {
++                urls.pop_front().into_iter().collect()
+             } else {
+-                to_request = remaining;
+-                remaining = &[][..];
+-            }
+-            if to_request.is_empty() {
+-                break;
+-            }
++                std::mem::take(&mut urls)
++            };
+ 
+-            first = false;
+             token = if args.use_old_http {
+                 old::old_client(
+                     &args,
+@@ -1417,7 +1412,7 @@ mod old {
+         local_addr: SocketAddr,
+         remote_addr: SocketAddr,
+         origin: &str,
+-        urls: &[Url],
++        url_queue: VecDeque<Url>,
+         token: Option<ResumptionToken>,
+     ) -> Res<Option<ResumptionToken>> {
+         let alpn = match args.alpn.as_str() {
+@@ -1449,7 +1444,7 @@ mod old {
+         let key_update = KeyUpdateState(args.key_update);
+         let mut h = HandlerOld {
+             streams: HashMap::new(),
+-            url_queue: VecDeque::from(urls.to_vec()),
++            url_queue,
+             all_paths: Vec::new(),
+             args,
+             token: None,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> Res<()>
+
+fn handle_test(
+testcase: &String,
+args: &mut Args,
+socket: &UdpSocket,
+poll: &Poll,
+local_addr: SocketAddr,
+remote_addr: SocketAddr,
+hostname: &str,
+url_queue: VecDeque<Url>,
+resumption_token: Option<ResumptionToken>) -> Res<Option<ResumptionToken>>
+
+fn client(
+args: &mut Args,
+socket: &UdpSocket,
+poll: &Poll,
+local_addr: SocketAddr,
+remote_addr: SocketAddr,
+hostname: &str,
+url_queue: VecDeque<Url>,
+resumption_token: Option<ResumptionToken>) -> Res<Option<ResumptionToken>>
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

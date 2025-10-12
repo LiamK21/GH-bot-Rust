@@ -1,0 +1,198 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Optimize `SentPackets::take_ranges`
+When CPU profiling a `test_fixtures::Simulator` run transferring 10 MiB from a server to a client, I see the following flamegraph:
+
+ 
+![flamegraph2](https://github.com/user-attachments/assets/940a7bf3-9ddd-4318-bfe1-92a9f0b417d9)
+
+The majority of CPU time is spent in `SentPackets::take_ranges`:
+
+https://github.com/mozilla/neqo/blob/f3d01912b9a2d5962fffae1a192a3f62e738f745/neqo-transport/src/recovery/sent.rs#L189-L213
+
+More specifically in the two calls to `BTreeMap::extend`:
+
+https://github.com/mozilla/neqo/blob/f3d01912b9a2d5962fffae1a192a3f62e738f745/neqo-transport/src/recovery/sent.rs#L200-L211
+
+Adding some logging, the following seems to be the case:
+
+- Assume we have two nodes, A and B, where A sends 10 MiB to B.
+- A has 100 packets in flight.
+- A receives an ACK from B, acknowledging the first 2 packets.
+- At the end of the first loop iteration:
+  - `packets.len()` will be `0`, given the ACK from B acknowledges the first 2 packets.
+  - `acked.len()` will be `2`, containing the two new acked `SentPacket`s.
+  - `keep.len()` will be `98`, containing all remaining packets
+- We then execute `self.packets.extend(keep)`, e.g. in the above scenario, adding all remaining 98 packets to the now empty `self.packets`.
+- In other words, we re-insert all remaining packets on each ACK.
+
+Unfortunately `BTreeMap` does not allow splitting out a full range. The closest to that is [`BTreeMap::extract_if`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html#method.extract_if) which is currently Nightly only.
+
+That said, I think the following change, optimizing for the scenario above, would get us a long way already:
+
+``` diff
+modified   neqo-transport/src/recovery/sent.rs
+@@ -197,18 +197,17 @@ impl SentPackets {
+     {
+         let mut result = Vec::new();
+         // Remove all packets. We will add them back as we don't need them.
+-        let mut packets = std::mem::take(&mut self.packets);
+         for range in acked_ranges {
+-            // For each acked range, split off the acknowledged part,
+-            // then split off the part that hasn't been acknowledged.
+-            // This order works better when processing ranges that
+-            // have already been processed, which is common.
+-            let mut acked = packets.split_off(range.start());
+-            let keep = acked.split_off(&(*range.end() + 1));
+-            self.packets.extend(keep);
++            let mut packets = std::mem::take(&mut self.packets);
++
++            let mut keep = packets.split_off(&(*range.end()));
++            let acked = packets.split_off(range.start());
++
++            keep.extend(packets);
++            self.packets = keep;
++
+             result.extend(acked.into_values().rev());
+         }
+-        self.packets.extend(packets);
+         result
+     }
+ ```
+
+CPU profiling once more, this resolves the hot-spot on `SentPackets::take_ranges`:
+
+![flamegraph](https://github.com/user-attachments/assets/7edf230d-f645-468e-a74f-1e8e4ae18e10)
+
+Let me know if I am missing something? E.g. the above scenario not being something worth optimizing for.
+
+See also past discussion: https://github.com/mozilla/neqo/pull/1886/files#r1591830138
+</issue>
+
+Patch:
+<patch>
+diff --git a/neqo-transport/src/recovery/sent.rs b/neqo-transport/src/recovery/sent.rs
+--- a/neqo-transport/src/recovery/sent.rs
++++ b/neqo-transport/src/recovery/sent.rs
+@@ -204,7 +204,7 @@ impl SentPackets {
+         self.packets.values_mut()
+     }
+ 
+-    /// Take values from a specified ranges of packet numbers.
++    /// Take values from specified ranges of packet numbers.
+     /// The values returned will be reversed, so that the most recent packet appears first.
+     /// This is because ACK frames arrive with ranges starting from the largest acknowledged
+     /// and we want to match that.
+@@ -214,19 +214,58 @@ impl SentPackets {
+         R::IntoIter: ExactSizeIterator,
+     {
+         let mut result = Vec::new();
+-        // Remove all packets. We will add them back as we don't need them.
++
++        // Start with all packets. We will add unacknowledged packets back.
++        //  [---------------------------packets----------------------------]
+         let mut packets = std::mem::take(&mut self.packets);
++
++        let mut previous_range_start: Option<PacketNumber> = None;
++
+         for range in acked_ranges {
+-            // For each acked range, split off the acknowledged part,
+-            // then split off the part that hasn't been acknowledged.
+-            // This order works better when processing ranges that
+-            // have already been processed, which is common.
+-            let mut acked = packets.split_off(range.start());
+-            let keep = acked.split_off(&(*range.end() + 1));
+-            self.packets.extend(keep);
+-            result.extend(acked.into_values().rev());
++            // Split off at the end of the acked range.
++            //
++            //  [---------packets--------][----------after_acked_range---------]
++            let after_acked_range = packets.split_off(&(*range.end() + 1));
++
++            // Split off at the start of the acked range.
++            //
++            //  [-packets-][-acked_range-][----------after_acked_range---------]
++            let acked_range = packets.split_off(range.start());
++
++            // According to RFC 9000 19.3.1 ACK ranges are in descending order:
++            //
++            // > Each ACK Range consists of alternating Gap and ACK Range Length
++            // > values in **descending packet number order**.
++            //
++            // <https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3.1>
++            debug_assert!(previous_range_start.map_or(true, |s| s > *range.end()));
++            previous_range_start = Some(*range.start());
++
++            // Thus none of the following ACK ranges will acknowledge packets in
++            // `after_acked_range`. Let's put those back early.
++            //
++            //  [-packets-][-acked_range-][------------self.packets------------]
++            if self.packets.is_empty() {
++                // Don't re-insert un-acked packets into empty collection, but
++                // instead replace the empty one entirely.
++                self.packets = after_acked_range;
++            } else {
++                // Need to extend existing one. Not the first iteration, thus
++                // `after_acked_range` should be small.
++                self.packets.extend(after_acked_range);
++            }
++
++            // Take the acked packets.
++            result.extend(acked_range.into_values().rev());
+         }
++
++        // Put remaining non-acked packets back.
++        //
++        // This is inefficient if the acknowledged packets include the last sent
++        // packet AND there is a large unacknowledged span of packets. That's
++        // rare enough that we won't do anything special for that case.
+         self.packets.extend(packets);
++
+         result
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at neqo and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
