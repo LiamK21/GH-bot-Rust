@@ -1,10 +1,13 @@
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
 import time
 from pathlib import Path
+
+from webhook_handler.models import LLMResponse
 
 logger = logging.getLogger(__name__)
 
@@ -95,3 +98,55 @@ def get_candidate_file(commit_hash: str, filename: str, tmp_repo_dir: str) -> st
     run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
 
     return file_content
+
+def retrieve_output_errors(out: str) -> str:
+    """
+    Retrieves only the linting errors from the linting output.
+
+    Parameters:
+        out (str): The full linting output
+    Returns:
+        str: The linting errors only
+    """
+    idx: int = 0
+    line: str = ""
+    result: list[str] = []
+    out_lines = out.splitlines()    
+    while idx < len(out_lines):
+        line = out_lines[idx].strip()
+        if line.startswith("error") and "could not compile" not in line: 
+            startIdx = idx
+            # Capture all lines related to this error
+            while idx < len(out_lines) and not out_lines[idx].strip() == "":
+                idx += 1
+            result.append("\n".join(out_lines[startIdx:idx]))
+        else:
+            idx += 1
+            
+    return "\n\n".join(result)
+
+def retrieve_output_test_failure(out: str) -> str:
+    out_lines = out.splitlines()
+    idx: int = 0
+    failure_reason: list[str] = []
+    running_test_pattern = r"running \d+ test"
+    
+    while idx < len(out_lines):
+        line = out_lines[idx].strip()
+        match = re.match(running_test_pattern, line)
+        if match:
+            startIdx = idx
+            idx += 2 # Skip the following newline
+            while idx < len(out_lines) and not out_lines[idx].strip() == "":
+                idx += 1
+            failure_reason.append("\n".join(out_lines[startIdx:idx]))
+        else:
+            idx += 1
+    
+    return "\n\n".join(out_lines)
+
+def build_response_test(llm_response: LLMResponse) -> str:
+    filename_block = f"\n<Filename>{llm_response.filename}</Filename>\n"
+    imports_block = f"<imports>{"\n".join(llm_response.imports)}</imports>\n"
+    test_block = f"<Rust>{llm_response.test_code}\n</Rust>\n"
+    return f"<TEST>{filename_block + imports_block + test_block}</TEST>\n\n"
