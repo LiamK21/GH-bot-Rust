@@ -28,6 +28,7 @@ class Config:
 
         self.execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.curr_attempt = 0
+        self.MAX_LLM_CALLS = 5
         self.root_dir = Path.cwd()
         self.is_server = Path("/home/runner").is_dir()
 
