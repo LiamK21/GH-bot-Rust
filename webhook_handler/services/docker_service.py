@@ -12,7 +12,7 @@ from docker.models.containers import Container
 from docker.models.images import Image
 
 from webhook_handler.helper.custom_errors import *
-from webhook_handler.models import PullRequestData
+from webhook_handler.models import LLMResponse, PullRequestData
 
 logger = logging.getLogger(__name__)
 
@@ -196,11 +196,10 @@ class DockerService:
             raise ExecutionError("Unexpected Docker error")
         finally:
             # Cleanup
-            # os.remove(patch_file_path)
             if container is not None:
                 container.stop()
                 container.remove()
-                logger.info("[*] Container not stopped and removed.")
+                logger.info("[*] Container stopped and removed.")
 
     def _handle_newly_added_files(self, patch: str, container: Container) -> set[str]:
         """Finds and creates files only if their patch chunk starts with '@@ -0,0 +'."""
@@ -372,3 +371,61 @@ class DockerService:
                 container.remove()
                 logger.info("[*] Container stopped and removed.")
                 
+    def run_linter(self, patch: str) -> TestResult:
+        """
+        Runs the linter inside a Docker container.
+
+        Parameters:
+            llm_response (LLMResponse): The LLM response containing the filename and imports
+            new_file_content (str): The content of the new file to be linted
+
+        Returns:
+            bool: True if the linter passed, False otherwise
+            str: The output from running the linter
+        """
+        container: Container | None = None
+        try:
+            logger.marker("Creating container for linter...")  # type: ignore[attr-defined]
+            container = self._client.containers.create(
+                image=self._pr_data.image_tag,
+                command="/bin/sh -c 'sleep infinity'",  # keep the container running
+                tty=True,  # allocate a TTY for interactive use
+                detach=True,
+            )
+            container.start()
+            logger.marker(f"Container {container.short_id} started")  # type: ignore[attr-defined]
+
+            # Create placeholder empty files for PRs that add new files
+            self._handle_newly_added_files(patch, container)
+
+            # Add the new file content to the container
+            self._add_file_and_apply_patch_in_container(container, patch, True)
+
+            logger.marker(f"Running linter")  # type: ignore[attr-defined]
+            lint_command: str = (
+                f"/bin/sh -c 'cd /app/testbed && "
+                f"cargo check'"
+            )
+            exec_result = container.exec_run(lint_command, stdout=True, stderr=True)
+            stdout: str = exec_result.output.decode()
+            lint_passed: bool = exec_result.exit_code == 0
+            stdout = "Exit Code: " + str(exec_result.exit_code) + "\n" + stdout
+            logger.info(f"[+] Linter result: {lint_passed}")
+            return lint_passed, stdout
+
+        except ImageNotFound as e:
+            logger.critical(f"Docker image not found: {e}")
+            raise ExecutionError("Docker image not found")
+        except APIError as e:
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+        except Exception as e:
+            logger.critical(f"Unexpected error: {e}")
+            raise ExecutionError("Unexpected")
+        
+        finally:
+            # Cleanup
+            if container is not None:
+                container.stop()
+                container.remove()
+                logger.info("[*] Container stopped and removed.")
