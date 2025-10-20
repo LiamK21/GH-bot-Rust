@@ -120,7 +120,7 @@ class DockerService:
         if repo == "grcov" and int(self._pr_data.number) < 703:
             logger.info("Using old Dockerfile for grcov")  
             return "Dockerfile_grcov_old"
-        elif repo == "rust-code-analysis" and int(pr_number) < 700:
+        elif repo == "rust-code-analysis" and int(pr_number) <699:
             logger.info("Using old Dockerfile for rust-code-analysis")
             return "Dockerfile_rust-code-analysis_old"
         else:
