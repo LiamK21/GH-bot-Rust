@@ -116,11 +116,12 @@ class BotRunner:
         )
 
         try:
-            result = generator.generate()
+            result, path = generator.generate()
             self._logger.success(f"Attempt %d with model %s finished successfully" % (curr_attempt + 1, model))  # type: ignore[attr-defined]
             if result is True:
+                assert path is not None
                 generated_test: str = Path(
-                    self._config.output_dir, "generated_test.txt"
+                    path, "generated_test.txt"
                 ).read_text(encoding="utf-8")
                 new_filename = (
                     f"{self._execution_id}_{self._config.output_dir.name}.txt"
@@ -132,28 +133,22 @@ class BotRunner:
 
         except (FileExistsError, FileNotFoundError, PermissionError) as e:
             self._logger.critical(f"File error occurred during runner execution: {e}")
-            # raise ExecutionError("File error occurred during execution")
             return False
         except DataMissingError as e:
             self._logger.critical(
                 f"Data missing error occurred during runner execution: {e}"
             )
-            # raise ExecutionError("Data missing error occurred during execution")
             return False
         except ExecutionError as e:
             self._logger.critical(
                 f"Execution error occurred during runner execution: {e}"
             )
-            # raise ExecutionError("Data missing error occurred during execution")
             return False
         except Exception as e:
             self._logger.critical(
                 f"Another error occurred during runner execution: {e}"
             )
-            # raise ExecutionError("File error occurred during execution")
             return False
-        finally:
-            self._record_result(curr_attempt, model)
 
     def prepare_environment(self) -> None:
         """Prepares all services and data used in each attempt"""
@@ -244,28 +239,6 @@ class BotRunner:
 
         # Create a generation subdirectory within the attempt directory
         self._logger.info(f"Created model attempt directory: {attempt_instance_dir}")
-
-    def _record_result(
-        self,
-        i_attempt: int,
-        model: LLM,
-    ) -> None:
-        """
-        Writes result to csv.
-
-        Parameters:
-            number (str): The number of the PR
-            model (LLM): The model
-            i_attempt (int): The attempt number
-            stop (bool | str): The stop flag or an error string
-        """
-
-        with open(Path(self._config.bot_log_dir, "results.csv"), "a") as f:
-            f.write(
-                "{:<9},{:<30},{:<9},{:<45}\n".format(
-                    self._pr_data.number, model, i_attempt, self._generation_completed
-                )
-            )
 
     def teardown(self) -> None:
         """
