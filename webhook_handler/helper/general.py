@@ -143,7 +143,7 @@ def retrieve_output_test_failure(out: str) -> str:
         else:
             idx += 1
     
-    return "\n\n".join(out_lines)
+    return "\n\n".join(failure_reason)
 
 def build_response_test(llm_response: LLMResponse) -> str:
     filename_block = f"\n<Filename>{llm_response.filename}</Filename>\n"
