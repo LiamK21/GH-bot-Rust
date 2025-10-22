@@ -116,11 +116,12 @@ class BotRunner:
         )
 
         try:
-            result = generator.generate()
+            result, path = generator.generate()
             self._logger.success(f"Attempt %d with model %s finished successfully" % (curr_attempt + 1, model))  # type: ignore[attr-defined]
             if result is True:
+                assert path is not None
                 generated_test: str = Path(
-                    self._config.output_dir, "generated_test.txt"
+                    path, "generated_test.txt"
                 ).read_text(encoding="utf-8")
                 new_filename = (
                     f"{self._execution_id}_{self._config.output_dir.name}.txt"

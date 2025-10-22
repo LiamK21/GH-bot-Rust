@@ -45,7 +45,7 @@ class TestGenerator:
 
         self._generation_dir: Path | None = None
 
-    def generate(self) -> bool | None:
+    def generate(self) -> tuple[bool, Path | None]:
 
         logger.marker("=============== Test Generation Started ==============")  # type: ignore[attr-defined]
         logger.marker("Attempt %d with model %s" % (self._i_attempt + 1, self._model))  # type: ignore[attr-defined]
@@ -66,11 +66,11 @@ class TestGenerator:
                     filename, imports, line_coverage_before, line_coverage_after
                 )
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
-            return True
+            return True, self._generation_dir
         else:
             logger.info("No Fail-to-Pass test generated")
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
-            return False
+            return False, None
 
     def run_workflow(
         self,
@@ -296,11 +296,6 @@ class TestGenerator:
         )
 
         (self._generation_dir / "before.txt").write_text(stdout, encoding="utf-8")
-        new_test_file = f"#{filename}\n{new_file_content}"
-
-        (self._generation_dir / "new_test_file_content.rs").write_text(
-            new_test_file, encoding="utf-8"
-        )
         return test_passed
 
     def run_test_post_pr(
@@ -338,6 +333,11 @@ class TestGenerator:
         )
 
         (self._generation_dir / "after.txt").write_text(stdout, encoding="utf-8")
+        new_test_file = f"#{filename}\n{new_file_content}"
+
+        (self._generation_dir / "new_file_content.rs").write_text(
+            new_test_file, encoding="utf-8"
+        )
 
         return test_passed, stdout
 
