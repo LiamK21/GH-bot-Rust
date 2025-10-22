@@ -1,6 +1,6 @@
 from webhook_handler.models import LLM
 
-USED_MODELS = [LLM.GPT4o, LLM.LLAMA, LLM.DEEPSEEK]
+USED_MODELS = [LLM.GPT4o, LLM.LLAMA, LLM.QWEN3]
 
 PROMPT_COMBINATIONS_GEN: dict[str, list[int | str]] = {
     "include_golden_code": [1, 1, 1, 1, 0],
