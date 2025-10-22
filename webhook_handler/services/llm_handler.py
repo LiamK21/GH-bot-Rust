@@ -43,9 +43,7 @@ class LLMHandler:
         diff, funcs = self._pr_diff_ctx.get_patch_and_modified_functions
 
         patch = f"Patch:\n<patch>\n{diff}\n</patch>\n\n"
-        funcs: str = ""
-        if prompt_type == PromptType.INITIAL:
-            funcs = f"Function signatures\n<Signatures>\n{"\n\n".join(funcs)}\n</Signatures>\n\n"
+        funcs = f"Function signatures\n<Signatures>\n{"\n\n".join(funcs)}\n</Signatures>\n\n"
 
 
         instructions = templates.get_instructions_template(self._pr_data.repo, prompt_type)
@@ -58,10 +56,6 @@ class LLMHandler:
             f"{previous_test}"
             f"{failed_output}"
             f"{funcs}"
-            # f"{available_imports}"
-            # f"{golden_code}"
-            # f"{test_code}"
-            # f"{pr_summary}"
             f"{instructions}"
             f"{templates.EXAMPLE_TEST_STRUCTURE}"
         )
@@ -107,7 +101,7 @@ class LLMHandler:
                 result = completion.choices[0].message.content
                 assert isinstance(result, str), "Expected response to be a string"
                 return result.strip()
-            elif model == LLM.DEEPSEEK:
+            elif model == LLM.QWEN3:
                 response = self._groq_client.chat.completions.create(
                     model=model,
                     messages=[
@@ -173,37 +167,6 @@ class LLMHandler:
         cleaned_test = code_match.group(1).strip()
 
         return filename, imports, self._adjust_function_indentation(cleaned_test)
-
-    @staticmethod
-    def _clean_descriptions(function_code: str) -> str:
-        """
-        Cleans the call expression descriptions used in the generated test by removing every non-letter character and multiple whitespaces.
-
-        Parameters:
-            function_code (str): Function code to clean
-
-        Returns:
-            str: Cleaned function code
-        """
-
-        pattern = re.compile(
-            r"\b(?P<ttype>describe|it)\(\s*"  # match describe( or it(
-            r'(?P<quote>[\'"])\s*'  # capture opening quote
-            r"(?P<name>.*?)"  # capture the raw name
-            r"(?P=quote)\s*,",  # match the same closing quote, then comma
-            flags=re.DOTALL,
-        )
-
-        def clean_test_name(match):
-            test_type = match.group("ttype")
-            q = match.group("quote")
-            name = match.group("name")
-            # strip out anything but A–Z or a–z
-            cleaned = re.sub(r"[^A-Za-z ]", "", name)
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            return f"{test_type}({q}{cleaned}{q},"
-
-        return pattern.sub(clean_test_name, function_code)
 
     @staticmethod
     def _adjust_function_indentation(function_code: str) -> str:
