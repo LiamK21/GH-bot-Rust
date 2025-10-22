@@ -5,7 +5,7 @@ from groq import Groq
 from openai import OpenAI
 
 from webhook_handler.helper import templates
-from webhook_handler.models import LLM, PipelineInputs
+from webhook_handler.models import LLM, PipelineInputs, PromptType
 from webhook_handler.services.config import Config
 
 logger = logging.getLogger(__name__)
@@ -23,116 +23,31 @@ class LLMHandler:
         self._openai_client = OpenAI(api_key=config.openai_key)
         self._groq_client = Groq(api_key=config.groq_key)
 
-    def build_prompt(
-        self,
-        # include_golden_code: bool,
-        # sliced: bool,
-        # include_pr_summary: bool,
-        # include_predicted_test_file: bool,
-        # test_filename: str,
-        # test_file_content_sliced: str,
-    ) -> str:
+    def build_prompt(self, prompt_type: PromptType, previous_test: str = "", failure_reason: str = "") -> str:
         """
         Builds prompt with available data.
-
-        Returns:
-            str: Prompt
         """
 
         linked_issue: str = (
             f"Issue:\n<issue>\n{self._pipeline_inputs.problem_statement}\n</issue>\n\n"
         )
 
-        # golden_code_patch = self._pr_diff_ctx.golden_code_patch
-        # src_code_file_diffs = self._pr_diff_ctx.source_code_file_diffs
         diff, funcs = self._pr_diff_ctx.get_patch_and_modified_functions
 
         patch = f"Patch:\n<patch>\n{diff}\n</patch>\n\n"
         funcs = f"Function signatures\n<Signatures>\n{"\n\n".join(funcs)}\n</Signatures>\n\n"
 
-        # available_imports = f"Imports:\n<imports>\n{available_packages}\n{available_relative_imports}\n</imports>\n\n"
 
-        # golden_code = ""
-        # if include_golden_code:
-        #     code_filenames = self._pr_diff_ctx.code_names
-        #     if sliced:
-        #         code = self._pipeline_inputs.code_sliced
-        #         golden_code += "Code:\n<code>\n"
-        #         for (f_name, f_code) in zip(code_filenames, code):
-        #             golden_code += ("File:\n"
-        #                             f"{f_name}\n"
-        #                             f"{f_code}\n")
-        #         golden_code += "</code>\n\n"
-        #     else:
-        #         code = self._pr_diff_ctx.code_before  # whole code
-        #         code = [self._add_line_numbers(x) for x in code]
-        #         golden_code += "Code:\n<code>\n"
-        #         for (f_name, f_code) in zip(code_filenames, code):
-        #             golden_code += ("File:\n"
-        #                             f"{f_name}\n"
-        #                             f"{f_code}\n")
-        #         golden_code += "</code>\n\n"
-
-        instructions = templates.get_instructions_template(self._pr_data.repo)
-
-        # test_code: str = ""
-        # if include_predicted_test_file:
-        #     if test_file_content_sliced:
-        #         test_code += f"Test file:\n<test_file>\nFile:\n{test_filename}\n{test_file_content_sliced}\n</test_file>\n\n"
-        #         instructions = ("Your task:\n"
-        #                         f"You are a software tester at {self._pr_data.repo}.\n"
-        #                         "1. Examine the existing test file. You may reuse any imports, helpers or setup blocks it already has.\n"
-        #                         "2. Write exactly one javascript test `it(\"...\", async () => {...})` block.\n"
-        #                         "3. Your test must fail on the code before the patch, and pass after, hence "
-        #                         "the test will verify that the patch resolves the issue.\n"
-        #                         "4. The test must be self-contained and to-the-point.\n"
-        #                         "5. If you need something new use only the provided imports (respect the paths "
-        #                         "exactly how they are given) by importing dynamically for compatibility with Node.js "
-        #                         "— no new dependencies. "
-        #                         f"{use_pdf}"
-        #                         "6. Return only the javascript code for the new `it(...)` block (no comments or explanations).\n\n")
-        #     else:
-        #         instructions = ("Your task:\n"
-        #                         f"You are a software tester at {self._pr_data.repo}.\n"
-        #                         "1. Create a new test file that includes:\n"
-        #                         "   - All necessary imports (use only the provided imports and respect the "
-        #                         "paths exactly how they are given) — no new dependencies. "
-        #                         f"{use_pdf}"
-        #                         "   - A top-level `describe(\"<brief suite name>\", () => {{ ... }})`.\n"
-        #                         "   - Exactly one `it(\"...\", async () => {{ ... }})` inside that block.\n"
-        #                         "2. The `it` test must fail on the code before the patch, and pass after, hence "
-        #                         "the test will verify that the patch resolves the issue.\n"
-        #                         "3. Keep the file self-contained — no external dependencies beyond those you import here.\n"
-        #                         "4. Return only the full JavaScript file contents (no comments explanations).\n\n")
-
-        #         example = ("Example structure:\n"
-        #                    "import { example } from \"../../src/core/example.js\";\n\n"
-        #                    "describe(\"<describe purpose>\", () => {\n"
-        #                    "  it(\"<describe behavior>\", async () => {\n"
-        #                    "    <initialize required variables>;\n"
-        #                    "    <define expected variable>;\n"
-        #                    "    <generate actual variables>;\n"
-        #                    "    <compare expected with actual>;\n"
-        #                    "  });\n"
-        #                    "});\n\n")
-
-        # pr_summary = ""
-        # if include_pr_summary:
-        #     pr_summary += f"PR summary:\n<pr_summary>\n{
-        #         self._pr_data.title
-        #     }\n{
-        #         self._pr_data.description
-        #     }\n</pr_summary>\n\n"
+        instructions = templates.get_instructions_template(self._pr_data.repo, prompt_type)
+        failed_output = ("<output>\n" + failure_reason + "\n</output>\n\n") if failure_reason else ""
 
         return (
             f"{templates.GUIDELINES}"
             f"{linked_issue}"
             f"{patch}"
+            f"{previous_test}"
+            f"{failed_output}"
             f"{funcs}"
-            # f"{available_imports}"
-            # f"{golden_code}"
-            # f"{test_code}"
-            # f"{pr_summary}"
             f"{instructions}"
             f"{templates.EXAMPLE_TEST_STRUCTURE}"
         )
@@ -178,7 +93,7 @@ class LLMHandler:
                 result = completion.choices[0].message.content
                 assert isinstance(result, str), "Expected response to be a string"
                 return result.strip()
-            elif model == LLM.DEEPSEEK:
+            elif model == LLM.QWEN3:
                 response = self._groq_client.chat.completions.create(
                     model=model,
                     messages=[
@@ -244,37 +159,6 @@ class LLMHandler:
         cleaned_test = code_match.group(1).strip()
 
         return filename, imports, self._adjust_function_indentation(cleaned_test)
-
-    @staticmethod
-    def _clean_descriptions(function_code: str) -> str:
-        """
-        Cleans the call expression descriptions used in the generated test by removing every non-letter character and multiple whitespaces.
-
-        Parameters:
-            function_code (str): Function code to clean
-
-        Returns:
-            str: Cleaned function code
-        """
-
-        pattern = re.compile(
-            r"\b(?P<ttype>describe|it)\(\s*"  # match describe( or it(
-            r'(?P<quote>[\'"])\s*'  # capture opening quote
-            r"(?P<name>.*?)"  # capture the raw name
-            r"(?P=quote)\s*,",  # match the same closing quote, then comma
-            flags=re.DOTALL,
-        )
-
-        def clean_test_name(match):
-            test_type = match.group("ttype")
-            q = match.group("quote")
-            name = match.group("name")
-            # strip out anything but A–Z or a–z
-            cleaned = re.sub(r"[^A-Za-z ]", "", name)
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            return f"{test_type}({q}{cleaned}{q},"
-
-        return pattern.sub(clean_test_name, function_code)
 
     @staticmethod
     def _adjust_function_indentation(function_code: str) -> str:
