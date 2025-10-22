@@ -218,8 +218,10 @@ class CSTBuilder:
         passed_children = 0
         for child in node.named_children:
             if (
-                child.type == "mod_item"
-                and self._get_node_name(child).strip() == "tests"
+                child.type == "mod_item" and
+                (self._get_node_name(child).strip() == "test" or
+                 self._get_node_name(child).strip() == "tests"
+                )
             ):
                 return child
             passed_children += 1
