@@ -1,0 +1,189 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Events need a "raw" RLB API for records coming over FOG IPC
+See https://github.com/mozilla/glean/pull/1264#discussion_r508548964.
+
+> 
+> 
+> re timestamp: we kinda do need that API.
+> For FOG's IPC we need to get the timestamp immediately, pass that through the IPC layer and then later record the full event.
+> What we could do though is having a special* `record_with_timestamp` API on the RLB only, not on the trait
+> 
+> * I already dislike the "special" API, but I don't see a way around it
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/event.rs b/glean-core/rlb/src/private/event.rs
+--- a/glean-core/rlb/src/private/event.rs
++++ b/glean-core/rlb/src/private/event.rs
+@@ -41,6 +41,15 @@ impl<K: traits::ExtraKeys> EventMetric<K> {
+             extra_keys: PhantomData,
+         }
+     }
++
++    /// Record a new event with a provided timestamp.
++    ///
++    /// It's the caller's responsibility to ensure the timestamp comes from the same clock source.
++    /// Use [`glean::get_timestamp_ms`](crate::get_timestamp_ms) to get a valid timestamp.
++    pub fn record_with_time(&self, timestamp: u64, extra: HashMap<i32, String>) {
++        let metric = Arc::clone(&self.inner);
++        crate::launch_with_glean(move |glean| metric.record(glean, timestamp, Some(extra)));
++    }
+ }
+ 
+ #[inherent(pub)]
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/event.rs</Filename>
+<imports>use std::collections::HashMap;
+use std::collections::HashSet;
+use crate::traits::ExtraKeys;</imports>
+<Rust>#[test]
+fn test_record_with_time() {
+    struct TestExtraKeys;
+    impl ExtraKeys for TestExtraKeys {
+        fn extra_keys() -> HashSet<&'static str> {
+            HashSet::new()
+        }
+    }
+    let metric = EventMetric::<TestExtraKeys>::new("category", "name", "event");
+    let extra = HashMap::new();
+    metric.record_with_time(1234567890, extra);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0407]: method `extra_keys` is not a member of trait `ExtraKeys`
+   --> glean-core/rlb/src/private/event.rs:190:13
+    |
+190 | /             fn extra_keys() -> HashSet<&'static str> {
+191 | |                 HashSet::new()
+192 | |             }
+    | |_____________^ not a member of trait `ExtraKeys`
+
+error[E0277]: the trait bound `TestExtraKeys: Copy` is not satisfied
+   --> glean-core/rlb/src/private/event.rs:189:28
+    |
+189 |         impl ExtraKeys for TestExtraKeys {
+    |                            ^^^^^^^^^^^^^ the trait `Copy` is not implemented for `TestExtraKeys`
+    |
+note: required by a bound in `ExtraKeys`
+   --> /app/testbed/glean-core/src/traits/event.rs:21:46
+    |
+21  | pub trait ExtraKeys: Hash + Eq + PartialEq + Copy {
+    |                                              ^^^^ required by this bound in `ExtraKeys`
+help: consider annotating `TestExtraKeys` with `#[derive(Copy)]`
+    |
+188 +         #[derive(Copy)]
+189 |         struct TestExtraKeys;
+    |
+
+error[E0277]: the trait bound `TestExtraKeys: Eq` is not satisfied
+   --> glean-core/rlb/src/private/event.rs:189:28
+    |
+189 |         impl ExtraKeys for TestExtraKeys {
+    |                            ^^^^^^^^^^^^^ the trait `Eq` is not implemented for `TestExtraKeys`
+    |
+note: required by a bound in `ExtraKeys`
+   --> /app/testbed/glean-core/src/traits/event.rs:21:29
+    |
+21  | pub trait ExtraKeys: Hash + Eq + PartialEq + Copy {
+    |                             ^^ required by this bound in `ExtraKeys`
+help: consider annotating `TestExtraKeys` with `#[derive(Eq)]`
+    |
+188 +         #[derive(Eq)]
+189 |         struct TestExtraKeys;
+    |
+
+error[E0277]: the trait bound `TestExtraKeys: Hash` is not satisfied
+   --> glean-core/rlb/src/private/event.rs:189:28
+    |
+189 |         impl ExtraKeys for TestExtraKeys {
+    |                            ^^^^^^^^^^^^^ the trait `Hash` is not implemented for `TestExtraKeys`
+    |
+note: required by a bound in `ExtraKeys`
+   --> /app/testbed/glean-core/src/traits/event.rs:21:22
+    |
+21  | pub trait ExtraKeys: Hash + Eq + PartialEq + Copy {
+    |                      ^^^^ required by this bound in `ExtraKeys`
+help: consider annotating `TestExtraKeys` with `#[derive(Hash)]`
+    |
+188 +         #[derive(Hash)]
+189 |         struct TestExtraKeys;
+    |
+
+error[E0046]: not all trait items implemented, missing: `ALLOWED_KEYS`, `index`
+   --> glean-core/rlb/src/private/event.rs:189:9
+    |
+189 |         impl ExtraKeys for TestExtraKeys {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `ALLOWED_KEYS`, `index` in implementation
+    |
+    = help: implement the missing item: `const ALLOWED_KEYS: &'static [&'static str] = &[];`
+    = help: implement the missing item: `fn index(self) -> i32 { todo!() }`
+
+error[E0061]: this function takes 1 argument but 3 arguments were supplied
+   --> glean-core/rlb/src/private/event.rs:194:22
+    |
+194 |         let metric = EventMetric::<TestExtraKeys>::new("category", "name", "event");
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ----------  ------  ------- unexpected argument #3 of type `&'static str`
+    |                                                        |           |
+    |                                                        |           unexpected argument #2 of type `&'static str`
+    |                                                        expected `CommonMetricData`, found `&str`
+    |
+note: associated function defined here
+   --> glean-core/rlb/src/private/event.rs:33:12
+    |
+33  |     pub fn new(meta: glean_core::CommonMetricData) -> Self {
+    |            ^^^ ----------------------------------
+help: remove the extra arguments
+    |
+194 -         let metric = EventMetric::<TestExtraKeys>::new("category", "name", "event");
+194 +         let metric = EventMetric::<TestExtraKeys>::new(/* glean_core::CommonMetricData */);
+    |
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

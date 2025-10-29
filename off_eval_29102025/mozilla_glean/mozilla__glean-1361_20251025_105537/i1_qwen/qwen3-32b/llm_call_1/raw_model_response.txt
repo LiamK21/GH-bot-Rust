@@ -1,0 +1,73 @@
+<think>
+Okay, I need to figure out if there's a unit test needed based on the provided patch. Let's look through the changes.
+
+The patch adds event handling in the RLB module. Specifically, there's a new `EventMetric` struct in `private/event.rs` and some test cases already there. The issue mentions dealing with TODO tests in `tests.rs`, but the user is asking about creating a regression test for the patch.
+
+Looking at the existing test in `private/event.rs`, there are two tests: `no_extra_keys` and `with_extra_keys`. These test the recording and retrieval of events with and without extra keys. But maybe there's an edge case not covered yet. For example, when the extra keys are invalid, does the error counting work?
+
+Wait, the new `EventMetric` has a `test_get_num_recorded_errors` function, which checks for errors like invalid extra keys. The `with_extra_keys` test shows that valid keys are recorded, but what happens when an invalid key is used? The user might expect that if an extra key is not allowed, an error is recorded.
+
+In the patch, the `EventMetric::record` method converts the extra keys to their index. If the key isn't allowed, that would result in an error. The `test_get_num_recorded_errors` function should count those errors. So, a test that tries to record an event with an invalid extra key and then checks that the error count increases.
+
+So the test should create an `EventMetric` with allowed keys, then try to record an event with an invalid key (like a key not in the allowed list), then check that the error count is 1. If the test is run before the patch, it might not count errors correctly, but after the patch, it should work.
+
+The existing tests don't cover invalid extra keys. So creating such a test would ensure that errors are properly counted when invalid keys are used.
+
+Now, I need to write a test for that. The test should:
+
+1. Set up an `EventMetric` with allowed keys.
+2. Record an event with an extra key that's not in the allowed list.
+3. Check that the error count for `InvalidExtraKey` is 1.
+
+Let me check the imports needed. The test is in the same module as the existing tests, so I can use `super::EventMetric`. Also, need to bring in `ErrorType`, and `CommonMetricData` from crate. Also, the `new_glean` and `lock_test` are used in the existing tests for setup.
+
+Putting it all together: create the metric, attempt to record with an invalid key, then check the error count. The key steps are:
+
+- Define an enum for extra keys with allowed keys.
+- Create the metric with those keys.
+- In the test, create a hashmap with an extra key that's not in the allowed list (e.g., "invalid_key").
+- Use `record` with that map.
+- Use `test_get_num_recorded_errors` with `ErrorType::InvalidExtraKey` and assert it's 1.
+
+This should fail before the patch (if the error tracking wasn't implemented) and pass after the patch. Since the patch includes the error counting logic, this test should verify that part.
+</think>
+
+<Filename>glean-core/rlb/src/private/event.rs</Filename>
+<imports>
+use super::EventMetric;
+use super::CommonMetricData;
+use crate::CommonTest;
+use crate::new_glean;
+use std::collections::HashMap;
+</imports>
+<Rust>
+#[test]
+fn test_invalid_extra_key_records_error() {
+    let _lock = CommonTest::lock_test();
+    let _t = new_glean(None, true);
+
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+    enum TestExtra {
+        ValidKey,
+    }
+
+    impl ExtraKeys for TestExtra {
+        const ALLOWED_KEYS: &'static [&'static str] = &["valid_key"];
+        fn index(self) -> i32 { self as i32 }
+    }
+
+    let metric: EventMetric<TestExtra> = EventMetric::new(CommonMetricData {
+        name: "event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["test1".into()],
+        ..Default::default()
+    });
+
+    let mut invalid_map = HashMap::new();
+    invalid_map.insert("other_key", "value".into()); // Not in allowed_keys
+    metric.record(invalid_map);
+
+    let errors = metric.test_get_num_recorded_errors(ErrorType::InvalidExtraKey, None);
+    assert_eq!(1, errors);
+}
+</Rust>

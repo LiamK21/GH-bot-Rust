@@ -1,0 +1,141 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Consider adding uploader_capabilities string list instrumentation to pings
+Right now it's tough to validate that any given received ping was uploaded with any given combination of `uploader_capabilities`. On the client we have assurances (we know what was compiled in from `pings.yaml` and we know what was stored to disk), but once the ping leaves the client there's nothing about it that says one way or another.
+
+It seems as though we should instrument the `uploader_capabilities` so that pings uploaded with them are annotated with them.
+
+The fun piece might be figuring out where to put this instrumentation:
+* `ping_info` feels like the right place, but some `uploader_capabilities` (notably ones that contain `'ohttp'`) require `include_info_sections: false`
+* putting it in the payload: we'd have to be careful about timing it for when the ping is submitted in case the `uploader_capabilities` under which the ping was created do not match those when it gets handed to the uploader. This might make testing difficult when using `test_before_next_submit`.
+* putting it in a header could be tricky to 1) make certain it's available in the data afterwards (I _think_ `metadata.headers` would be straightforward to augment, but I've not done it before), and 2) make certain it's in the correct headers that'll make it through all the encode and decode steps that might be required for combinations of `uploader_capabilities`
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/ping/mod.rs b/glean-core/src/ping/mod.rs
+--- a/glean-core/src/ping/mod.rs
++++ b/glean-core/src/ping/mod.rs
+@@ -287,6 +287,32 @@ impl PingMaker {
+             .event_storage()
+             .snapshot_as_json(glean, ping.name(), true);
+ 
++        // We're adding the metric `glean.ping.uploader_capabilities` the most manual way here.
++        // This avoids creating a `StringListMetric` and further indirection.
++        // It also avoids yet another database write.
++        // It's only added if
++        // (1) There's already data in `metrics` or `events`
++        // (2) or the ping should be sent empty (`send_if_empty=true`)
++        let uploader_capabilities = ping.uploader_capabilities();
++        if !uploader_capabilities.is_empty() {
++            if metrics_data.is_none() && (ping.send_if_empty() || events_data.is_some()) {
++                metrics_data = Some(json!({}))
++            }
++
++            if let Some(map) = metrics_data.as_mut().and_then(|o| o.as_object_mut()) {
++                let lists = map
++                    .entry("string_list")
++                    .or_insert_with(|| json!({}))
++                    .as_object_mut()
++                    .unwrap();
++
++                lists.insert(
++                    "glean.ping.uploader_capabilities".to_string(),
++                    json!(uploader_capabilities),
++                );
++            }
++        }
++
+         // Due to the way the experimentation identifier could link datasets that are intentionally unlinked,
+         // it will not be included in pings that specifically exclude the Glean client-id, those pings that
+         // should not be sent if empty, or pings that exclude the {client|ping}_info sections wholesale.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/ping/mod.rs</Filename>
+<imports>use serde_json::json;
+use crate::ping::Ping;</imports>
+<Rust>#[test]
+fn test_uploader_capabilities_instrumentation() {
+    let ping = Ping::new("test_ping", true, true, vec!["ohttp".to_string()]);
+    let ping_maker = PingMaker;
+
+    let expected = json!({
+        "string_list": {
+            "glean.ping.uploader_capabilities": ["ohttp"]
+        }
+    });
+
+    let actual = ping_maker.make_metrics_data(&ping);
+
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `new` found for struct `ping::Ping` in the current scope
+   --> glean-core/src/ping/mod.rs:543:26
+    |
+22  | pub struct Ping<'a> {
+    | ------------------- function or associated item `new` not found for this struct
+...
+543 |         let ping = Ping::new("test_ping", true, true, vec!["ohttp".to_string()]);
+    |                          ^^^ function or associated item not found in `ping::Ping<'_>`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `new`, perhaps you need to implement it:
+            candidate #1: `BackendEnvironmentBuilder`
+
+error[E0599]: no method named `make_metrics_data` found for struct `ping::PingMaker` in the current scope
+   --> glean-core/src/ping/mod.rs:552:33
+    |
+42  | pub struct PingMaker;
+    | -------------------- method `make_metrics_data` not found for this struct
+...
+552 |         let actual = ping_maker.make_metrics_data(&ping);
+    |                                 ^^^^^^^^^^^^^^^^^ method not found in `ping::PingMaker`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

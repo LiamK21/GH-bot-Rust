@@ -1,0 +1,256 @@
+<think>
+Okay, let's see. The user provided a patch that moves ping logging to Rust core. The existing test for the request's pretty_body function is failing. The errors in the output need to be addressed so that the test fails before the patch but passes after.
+
+First, looking at the first error about write_all not being found for GzEncoder. The help message says that the Write trait is implemented but not in scope. So, I need to import std::io::Write to get access to write_all. That's a missing import.
+
+Second error is a type mismatch: enqueue_ping expects a serde_json::Value for the body, but the test is passing &Vec<u8>. The patch added a pretty_body method which uses GzDecoder to decompress and parse the body as JSON. So the enqueue_ping in the test is currently passing compressed data, but the PingRequest's body is just a Vec<u8> which might not be JSON. Wait, in the code, the PingRequest stores the body as bytes, and the pretty_body method decompresses it, tries to parse as JSON, then pretty-prints it. 
+
+So for the test, we need to create a PingRequest with a compressed JSON body. The test is trying to mimic that. The enqueue_ping function in PingUploadManager probably expects the body to be the compressed data, which is correct. However, the error is because the body is a Vec<u8> (compressed JSON), and enqueue_ping expects a JsonValue. Wait, no. Looking at the method signature from the Signatures section, the test is using glean_upload_manager::enqueue_ping, which in the code is defined to take a body of type JsonValue. Wait, but in the code diff, the enqueue_ping function's signature is part of the upload module. Wait, the original code (before the patch) might have different parameters. Let me check the existing code before the patch.
+
+Wait, the issue is that in the existing test code (based on the error message), the function enqueue_ping is being passed a &Vec<u8>, but the function's expected parameter is JsonValue. That's conflicting. But in the patch, the enqueue_ping function isn't modified, but in the PingUploadManager, the enqueue_ping method is likely used with JSON data. But the current test is trying to enqueue a compressed JSON blob. This suggests that the test is incorrect because it's enqueuing a compressed byte array instead of a JSON value. However, according to the patch, the upload manager should handle gzip-compressed pings and decompress them in Rust for logging. So the PingRequest's body is the compressed data, and in the test, we need to create a compressed JSON payload.
+
+Wait, perhaps the original enqueue_ping method expects the body as a JsonValue (uncompressed), but in the new code, the PingRequest stores the body as a compressed Vec<u8>. The test is trying to enqueue a compressed body, but the enqueue_ping method might expect a JsonValue. This is the crux of the error.
+
+Wait, looking at the error message: the enqueue_ping method's signature is defined to take a JsonValue (as per the error message's note: expected 'Value', found '&Vec<u8>'). So the current code for enqueue_ping probably expects a JSON value, but the test is passing compressed data. That's a problem.
+
+Wait, but the patch adds a function to decompress the body (pretty_body) which requires that the PingRequest's body is the compressed data. So perhaps the enqueue_ping in the code is actually supposed to take a raw body (Vec<u8>), not a JsonValue. But according to the error, the method expects a JsonValue. That suggests that the enqueue_ping method hasn't been updated yet. But according to the patch provided, the upload mechanism is controlled on the Rust side, so the PingRequests are created with compressed bodies. This implies that there's a discrepancy between the test and the actual code.
+
+So the test's enqueue_ping is passing a Vec<u8> (compressed data) into a method that expects a JsonValue. That's wrong. Therefore, the test is incorrect. The correct approach would be to create a PingRequest with a compressed body, but how is that being created in the test?
+
+Wait, maybe the enqueue_ping method in the PingUploadManager is supposed to take the compressed body as the payload. But according to the error message, the enqueue_ping function's signature is:
+
+pub fn enqueue_ping(&self, document_id: &str, path: &str, body: JsonValue)
+
+Ah, so the body is a JsonValue (uncompressed). Therefore, the test is passing a Vec<u8> which is incorrect. Therefore, the test is flawed.
+
+So to fix the test, we need to enqueue a PingRequest that has a compressed body. But how is that done? Because the enqueue_ping function here is not part of the upload::request module. The enqueue_ping method is part of the upload::mod.rs's PingUploadManager. Let me check the code.
+
+In the patch's diff for glean-core/src/upload/mod.rs, the enqueue_ping method is defined as:
+
+pub fn enqueue_ping(&self, document_id: &str, path: &str, body: JsonValue) {
+
+So, the body is a JSON value. Therefore, to enqueue a ping, the test should pass a JsonValue, not a compressed Vec<u8>. However, the test is trying to simulate the scenario where the PingRequest has a compressed body. How is that handled in the code? The code may actually be compressing the body when enqueuing. But in the current test, the code is not doing that.
+
+Ah, looking at the patch's code, in the PingRequest struct, the body is a Vec<u8>. When the Ping is enqueued into the PingUploadManager, it's being stored as a byte vector, presumably after compression. So the enqueue_ping method may take a JsonValue, compress it, and store as bytes in the PingRequest. Therefore, in the test, we need to enqueue a JSON value (not compressed) and the code should compress it before storing. But the test is passing a compressed Vec<u8>, which is incorrect. 
+
+So, the test in the <TEST> block is trying to enqueue a compressed JSON payload as the body. However, the enqueue_ping method expects a JsonValue. Therefore, the test is passing the wrong type. 
+
+To correct this, the test should enqueue a JsonValue (uncompressed JSON), and the code should handle the compression when creating the PingRequest. Therefore, in the test, instead of compressing the JSON and passing it as &Vec<u8>, we should pass the JSON as a serde_json::Value and let the code handle the compression.
+
+So, the test needs to be adjusted in two main ways:
+
+1. Import the Write trait to fix the write_all error.
+2. Modify the test to enqueue a JsonValue instead of a compressed Vec<u8>.
+3. Let the PingUploadManager's enqueue_ping method compress the body automatically.
+
+Wait, but does the code in the PingUploadManager enqueue_ping method compress the body? Looking at the code in the patch for the enqueue_ping function in upload/mod.rs:
+
+In the enqueue_ping function, when adding the ping, it calls PingRequest::new, which in the code (based on the patch) may compress the body. Wait, looking at the code for PingRequest::new in upload/request.rs (from the patch), the body is gzip-compressed:
+
+fn gzip_content(path: &str, content: &[u8]) -> Option<Vec<u8>> {
+    let mut gzipper = GzEncoder::new(Vec::new(), Compression::default());
+    ...
+}
+Then in PingRequest::new, it probably uses this method to compress the content. However, the enqueue_ping method accepts a JsonValue. Therefore, the enqueue_ping method would need to serialize the JsonValue to a string, compress it, and store as bytes.
+
+Therefore, in the test, the correct approach is to pass a JsonValue, not a compressed Vec<u8>. So, the current test is wrong. Therefore, the test should be changed to enqueue a JsonValue (as a string) which is then compressed by the PingRequest's internal logic.
+
+Therefore, the test should create a JSON value, enqueue it, and then verify that when the PingRequest is retrieved, the pretty_body method correctly decompresses and pretty-prints it.
+
+So, to fix the test:
+
+1. Remove the GzEncoder step.
+2. Create a serde_json::Value from the JSON string.
+3. Enqueue that value via enqueue_ping.
+4. Then, check the pretty_body.
+
+Let me outline the corrected steps.
+
+Original test code:
+
+let json = r#"{"a":true,"b":0}"#;
+let mut encoder = GzEncoder::new(...);
+encoder.write_all(...);
+let compressed = encoder.finish().unwrap();
+upload_manager.enqueue_ping(..., &compressed);
+
+But enqueue_ping expects a JsonValue, not a Vec<u8>. Therefore, the test should pass theJsonValue::from_str(json).unwrap().
+
+Wait, no. The enqueue_ping method's parameter is a JsonValue. So, the correct steps are:
+
+1. Create a JSON string (like {"a": true}).
+2. Parse it into a JsonValue.
+3. Enqueue it into the upload_manager.
+4. The code should compress it when creating the PingRequest.
+
+In the test, the upload manager's enqueue_ping takes the JsonValue, compresses it, and stores it in the PingRequest's body.
+
+So, the corrected test code would look like:
+
+let json = r#"{"a":true,"b":0}"#;
+let value: JsonValue = serde_json::from_str(json).unwrap();
+upload_manager.enqueue_ping("test-doc", "test-path", value);
+
+Then, when retrieving the PingRequest, the body is compressed, and the pretty_body method should decompress it and pretty-print.
+
+So the test should not manually compress the data.
+
+By making this change, the type mismatch is resolved.
+
+Now, applying these changes to the existing test.
+
+First, the missing import for std::io::Write to use write_all (though the test code doesn't need that anymore since it's not compressing manually).
+
+Wait, in the current test code, the encoder is used for compression. But if we remove that, then the test doesn't need the GzEncoder anymore. So, the test can be corrected as follows.
+
+So the steps for the corrected test:
+
+1. Use std::io::Write to be able to use write_all (though in this corrected test, we might not need it. Wait, no, since we're no longer manually compressing, but the code should handle that automatically.)
+
+Wait, the test's enqueue_ping is called with a JsonValue, and the PingRequest's constructor would handle compression. The problem is that in the current test code, the code is not doing that. But according to the patch, the code in PingRequest::new should handle compression. So perhaps the code in the test is correct, but the test setup is incorrect.
+
+Wait, the test is testing the pretty_body function, which is part of PingRequest. The pretty_body function is supposed to decompress the body. So, the PingRequest's body must be a compressed JSON. Therefore, to trigger the decompression, the test must enqueue a PingRequest whose body is compressed.
+
+But in the current code of the test, the enqueue_ping is given a JsonValue, which would be compressed when creating the PingRequest. Therefore, in the test, when you enqueue a JsonValue, the code compresses it, and the PingRequest's body becomes the compressed data. Then, the pretty_body can decompress and pretty-print it.
+
+So the test should enqueue a JsonValue, not the compressed data. Therefore, the test code should be:
+
+let json = r#"{"a":true,"b":0}"#;
+let value: JsonValue = serde_json::from_str(json).unwrap();
+upload_manager.enqueue_ping("test-doc", "test-path", value);
+
+This would enqueue the JSON value, which the code would compress and store as the PingRequest's body. Then, the pretty_body method would decompress and pretty-print it.
+
+By changing the test to enqueue a JsonValue instead of a Vec<u8>, the type mismatch is resolved.
+
+So putting it all together, the corrected test would:
+
+- Remove the GzEncoder code.
+- Use a JsonValue.
+- Enqueue it via enqueue_ping.
+- Then verify that the pretty_body correctly decompresses and formats the JSON.
+
+So the corrected test code would look like this:
+
+#[test]
+fn test_pretty_body() {
+    let tempdir = TempDir::new().unwrap();
+    let upload_manager = PingUploadManager::new(tempdir.path());
+
+    let json = r#"{"a":true,"b":0}"#;
+    let value: JsonValue = serde_json::from_str(json).unwrap();
+    upload_manager.enqueue_ping("test-doc", "test-path", value);
+
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let upload_task = upload_manager.get_upload_task(false);
+    let request = match upload_task {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected Upload task"),
+    };
+
+    let pretty = request.pretty_body().unwrap();
+    let expected = r#"
+{
+  "a": true,
+  "b": 0
+}"#;
+    assert_eq!(pretty, expected.trim());
+}
+
+Additionally, the test requires importing necessary modules. The original imports were:
+
+use crate::upload::PingUploadManager;
+use crate::upload::PingUploadTask;
+use std::thread;
+use std::time::Duration;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tempfile::TempDir;
+
+But since the corrected test doesn't need GzEncoder anymore, we can remove that import line.
+
+Also, the test needs to import serde_json for the from_str function.
+
+Therefore, the imports should be adjusted to:
+
+<imports>
+use crate::upload::PingUploadManager;
+use crate::upload::PingUploadTask;
+use std::thread;
+use std::time::Duration;
+use std::io::Write;
+use std::fs::File;
+use std::path::Path;
+use std::io;
+use tempfile::TempDir;
+use serde_json::{self, Value as JsonValue};
+</imports>
+
+Wait, but the test might need the Write trait to be imported for the write_all method. However, in the corrected test, the test doesn't compress manually, so the write_all isn't used. So maybe the Write import is unnecessary, but the original error was due to a missing import for write_all when the test was using GzEncoder. But since the test no longer uses GzEncoder, the Write import can be omitted.
+
+Alternatively, if any part of the test uses Write::write_all (but in this corrected version, it's not needed), so we can remove it.
+
+Thus, the imports should include serde_json for the JsonValue and from_str function.
+
+Putting it all together, the imports would be:
+
+<imports>
+use crate::upload::PingUploadManager;
+use crate::upload::PingUploadTask;
+use std::thread;
+use std::time::Duration;
+use tempfile::TempDir;
+use serde_json::{self, Value as JsonValue};
+</imports>
+
+But wait, the original imports had some other things, but the user's test is using upload::PingUploadManager and PingUploadTask, which are correct.
+
+So the corrected test would address both errors:
+
+1. The missing Write trait for write_all (but in the test, we don't need it anymore).
+2. The type mismatch by passing a JsonValue instead of a compressed Vec<u8>.
+
+With these changes, the test should compile and run correctly.
+</think>
+
+<Filename>glean-core/src/upload/request.rs</Filename>
+<imports>
+use crate::upload::PingUploadManager;
+use crate::upload::PingUploadTask;
+use std::thread;
+use std::time::Duration;
+use tempfile::TempDir;
+use serde_json::{self, Value as JsonValue};
+</imports>
+<Rust>
+#[test]
+fn test_pretty_body() {
+    let tempdir = TempDir::new().unwrap();
+    let upload_manager = PingUploadManager::new(tempdir.path());
+
+    let json = r#"{"a":true,"b":0}"#;
+    let value: JsonValue = serde_json::from_str(json).unwrap();
+    upload_manager.enqueue_ping("test-doc", "test-path", value);
+
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let upload_task = upload_manager.get_upload_task(false);
+    let request = match upload_task {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected Upload task"),
+    };
+
+    let pretty = request.pretty_body().unwrap();
+    let expected = r#"
+{
+  "a": true,
+  "b": 0
+}"#;
+    assert_eq!(pretty, expected.trim());
+}
+</Rust>

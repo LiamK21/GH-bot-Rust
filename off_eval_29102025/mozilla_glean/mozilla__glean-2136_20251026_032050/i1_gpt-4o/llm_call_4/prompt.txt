@@ -1,0 +1,458 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Embedders can't communicate the network isn't available
+As an example, Firefox Desktop knows precisely when it is unable to use the network (when we're in/after [shutdown phase `AppShutdownNetTeardown`](https://searchfox.org/mozilla-central/rev/0069a0cdc3cd136ea7411521219df6665f260be7/xpcom/base/ShutdownPhase.h#16)). At present, upload jobs submitted at this time will return as a recoverable (since bug 1776201) network failure. The SDK instruments this as an error and may continue to send work that will also fail.
+
+This bug is for designing and implementing a way for embedders to communicate that upload jobs are expected to fail and whether or not the SDK should submit more of them at the moment (or at all).
+
+The solution that seems most straightforward would be to augment `UploadResult` to have, say, a `NotReady` or `Delay` return value (perhaps parameterized with a realtime delay to wait before submitting more jobs?), ensuring that this isn't instrumented as an error case (though we may still wish to instrument it for its own reasons).
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/net/mod.rs b/glean-core/rlb/src/net/mod.rs
+--- a/glean-core/rlb/src/net/mod.rs
++++ b/glean-core/rlb/src/net/mod.rs
+@@ -15,7 +15,7 @@ use std::thread;
+ use std::time::Duration;
+ 
+ use glean_core::upload::PingUploadTask;
+-pub use glean_core::upload::{PingRequest, UploadResult};
++pub use glean_core::upload::{PingRequest, UploadResult, UploadTaskAction};
+ 
+ pub use http_uploader::*;
+ 
+@@ -87,31 +87,38 @@ impl UploadManager {
+         thread::Builder::new()
+             .name("glean.upload".into())
+             .spawn(move || {
++                log::trace!("Started glean.upload thread");
+                 loop {
+                     let incoming_task = glean_core::glean_get_upload_task();
+ 
+-                    log::trace!("Received upload task: {:?}", incoming_task);
+                     match incoming_task {
+                         PingUploadTask::Upload { request } => {
++                            log::trace!("Received upload task with request {:?}", request);
+                             let doc_id = request.document_id.clone();
+                             let upload_url = format!("{}{}", inner.server_endpoint, request.path);
+                             let headers: Vec<(String, String)> =
+                                 request.headers.into_iter().collect();
+                             let result = inner.uploader.upload(upload_url, request.body, headers);
+                             // Process the upload response.
+-                            glean_core::glean_process_ping_upload_response(doc_id, result);
++                            match glean_core::glean_process_ping_upload_response(doc_id, result) {
++                                UploadTaskAction::Next => continue,
++                                UploadTaskAction::End => break,
++                            }
+                         }
+                         PingUploadTask::Wait { time } => {
++                            log::trace!("Instructed to wait for {:?}ms", time);
+                             thread::sleep(Duration::from_millis(time));
+                         }
+                         PingUploadTask::Done { .. } => {
+-                            // Nothing to do here, break out of the loop and clear the
+-                            // running flag.
+-                            inner.thread_running.store(false, Ordering::SeqCst);
+-                            return;
++                            log::trace!("Received PingUploadTask::Done. Exiting.");
++                            // Nothing to do here, break out of the loop.
++                            break;
+                         }
+                     }
+                 }
++
++                // Clear the running flag to signal that this thread is done.
++                inner.thread_running.store(false, Ordering::SeqCst);
+             })
+             .expect("Failed to spawn Glean's uploader thread");
+     }
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -2,6 +2,9 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
++use std::sync::{Arc, Barrier, Mutex};
++use std::thread::{self, ThreadId};
++
+ use crate::private::PingType;
+ use crate::private::{BooleanMetric, CounterMetric, EventMetric, StringMetric};
+ 
+@@ -1131,3 +1134,84 @@ fn test_boolean_get_num_errors() {
+ 
+     assert_eq!(result, 0);
+ }
++
++#[test]
++fn signaling_done() {
++    let _lock = lock_test();
++
++    // Define a fake uploader that reports back the submission URL
++    // using a crossbeam channel.
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        barrier: Arc<Barrier>,
++        counter: Arc<Mutex<HashMap<ThreadId, u32>>>,
++    }
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            _url: String,
++            _body: Vec<u8>,
++            _headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            let mut map = self.counter.lock().unwrap();
++            *map.entry(thread::current().id()).or_insert(0) += 1;
++
++            // Wait for the sync.
++            self.barrier.wait();
++
++            // Signal that this uploader thread is done.
++            net::UploadResult::done()
++        }
++    }
++
++    // Create a custom configuration to use a fake uploader.
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
++
++    // We use a barrier to sync this test thread with the uploader thread.
++    let barrier = Arc::new(Barrier::new(2));
++    // We count how many times `upload` was invoked per thread.
++    let call_count = Arc::new(Mutex::default());
++
++    let cfg = Configuration {
++        data_path: tmpname,
++        application_id: GLOBAL_APPLICATION_ID.into(),
++        upload_enabled: true,
++        max_events: None,
++        delay_ping_lifetime_io: false,
++        server_endpoint: Some("invalid-test-host".into()),
++        uploader: Some(Box::new(FakeUploader {
++            barrier: Arc::clone(&barrier),
++            counter: Arc::clone(&call_count),
++        })),
++        use_core_mps: false,
++    };
++
++    let _t = new_glean(Some(cfg), true);
++
++    // Define a new ping and submit it.
++    const PING_NAME: &str = "test-ping";
++    let custom_ping = private::PingType::new(PING_NAME, true, true, vec![]);
++    custom_ping.submit(None);
++    custom_ping.submit(None);
++
++    // Sync up with the upload thread.
++    barrier.wait();
++
++    // Submit another ping and wait for it to do work.
++    custom_ping.submit(None);
++
++    // Sync up with the upload thread again.
++    // This will not be the same thread as the one before (hopefully).
++    barrier.wait();
++
++    // No one's ever gonna wait for the uploader thread (the RLB doesn't store the handle to it),
++    // so all we can do is hope it finishes within time.
++    std::thread::sleep(std::time::Duration::from_millis(100));
++
++    let map = call_count.lock().unwrap();
++    assert_eq!(2, map.len(), "should have launched 2 uploader threads");
++    for &count in map.values() {
++        assert_eq!(1, count, "each thread should call upload only once");
++    }
++}
+
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -13,7 +13,7 @@ use crate::internal_pings::InternalPings;
+ use crate::metrics::{self, ExperimentMetric, Metric, MetricType, PingType, RecordedExperiment};
+ use crate::ping::PingMaker;
+ use crate::storage::{StorageManager, INTERNAL_STORAGE};
+-use crate::upload::{PingUploadManager, PingUploadTask, UploadResult};
++use crate::upload::{PingUploadManager, PingUploadTask, UploadResult, UploadTaskAction};
+ use crate::util::{local_now_with_offset, sanitize_application_id};
+ use crate::{
+     scheduler, system, CommonMetricData, ErrorKind, InternalConfiguration, Lifetime, Result,
+@@ -565,9 +565,13 @@ impl Glean {
+     ///
+     /// * `uuid` - The UUID of the ping in question.
+     /// * `status` - The upload result.
+-    pub fn process_ping_upload_response(&self, uuid: &str, status: UploadResult) {
++    pub fn process_ping_upload_response(
++        &self,
++        uuid: &str,
++        status: UploadResult,
++    ) -> UploadTaskAction {
+         self.upload_manager
+-            .process_ping_upload_response(self, uuid, status);
++            .process_ping_upload_response(self, uuid, status)
+     }
+ 
+     /// Takes a snapshot for the given store and optionally clear it.
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -63,7 +63,7 @@ pub use crate::metrics::{
+     StringListMetric, StringMetric, TextMetric, TimeUnit, TimerId, TimespanMetric,
+     TimingDistributionMetric, UrlMetric, UuidMetric,
+ };
+-pub use crate::upload::{PingRequest, PingUploadTask, UploadResult};
++pub use crate::upload::{PingRequest, PingUploadTask, UploadResult, UploadTaskAction};
+ 
+ const GLEAN_VERSION: &str = env!("CARGO_PKG_VERSION");
+ const GLEAN_SCHEMA_VERSION: u32 = 1;
+@@ -851,7 +851,7 @@ pub fn glean_get_upload_task() -> PingUploadTask {
+ }
+ 
+ /// Processes the response from an attempt to upload a ping.
+-pub fn glean_process_ping_upload_response(uuid: String, result: UploadResult) {
++pub fn glean_process_ping_upload_response(uuid: String, result: UploadResult) -> UploadTaskAction {
+     core::with_glean(|glean| glean.process_ping_upload_response(&uuid, result))
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -25,7 +25,7 @@ use crate::{internal_metrics::UploadMetrics, Glean};
+ use directory::{PingDirectoryManager, PingPayloadsByDirectory};
+ use policy::Policy;
+ pub use request::{HeaderMap, PingRequest};
+-pub use result::UploadResult;
++pub use result::{UploadResult, UploadTaskAction};
+ 
+ mod directory;
+ mod policy;
+@@ -655,7 +655,7 @@ impl PingUploadManager {
+         glean: &Glean,
+         document_id: &str,
+         status: UploadResult,
+-    ) {
++    ) -> UploadTaskAction {
+         use UploadResult::*;
+ 
+         if let Some(label) = status.get_label() {
+@@ -688,7 +688,14 @@ impl PingUploadManager {
+                 self.recoverable_failure_count
+                     .fetch_add(1, Ordering::SeqCst);
+             }
++
++            Done { .. } => {
++                log::debug!("Uploader signaled Done. Exiting.");
++                return UploadTaskAction::End;
++            }
+         };
++
++        UploadTaskAction::Next
+     }
+ }
+ 
+@@ -1191,11 +1198,13 @@ mod test {
+         // Return the max recoverable error failures in a row
+         for _ in 0..max_recoverable_failures {
+             match upload_manager.get_upload_task(&glean, false) {
+-                PingUploadTask::Upload { request } => upload_manager.process_ping_upload_response(
+-                    &glean,
+-                    &request.document_id,
+-                    UploadResult::recoverable_failure(),
+-                ),
++                PingUploadTask::Upload { request } => {
++                    upload_manager.process_ping_upload_response(
++                        &glean,
++                        &request.document_id,
++                        UploadResult::recoverable_failure(),
++                    );
++                }
+                 _ => panic!("Expected upload manager to return the next request!"),
+             }
+         }
+
+diff --git a/glean-core/src/upload/result.rs b/glean-core/src/upload/result.rs
+--- a/glean-core/src/upload/result.rs
++++ b/glean-core/src/upload/result.rs
+@@ -32,6 +32,14 @@ pub enum UploadResult {
+         /// The HTTP status code
+         code: i32,
+     },
++
++    /// Signal that this uploader is done with work
++    /// and won't accept new work.
++    Done {
++        #[doc(hidden)]
++        /// Unused field. Required because UniFFI can't handle variants without fields.
++        unused: i8,
++    },
+ }
+ 
+ impl UploadResult {
+@@ -47,6 +55,7 @@ impl UploadResult {
+             UploadResult::HttpStatus { .. } => Some("status_code_unknown"),
+             UploadResult::UnrecoverableFailure { .. } => Some("unrecoverable"),
+             UploadResult::RecoverableFailure { .. } => Some("recoverable"),
++            UploadResult::Done { .. } => None,
+         }
+     }
+ 
+@@ -72,4 +81,18 @@ impl UploadResult {
+     pub fn http_status(code: i32) -> Self {
+         Self::HttpStatus { code }
+     }
++
++    /// This uploader is done.
++    pub fn done() -> Self {
++        Self::Done { unused: 0 }
++    }
++}
++
++/// Communication back whether the uploader loop should continue.
++#[derive(Debug)]
++pub enum UploadTaskAction {
++    /// Instruct the caller to continue with work.
++    Next,
++    /// Instruct the caller to end work.
++    End,
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/result.rs</Filename>
+<imports>use super::UploadResult;
+use super::UploadTaskAction;
+use super::UploadResult::Done;</imports>
+<Rust>#[test]
+fn test_upload_result_done() {
+    let result = UploadResult::done();
+    let expected = UploadTaskAction::End;
+    let actual = match result {
+        Done { .. } => UploadTaskAction::End,
+        _ => UploadTaskAction::Next,
+    };
+    assert_eq!(expected, actual, "Expected UploadTaskAction::End");
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0277]: the trait bound `UploadTaskAction: FfiDefault` is not satisfied
+    --> /app/testbed/target/debug/build/glean-core-e89cd6841e7d511f/out/glean.uniffi.rs:1285:1
+     |
+1285 | / uniffi::call_with_output(call_status, || {
+1286 | |     
+1287 | |     r#glean_process_ping_upload_response(
+1288 | |         match<String as uniffi::FfiConverter>::try_lift(r#uuid) {
+...    |
+1301 | |         })
+1302 | |     })
+     | |______^ the trait `FfiDefault` is not implemented for `UploadTaskAction`
+     |
+     = help: the following other types implement trait `FfiDefault`:
+               ()
+               *const c_void
+               RustBuffer
+               f32
+               f64
+               i16
+               i32
+               i64
+             and 5 others
+note: required by a bound in `call_with_output`
+    --> /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/uniffi-0.19.3/src/ffi/rustcalls.rs:156:8
+     |
+153  | pub fn call_with_output<F, R>(out_status: &mut RustCallStatus, callback: F) -> R
+     |        ---------------- required by a bound in this function
+...
+156  |     R: FfiDefault,
+     |        ^^^^^^^^^^ required by this bound in `call_with_output`
+
+error[E0308]: mismatched types
+    --> /app/testbed/target/debug/build/glean-core-e89cd6841e7d511f/out/glean.uniffi.rs:1285:1
+     |
+1285 | / uniffi::call_with_output(call_status, || {
+1286 | |     
+1287 | |     r#glean_process_ping_upload_response(
+1288 | |         match<String as uniffi::FfiConverter>::try_lift(r#uuid) {
+...    |
+1301 | |         })
+1302 | |     })
+     | |______^ expected `()`, found `UploadTaskAction`
+     |
+help: consider using a semicolon here
+     |
+1302 |     });
+     |       +
+help: try adding a return type
+     |
+1279 | ) -> UploadTaskAction  {
+     |   +++++++++++++++++++
+
+error[E0004]: non-exhaustive patterns: `upload::result::UploadResult::Done { .. }` not covered
+   --> /app/testbed/target/debug/build/glean-core-e89cd6841e7d511f/out/glean.uniffi.rs:173:15
+    |
+173 |         match obj {
+    |               ^^^ pattern `upload::result::UploadResult::Done { .. }` not covered
+    |
+note: `upload::result::UploadResult` defined here
+   --> glean-core/src/upload/result.rs:7:10
+    |
+7   | pub enum UploadResult {
+    |          ^^^^^^^^^^^^
+...
+38  |     Done {
+    |     ---- not covered
+    = note: the matched value is of type `upload::result::UploadResult`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+185 ~             },
+186 ~             upload::result::UploadResult::Done { .. } => todo!(),
+    |
+</output>
+
+Function signatures
+<Signatures>
+pub fn glean_get_upload_task() -> PingUploadTask
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

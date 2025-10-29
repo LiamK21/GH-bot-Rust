@@ -1,0 +1,285 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+TimingDistribution trait doesn't expose the accumulate_samples API
+The [TimingDistribution trait](https://github.com/mozilla/glean/blob/main/glean-core/src/traits/timing_distribution.rs) doesn't expose the `accumulate_samples` or `accumulate_raw_samples` API functions and we are starting to see [use cases](https://phabricator.services.mozilla.com/D175589?id=707118#inline-974872) where we could use this.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/traits/timing_distribution.rs b/glean-core/src/traits/timing_distribution.rs
+--- a/glean-core/src/traits/timing_distribution.rs
++++ b/glean-core/src/traits/timing_distribution.rs
+@@ -43,6 +43,41 @@ pub trait TimingDistribution {
+     ///   same timing distribution metric.
+     fn cancel(&self, id: TimerId);
+ 
++    /// Accumulates the provided signed samples in the metric.
++    ///
++    /// This is required so that the platform-specific code can provide us with
++    /// 64 bit signed integers if no `u64` comparable type is available. This
++    /// will take care of filtering and reporting errors for any provided negative
++    /// sample.
++    ///
++    /// Please note that this assumes that the provided samples are already in
++    /// the "unit" declared by the instance of the metric type (e.g. if the
++    /// instance this method was called on is using [`crate::TimeUnit::Second`], then
++    /// `samples` are assumed to be in that unit).
++    ///
++    /// # Arguments
++    ///
++    /// * `samples` - The vector holding the samples to be recorded by the metric.
++    ///
++    /// ## Notes
++    ///
++    /// Discards any negative value in `samples` and report an [`ErrorType::InvalidValue`]
++    /// for each of them. Reports an [`ErrorType::InvalidOverflow`] error for samples that
++    /// are longer than `MAX_SAMPLE_TIME`.
++    fn accumulate_samples(&self, samples: Vec<i64>);
++
++    /// Accumulates the provided samples in the metric.
++    ///
++    /// # Arguments
++    ///
++    /// * `samples` - A list of samples recorded by the metric.
++    ///               Samples must be in nanoseconds.
++    /// ## Notes
++    ///
++    /// Reports an [`ErrorType::InvalidOverflow`] error for samples that
++    /// are longer than `MAX_SAMPLE_TIME`.
++    fn accumulate_raw_samples_nanos(&self, samples: Vec<u64>);
++
+     /// **Exported for test purposes.**
+     ///
+     /// Gets the currently stored value of the metric.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/traits/timing_distribution.rs</Filename>
+<imports>use super::TimingDistribution;
+use super::TimerId;
+use super::ErrorType;
+use super::MAX_SAMPLE_TIME;
+use std::vec::Vec;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_accumulate_samples() {
+  let mut timing_distribution = MockTimingDistribution {
+    valid_samples: Vec::new(),
+    invalid_samples: Vec::new(),
+  };
+  let samples = vec![10, 20, -30, 40];
+  let expected_valid_samples = vec![10, 20, 40];
+  let expected_invalid_samples = vec![-30];
+
+  timing_distribution.accumulate_samples(samples);
+
+  assert_eq!(timing_distribution.valid_samples, expected_valid_samples);
+  assert_eq!(timing_distribution.invalid_samples, expected_invalid_samples);
+}
+
+struct MockTimingDistribution {
+    valid_samples: Vec<i64>,
+    invalid_samples: Vec<i64>,
+}
+
+impl TimingDistribution for MockTimingDistribution {
+    fn start(&self) -> TimerId {
+        TimerId {}
+    }
+
+    fn stop_and_accumulate(&self, id: TimerId) {
+    }
+
+    fn cancel(&self, id: TimerId) {
+    }
+
+    fn accumulate_samples(&mut self, samples: Vec<i64>) {
+        for sample in samples {
+            if sample < 0 {
+                self.invalid_samples.push(sample);
+            } else if sample <= MAX_SAMPLE_TIME {
+                self.valid_samples.push(sample);
+            } else {
+                // handle overflow
+            }
+        }
+    }
+
+    fn accumulate_raw_samples_nanos(&self, samples: Vec<u64>) {
+    }
+
+    fn test_get_value<'a, S: Into<Option<&'a str>>>(
+        &self,
+        ping_name: S,
+    ) -> Option<DistributionData> {
+        None
+    }
+
+    fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+        0
+    }
+}
+
+struct TimerId {}
+
+struct DistributionData {}
+</Rust>
+</TEST>
+
+<output>
+error[E0255]: the name `TimerId` is defined multiple times
+   --> glean-core/src/traits/timing_distribution.rs:178:1
+    |
+113 | use super::TimerId;
+    |     -------------- previous import of the type `TimerId` here
+...
+178 | struct TimerId {}
+    | ^^^^^^^^^^^^^^ `TimerId` redefined here
+    |
+    = note: `TimerId` must be defined only once in the type namespace of this module
+help: you can use `as` to change the binding name of the import
+    |
+113 | use super::TimerId as OtherTimerId;
+    |                    +++++++++++++++
+
+error[E0432]: unresolved import `super::MAX_SAMPLE_TIME`
+   --> glean-core/src/traits/timing_distribution.rs:115:5
+    |
+115 | use super::MAX_SAMPLE_TIME;
+    |     ^^^^^^^^^^^^^^^^^^^^^^ no `MAX_SAMPLE_TIME` in `traits::timing_distribution`
+
+error[E0053]: method `start` has an incompatible type for trait
+   --> glean-core/src/traits/timing_distribution.rs:141:24
+    |
+141 |     fn start(&self) -> TimerId {
+    |                        ^^^^^^^ expected `metrics::timing_distribution::TimerId`, found `TimerId`
+    |
+note: type in trait
+   --> glean-core/src/traits/timing_distribution.rs:20:24
+    |
+20  |     fn start(&self) -> TimerId;
+    |                        ^^^^^^^
+    = note: expected signature `fn(&MockTimingDistribution) -> metrics::timing_distribution::TimerId`
+               found signature `fn(&MockTimingDistribution) -> traits::timing_distribution::tests::TimerId`
+help: change the output type to match the trait
+    |
+141 |     fn start(&self) -> metrics::timing_distribution::TimerId {
+    |                        ++++++++++++++++++++++++++++++
+
+error[E0053]: method `stop_and_accumulate` has an incompatible type for trait
+   --> glean-core/src/traits/timing_distribution.rs:145:39
+    |
+145 |     fn stop_and_accumulate(&self, id: TimerId) {
+    |                                       ^^^^^^^ expected `metrics::timing_distribution::TimerId`, found `TimerId`
+    |
+note: type in trait
+   --> glean-core/src/traits/timing_distribution.rs:33:39
+    |
+33  |     fn stop_and_accumulate(&self, id: TimerId);
+    |                                       ^^^^^^^
+    = note: expected signature `fn(&MockTimingDistribution, metrics::timing_distribution::TimerId)`
+               found signature `fn(&MockTimingDistribution, traits::timing_distribution::tests::TimerId)`
+help: change the parameter type to match the trait
+    |
+145 |     fn stop_and_accumulate(&self, id: metrics::timing_distribution::TimerId) {
+    |                                       ++++++++++++++++++++++++++++++
+
+error[E0053]: method `cancel` has an incompatible type for trait
+   --> glean-core/src/traits/timing_distribution.rs:148:26
+    |
+148 |     fn cancel(&self, id: TimerId) {
+    |                          ^^^^^^^ expected `metrics::timing_distribution::TimerId`, found `TimerId`
+    |
+note: type in trait
+   --> glean-core/src/traits/timing_distribution.rs:44:26
+    |
+44  |     fn cancel(&self, id: TimerId);
+    |                          ^^^^^^^
+    = note: expected signature `fn(&MockTimingDistribution, metrics::timing_distribution::TimerId)`
+               found signature `fn(&MockTimingDistribution, traits::timing_distribution::tests::TimerId)`
+help: change the parameter type to match the trait
+    |
+148 |     fn cancel(&self, id: metrics::timing_distribution::TimerId) {
+    |                          ++++++++++++++++++++++++++++++
+
+error[E0053]: method `accumulate_samples` has an incompatible type for trait
+   --> glean-core/src/traits/timing_distribution.rs:151:27
+    |
+151 |     fn accumulate_samples(&mut self, samples: Vec<i64>) {
+    |                           ^^^^^^^^^ types differ in mutability
+    |
+note: type in trait
+   --> glean-core/src/traits/timing_distribution.rs:67:27
+    |
+67  |     fn accumulate_samples(&self, samples: Vec<i64>);
+    |                           ^^^^^
+    = note: expected signature `fn(&MockTimingDistribution, Vec<_>)`
+               found signature `fn(&mut MockTimingDistribution, Vec<_>)`
+help: change the self-receiver type to match the trait
+    |
+151 -     fn accumulate_samples(&mut self, samples: Vec<i64>) {
+151 +     fn accumulate_samples(&self, samples: Vec<i64>) {
+    |
+
+error[E0053]: method `test_get_value` has an incompatible type for trait
+   --> glean-core/src/traits/timing_distribution.rs:169:10
+    |
+169 |     ) -> Option<DistributionData> {
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^ expected `metrics::DistributionData`, found `DistributionData`
+    |
+note: type in trait
+   --> glean-core/src/traits/timing_distribution.rs:94:10
+    |
+94  |     ) -> Option<DistributionData>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: expected signature `fn(&MockTimingDistribution, _) -> std::option::Option<metrics::DistributionData>`
+               found signature `fn(&MockTimingDistribution, _) -> std::option::Option<traits::timing_distribution::tests::DistributionData>`
+help: change the output type to match the trait
+    |
+169 -     ) -> Option<DistributionData> {
+169 +     ) -> std::option::Option<metrics::DistributionData> {
+    |
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,210 @@
+<think>
+Okay, let's dive into this problem. The issue is that when a ping is disabled, any pings scheduled to follow it aren't submitted. The patch supposedly fixes this by ensuring that even if a ping is disabled, the pings in its schedule are still processed.
+
+First, I need to understand why the existing test passes before the patch. The user provided a test case where a parent ping is disabled, but the child (scheduled) ping should still be submitted. The current test in the <TEST> block is supposed to check this. But in the code before the patch, when a ping is disabled, it returns early without scheduling the child pings. So why is the test passing now?
+
+Looking at the existing test, the parent ping has schedules_pings set to ["child_ping"], and it's disabled. When submitting the parent ping, even though it's disabled, the test expects the child ping to be submitted. Wait, in the current code (before the patch), when submit_sync is called on the parent ping, it checks if it's enabled. Since it's disabled, it returns false immediately. But in the patch, the handle_ping_schedule method was added to handle scheduling even when the ping is disabled. So, before the patch, the child ping wouldn't be scheduled because the parent ping is disabled. But in the test, the parent's schedules_pings is set, which should trigger the scheduling logic, but in the original code, that code is only executed if the ping is enabled.
+
+Ah, right. In the original implementation, the scheduling logic (submitting the child pings) only occurs if the parent ping is enabled and successfully submitted. If the parent is disabled, it returns early, and the scheduling code isn't executed. The patch moves the scheduling code into a handle_ping_schedule method which is called regardless of whether the ping is enabled, ensuring that the child pings are scheduled even if the parent is disabled.
+
+So in the existing test, the parent ping is disabled but has schedules_pings specified. With the original code (before the patch), when the parent ping is submitted, it's disabled, so it logs and returns false immediately. The scheduling code (in submit_sync) isn't called, so the child ping isn't submitted. But in the test, the channel is expecting a submission. Therefore, the current test should fail before the patch. However, the user says that the current test passes even before the patch. That suggests there's a problem with the existing test.
+
+So, the user's existing test in the <TEST> block is passing before the patch when it shouldn't. I need to figure out why and adjust it.
+
+Looking at the test code in the <TEST> block, it sets up a parent ping and a child ping. The parent ping is configured with schedules_pings including "child_ping". The parent is disabled, and when it's submitted, the test expects the child ping to be uploaded. But in the original code, since the parent ping is disabled, the code returns early, and the handle_ping_schedule isn't called. Therefore, the child ping should not be submitted. But the current test is passing before the patch. That indicates that in the current setup, the test isn't failing as expected. Why?
+
+Wait, in the original code, when the parent ping's submit_sync is called, the code checks if it's enabled. If not, it returns false immediately. However, the original code doesn't call handle_ping_schedule (which wasn't a separate function yet), so the child wouldn't be submitted. Therefore, the test should fail before the patch. But the user is saying the test passes before the patch. So maybe there's a mistake in the setup of the test.
+
+Looking at the test code in the <TEST> block:
+
+The test creates a parent ping with schedules_pings as ["child_ping"] and disables it. Then, it calls Glean::submit_ping_by_name("parent", None). However, in the original code, the scheduling logic is only triggered when the ping is enabled and successfully assembled. So if the parent is disabled, it skips the scheduling part. Therefore, the test should fail. But the user says the test passes before the patch. That suggests that maybe the test isn't structured correctly.
+
+Wait, maybe the problem is that the parent ping is disabled, but the child ping is set up as a scheduled ping via the ping_schedule hashmap. Let me check the code setup in the test. The test sets up a ping_schedule as HashMap::from([("parent".to_string(), vec![])]). Wait, that's an empty vector. Then, the parent ping's schedules_pings is ["child_ping"]. So in the original code, when submit_sync is called, since the ping is disabled, it returns early. However, the code for scheduling via schedules_pings would trigger if the parent is enabled. But since the ping_schedule is empty and the parent is disabled, the original code does not schedule the child ping. Therefore, the test should fail.
+
+But according to the user, the existing test passes even before the patch. So there's a problem here. How is that possible?
+
+Ah, wait. Let's look at the test code again. The test's ping_schedule is set to HashMap::from([("parent".to_string(), vec![])]). Then, the parent_ping is created with schedules_pings as ["child_ping"]. The child_ping is created with enabled true. Then, in the test, Glean::submit_ping_by_name("parent", None) is called. But when the parent is disabled, according to the original code (before the patch), it would return early and not trigger the scheduling via schedules_pings. Therefore, the child_ping should not be submitted, and the test should fail. But the user says it's currently passing. That suggests that perhaps there's a mistake in how the test is structured.
+
+Wait, maybe I'm missing something. The parent_ping has schedules_pings as ["child_ping"], which in the original code, in submit_sync, the code would check if schedules_pings is not empty and schedule them. However, that code is only reached if the ping is enabled. So if the parent ping is disabled, the code would not reach that part. Therefore, in the original code, the test should fail. But according to the user, it's passing. Therefore, there's an issue with the test setup.
+
+Wait, in the test, after setting up the child_ping and parent_ping, the code calls Glean::submit_ping_by_name("parent", None). But the parent_ping is not set up with metadata.ping_schedule, nor is it being followed via the ping_schedule in the configuration. Wait, the ping_schedule in the configuration is empty. The parent_ping has schedules_pings as ["child_ping"], which would trigger the code via the schedules_pings field. So in the original code, the submit_sync function checks if the ping is enabled. If not, it returns false early. Therefore, the code that checks schedules_pings is not executed. Therefore, the child_ping should not be scheduled, and the test should fail. But the test is passing, which is a problem.
+
+So why is the test passing when it shouldn't? Maybe there's a mistake in how the parent_ping is created. Let me look at the code again. The parent_ping has schedules_pings set to ["child_ping"], but in the test, the parent_ping is submitted with Glean::submit_ping_by_name. But if the parent_ping is disabled, the code would not proceed to schedule the child_pings. Therefore, the test should fail, but it's passing. That indicates that maybe the parent_ping is not being disabled correctly, or the test setup is incorrect.
+
+Alternatively, maybe the test's parent_ping is enabled. Wait, the test code sets parent_ping.set_enabled(false). So the parent is disabled. If the original code skips the scheduling code in that case, the test should fail. But the user says it passes. That suggests that the original code allows the child to be submitted even when the parent is disabled, which contradicts the issue description.
+
+Wait, maybe the original code does schedule the pings in the schedules_pings even when the parent is disabled. Let me check the original code before the patch.
+
+Looking at the original code for submit_sync. Before the patch, the code would check if the ping is enabled. If not, return false. Then, if the ping is enabled, collect, but even after collecting, there's another check if the ping is enabled (which is redundant but present). Then, after collecting, the code schedules the pings in schedules_pings if any. So in the original code, the code for handling schedules_pings is in the else clause after the initial enabled check. Therefore, if the ping is disabled, the code returns and doesn't reach the schedules_pings part. Hence, the test should fail. But the test is passing, so there's a discrepancy.
+
+This suggests that there's an error in how the test is structured. Perhaps the test is using a different mechanism to schedule the child ping, such as the ping_schedule configuration instead of the schedules_pings field. Let me check the test's setup again.
+
+In the test, the parent_ping is created with schedules_pings set to ["child_ping"], and the ping_schedule in the configuration is set to an empty vec. Therefore, the scheduling should happen via the schedules_pings field. However, in the original code (before the patch), the code for schedules_pings is only executed if the ping is enabled and the ping is collected. But in the test, the parent is disabled. Therefore, the schedules_pings code is not reached. The child_ping should not be submitted, but the test expects it to be. Therefore, the test should fail before the patch, but the user says it's passing. That's confusing.
+
+So the problem is that the existing test is passing when it should fail. To fix this, perhaps the test should be written in a way that the parent ping is disabled but the child is scheduled via the ping_schedule configuration instead of the schedules_pings field.
+
+Wait, the original issue describes that "pings can follow another ping's schedule by annotating them with metadata.ping_schedule". So in the original code, the ping_schedule is part of the configuration, and the parent ping's name is in the ping_schedule. Wait, in the initial patch, there's a test called pings_get_submitted_on_disabled_ping_schedule, which sets up a ping_schedule as {"baseline": ["ride-along"]}, and the baseline ping is disabled. In that test, when the baseline ping is submitted (even if disabled), the ride-along is supposed to be submitted. But according to the original code, when the parent ping is disabled, it's not scheduled. The patch fixes this by moving the scheduling code to be called even when the ping is disabled.
+
+So perhaps the original test in the <TEST> block is structured incorrectly. Instead of using the schedules_pings field, it should use the ping_schedule configuration. Because in the original code, if the ping_schedule is set, the code would look up the ping_schedule on the Glean instance and submit the scheduled pings. However, the code in the test's PingType's parent_ping has schedules_pings set, which is different from the ping_schedule configuration.
+
+Therefore, the existing test is using the schedules_pings field, but the patch's test uses the ping_schedule configuration. The problem arises because the original code for handling ping_schedule in the configuration is part of the PingType's submit_sync method. So in the original code, if a ping's name is in the ping_schedule, when that ping is disabled, it's not scheduled. The patch fixes this by moving the scheduling code to handle_ping_schedule, which is called regardless of the ping's enabled state.
+
+So, to correctly test this, the test should use the ping_schedule configuration, not the schedules_pings field. The original test is using the schedules_pings field, which may not trigger the same code path as the ping_schedule in the configuration. Therefore, the existing test is using the wrong approach.
+
+Therefore, the error in the current test is that it's using schedules_pings on the PingType, but the issue is about the ping_schedule in the configuration. The test should create a ping_schedule configuration where the parent ping is the key, and the child is the value, and then submit the parent ping (which is disabled), and expect the child to be submitted.
+
+So to make the test fail before the patch, the test should:
+
+1. Create a ping_schedule configuration with a parent ping name that schedules the child.
+2. Create a parent ping that is disabled.
+3. Create a child ping that is enabled.
+4. Submit the parent ping (which is disabled), but because of the ping_schedule, the child should be submitted.
+
+In the original code, if the parent ping is disabled, when it's submitted, the code returns early, and the ping_schedule code is not executed. Therefore, the child is not submitted. The patched code calls handle_ping_schedule even if the ping is disabled, thus scheduling the child.
+
+So, the existing test in the <TEST> block is using the schedules_pings field, not the ping_schedule configuration. Therefore, it's not testing the correct code path. The test should be adjusted to use the ping_schedule configuration instead of the schedules_pings field.
+
+Therefore, the correct test setup is to have the parent ping not have schedules_pings, but instead the ping_schedule configuration maps the parent's name to the child's name.
+
+So, adjusting the test accordingly:
+
+- Set up a ping_schedule in the ConfigurationBuilder as HashMap::from([("parent".to_string(), vec!["child_ping".to_string()])]).
+- The parent_ping is created with schedules_pings as empty, and no schedules_pings in PingType (since that's a separate mechanism).
+- When the parent ping is submitted (even when disabled), the code should check the ping_schedule and submit the child ping.
+
+In this scenario, the original code would fail to submit the child ping (since the parent is disabled, the code returns early), thus the test would fail. The patch should fix this, making the test pass.
+
+So, the existing test in the <TEST> block is structured incorrectly by using schedules_pings instead of ping_schedule. The test should be modified to use the ping_schedule configuration. That way, the test will hit the code path that checks the ping_schedule in the Glean instance, which is where the original issue was.
+
+To fix the test:
+
+1. Adjust the ping_schedule configuration to map the parent to the child.
+2. Remove the schedules_pings from the parent_ping.
+3. Ensure the parent_ping is disabled.
+4. Submit the parent_ping and check if the child_ping is submitted.
+
+Thus, the updated test should look like this:
+
+- The ping_schedule is set as {"parent": ["child_ping"]}.
+- The parent_ping is not in schedules_pings.
+- The parent_ping is disabled.
+- Submit the parent_ping, expecting the child_ping to be submitted.
+
+In the original code, this would fail because the parent is disabled and the code skips scheduling. The patch fixes it.
+
+So, modifying the test's configuration and PingType setup accordingly.
+
+Now, let's modify the existing test in the <TEST> block to reflect this. The previous test had a ping_schedule of parent: vec![] which was incorrect. Instead, it should be {"parent": ["child_ping"]}.
+
+Also, the parent_ping in the test is set with schedules_pings: ["child_ping"], which is incorrect for this scenario. Instead, the schedules_pings should be empty, and the ping_schedule configuration should define the relationship.
+
+So, the corrected test should:
+
+- Set the ping_schedule to {"parent": ["child_ping"]}.
+- Parent ping has schedules_pings as empty.
+- Child ping is enabled and registered.
+
+Then, when the parent ping is submitted (even when disabled), the code should schedule the child.
+
+In this setup, the original code would fail, but the patched code would pass.
+
+So, adjusting the test code accordingly.
+
+The existing test in the <TEST> block has:
+
+let ping_schedule = std::collections::HashMap::from([("parent".to_string(), vec![])]);
+
+This is incorrect. It should be vec!["child_ping".to_string()].
+
+Also, the parent_ping was created with schedules_pings as ["child_ping"], which is not required in this scenario. Because the scheduling is via the configuration, not via the PingType's schedules_pings.
+
+Therefore, updating the test code to fix these issues.
+
+In summary, the original test passes because it's using the schedules_pings field, which may not trigger the same code path as the ping_schedule configuration. The correct test should use the ping_schedule configuration, ensuring that the parent ping is disabled but the scheduled ping is submitted.
+</think>
+
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>
+use crossbeam_channel;
+use std::time::Duration;
+use glean_core::types::ConfigurationBuilder;
+use glean_core::types::PingType;
+use std::path::PathBuf;
+use tempfile;
+use std::collections::HashMap;
+use glean_core::net;
+use glean_core::constants::GLOBAL_APPLICATION_ID;
+use glean_core::types::Glean;
+use super::new_glean;
+</imports>
+<Rust>
+#[test]
+fn test_scheduled_pings_after_disabled_ping() {
+    let _lock = lock_test();
+
+    let (s, r) = crossbeam_channel::bounded::<String>(1);
+
+    struct FakeUploader {
+        sender: crossbeam_channel::Sender<String>,
+    }
+
+    impl net::PingUploader for FakeUploader {
+        fn upload(&self, req: net::CapablePingUploadRequest) -> net::UploadResult {
+            let req = req.capable(|_| true).unwrap();
+            self.sender.send(req.url).unwrap();
+            net::UploadResult::http_status(200)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let ping_schedule = HashMap::from([("parent_ping".to_string(), vec!["child_ping".to_string()])]);
+
+    let cfg = ConfigurationBuilder::new(false, tmpname, GLOBAL_APPLICATION_ID)
+        .with_server_endpoint("invalid-test-host")
+        .with_uploader(FakeUploader { sender: s })
+        .with_ping_schedule(ping_schedule)
+        .build();
+
+    let _glean = new_glean(Some(cfg), true);
+
+    let parent_ping = PingType::new(
+        "parent_ping",
+        true,
+        false,
+        false,
+        false,
+        true,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+    parent_ping.set_enabled(false);
+
+    let child_ping = PingType::new(
+        "child_ping",
+        true,
+        true,
+        true,
+        true,
+        true,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+    child_ping.set_enabled(true);
+
+    parent_ping.register(&_glean);
+    child_ping.register(&_glean);
+
+    // Submit parent ping which is disabled but in ping_schedule
+    Glean::submit_ping_by_name("parent_ping", None);
+
+    // Ensure submission occurs despite parent ping being disabled
+    let url = r.recv_timeout(Duration::from_millis(100)).unwrap();
+    assert!(url.contains("child_ping"));
+}
+</Rust>

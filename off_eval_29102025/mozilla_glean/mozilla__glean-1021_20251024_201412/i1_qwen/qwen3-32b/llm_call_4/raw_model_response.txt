@@ -1,0 +1,87 @@
+<think>
+Okay, let's see. The user is pointing out that there's an issue with tests failing on CI but not locally, specifically with a test called test_processes_correctly_client_error_upload_response. The problem seems to be related to how pings are processed after an upload response, possibly due to order or additional pending pings not being cleared.
+
+Looking at the provided patch, several changes were made. The test in question is in the upload module. The original test is expecting that after a client error, the ping is requeued. But with the old code, maybe the ping wasn't being requeued correctly, leading to a mismatch in the expected outcome.
+
+The patch adds a debug_view_tag parameter to process_ping_upload_response and introduces a check to avoid adding duplicate pings in enqueue_ping. Also, in the test, they're checking if a ping is correctly requeued after a client error. The error in the output shows that the expected result was 'Done' but got 'Upload(PingRequest...)', indicating the ping wasn't processed as expected.
+
+In the test, the problem might be that the initial ping isn't properly queued before simulating the response. The original test might not have ensured that the PingDirectoryManager had processed the ping file into the queue before calling process_ping_upload_response. 
+
+So, to create a regression test, I need to make sure the test setup properly adds a ping to the queue, then handles the client error response. The test should fail before the patch because the old code didn't check for duplicates when requeuing from disk, leading to multiple entries. After the patch, the enqueue_ping method checks for existing pings by document_id, so duplicates aren't added, and the test passes.
+
+The new test should simulate a ping being uploaded, then trigger a client error (400), and check that the ping is requeued correctly. To ensure this, the test should create a ping file, wait for the upload manager to process it, then simulate the client error. Finally, verify that the requeued ping is the one we expect.
+
+So, the test should:
+
+1. Create a temporary directory and PingDirectoryManager.
+2. Create a ping file with a known document_id.
+3. Ensure the upload manager processes this ping into the queue.
+4. Process the upload response with a client error (400).
+5. Check that the ping is requeued from the disk (i.e., the queue now has the ping again).
+6. Verify the document_id matches the original.
+
+In the original test, maybe the ping wasn't added to the queue before processing the response. Or perhaps the code didn't wait for the directory processing to complete, leading to the queue being empty. The new test should handle these steps properly.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use uuid::Uuid;
+</imports>
+<Rust>
+#[test]
+fn test_requeues_after_client_error_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), false);
+    let ping_dir = dir.path().join(PENDING_PINGS_DIRECTORY);
+    fs::create_dir_all(&ping_dir).unwrap();
+
+    let doc_id = Uuid::new_v4().to_string();
+    let ping_path = ping_dir.join(format!("{}.incomplete", doc_id));
+    {
+        let mut file = File::create(&ping_path).unwrap();
+        writeln!(file, "/submit/APP_ID/PING_NAME/1/{}", doc_id).unwrap();
+        writeln!(file, "{{\"test\": \"data\"}}").unwrap();
+    }
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Ensure the ping is queued
+    let queue = upload_manager.queue.read().unwrap();
+    assert_eq!(queue.len(), 0, "Initial queue should be empty");
+    drop(queue);
+
+    // Simulate successful processing to trigger directory scanning
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(200), None);
+
+    // Wait for processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Simulate client error (400) response to force requeue from disk
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(400), None);
+
+    // Wait for requeue processing
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let request = match upload_manager.get_upload_task(false) {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected requeued ping"),
+    };
+
+    assert_eq!(request.document_id, doc_id);
+    assert_eq!(request.body, json!({ "test": "data" }));
+}
+</Rust>

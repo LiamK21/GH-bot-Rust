@@ -1,0 +1,23 @@
+#tools/embedded-uniffi-bindgen/src/lib.rs
+// intentionally left empty. only exists to make a warning go away
+
+#[cfg(test)]
+mod tests {
+use std::fs;
+use std::path::Path;
+use std::io::Write;
+use std::fs::File;
+
+#[test]
+fn test_file_exists() {
+    let path = Path::new("tools/embedded-uniffi-bindgen/src/lib.rs");
+    let expected_content = "// intentionally left empty. only exists to make a warning go away";
+    let mut file = File::create(&path).unwrap();
+    writeln!(file, "{}", expected_content).unwrap();
+    let expected = true;
+    let actual = path.exists() && fs::metadata(path).unwrap().len() > 0;
+    assert_eq!(expected, actual);
+    let content = fs::read_to_string(path).unwrap();
+    assert_eq!(content.trim(), expected_content);
+}
+}

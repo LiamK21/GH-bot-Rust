@@ -1,0 +1,281 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add Experiments API limits violations to Glean error reporting
+The current Experiments function `setActiveExperiement` applies some limits to the fields that should be reported in Glean's error reporting mechanism.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -474,7 +474,7 @@ impl Glean {
+         branch: String,
+         extra: Option<HashMap<String, String>>,
+     ) {
+-        let metric = metrics::ExperimentMetric::new(experiment_id);
++        let metric = metrics::ExperimentMetric::new(&self, experiment_id);
+         metric.set_active(&self, branch, extra);
+     }
+ 
+@@ -484,7 +484,7 @@ impl Glean {
+     ///
+     /// * `experiment_id` - The id of the active experiment to deactivate (maximum 30 bytes).
+     pub fn set_experiment_inactive(&self, experiment_id: String) {
+-        let metric = metrics::ExperimentMetric::new(experiment_id);
++        let metric = metrics::ExperimentMetric::new(&self, experiment_id);
+         metric.set_inactive(&self);
+     }
+ 
+@@ -518,7 +518,7 @@ impl Glean {
+     /// { 'branch': 'the-branch-name', 'extra': {'key': 'value', ...}}
+     /// Otherwise, None.
+     pub fn test_get_experiment_data_as_json(&self, experiment_id: String) -> Option<String> {
+-        let metric = metrics::ExperimentMetric::new(experiment_id);
++        let metric = metrics::ExperimentMetric::new(&self, experiment_id);
+         metric.test_get_value_as_json_string(&self)
+     }
+
+diff --git a/glean-core/src/metrics/experiment.rs b/glean-core/src/metrics/experiment.rs
+--- a/glean-core/src/metrics/experiment.rs
++++ b/glean-core/src/metrics/experiment.rs
+@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
+ use serde_json::json;
+ use std::collections::HashMap;
+ 
++use crate::error_recording::{record_error, ErrorType};
+ use crate::metrics::Metric;
+ use crate::metrics::MetricType;
+ use crate::storage::StorageManager;
+-use crate::util::truncate_string_at_boundary;
++use crate::util::{truncate_string_at_boundary, truncate_string_at_boundary_with_error};
+ use crate::CommonMetricData;
+ use crate::Glean;
+ use crate::Lifetime;
+@@ -63,20 +64,23 @@ impl ExperimentMetric {
+     ///
+     /// * `id` - the id of the experiment. Please note that this will be
+     ///          truncated to `MAX_EXPERIMENTS_IDS_LEN`, if needed.
+-    pub fn new(id: String) -> Self {
++    pub fn new(glean: &Glean, id: String) -> Self {
++        let mut error = None;
++
+         // Make sure that experiment id is within the expected limit.
+         let truncated_id = if id.len() > MAX_EXPERIMENTS_IDS_LEN {
+-            log::warn!(
++            let msg = format!(
+                 "Value length {} for experiment id exceeds maximum of {}",
+                 id.len(),
+                 MAX_EXPERIMENTS_IDS_LEN
+             );
++            error = Some(msg);
+             truncate_string_at_boundary(id, MAX_EXPERIMENTS_IDS_LEN)
+         } else {
+             id
+         };
+ 
+-        Self {
++        let new_experiment = Self {
+             meta: CommonMetricData {
+                 name: format!("{}#experiment", truncated_id),
+                 // We don't need a category, the name is already unique
+@@ -85,7 +89,20 @@ impl ExperimentMetric {
+                 lifetime: Lifetime::Application,
+                 ..Default::default()
+             },
++        };
++
++        // Check for a truncation error to record
++        if let Some(msg) = error {
++            record_error(
++                glean,
++                &new_experiment.meta,
++                ErrorType::InvalidValue,
++                msg,
++                None,
++            );
+         }
++
++        new_experiment
+     }
+ 
+     /// Record an experiment as active.
+@@ -109,12 +126,12 @@ impl ExperimentMetric {
+ 
+         // Make sure that branch id is within the expected limit.
+         let truncated_branch = if branch.len() > MAX_EXPERIMENTS_IDS_LEN {
+-            log::warn!(
+-                "Value length {} for branch exceeds maximum of {}",
+-                branch.len(),
+-                MAX_EXPERIMENTS_IDS_LEN
+-            );
+-            truncate_string_at_boundary(branch, MAX_EXPERIMENTS_IDS_LEN)
++            truncate_string_at_boundary_with_error(
++                glean,
++                &self.meta,
++                branch,
++                MAX_EXPERIMENTS_IDS_LEN,
++            )
+         } else {
+             branch
+         };
+@@ -122,32 +139,33 @@ impl ExperimentMetric {
+         // Apply limits to extras
+         let truncated_extras = extra.and_then(|extra| {
+             if extra.len() > MAX_EXPERIMENTS_EXTRAS_SIZE {
+-                log::warn!(
++                let msg = format!(
+                     "Extra hash map length {} exceeds maximum of {}",
+                     extra.len(),
+                     MAX_EXPERIMENTS_EXTRAS_SIZE
+                 );
++                record_error(glean, &self.meta, ErrorType::InvalidValue, msg, None);
+             }
+ 
+             let mut temp_map = HashMap::new();
+             for (key, value) in extra.into_iter().take(MAX_EXPERIMENTS_EXTRAS_SIZE) {
+                 let truncated_key = if key.len() > MAX_EXPERIMENTS_IDS_LEN {
+-                    log::warn!(
+-                        "Extra key length {} exceeds maximum of {}",
+-                        key.len(),
+-                        MAX_EXPERIMENTS_IDS_LEN
+-                    );
+-                    truncate_string_at_boundary(key, MAX_EXPERIMENTS_IDS_LEN)
++                    truncate_string_at_boundary_with_error(
++                        glean,
++                        &self.meta,
++                        key,
++                        MAX_EXPERIMENTS_IDS_LEN,
++                    )
+                 } else {
+                     key
+                 };
+                 let truncated_value = if value.len() > MAX_EXPERIMENT_VALUE_LEN {
+-                    log::warn!(
+-                        "Extra value length {} exceeds maximum of {}",
+-                        value.len(),
+-                        MAX_EXPERIMENT_VALUE_LEN
+-                    );
+-                    truncate_string_at_boundary(value, MAX_EXPERIMENT_VALUE_LEN)
++                    truncate_string_at_boundary_with_error(
++                        glean,
++                        &self.meta,
++                        value,
++                        MAX_EXPERIMENT_VALUE_LEN,
++                    )
+                 } else {
+                     value
+                 };
+
+diff --git a/glean-core/src/storage/mod.rs b/glean-core/src/storage/mod.rs
+--- a/glean-core/src/storage/mod.rs
++++ b/glean-core/src/storage/mod.rs
+@@ -212,7 +212,7 @@ mod test {
+             .cloned()
+             .collect();
+ 
+-        let metric = ExperimentMetric::new("some-experiment".to_string());
++        let metric = ExperimentMetric::new(&glean, "some-experiment".to_string());
+ 
+         metric.set_active(&glean, "test-branch".to_string(), Some(extra));
+         let snapshot = StorageManager
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/experiment.rs</Filename>
+<imports>use crate::error_recording::{record_error, ErrorType};
+use crate::Glean;
+use crate::metrics::ExperimentMetric;
+use std::collections::HashMap;
+use crate::Configuration;
+use crate::error::Error;
+use log::info;</imports>
+<Rust>#[test]
+fn test_experiment_metric_limits_violations() {
+  let config = Configuration { ..Default::default() };
+  let glean = Glean::new(config).unwrap();
+  let experiment_id = "a".repeat(31);
+  let branch = "b".repeat(31);
+  let extra = HashMap::from([("key".to_string(), "value".to_string())]);
+  let metric = ExperimentMetric::new(&glean, experiment_id);
+  metric.set_active(&glean, branch, Some(extra.clone()));
+  let metric_before_patch = ExperimentMetric::new(experiment_id);
+  metric_before_patch.set_active(&glean, branch, Some(extra));
+  info!("Test passed if no errors are logged for the metric after the patch");
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0277]: the trait bound `Configuration: Default` is not satisfied
+   --> glean-core/src/metrics/experiment.rs:232:34
+    |
+232 |   let config = Configuration { ..Default::default() };
+    |                                  ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Configuration`
+    |
+help: consider annotating `Configuration` with `#[derive(Default)]`
+   --> glean-core/src/lib.rs:56:1
+    |
+56  + #[derive(Default)]
+57  | pub struct Configuration {
+    |
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+   --> glean-core/src/metrics/experiment.rs:239:29
+    |
+239 |   let metric_before_patch = ExperimentMetric::new(experiment_id);
+    |                             ^^^^^^^^^^^^^^^^^^^^^ ------------- argument #1 of type `&Glean` is missing
+    |
+note: associated function defined here
+   --> glean-core/src/metrics/experiment.rs:67:12
+    |
+67  |     pub fn new(glean: &Glean, id: String) -> Self {
+    |            ^^^ -------------
+help: provide the argument
+    |
+239 |   let metric_before_patch = ExperimentMetric::new(/* &Glean */, experiment_id);
+    |                                                   +++++++++++++
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

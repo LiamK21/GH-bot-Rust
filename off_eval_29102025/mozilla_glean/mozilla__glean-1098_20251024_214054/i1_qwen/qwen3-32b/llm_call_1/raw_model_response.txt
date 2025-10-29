@@ -1,0 +1,265 @@
+<think>
+Okay, I need to create a regression test for the patch that prevents uploading pings larger than 1MB. Let's look at the changes made.
+
+The main changes are in the upload manager's enqueue_ping function. There's a new build_ping_request function that checks the body size against PING_BODY_MAX_SIZE (1MB). If it's larger, it returns an error, deletes the ping file, and records metrics.
+
+The unit test should verify that pings exceeding 1MB are not enqueued and that the error metrics are incremented. The test should also check that pings under 1MB are processed normally.
+
+Looking at the existing test cases in the patch, there's a test for building a ping request with an oversized body, which checks for an error. That's probably part of the request builder test. But I need to ensure that the upload manager handles this correctly by not adding the request to the queue and updating the metrics.
+
+So, the test should set up a ping file that's just over 1MB, enqueue it, and check that the upload queue doesn't have the request. Also, verify that the discarded metrics are recorded correctly.
+
+The test can create a temporary directory, generate a ping file with a body larger than 1MB, let the upload manager process it, and then check the queue and metrics.
+
+I'll need to use the PingUploadManager::new, enqueue_ping, and then check the queue's contents. Additionally, I need to access the upload_metrics to see if the discarded metric was incremented.
+
+The existing test code uses a function new_glean(), so I should use that. Then, create a temporary ping file with a body size of 1MB + 1 byte. Enqueue it, wait for processing, and check the queue and metrics.
+
+I should also test the inverse, ensuring a ping under 1MB is correctly enqueued.
+
+But since the user asked for one test, perhaps focus on the oversized case. Let's create a test that:
+
+1. Creates a ping file with body size >1MB.
+2. Enqueues it via the upload manager.
+3. Checks that the queue doesn't have the request.
+4. Verifies that the discard metric was recorded.
+
+To implement this, I'll need to set up the PingUploadManager, create the ping with a large body, and check the results. The build_ping_request function should return None in this case, so the queue remains empty.
+
+In the test code, I can use the directory manager to create the ping file, enqueue it, then check the queue. Also, access the upload_metrics of the manager to check if the discarded size was added.
+
+So the steps in code would be:
+
+- Create a temporary directory with a ping file whose body is over 1MB.
+- Initialize the upload manager with that dir.
+- Process the directory (wait for pending pings processing).
+- Check if the queue is empty.
+- Check that the discarded metric has the size recorded.
+
+The existing test uses enqueue_ping_from_file, but with the new logic, the build_ping_request is called when enqueuing. So the test needs to simulate processing a ping file with a large body.
+
+Now, in code:
+
+Use the PingUploadManager::new with a directory that has a ping file with a large body. Verify that enqueue_ping_from_file doesn't add it to the queue due to size.
+
+Also, check the upload_metrics.ping_upload_failure and discarded_exceeding_pings_size.
+
+Wait, the upload_metrics includes the 'discarded_exceeding_pings_size' metric. So the test should check that this metric's count is 1 after processing a large ping.
+
+But in the test, after enqueueing, the manager processes the directory and attempts to enqueue the ping. If the ping is too big, the metric should be recorded.
+
+So the test should:
+
+- Create the ping file in the directory.
+- Let the upload manager process it.
+- Check that the metric's value is recorded.
+
+Therefore, in the test:
+
+1. Create a temporary directory and a ping file with a body size of 1MB +1 byte.
+2. Initialize the upload manager with that directory.
+3. Wait for processing to complete.
+4. Check that the manager's queue is empty.
+5. Check that the discarded metric has a count of 1.
+
+This can be implemented by:
+
+- Creating a file with a body of "x".repeat(1024*1024 + 1) bytes.
+- Using the directory manager to process the file.
+- Checking the queue and metrics.
+
+The existing test code uses functions like new_upload_manager and helper functions. However, the new_glean function might be needed to create the Glean instance, but since the test is in the upload module, perhaps the patch's test functions can be adapted.
+
+But in the patch's test functions, they create a Glean instance, so the test should do the same.
+
+Putting it all together:
+
+The test will:
+
+- Create a temp dir.
+- Create a ping file with a body size >1MB.
+- Create a Glean instance and upload manager.
+- Process the dir and check results.
+
+So the code would look like:
+
+use glean_core::testing::new_glean;
+use tempfile;
+use std::fs::File;
+use std::io::Write;
+
+#[test]
+fn test_ping_exceeds_max_size() {
+    let (glean, _) = new_glean(None);
+    let dir = tempfile::tempdir().unwrap();
+    let mut upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+    
+    // Create a ping file with body size 1MB + 1 byte
+    let doc_id = "over_sized";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body = "x".repeat(1024 * 1024 + 1); // 1MB + 1 byte
+    upload_manager.directory_manager.create_file(&doc_id, &path, &body, None);
+
+    // Wait for processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Check that the queue is empty
+    let task = upload_manager.get_upload_task(&glean, false);
+    assert_eq!(task, PingUploadTask::Done);
+
+    // Check that the discard metric was recorded
+    let discarded_metric = upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    assert_eq!(discarded_metric.test_get_num_recorded_errors(&glean, None), 0); // Wait, maybe check the distribution?
+    // Or check the ping_upload_failure label?
+    // Alternatively, perhaps the metric is a distribution, so check the sample.
+    // Wait, the discarded_exceeding_pings_size is a MemoryDistributionMetric with unit Kilobyte.
+    // The test should check that the distribution has a value of (1024 * 1024 + 1) / 1024.
+
+    // The size is 1048577 bytes (approx 1024.00098 KB)
+    // So, the metric should have a sample around that.
+    let samples = discarded_metric.test_get_values(&glean, None).unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0], 1024); // Wait, the exact calculation is (s / 1024), but s is the actual size. Wait in the code, it's s / 1024.
+    // The code in the error kind's display is s / 1024, but in the PingBodyOverflow, the stored size is in bytes. So when the ping is 1MB + 1, the sample added is (1024*1024 +1) / 1024 = 1024 + 1/1024 ≈ 1024.0009765625 KB. Since it's a distribution, it's an integer, so it rounds. But the code uses 'as u64 / 1024', which for 1048577 bytes would be 1024.000976... which truncates to 1024 in integer division. Wait no, wait:
+
+Wait, the code in the error is:
+
+self.upload_metrics
+    .discarded_exceeding_pings_size
+    .accumulate(glean, *s as u64 / 1024);
+
+Where s is the body size in bytes. So for 1024*1024 +1 = 1048577 bytes:
+
+s = 1048577
+s / 1024 = 1024.0009765625 => integer division gives 1024.
+
+But wait, in the test, the sample would be 1024 (KB), even though the actual size is slightly over 1MB. But the test expects the distribution metric to have a value of 1024. However, the actual bytes are 1048577, which is 1MB +1 byte. So the KB is 1024.00097... which when converted as integer is 1024. But in the code, the division is in bytes as u64 / 1024. So for 1048577 bytes, (1048577 / 1024) would be 1024.00097... → 1024 as u64.
+
+So in the test, the sample would be 1024. Therefore, the test would check that the sample is 1024.
+
+So the test code would check that the discarded_exceeding_pings_size has a sample of 1024.
+
+Additionally, check that the ping_upload_failure metric has a count. The ping_upload_failure is a labeled counter. Since the error is "ping_body_overflow", the label would be for that. But in the test code, the process_ping_upload_response adds to the ping_upload_failure counter if there's a label. However, in this scenario, the ping is enqueued and processed as a build failure, but since the enqueue fails, maybe the upload manager's process_ping_upload_response isn't called here. Wait, in the test, the ping is processed by the directory manager, which creates the PingPayload, and then the pending_pings are enqueued. However, in the enqueue_ping function, when building the request, if it's an error, it's handled.
+
+In this test case, the ping is processed, and during enqueue_ping, build_ping_request returns None. Therefore, no request is added. But the discarded_exceeding_pings_size metric is recorded.
+
+Therefore, the test needs to check that this distribution metric was updated.
+
+So the test code would proceed to check that the distribution has a sample of 1024KB (approx) for the oversized ping.
+
+Putting this into the test:
+
+After creating the ping, processing it, the test can check the distribution metric's samples.
+
+But how is the MemoryDistributionMetric tested? The test_get_values function is used. So in the code, the test would:
+
+let distributed = upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = distributed.test_get_values(&glean, None).unwrap();
+assert_eq!(samples.len(), 1);
+assert_eq!(samples[0], 1024);
+
+So putting all together:
+
+use glean_core::testing::new_glean;
+use std::thread;
+use std::time::Duration;
+use std::fs::File;
+use std::io::Write;
+use std::ops::Deref;
+use tempfile::TempDir;
+
+#[test]
+fn test_ping_over_1mb_rejected() {
+    let (glean, _) = new_glean(None);
+    let dir = TempDir::new().unwrap();
+    let mut upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Create a ping file with body size just over 1MB
+    let doc_id = "over_1mb";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body_size = 1024 * 1024 + 1; // 1MB + 1 byte
+    let body = "x".repeat(body_size);
+    upload_manager.directory_manager.create_file(&doc_id, &path, &body, None);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Check that no ping is enqueued
+    let task = upload_manager.get_upload_task(&glean, false);
+    match task {
+        PingUploadTask::Done => {}
+        _ => panic!("Expected no pings to be enqueued"),
+    }
+
+    // Check that the discard metric was recorded
+    let discarded_metric = upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    let samples = discarded_metric.test_get_values(&glean, None).unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0], 1024); // body_size / 1024 is 1024.00097..., so rounded down to 1024
+}
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use glean_core::testing::new_glean;
+use glean_core::upload::{PingUploadManager, PingUploadTask};
+use std::thread;
+use std::time::Duration;
+use std::ops::Deref;
+use tempfile::TempDir;
+use std::fs::File;
+use std::io::Write;
+</imports>
+<Rust>
+#[test]
+fn test_ping_over_1mb_rejected() {
+    let (glean, _) = new_glean(None);
+    let dir = TempDir::new().unwrap();
+    let mut upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Create a ping file with body size just over 1MB (1024*1024 + 1 bytes)
+    let doc_id = "over_1mb";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body_size = 1024 * 1024 + 1;
+    let mut file = File::create(dir.path().join(doc_id)).unwrap();
+    writeln!(file, "x").unwrap(); // Write a minimal body
+    // Simulate the directory manager having processed this file
+    upload_manager.pending_pings.write().unwrap().push((
+        doc_id.to_string(),
+        path,
+        "x".repeat(body_size),
+        None
+    ));
+
+    // Process pending pings
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Verify ping was not enqueued
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => {}
+        _ => panic!("Unexpected upload task"),
+    }
+
+    // Verify discard metric was recorded
+    let discarded_metric = upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    let samples = discarded_metric.test_get_values(&glean, None).unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0], 1024); // 1MB+1 = 1024.00097... KB
+}
+</Rust>

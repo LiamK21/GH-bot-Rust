@@ -1,0 +1,62 @@
+<think>
+Okay, let's see. The user provided a test that's failing due to a missing method. The error says that `write_all` isn't found for the `File` struct. The hint mentions that the `Write` trait needs to be imported because `write_all` is part of that trait. 
+
+So, the test in the <TEST> block is trying to write to a file using `file.write_all(...)`, but without importing `std::io::Write`, which is necessary for that method. The solution is to add the correct import.
+
+Looking at the existing imports in the <imports> section, they have `use tempfile;`, `use std::fs;`, `use std::path::PathBuf;`, and `use std::time;`. The missing import here is `use std::io::Write;` because the `Write` trait is needed for `write_all`.
+
+I need to add that import. So in the <imports> block, add `use std::io::Write;` to make the `write_all` method available. That should fix the compiler error.
+
+Now, I'll adjust the <imports> section in the provided test to include this new import. The rest of the test code seems okay. Let me check again: the test creates a temporary directory, sets up the upload manager, enqueues two pings, checks if the second ping is processed after the first. The main issue was the missing import.
+
+So the corrected test should have the import for `Write`, and then the `write_all` call will work. That's the only change needed. The test should now compile and run correctly. Once this is done, the test should fail on the code before the patch (because the second ping isn't picked up) and pass after the patch (because the new upload mechanism handles concurrent pings).
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use tempfile;
+use std::fs;
+use std::path::PathBuf;
+use std::time;
+use std::io::Write;</imports>
+<Rust>
+#[test]
+fn test_concurrent_ping_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path());
+    while upload_manager.get_upload_task() == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let doc1 = "684fa150-8dff-11ea-8faf-cb1ff3b11119";
+    let path1 = format!("/submit/app_id/test-ping/1/{}", doc1);
+    let doc2 = "74f14e9a-8dff-11ea-b45a-6f936923f639";
+    let path2 = format!("/submit/app_id/test-ping/1/{}", doc2);
+
+    upload_manager.enqueue_ping(doc1, &path1, json!({}));
+    let req1 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("First ping not enqueued"),
+    };
+    assert_eq!(doc1, req1.document_id);
+
+    // Manually create the second ping in the pending directory as an actual file.
+    let pending_dir = dir.path().join("pending");
+    fs::create_dir_all(&pending_dir).unwrap();
+    let doc2_pending_path = pending_dir.join(doc2);
+    let mut file = fs::File::create(doc2_pending_path).unwrap();
+    file.write_all(br#"{"ping": "data"}"#).unwrap();
+
+    // Process the first ping
+    upload_manager.process_ping_upload_response(&req1.document_id, HttpStatus(200));
+
+    // Now the second ping should be picked up.
+    let req2 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Second ping not found after processing first"),
+    };
+    assert_eq!(doc2, req2.document_id);
+
+    upload_manager.process_ping_upload_response(&req2.document_id, HttpStatus(200));
+    assert!(matches!(upload_manager.get_upload_task(), PingUploadTask::Done));
+}
+</Rust>

@@ -1,0 +1,159 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Crash in [@ ffi_support::handle_map::ConcurrentHandleMap<T>::insert]
+Crash report: https://crash-stats.mozilla.org/report/index/5e834290-9eb1-4d57-bad7-f90750211002
+
+MOZ_CRASH Reason: ```Bug: next_index pointed at non-free list entry (or end of list)```
+
+Top 10 frames of crashing thread:
+```
+0 libxul.so RustMozCrash mozglue/static/rust/wrappers.cpp:18
+1 libxul.so mozglue_static::panic_hook mozglue/static/rust/lib.rs:91
+2 libxul.so core::ops::function::Fn::call library/core/src/ops/function.rs:70
+3 libxul.so std::panicking::rust_panic_with_hook library/std/src/panicking.rs:626
+4 libxul.so std::panicking::begin_panic::{{closure}} library/std/src/panicking.rs:542
+5 libxul.so std::sys_common::backtrace::__rust_end_short_backtrace library/std/src/sys_common/backtrace.rs:141
+6 libxul.so std::panicking::begin_panic library/std/src/panicking.rs:541
+7 libxul.so ffi_support::handle_map::ConcurrentHandleMap<T>::insert third_party/rust/ffi-support/src/handle_map.rs:762
+8 libxul.so glean_labeled_counter_metric_get third_party/rust/glean-ffi/src/labeled.rs:77
+9 libjnidispatch.so libjnidispatch.so@0x10154 
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/labeled.rs b/glean-core/ffi/src/labeled.rs
+--- a/glean-core/ffi/src/labeled.rs
++++ b/glean-core/ffi/src/labeled.rs
+@@ -74,10 +74,38 @@ macro_rules! impl_labeled_metric {
+         /// Create a new instance of the sub-metric of this labeled metric.
+         #[no_mangle]
+         pub extern "C" fn $get_name(handle: u64, label: FfiStr) -> u64 {
+-            $global.call_infallible_mut(handle, |labeled| {
+-                let metric = labeled.get(label.as_str());
+-                $metric_global.insert_with_log(|| Ok(metric))
+-            })
++            // A map from a unique ID for the labeled submetric to a handle of an instantiated
++            // metric type.
++            static LABEL_MAP: once_cell::sync::Lazy<
++                std::sync::Mutex<std::collections::HashMap<String, u64>>,
++            > = once_cell::sync::Lazy::new(|| {
++                std::sync::Mutex::new(std::collections::HashMap::new())
++            });
++
++            // The handle is a unique number per metric.
++            // The label identifies the submetric.
++            let id = format!("{}/{}", handle, label.as_str());
++
++            let mut map = LABEL_MAP.lock().unwrap();
++
++            use std::collections::hash_map::Entry;
++            match map.entry(id) {
++                Entry::Occupied(entry) => {
++                    // This label handle _could_ get stale if language SDKs call the corresponding
++                    // `glean_destroy_*` functions on the sub-metric.
++                    // We don't guard against this for now, but ensure our language SDKs don't call
++                    // it for metric types that can be labeled (counter, string, boolean).
++                    *entry.get()
++                }
++                Entry::Vacant(entry) => {
++                    let label_handle = $global.call_infallible_mut(handle, |labeled| {
++                        let metric = labeled.get(label.as_str());
++                        $metric_global.insert_with_log(|| Ok(metric))
++                    });
++                    entry.insert(label_handle);
++                    label_handle
++                }
++            }
+         }
+ 
+         #[no_mangle]
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/ffi/src/labeled.rs</Filename>
+<imports>use super::glean_labeled_counter_metric_get;
+use ffi_support::FfiStr;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;</imports>
+<Rust>#[test]
+fn test_labeled_metric_handle_reuse() {
+    static TEST_LABEL_MAP: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    let handle = 1;
+    let label = FfiStr::from_bytes_with_nul(b"test_label\0").unwrap();
+    let id = format!("{}/{}", handle, label.as_str());
+
+    let mut map = TEST_LABEL_MAP.lock().unwrap();
+    map.insert(id.clone(), 42);
+
+    let expected = 42;
+    let actual = glean_labeled_counter_metric_get(handle, label);
+
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `from_bytes_with_nul` found for struct `ffi_support::FfiStr` in the current scope
+   --> glean-core/ffi/src/labeled.rs:181:25
+    |
+181 |     let label = FfiStr::from_bytes_with_nul(b"test_label\0").unwrap();
+    |                         ^^^^^^^^^^^^^^^^^^^ function or associated item not found in `ffi_support::FfiStr<'_>`
+    |
+note: if you're trying to build a new `ffi_support::FfiStr<'_>` consider using one of the following associated functions:
+      ffi_support::FfiStr::<'a>::from_raw
+      ffi_support::FfiStr::<'a>::from_cstr
+   --> /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ffi-support-0.4.4/src/ffistr.rs:80:5
+    |
+80  |     pub unsafe fn from_raw(ptr: *const c_char) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+90  |     pub fn from_cstr(cstr: &'a CStr) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

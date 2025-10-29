@@ -1,0 +1,58 @@
+<think>
+Okay, let's see. The user provided a test that's failing after the patch. The errors are about using from_str on FfiStr, which doesn't exist. The correct method is from_cstr, but that requires a CString or a CStr. Also, there's an issue with the max_events field expecting an Option<&i32> but getting an i32. And the function call to glean_get_upload_task is passing a reference to a mutable pointer instead of the pointer directly.
+
+First, I need to fix the FfiStr initializations. The test is using FfiStr::from_str, which doesn't exist. So for data_dir, package_name, and language_binding_name, I should use FfiStr::from_cstr. But wait, "from_cstr" takes a &CStr. So I need to create a CString from the string literals. For example, CString::new("test-app").unwrap().as_c_str(), then pass that to from_cstr.
+
+Next, the max_events field in the FfiConfiguration struct is of type Option<&i32> according to the error. The test is assigning 100, which is an i32. So I need to box it as a reference. Like Some(&100 as *const i32). But wait, how is the FfiConfiguration defined? Maybe the original code uses Option<&i32> for max_events. So the test should set max_events: Some(&100).
+
+Then, for the function call to glean_get_upload_task, the function signature expects a *mut FfiPingUploadTask as the first argument, but the test is passing &mut task. So the correct call is to pass task directly, not a reference. So change &mut task to just task.
+
+Putting it all together:
+
+- For each FfiStr field in the config, create a CString, then get the CStr, then use FfiStr::from_cstr.
+- For max_events, use Some(&100).
+- Adjust the function call to pass the raw pointer.
+
+Let me make sure I don't miss any other issues. Also, the test should fail before the patch because the old code might have different setup. The new patch introduces new functions, so the test is checking that the subprocess initialization works.
+
+So the corrected test should now use the proper FfiStr construction, fix the max_events to be an Option with a reference, and fix the function call. This should make the test pass after the patch and fail before, since the old code might not handle the subprocess setup correctly.
+</think>
+
+<Filename>glean-core/ffi/src/lib.rs</Filename>
+<imports>use std::ffi::CString;
+use std::os::raw::c_char;
+use std::ptr;
+use crate::FfiConfiguration;
+use crate::glean_initialize_for_subprocess;
+use crate::glean_get_upload_task;
+use crate::glean_process_ping_upload_response;
+use crate::FfiPingUploadTask;</imports>
+<Rust>
+#[test]
+fn test_subprocess_upload_handling() {
+    let c_data_dir = CString::new("/tmp/glean-test").unwrap();
+    let c_package_name = CString::new("test-app").unwrap();
+    let c_language_binding = CString::new("python").unwrap();
+
+    let config = FfiConfiguration {
+        data_dir: unsafe { FfiStr::from_cstr(c_data_dir.as_c_str()) },
+        package_name: unsafe { FfiStr::from_cstr(c_package_name.as_c_str()) },
+        language_binding_name: unsafe { FfiStr::from_cstr(c_language_binding.as_c_str()) },
+        upload_enabled: 1,
+        max_events: Some(&100),
+        delay_ping_lifetime_io: 0,
+    };
+
+    unsafe {
+        let init_result = glean_initialize_for_subprocess(&config);
+        assert_eq!(init_result, 1);
+
+        let mut task: *mut FfiPingUploadTask = ptr::null_mut();
+        glean_get_upload_task(&mut task, 1);
+
+        if !task.is_null() {
+            glean_process_ping_upload_response(task, 200);
+        }
+    }
+}
+</Rust>

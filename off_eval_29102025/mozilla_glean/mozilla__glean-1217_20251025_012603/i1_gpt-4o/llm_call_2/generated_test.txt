@@ -1,0 +1,55 @@
+#[test]
+fn test_pending_pings_quota_enforced() {
+    let (mut glean, dir) = new_glean(None);
+
+    let ping_type = PingType::new("test", true, true, vec![]);
+    glean.register_ping_type(&ping_type);
+
+    let count_quota = 5;
+    let n = 20;
+
+    for _ in 0..n {
+        glean.submit_ping(&ping_type, None).unwrap();
+    }
+
+    let directory_manager = crate::upload::PingDirectoryManager::new(dir.path());
+    let pending_pings = directory_manager.process_dirs().pending_pings;
+    let expected_pings = pending_pings
+        .iter()
+        .rev()
+        .take(count_quota)
+        .map(|(_, ping)| ping.0.clone())
+        .collect::<Vec<_>>();
+
+    let mut upload_manager = PingUploadManager::no_policy(dir.path());
+    upload_manager.policy.set_max_pending_pings_count(Some(count_quota as u64));
+
+    for ping_id in expected_pings.iter().rev() {
+        match upload_manager.get_upload_task(&glean, false) {
+            PingUploadTask::Upload(request) => assert_eq!(&request.document_id, ping_id),
+            _ => panic!("Expected upload manager to return the next request!"),
+        }
+    }
+
+    assert_eq!(
+        upload_manager.get_upload_task(&glean, false),
+        PingUploadTask::Done
+    );
+
+    assert_eq!(
+        (n - count_quota) as i32,
+        upload_manager
+            .upload_metrics
+            .deleted_pings_after_quota_hit
+            .test_get_value(&glean, "metrics")
+            .unwrap()
+    );
+    assert_eq!(
+        n as i32,
+        upload_manager
+            .upload_metrics
+            .pending_pings
+            .test_get_value(&glean, "metrics")
+            .unwrap()
+    );
+}

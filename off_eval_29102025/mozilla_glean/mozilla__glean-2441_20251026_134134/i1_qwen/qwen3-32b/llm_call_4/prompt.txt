@@ -1,0 +1,227 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Event max_events overflow doesn't trigger upload right away
+When an event is recorded and the `max_events` limit is reached an `events` ping is submitted, but this doesn't trigger the uploader.
+The ping thus can stick around for a while until the uploader runs the next time.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/event_database/mod.rs b/glean-core/src/event_database/mod.rs
+--- a/glean-core/src/event_database/mod.rs
++++ b/glean-core/src/event_database/mod.rs
+@@ -258,16 +258,21 @@ impl EventDatabase {
+     ///   monotonically increasing timer (this value is obtained on the
+     ///   platform-specific side).
+     /// * `extra` - Extra data values, mapping strings to strings.
++    ///
++    /// ## Returns
++    ///
++    /// `true` if a ping was submitted and should be uploaded.
++    /// `false` otherwise.
+     pub fn record(
+         &self,
+         glean: &Glean,
+         meta: &CommonMetricDataInternal,
+         timestamp: u64,
+         extra: Option<HashMap<String, String>>,
+-    ) {
++    ) -> bool {
+         // If upload is disabled we don't want to record.
+         if !glean.is_upload_enabled() {
+-            return;
++            return false;
+         }
+ 
+         let mut submit_max_capacity_event_ping = false;
+@@ -303,6 +308,9 @@ impl EventDatabase {
+         }
+         if submit_max_capacity_event_ping {
+             glean.submit_ping_by_name("events", Some("max_capacity"));
++            true
++        } else {
++            false
+         }
+     }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -170,6 +170,7 @@ static STATE: OnceCell<Mutex<State>> = OnceCell::new();
+ /// Get a reference to the global state object.
+ ///
+ /// Panics if no global state object was set.
++#[track_caller] // If this fails we're interested in the caller.
+ fn global_state() -> &'static Mutex<State> {
+     STATE.get().unwrap()
+ }
+
+diff --git a/glean-core/src/metrics/event.rs b/glean-core/src/metrics/event.rs
+--- a/glean-core/src/metrics/event.rs
++++ b/glean-core/src/metrics/event.rs
+@@ -68,7 +68,15 @@ impl EventMetric {
+     ///             If any key is not allowed, an error is reported and no event is recorded.
+     pub fn record_with_time(&self, timestamp: u64, extra: HashMap<String, String>) {
+         let metric = self.clone();
+-        crate::launch_with_glean(move |glean| metric.record_sync(glean, timestamp, extra));
++        crate::launch_with_glean(move |glean| {
++            let sent = metric.record_sync(glean, timestamp, extra);
++            if sent {
++                let state = crate::global_state().lock().unwrap();
++                if let Err(e) = state.callbacks.trigger_upload() {
++                    log::error!("Triggering upload failed. Error: {}", e);
++                }
++            }
++        });
+     }
+ 
+     /// Validate that extras are empty or all extra keys are allowed.
+@@ -104,20 +112,30 @@ impl EventMetric {
+     }
+ 
+     /// Records an event.
++    ///
++    /// ## Returns
++    ///
++    /// `true` if a ping was submitted and should be uploaded.
++    /// `false` otherwise.
+     #[doc(hidden)]
+-    pub fn record_sync(&self, glean: &Glean, timestamp: u64, extra: HashMap<String, String>) {
++    pub fn record_sync(
++        &self,
++        glean: &Glean,
++        timestamp: u64,
++        extra: HashMap<String, String>,
++    ) -> bool {
+         if !self.should_record(glean) {
+-            return;
++            return false;
+         }
+ 
+         let extra_strings = match self.validate_extra(glean, extra) {
+             Ok(extra) => extra,
+-            Err(()) => return,
++            Err(()) => return false,
+         };
+ 
+         glean
+             .event_storage()
+-            .record(glean, &self.meta, timestamp, extra_strings);
++            .record(glean, &self.meta, timestamp, extra_strings)
+     }
+ 
+     /// **Test-only API (exported for FFI purposes).**
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/event.rs</Filename>
+<imports>use super::EventMetric;
+use once_cell::sync::OnceCell;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use crate::Glean;
+use crate::callbacks::Callbacks;
+use crate::CommonMetricData;</imports>
+<Rust>#[test]
+fn test_upload_triggered_on_max_events() {
+    static STATE: OnceCell<Mutex<StateMock>> = OnceCell::new();
+
+    struct StateMock {
+        upload_counter: Cell<u8>,
+    }
+
+    impl StateMock {
+        fn new() -> Self {
+            Self {
+                upload_counter: Cell::new(0),
+            }
+        }
+
+        fn callbacks(&self) -> &dyn Callbacks {
+            self
+        }
+    }
+
+    impl Callbacks for StateMock {
+        fn trigger_upload(&self) -> Result<(), ()> {
+            self.upload_counter.set(self.upload_counter.get() + 1);
+            Ok(())
+        }
+    }
+
+    STATE.set(Mutex::new(StateMock::new())).unwrap();
+
+    let glean = Glean::new(true).unwrap();
+
+    let metric = EventMetric::new(crate::CommonMetricData {
+        name: "test_event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["events".into()],
+        dynamic_children_send_in_pings: Vec::new(),
+        disabled: false,
+        lifetime: crate::Lifetime::Application,
+        max_events: Some(1),
+        allowed_extra_keys: None,
+    });
+
+    metric.record_with_time(0, HashMap::new());
+
+    metric.record_with_time(1, HashMap::new());
+
+    let state = STATE.get().unwrap().lock().unwrap();
+    assert_eq!(state.upload_counter.get(), 1);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::callbacks`
+   --> glean-core/src/metrics/event.rs:199:12
+    |
+199 | use crate::callbacks::Callbacks;
+    |            ^^^^^^^^^ could not find `callbacks` in the crate root
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

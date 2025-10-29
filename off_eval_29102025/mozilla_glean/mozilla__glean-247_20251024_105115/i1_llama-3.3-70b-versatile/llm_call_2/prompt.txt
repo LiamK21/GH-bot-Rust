@@ -1,0 +1,254 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add a limit for the experiment's extra fields
+Currently, the Glean SDK does not enforce any limit for the values in the `extra` section of an experiment. See [the current implementation](https://github.com/mozilla-mobile/android-components/blob/48a1be86974d633420e869d6ee06d5723ce1ab32/components/service/glean/src/main/java/mozilla/components/service/glean/storages/ExperimentsStorageEngine.kt#L39-L61).
+
+We should add a limit for both the key and the value. Maybe even add a limit for the number of allowed keys.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -596,6 +596,61 @@ mod test {
+         assert_eq!(expected_branch_id, parsed_json.branch);
+     }
+ 
++    #[test]
++    fn limits_on_experiments_extras_are_applied_correctly() {
++        let t = tempfile::tempdir().unwrap();
++        let name = t.path().display().to_string();
++        let glean = Glean::with_options(&name, "org.mozilla.glean.tests", true).unwrap();
++
++        let experiment_id = "test-experiment_id".to_string();
++        let branch_id = "test-branch-id".to_string();
++        let mut extras = HashMap::new();
++
++        let too_long_key = "0123456789".repeat(5);
++        let too_long_value = "0123456789".repeat(6);
++
++        // Build and extras HashMap that's a little too long in every way
++        for n in 0..21 {
++            extras.insert(format!("{}-{}", n, too_long_key), too_long_value.clone());
++        }
++
++        // Mark the experiment as active.
++        glean.set_experiment_active(experiment_id.clone(), branch_id.clone(), Some(extras));
++
++        // Make sure it is active
++        assert!(
++            glean.test_is_experiment_active(experiment_id.clone()),
++            "An experiment with the truncated id should be available"
++        );
++
++        // Get the data
++        let experiment_data = glean.test_get_experiment_data_as_json(experiment_id.clone());
++        assert!(
++            !experiment_data.is_none(),
++            "Experiment data must be available"
++        );
++
++        // Parse the JSON and validate the lengths
++        let parsed_json: RecordedExperimentData =
++            ::serde_json::from_str(&experiment_data.unwrap()).unwrap();
++        assert_eq!(
++            20,
++            parsed_json.clone().extra.unwrap().len(),
++            "Experiments extra must be less than max length"
++        );
++
++        for (key, value) in parsed_json.extra.as_ref().unwrap().iter() {
++            assert!(
++                key.len() <= 30,
++                "Experiments extra key must be less than max length"
++            );
++            assert!(
++                value.len() <= 50,
++                "Experiments extra value must be less than max length"
++            );
++        }
++    }
++
+     #[test]
+     fn experiments_status_is_correctly_toggled() {
+         let t = tempfile::tempdir().unwrap();
+
+diff --git a/glean-core/src/metrics/experiment.rs b/glean-core/src/metrics/experiment.rs
+--- a/glean-core/src/metrics/experiment.rs
++++ b/glean-core/src/metrics/experiment.rs
+@@ -18,9 +18,16 @@ use crate::Lifetime;
+ // An internal ping name, not to be touched by anything else
+ const INTERNAL_STORAGE: &str = "glean_internal_info";
+ 
+-/// The maximum length of the experiment id and the branch id. Identifiers
+-/// longer than this number of characters are truncated.
++/// The maximum length of the experiment id, the branch id, and the keys of the
++/// `extra` map. Identifiers longer than this number of characters are truncated.
+ const MAX_EXPERIMENTS_IDS_LEN: usize = 30;
++/// The maximum length of the experiment `extra` values.  Values longer than this
++/// limit will be truncated.
++const MAX_EXPERIMENT_VALUE_LEN: usize = 50;
++/// The maximum number of extras allowed in the `extra` hash map.  Any items added
++/// beyond this limit will be dropped. Note that truncation of a hash map is
++/// nondeterministic in which items are truncated.
++const MAX_EXPERIMENTS_EXTRAS_SIZE: usize = 20;
+ 
+ /// The data for a single experiment.
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+@@ -112,12 +119,47 @@ impl ExperimentMetric {
+             branch
+         };
+ 
+-        // TODO (bug 1566001): add sane limits for the extra keys and
+-        // values as well.
++        // Apply limits to extras
++        let truncated_extras = extra.and_then(|extra| {
++            if extra.len() > MAX_EXPERIMENTS_EXTRAS_SIZE {
++                log::warn!(
++                    "Extra hash map length {} exceeds maximum of {}",
++                    extra.len(),
++                    MAX_EXPERIMENTS_EXTRAS_SIZE
++                );
++            }
++
++            let mut temp_map = HashMap::new();
++            for (key, value) in extra.into_iter().take(MAX_EXPERIMENTS_EXTRAS_SIZE) {
++                let truncated_key = if key.len() > MAX_EXPERIMENTS_IDS_LEN {
++                    log::warn!(
++                        "Extra key length {} exceeds maximum of {}",
++                        key.len(),
++                        MAX_EXPERIMENTS_IDS_LEN
++                    );
++                    truncate_string_at_boundary(key, MAX_EXPERIMENTS_IDS_LEN)
++                } else {
++                    key
++                };
++                let truncated_value = if value.len() > MAX_EXPERIMENT_VALUE_LEN {
++                    log::warn!(
++                        "Extra value length {} exceeds maximum of {}",
++                        value.len(),
++                        MAX_EXPERIMENT_VALUE_LEN
++                    );
++                    truncate_string_at_boundary(value, MAX_EXPERIMENT_VALUE_LEN)
++                } else {
++                    value
++                };
++
++                temp_map.insert(truncated_key, truncated_value);
++            }
++            Some(temp_map)
++        });
+ 
+         let value = Metric::Experiment(RecordedExperimentData {
+             branch: truncated_branch,
+-            extra,
++            extra: truncated_extras,
+         });
+         glean.storage().record(&self.meta, &value)
+     }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/experiment.rs</Filename>
+<imports>use crate::metrics::ExperimentMetric;
+use crate::storage::Storage;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_experiments_extra_limits() {
+  let mut extra = HashMap::new();
+  let too_long_key = "0123456789".repeat(5);
+  let too_long_value = "0123456789".repeat(6);
+  for n in 0..21 {
+    extra.insert(format!("{}-{}", n, too_long_key), too_long_value.clone());
+  }
+  let experiment_id = "test-experiment_id".to_string();
+  let branch_id = "test-branch-id".to_string();
+  let experiment = ExperimentMetric::new(experiment_id, branch_id, Some(extra));
+  let truncated_extras = experiment.extra.unwrap();
+  assert!(truncated_extras.len() <= 20);
+  for (key, value) in truncated_extras.iter() {
+    assert!(key.len() <= 30);
+    assert!(value.len() <= 50);
+  }
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::storage::Storage`
+   --> glean-core/src/metrics/experiment.rs:205:5
+    |
+205 | use crate::storage::Storage;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^ no `Storage` in `storage`
+
+error[E0061]: this function takes 1 argument but 3 arguments were supplied
+   --> glean-core/src/metrics/experiment.rs:218:20
+    |
+218 |   let experiment = ExperimentMetric::new(experiment_id, branch_id, Some(extra));
+    |                    ^^^^^^^^^^^^^^^^^^^^^                ---------  ----------- unexpected argument #3 of type `std::option::Option<std::collections::HashMap<std::string::String, std::string::String>>`
+    |                                                         |
+    |                                                         unexpected argument #2 of type `std::string::String`
+    |
+note: associated function defined here
+   --> glean-core/src/metrics/experiment.rs:66:12
+    |
+66  |     pub fn new(id: String) -> Self {
+    |            ^^^
+help: remove the extra arguments
+    |
+218 -   let experiment = ExperimentMetric::new(experiment_id, branch_id, Some(extra));
+218 +   let experiment = ExperimentMetric::new(experiment_id);
+    |
+
+error[E0609]: no field `extra` on type `ExperimentMetric`
+   --> glean-core/src/metrics/experiment.rs:219:37
+    |
+219 |   let truncated_extras = experiment.extra.unwrap();
+    |                                     ^^^^^ unknown field
+    |
+    = note: available field is: `meta`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

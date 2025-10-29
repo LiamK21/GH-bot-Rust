@@ -1,0 +1,148 @@
+<think>
+Okay, let's see. The test is failing because the 'count' field isn't present in the DistributionData. The user was trying to check that there's one sample in the metric, but the structure they're accessing doesn't have a 'count' field.
+
+Looking at the imports and the code, the 'discarded_exceeding_pings_size' is a MemoryDistributionMetric. When you call 'test_get_value', it returns a DistributionData. But the DistributionData struct in Glean probably has 'values' (a hashmap of counts per value) and 'sum', not a 'count' field. So the user is using the wrong approach to verify the sample count.
+
+The correct way would be to check the 'values' field. Since the test is for a single sample of a certain value (the size in KB), the test should look for that specific value in the 'values' map and assert that it's 1. Alternatively, if the metric is supposed to accumulate the count, maybe the sum isn't the right approach either.
+
+Wait, the metric is a distribution, which tracks individual samples. If the ping was 1MB + 1 byte, the size in KB would be (1024*1024 +1)/1024, which is 1024 + 1/1024, but since it's converted to integer maybe it's 1024 KB? Or perhaps it's rounded. The metric is using MemoryUnit::Kilobyte, which probably means the value stored is the size in KB as an integer.
+
+In the test, when the ping is over 1MB, the size in KB would be 1024.0 (since 1MB is exactly 1024*1024 bytes). Wait, no, 1024*1024 bytes is 1048576 bytes, which is 1024 KB. The patch says "s / 1024" so the value stored is in KB. So for a ping that's exactly 1MB, the value would be 1024 KB. But in the test, the body is 1MB + 1 byte (1024*1024 + 1 bytes), which when divided by 1024 gives 1024 + 1/1024, which would truncate to 1024 KB (since integer division in Rust is truncating).
+
+So the sample would be 1024 in the distribution. The test should check that the 'values' in the DistributionData have an entry at 1024 with a count of 1.
+
+So the corrected test needs to call 'test_get_value' and then assert that the 'values' entry for 1024 is 1.
+
+So the line that's wrong is 'assert_eq!(samples.count, 1);', which should be replaced with checking the 'values' hash map.
+
+Also, the test should make sure that the metric 'discarded_exceeding_pings_size' exists in the 'glean.upload' category, but the test_get_value is called with the correct ping name.
+
+Wait, in the code, the 'discarded_exceeding_pings_size' metric is in the 'glean.upload' category, and the 'send_in_pings' is set to ["metrics"], so when testing, the 'test_get_value' would be called with the ping name "metrics".
+
+So the code in the test should be:
+
+let samples = discarded_metric.test_get_value(&glean, "glean.upload", "discarded_exceeding_ping_size", "metrics")?; // Maybe not exact, depends on the actual API.
+
+Wait, looking back at the code in the patch, the metric is defined as:
+
+discarded_exceeding_pings_size: MemoryDistributionMetric::new(
+    CommonMetricData {
+        name: "discarded_exceeding_ping_size".into(),
+        category: "glean.upload".into(),
+        send_in_pings: vec!["metrics".into()],
+        ...
+    },
+    ...
+),
+
+So the metric's name is 'discarded_exceeding_ping_size' in the category 'glean.upload'. But in the test, the code is:
+
+discarded_metric.test_get_value(&glean, "metrics")
+
+But the test_get_value function for metrics might require the metric identifier (category and name) or just the name if the metric is already known. Wait, how is test_get_value implemented? Probably, for testing, the method would require passing the category and metric name to retrieve the data.
+
+But in the code from the test, the UploadMetrics struct's 'discarded_exceeding_pings_size' is a field, and the test is calling 'test_get_value' on that, which is a method of the MemoryDistributionMetric. So if the MemoryDistributionMetric's test_get_value method is designed to fetch the data based on the metric's own name and category, then the call would be to 'test_get_value(&glean, "metrics")' where "metrics" is the ping name. But perhaps the test_get_value function's signature is different.
+
+Wait, looking at the patch's test code, in the 'test_ping_over_1mb_rejected' function, the code is:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+
+But the error says that 'samples.count' is not found. So the function test_get_value returns a DistributionData, which has a 'values' field (HashMap<u64, u64>), where each entry is a value and the count of occurrences.
+
+Therefore, the correct way to check if there's one sample of 1024 is to check the 'values' field. So the test should assert that the 'values' HashMap contains an entry with the key 1024 and value 1.
+
+So the corrected line would be:
+
+assert_eq!(*samples.values.get(&1024).unwrap(), 1);
+
+But the test code should also make sure that 'samples.values' is not empty, and that the specific key exists.
+
+So modifying the test:
+
+In the original patch test, the code is:
+
+let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+assert_eq!(samples.count, 1);
+
+But this is wrong because 'count' doesn't exist. So it should be adjusted to check 'values' instead.
+
+Therefore, the corrected code would be:
+
+assert!(samples.values.contains_key(&1024));
+assert_eq!(*samples.values.get(&1024).unwrap(), 1);
+
+But since the body is 1024*1024 +1 bytes, the value stored is (body.len() / 1024). So body.len() is 1048577 bytes. Divided by 1024 is 1024.0... something, but since it's integer division in the code (s / 1024), the value would be 1024. So the key in the distribution should be 1024.
+
+So the test should check that the value 1024 in the 'values' map has a count of 1.
+
+So the test should be modified to:
+
+let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+assert_eq!(samples.values.len(), 1);
+assert_eq!(*samples.values.get(&1024).unwrap(), 1);
+
+But how to handle if the test_get_value returns an Option or a Result? Well, the original code uses unwrap(), so assuming it's safe.
+
+So the corrected test should replace the count assertion with checking the values.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::io::Write;
+use crate::upload::PingDirectoryManager;
+use crate::upload::PingUploadManager;
+use crate::Glean;
+use crate::error::ErrorKind;
+use crate::internal_metrics::UploadMetrics;
+use tempfile;
+use std::collections::HashMap;
+</imports>
+<Rust>
+#[test]
+fn test_ping_over_1mb_rejected() {
+    let (glean, _) = new_glean(None);
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Create a ping payload with body size just over 1MB
+    let doc_id = "over_1mb";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body_size = 1024 * 1024 + 1;
+    let body = String::from_utf8(vec![b'x'; body_size]).unwrap();
+
+    // Add the payload to pending pings
+    upload_manager.pending_pings.write().unwrap().push((
+        doc_id.to_string(),
+        path,
+        body,
+        None,
+    ));
+
+    // Process pending pings
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Verify ping was not enqueued
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => {}
+        _ => panic!("Unexpected upload task"),
+    }
+
+    // Verify discard metric was recorded in the correct storage
+    let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+    assert_eq!(samples.values.len(), 1);
+    assert_eq!(*samples.values.get(&1024).unwrap(), 1);
+}
+</Rust>

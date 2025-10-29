@@ -1,0 +1,217 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Remove infill 0 buckets from custom_distributions as well
+In Firefox Desktop a team is about to add a 2^32-bucket `custom_distribution` (for counts of connections per port, if you're curious). `custom_distribution` metrics are currently [padded with 0-count buckets](https://searchfox.org/glean/source/glean-core/src/histogram/mod.rs#126), and so we might find ourselves with a very expensive piece of data collection all of a sudden.
+
+Maybe we should drop the 0-count buckets, like we did for `timing_distribution` and `memory_distribution` in bug 1898336? Or maybe we should make it optional somehow?
+
+As far as I can remember, these buckets were included so that bucket dimensions could always be determined by information contained solely within the payload. If we want to continue with that promise, maybe we could do that with just adjacent 0-count buckets?
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/histogram/exponential.rs b/glean-core/src/histogram/exponential.rs
+--- a/glean-core/src/histogram/exponential.rs
++++ b/glean-core/src/histogram/exponential.rs
+@@ -57,7 +57,7 @@ fn exponential_range(min: u64, max: u64, bucket_count: usize) -> Vec<u64> {
+ ///
+ /// Buckets are pre-computed at instantiation with an exponential distribution from `min` to `max`
+ /// and `bucket_count` buckets.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, MallocSizeOf)]
++#[derive(Debug, Clone, Serialize, Deserialize, Eq, MallocSizeOf)]
+ pub struct PrecomputedExponential {
+     // Don't serialize the (potentially large) array of ranges, instead compute them on first
+     // access.
+@@ -68,6 +68,14 @@ pub struct PrecomputedExponential {
+     pub(crate) bucket_count: usize,
+ }
+ 
++impl PartialEq for PrecomputedExponential {
++    fn eq(&self, other: &Self) -> bool {
++        // `bucket_ranges` are computed on-demand based on `min`, `max` and `bucket_count`,
++        // so we don't need to compare it (and thus forcing it to be computed)
++        self.min == other.min && self.max == other.max && self.bucket_count == other.bucket_count
++    }
++}
++
+ impl Bucketing for PrecomputedExponential {
+     /// Get the bucket for the sample.
+     ///
+
+diff --git a/glean-core/src/histogram/linear.rs b/glean-core/src/histogram/linear.rs
+--- a/glean-core/src/histogram/linear.rs
++++ b/glean-core/src/histogram/linear.rs
+@@ -37,7 +37,7 @@ fn linear_range(min: u64, max: u64, count: usize) -> Vec<u64> {
+ ///
+ /// Buckets are pre-computed at instantiation with a linear  distribution from `min` to `max`
+ /// and `bucket_count` buckets.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, MallocSizeOf)]
++#[derive(Debug, Clone, Serialize, Deserialize, Eq, MallocSizeOf)]
+ pub struct PrecomputedLinear {
+     // Don't serialize the (potentially large) array of ranges, instead compute them on first
+     // access.
+@@ -48,6 +48,12 @@ pub struct PrecomputedLinear {
+     pub(crate) bucket_count: usize,
+ }
+ 
++impl PartialEq for PrecomputedLinear {
++    fn eq(&self, other: &Self) -> bool {
++        self.min == other.min && self.max == other.max && self.bucket_count == other.bucket_count
++    }
++}
++
+ impl Bucketing for PrecomputedLinear {
+     /// Get the bucket for the sample.
+     ///
+
+diff --git a/glean-core/src/histogram/mod.rs b/glean-core/src/histogram/mod.rs
+--- a/glean-core/src/histogram/mod.rs
++++ b/glean-core/src/histogram/mod.rs
+@@ -124,19 +124,7 @@ impl<B: Bucketing> Histogram<B> {
+     /// Gets a snapshot of all values from the first bucket until one past the last filled bucket,
+     /// filling in empty buckets with 0.
+     pub fn snapshot_values(&self) -> HashMap<u64, u64> {
+-        let mut res = self.values.clone();
+-
+-        let max_bucket = self.values.keys().max().cloned().unwrap_or(0);
+-
+-        for &min_bucket in self.bucketing.ranges() {
+-            // Fill in missing entries.
+-            let _ = res.entry(min_bucket).or_insert(0);
+-            // stop one after the last filled bucket
+-            if min_bucket > max_bucket {
+-                break;
+-            }
+-        }
+-        res
++        self.values.clone()
+     }
+ 
+     /// Clear this histogram.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/histogram/mod.rs</Filename>
+<imports>use super::Histogram;
+use super::Bucketing;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_snapshot_values_no_infill_zero_buckets() {
+    let bucketing = MockBucketing::new(vec![0, 10, 20, 30, 40]);
+    let mut histogram = Histogram::new(bucketing);
+    histogram.accumulate(15, 1);
+    histogram.accumulate(25, 1);
+
+    let expected: HashMap<u64, u64> = [(10, 1), (20, 1)].iter().cloned().collect();
+    let actual = histogram.snapshot_values();
+
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0433]: failed to resolve: use of undeclared type `MockBucketing`
+   --> glean-core/src/histogram/mod.rs:270:21
+    |
+270 |     let bucketing = MockBucketing::new(vec![0, 10, 20, 30, 40]);
+    |                     ^^^^^^^^^^^^^
+    |                     |
+    |                     use of undeclared type `MockBucketing`
+    |                     help: a trait with a similar name exists: `Bucketing`
+
+error[E0599]: no function or associated item named `new` found for struct `histogram::Histogram` in the current scope
+   --> glean-core/src/histogram/mod.rs:271:36
+    |
+64  | pub struct Histogram<B> {
+    | ----------------------- function or associated item `new` not found for this struct
+...
+271 |     let mut histogram = Histogram::new(bucketing);
+    |                                    ^^^ function or associated item not found in `histogram::Histogram<_>`
+    |
+note: if you're trying to build a new `histogram::Histogram<_>` consider using one of the following associated functions:
+      exponential::<impl histogram::Histogram<PrecomputedExponential>>::exponential
+      functional::<impl histogram::Histogram<Functional>>::functional
+      linear::<impl histogram::Histogram<PrecomputedLinear>>::linear
+      histogram::Histogram::<LinearOrExponential>::_linear
+      histogram::Histogram::<LinearOrExponential>::_exponential
+   --> glean-core/src/histogram/mod.rs:151:5
+    |
+151 |       pub fn _linear(min: u64, max: u64, bucket_count: usize) -> Histogram<LinearOrExponential> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+169 |       pub fn _exponential(min: u64, max: u64, bucket_count: usize) -> Histogram<LinearOrExponential> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: glean-core/src/histogram/functional.rs:75:5
+    |
+75  |       pub fn functional(log_base: f64, buckets_per_magnitude: f64) -> Histogram<Functional> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: glean-core/src/histogram/linear.rs:82:5
+    |
+82  |       pub fn linear(min: u64, max: u64, bucket_count: usize) -> Histogram<PrecomputedLinear> {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+   ::: glean-core/src/histogram/exponential.rs:104:5
+    |
+104 | /     pub fn exponential(
+105 | |         min: u64,
+106 | |         max: u64,
+107 | |         bucket_count: usize,
+108 | |     ) -> Histogram<PrecomputedExponential> {
+    | |__________________________________________^
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `new`, perhaps you need to implement it:
+            candidate #1: `BackendEnvironmentBuilder`
+help: there is a method `ne` with a similar name
+    |
+271 -     let mut histogram = Histogram::new(bucketing);
+271 +     let mut histogram = Histogram::ne(bucketing);
+    |
+</output>
+
+Function signatures
+<Signatures>
+fn exponential_range(min: u64, max: u64, bucket_count: usize) -> Vec<u64>
+
+fn linear_range(min: u64, max: u64, count: usize) -> Vec<u64>
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

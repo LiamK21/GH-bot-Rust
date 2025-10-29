@@ -1,0 +1,675 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the designed attribution and distribution mechanism in Glean
+bug 1930762 gave us a design. Let's implement it, shall we?
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/build/src/lib.rs b/glean-core/build/src/lib.rs
+--- a/glean-core/build/src/lib.rs
++++ b/glean-core/build/src/lib.rs
+@@ -39,7 +39,7 @@ use std::{env, path::PathBuf};
+ 
+ use xshell_venv::{Result, Shell, VirtualEnv};
+ 
+-const GLEAN_PARSER_VERSION: &str = "17.0.1";
++const GLEAN_PARSER_VERSION: &str = "17.1.0";
+ 
+ /// A Glean Rust bindings generator.
+ pub struct Builder {
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -39,8 +39,8 @@ pub use glean_core::{
+         Datetime, DistributionData, MemoryUnit, MetricIdentifier, Rate, RecordedEvent, TimeUnit,
+         TimerId,
+     },
+-    traits, CommonMetricData, Error, ErrorType, Glean, HistogramType, LabeledMetricData, Lifetime,
+-    PingRateLimit, RecordedExperiment, Result,
++    traits, AttributionMetrics, CommonMetricData, DistributionMetrics, Error, ErrorType, Glean,
++    HistogramType, LabeledMetricData, Lifetime, PingRateLimit, RecordedExperiment, Result,
+ };
+ 
+ mod configuration;
+@@ -356,5 +356,31 @@ pub fn get_registered_ping_names() -> Vec<String> {
+     glean_core::glean_get_registered_ping_names()
+ }
+ 
++/// Updates attribution fields with new values.
++/// AttributionMetrics fields with `None` values will not overwrite older values.
++pub fn update_attribution(attribution: AttributionMetrics) {
++    glean_core::glean_update_attribution(attribution);
++}
++
++/// **TEST-ONLY Method**
++///
++/// Returns the current attribution metrics.
++pub fn test_get_attribution() -> AttributionMetrics {
++    glean_core::glean_test_get_attribution()
++}
++
++/// Updates distribution fields with new values.
++/// DistributionMetrics fields with `None` values will not overwrite older values.
++pub fn update_distribution(distribution: DistributionMetrics) {
++    glean_core::glean_update_distribution(distribution);
++}
++
++/// **TEST-ONLY Method**
++///
++/// Returns the current distribution metrics.
++pub fn test_get_distribution() -> DistributionMetrics {
++    glean_core::glean_test_get_distribution()
++}
++
+ #[cfg(test)]
+ mod test;
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -1501,3 +1501,49 @@ fn pings_ride_along_builtin_pings() {
+     let url = r.recv().unwrap();
+     assert!(url.contains("ride-along"));
+ }
++
++#[test]
++fn test_attribution_and_distribution_updates_before_glean_inits() {
++    let _lock = lock_test();
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
++
++    destroy_glean(true, &tmpname);
++
++    // No Glean, let's set and update some attribution + distribution.
++    let mut attribution = AttributionMetrics {
++        source: Some("source".into()),
++        medium: Some("medium".into()),
++        campaign: Some("campaign".into()),
++        term: Some("term".into()),
++        content: Some("content".into()),
++    };
++    let distribution = DistributionMetrics {
++        name: Some("name".into()),
++    };
++    update_attribution(attribution.clone());
++    update_distribution(distribution);
++
++    let attribution_update = AttributionMetrics {
++        term: Some("new term".into()),
++        ..Default::default()
++    };
++    let distribution_update = DistributionMetrics {
++        name: Some("different name".into()),
++    };
++    update_attribution(attribution_update);
++    update_distribution(distribution_update.clone());
++
++    test_reset_glean(
++        ConfigurationBuilder::new(true, tmpname, GLOBAL_APPLICATION_ID)
++            .with_server_endpoint("invalid-test-host")
++            .build(),
++        ClientInfoMetrics::unknown(),
++        false,
++    );
++
++    // Ensure the updated attribution + distribution are correctly stored.
++    attribution.term = Some("new term".into());
++    assert_eq!(attribution, test_get_attribution());
++    assert_eq!(distribution_update, test_get_distribution());
++}
+
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -24,8 +24,9 @@ use crate::storage::{StorageManager, INTERNAL_STORAGE};
+ use crate::upload::{PingUploadManager, PingUploadTask, UploadResult, UploadTaskAction};
+ use crate::util::{local_now_with_offset, sanitize_application_id};
+ use crate::{
+-    scheduler, system, CommonMetricData, ErrorKind, InternalConfiguration, Lifetime, PingRateLimit,
+-    Result, DEFAULT_MAX_EVENTS, GLEAN_SCHEMA_VERSION, GLEAN_VERSION, KNOWN_CLIENT_ID,
++    scheduler, system, AttributionMetrics, CommonMetricData, DistributionMetrics, ErrorKind,
++    InternalConfiguration, Lifetime, PingRateLimit, Result, DEFAULT_MAX_EVENTS,
++    GLEAN_SCHEMA_VERSION, GLEAN_VERSION, KNOWN_CLIENT_ID,
+ };
+ 
+ static GLEAN: OnceCell<Mutex<Glean>> = OnceCell::new();
+@@ -1084,4 +1085,76 @@ impl Glean {
+             scheduler::schedule(self);
+         }
+     }
++
++    /// Updates attribution fields with new values.
++    /// AttributionMetrics fields with `None` values will not overwrite older values.
++    pub fn update_attribution(&self, attribution: AttributionMetrics) {
++        if let Some(source) = attribution.source {
++            self.core_metrics.attribution_source.set_sync(self, source);
++        }
++        if let Some(medium) = attribution.medium {
++            self.core_metrics.attribution_medium.set_sync(self, medium);
++        }
++        if let Some(campaign) = attribution.campaign {
++            self.core_metrics
++                .attribution_campaign
++                .set_sync(self, campaign);
++        }
++        if let Some(term) = attribution.term {
++            self.core_metrics.attribution_term.set_sync(self, term);
++        }
++        if let Some(content) = attribution.content {
++            self.core_metrics
++                .attribution_content
++                .set_sync(self, content);
++        }
++    }
++
++    /// **TEST-ONLY Method**
++    ///
++    /// Returns the current attribution metrics.
++    pub fn test_get_attribution(&self) -> AttributionMetrics {
++        AttributionMetrics {
++            source: self
++                .core_metrics
++                .attribution_source
++                .get_value(self, Some("glean_client_info")),
++            medium: self
++                .core_metrics
++                .attribution_medium
++                .get_value(self, Some("glean_client_info")),
++            campaign: self
++                .core_metrics
++                .attribution_campaign
++                .get_value(self, Some("glean_client_info")),
++            term: self
++                .core_metrics
++                .attribution_term
++                .get_value(self, Some("glean_client_info")),
++            content: self
++                .core_metrics
++                .attribution_content
++                .get_value(self, Some("glean_client_info")),
++        }
++    }
++
++    /// Updates distribution fields with new values.
++    /// DistributionMetrics fields with `None` values will not overwrite older values.
++    pub fn update_distribution(&self, distribution: DistributionMetrics) {
++        if let Some(name) = distribution.name {
++            self.core_metrics.distribution_name.set_sync(self, name);
++        }
++    }
++
++    /// **TEST-ONLY Method**
++    ///
++    /// Returns the current distribution metrics.
++    pub fn test_get_distribution(&self) -> DistributionMetrics {
++        DistributionMetrics {
++            name: self
++                .core_metrics
++                .distribution_name
++                .get_value(self, Some("glean_client_info")),
++        }
++    }
+ }
+
+diff --git a/glean-core/src/core_metrics.rs b/glean-core/src/core_metrics.rs
+--- a/glean-core/src/core_metrics.rs
++++ b/glean-core/src/core_metrics.rs
+@@ -42,6 +42,58 @@ pub struct ClientInfoMetrics {
+     pub locale: Option<String>,
+ }
+ 
++/// Optional product attribution metrics carried in `client_info.attribution`.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct AttributionMetrics {
++    /// The attribution source (e.g. "google-play").
++    pub source: Option<String>,
++    /// The attribution medium (e.g. "organic" for a search engine).
++    pub medium: Option<String>,
++    /// The attribution campaign (e.g. "mozilla-org").
++    pub campaign: Option<String>,
++    /// The attribution term (e.g. "browser with developer tools for android").
++    pub term: Option<String>,
++    /// The attribution content (e.g. "firefoxview").
++    pub content: Option<String>,
++}
++
++impl AttributionMetrics {
++    /// Update self with any non-`None` fields from `other`.
++    pub fn update(&mut self, other: AttributionMetrics) {
++        if let Some(source) = other.source {
++            self.source = Some(source);
++        }
++        if let Some(medium) = other.medium {
++            self.medium = Some(medium);
++        }
++        if let Some(campaign) = other.campaign {
++            self.campaign = Some(campaign);
++        }
++        if let Some(term) = other.term {
++            self.term = Some(term);
++        }
++        if let Some(content) = other.content {
++            self.content = Some(content);
++        }
++    }
++}
++
++/// Optional product distribution metrics carried in `client_info.distribution`.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct DistributionMetrics {
++    /// The distribution name (e.g. "MozillaOnline").
++    pub name: Option<String>,
++}
++
++impl DistributionMetrics {
++    /// Update self with any non-`None` fields from `other`.
++    pub fn update(&mut self, other: DistributionMetrics) {
++        if let Some(name) = other.name {
++            self.name = Some(name);
++        }
++    }
++}
++
+ /// Metrics included in every ping as `client_info`.
+ impl ClientInfoMetrics {
+     /// Creates the client info with dummy values for all.
+@@ -204,3 +256,62 @@ pub mod internal_metrics {
+         )
+     });
+ }
++
++#[cfg(test)]
++mod test {
++    use super::*;
++
++    #[test]
++    fn update_attribution() {
++        let mut attr: AttributionMetrics = Default::default();
++        let empty: AttributionMetrics = Default::default();
++
++        // Ensure the identity operation works.
++        attr.update(empty.clone());
++        assert_eq!(None, attr.source);
++
++        // Ensure simple updates work.
++        attr.update(AttributionMetrics {
++            source: Some("a source".into()),
++            ..Default::default()
++        });
++        assert_eq!(Some("a source".into()), attr.source);
++
++        // Ensure None doesn't overwrite.
++        attr.update(empty);
++        assert_eq!(Some("a source".into()), attr.source);
++
++        // Ensure updates of Some work.
++        attr.update(AttributionMetrics {
++            source: Some("another source".into()),
++            ..Default::default()
++        });
++        assert_eq!(Some("another source".into()), attr.source);
++    }
++
++    #[test]
++    fn update_distribution() {
++        let mut dist: DistributionMetrics = Default::default();
++        let empty: DistributionMetrics = Default::default();
++
++        // Ensure the identity operation works.
++        dist.update(empty.clone());
++        assert_eq!(None, dist.name);
++
++        // Ensure simple updates work.
++        dist.update(DistributionMetrics {
++            name: Some("a name".into()),
++        });
++        assert_eq!(Some("a name".into()), dist.name);
++
++        // Ensure None doesn't overwrite.
++        dist.update(empty);
++        assert_eq!(Some("a name".into()), dist.name);
++
++        // Ensure updates of Some work.
++        dist.update(DistributionMetrics {
++            name: Some("another name".into()),
++        });
++        assert_eq!(Some("another name".into()), dist.name);
++    }
++}
+
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -11,6 +11,12 @@ pub struct CoreMetrics {
+     pub client_id: UuidMetric,
+     pub first_run_date: DatetimeMetric,
+     pub os: StringMetric,
++    pub attribution_source: StringMetric,
++    pub attribution_medium: StringMetric,
++    pub attribution_campaign: StringMetric,
++    pub attribution_term: StringMetric,
++    pub attribution_content: StringMetric,
++    pub distribution_name: StringMetric,
+ }
+ 
+ #[derive(Debug)]
+@@ -65,6 +71,60 @@ impl CoreMetrics {
+                 disabled: false,
+                 dynamic_label: None,
+             }),
++
++            attribution_source: StringMetric::new(CommonMetricData {
++                name: "source".into(),
++                category: "attribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
++
++            attribution_medium: StringMetric::new(CommonMetricData {
++                name: "medium".into(),
++                category: "attribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
++
++            attribution_campaign: StringMetric::new(CommonMetricData {
++                name: "campaign".into(),
++                category: "attribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
++
++            attribution_term: StringMetric::new(CommonMetricData {
++                name: "term".into(),
++                category: "attribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
++
++            attribution_content: StringMetric::new(CommonMetricData {
++                name: "content".into(),
++                category: "attribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
++
++            distribution_name: StringMetric::new(CommonMetricData {
++                name: "name".into(),
++                category: "distribution".into(),
++                send_in_pings: vec!["glean_client_info".into()],
++                lifetime: Lifetime::User,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -59,7 +59,7 @@ mod fd_logger;
+ 
+ pub use crate::common_metric_data::{CommonMetricData, Lifetime};
+ pub use crate::core::Glean;
+-pub use crate::core_metrics::ClientInfoMetrics;
++pub use crate::core_metrics::{AttributionMetrics, ClientInfoMetrics, DistributionMetrics};
+ pub use crate::error::{Error, ErrorKind, Result};
+ pub use crate::error_recording::{test_get_num_recorded_errors, ErrorType};
+ pub use crate::histogram::HistogramType;
+@@ -102,6 +102,10 @@ static PRE_INIT_SOURCE_TAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+ static PRE_INIT_PING_REGISTRATION: Mutex<Vec<metrics::PingType>> = Mutex::new(Vec::new());
+ static PRE_INIT_PING_ENABLED: Mutex<Vec<(metrics::PingType, bool)>> = Mutex::new(Vec::new());
+ 
++/// Keep track of attribution and distribution supplied before Glean is initialized.
++static PRE_INIT_ATTRIBUTION: Mutex<Option<AttributionMetrics>> = Mutex::new(None);
++static PRE_INIT_DISTRIBUTION: Mutex<Option<DistributionMetrics>> = Mutex::new(None);
++
+ /// Global singleton of the handles of the glean.init threads.
+ /// For joining. For tests.
+ /// (Why a Vec? There might be more than one concurrent call to initialize.)
+@@ -448,6 +452,15 @@ fn initialize_inner(
+                     glean.set_ping_enabled(ping, *enabled);
+                 }
+ 
++                // The attribution and distribution might have been set before initialize,
++                // take the cached values and set them.
++                if let Some(attribution) = PRE_INIT_ATTRIBUTION.lock().unwrap().take() {
++                    glean.update_attribution(attribution);
++                }
++                if let Some(distribution) = PRE_INIT_DISTRIBUTION.lock().unwrap().take() {
++                    glean.update_distribution(distribution);
++                }
++
+                 // If this is the first time ever the Glean SDK runs, make sure to set
+                 // some initial core metrics in case we need to generate early pings.
+                 // The next times we start, we would have them around already.
+@@ -1255,6 +1268,50 @@ pub fn glean_set_dirty_flag(new_value: bool) {
+     core::with_glean(|glean| glean.set_dirty_flag(new_value))
+ }
+ 
++/// Updates attribution fields with new values.
++/// AttributionMetrics fields with `None` values will not overwrite older values.
++pub fn glean_update_attribution(attribution: AttributionMetrics) {
++    if was_initialize_called() {
++        core::with_glean(|glean| glean.update_attribution(attribution));
++    } else {
++        PRE_INIT_ATTRIBUTION
++            .lock()
++            .unwrap()
++            .get_or_insert(Default::default())
++            .update(attribution);
++    }
++}
++
++/// **TEST-ONLY Method**
++///
++/// Returns the current attribution metrics.
++/// Panics if called before init.
++pub fn glean_test_get_attribution() -> AttributionMetrics {
++    core::with_glean(|glean| glean.test_get_attribution())
++}
++
++/// Updates distribution fields with new values.
++/// DistributionMetrics fields with `None` values will not overwrite older values.
++pub fn glean_update_distribution(distribution: DistributionMetrics) {
++    if was_initialize_called() {
++        core::with_glean(|glean| glean.update_distribution(distribution));
++    } else {
++        PRE_INIT_DISTRIBUTION
++            .lock()
++            .unwrap()
++            .get_or_insert(Default::default())
++            .update(distribution);
++    }
++}
++
++/// **TEST-ONLY Method**
++///
++/// Returns the current distribution metrics.
++/// Panics if called before init.
++pub fn glean_test_get_distribution() -> DistributionMetrics {
++    core::with_glean(|glean| glean.test_get_distribution())
++}
++
+ #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
+ static FD_LOGGER: OnceCell<fd_logger::FdLogger> = OnceCell::new();
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -396,6 +396,58 @@ fn client_id_is_set_to_random_value_when_uploading_enabled_at_start() {
+     assert_ne!(*KNOWN_CLIENT_ID, current_client_id.unwrap());
+ }
+ 
++#[test]
++fn attribution_and_distribution_are_correctly_stored() {
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++    let glean = Glean::with_options(&tmpname, GLOBAL_APPLICATION_ID, true, true);
++
++    // On a fresh Glean, no attribution or distribution information is set.
++    assert_eq!(
++        <AttributionMetrics as Default>::default(),
++        glean.test_get_attribution()
++    );
++    assert_eq!(
++        <DistributionMetrics as Default>::default(),
++        glean.test_get_distribution()
++    );
++
++    let mut attribution = AttributionMetrics {
++        source: Some("source".into()),
++        medium: Some("medium".into()),
++        campaign: Some("campaign".into()),
++        term: Some("term".into()),
++        content: Some("content".into()),
++    };
++    let distribution = DistributionMetrics {
++        name: Some("name".into()),
++    };
++
++    // Set them all at once.
++    glean.update_attribution(attribution.clone());
++    glean.update_distribution(distribution.clone());
++
++    assert_eq!(attribution, glean.test_get_attribution());
++    assert_eq!(distribution, glean.test_get_distribution());
++
++    let attribution_update = AttributionMetrics {
++        campaign: Some("new campaign".into()),
++        ..Default::default()
++    };
++    let distribution_update = DistributionMetrics {
++        name: Some("new name".into()),
++    };
++
++    // Perform updates.
++    glean.update_attribution(attribution_update);
++    glean.update_distribution(distribution_update.clone());
++
++    // Ensure only the updated fields took over
++    attribution.campaign = Some("new campaign".into());
++    assert_eq!(attribution, glean.test_get_attribution());
++    assert_eq!(distribution_update, glean.test_get_distribution());
++}
++
+ #[test]
+ fn enabling_when_already_enabled_is_a_noop() {
+     let dir = tempfile::tempdir().unwrap();
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/lib_unit_tests.rs</Filename>
+<imports>use super::glean_update_attribution;
+use super::glean_update_distribution;
+use super::glean_test_get_attribution;
+use super::glean_test_get_distribution;
+use std::path::PathBuf;
+use tempfile::tempdir;
+use crate::core::Glean;
+use crate::core_metrics::AttributionMetrics;
+use crate::core_metrics::DistributionMetrics;</imports>
+<Rust>#[test]
+fn test_attribution_and_distribution_persistence() {
+  let dir = tempdir().unwrap();
+  let tmpname = dir.path().to_path_buf().display().to_string();
+  let glean = Glean::with_options(&tmpname, "test_app", true, true);
+
+  let mut attribution = AttributionMetrics {
+    source: Some("source".into()),
+    medium: Some("medium".into()),
+    campaign: Some("campaign".into()),
+    term: Some("term".into()),
+    content: Some("content".into()),
+  };
+  let distribution = DistributionMetrics {
+    name: Some("name".into()),
+  };
+
+  glean_update_attribution(attribution.clone());
+  glean_update_distribution(distribution.clone());
+
+  let updated_attribution = glean_test_get_attribution();
+  let updated_distribution = glean_test_get_distribution();
+
+  assert_eq!(attribution, updated_attribution);
+  assert_eq!(distribution, updated_distribution);
+}
+</Rust>
+</TEST>
+
+<output>
+running 1 test
+
+thread 'tests::tests::test_attribution_and_distribution_persistence' panicked at glean-core/src/core/mod.rs:72:32:
+Global Glean object not initialized
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::tests::test_attribution_and_distribution_persistence ... FAILED
+</output>
+
+Function signatures
+<Signatures>
+pub fn get_registered_ping_names() -> Vec<String>
+
+fn pings_ride_along_builtin_pings() -> ()
+
+fn initialize_inner(
+cfg: InternalConfiguration,
+client_info: ClientInfoMetrics,
+callbacks: Box<dyn OnGleanEvents>) -> ()
+
+pub fn glean_set_dirty_flag(new_value: bool) -> ()
+
+fn client_id_is_set_to_random_value_when_uploading_enabled_at_start() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently fails after the patch.
+Your task is to:
+1. Identify and understand why the unit test failed.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

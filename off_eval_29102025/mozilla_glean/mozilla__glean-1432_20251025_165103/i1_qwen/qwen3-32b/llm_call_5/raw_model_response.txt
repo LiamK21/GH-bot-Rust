@@ -1,0 +1,86 @@
+<think>
+Okay, let's tackle this problem. The user provided a patch and a test that's failing after applying the patch. My job is to understand why the test is failing and adjust it so that it correctly verifies the fix.
+
+First, looking at the errors in the output. The main issues are:
+
+1. The Configuration struct doesn't implement Clone, so config1.clone() fails.
+2. The app_channel is not being accessed correctly. The previous code uses app_channel::set_sync, but in the patched code, the InternalMetrics struct was replaced with Lazy statics inside a module called internal_metrics under core_metrics.
+
+In the original test, app_channel is accessed as a static from a module. The test was using app_channel::set_sync(...), but after the patch, the InternalMetrics struct's fields became module-level statics under core_metrics::internal_metrics. So the correct path would be core_metrics::internal_metrics::app_channel.
+
+Also, since the Configuration doesn't have a Clone implementation, the test should create a new Configuration instead of cloning. The test initializes config1 with certain values and then tries to clone it. To fix that, we can make config1 and config2 as separate instances constructed with the same values instead of cloning.
+
+Next, looking at the patch. The InternalMetrics struct was removed, and each field in internal_metrics became a Lazy static. The test needs to reference them through that module path.
+
+So, the test should import core_metrics::internal_metrics::app_channel. The imports block in the test should be updated to include that.
+
+The original test tried to use app_channel::set_sync, which was incorrect after the patch. The correct path is core_metrics::internal_metrics::app_channel. Therefore, the test needs to import that path and use it.
+
+Putting this all together:
+
+- The test should use core_metrics::internal_metrics::app_channel.
+- Configuration instances should be created without cloning, just by reassigning the same values.
+- The imports need to be adjusted to bring app_channel into scope correctly.
+
+So the corrected test would have the proper imports, use the correct path to app_channel, and create the Configuration instances without cloning.
+
+Let me adjust the test code accordingly. Also, ensure that the test properly initializes Glean, sets the app_channel value, resets Glean, and checks that the value is cleared.
+</think>
+
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>
+use super::test_reset_glean;
+use super::ClientInfoMetrics;
+use super::Configuration;
+use crate::core_metrics::internal_metrics::app_channel;
+use crate::test::lock_test;
+use crate::test::new_glean;
+use std::path::PathBuf;
+use tempfile::tempdir;
+</imports>
+<Rust>
+#[test]
+fn test_core_metrics_cleared_after_reset() {
+    let _lock = lock_test();
+    let tmpdir = tempdir().unwrap();
+    let tmpname = tmpdir.path().display().to_string();
+
+    // First configuration
+    let config1 = Configuration {
+        data_path: tmpname.clone(),
+        application_id: "test_app".into(),
+        upload_enabled: true,
+        server_endpoint: Some("https://example.com/upload".into()),
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: None,
+        uploader: None,
+    };
+
+    // Initialize Glean with config1
+    test_reset_glean(config1.clone(), ClientInfoMetrics::unknown(), true);
+    let glean = new_glean(Some(config1.clone()), true);
+
+    // Set app_channel value
+    app_channel.set_sync(&glean, "test_value");
+    assert_eq!(Some("test_value".to_string()), app_channel.test_get_value(None));
+
+    // Second configuration (same as first) for reset
+    let config2 = Configuration {
+        data_path: tmpname.clone(),
+        application_id: "test_app".into(),
+        upload_enabled: true,
+        server_endpoint: Some("https://example.com/upload".into()),
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: None,
+        uploader: None,
+    };
+
+    // Reset Glean state
+    test_reset_glean(config2, ClientInfoMetrics::unknown(), false);
+
+    // Verify app_channel is cleared
+    assert!(app_channel.test_get_value(None).is_none());
+}
+</Rust>

@@ -1,0 +1,194 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Language Bindings have difficulty recording errors
+The Glean SDK has a lovely Error Reporting mechanism for metrics. Our specific metrics APIs trie to forbid any and all misuse, but for the ones that sneak in despite our best efforts we need to record and report them.
+
+Some errors of usage are only known and checked deep in the core. What is the length for an event extra value? What is the regex for valid labels? What is the maximum value we permit in a Memory Distribution?
+
+Some errors are known at the Language Binding layer, but are passed deep into the core anyway so that we can record errors about them. Counters cannot count backwards, so negative values are an error. We could forbid them at the API by using an unsigned type... but not all of our language bindings support unsigned types. So we weaken our specific metrics API to accept a signed type just so negative values can reach the error reporting machinery in glean-core.
+
+And then there's errors known at the Language Binding layer that we can't pass down.  [FOG forbids certain operations over IPC](https://searchfox.org/mozilla-central/search?q=TODO%3A+record+an+error&path=&case=false&regexp=false).  It would be nice to be able to report errors in the same place that our users expect to find them, and in the same ways.
+
+LBs could manufacture their own `labeled_counter`-based error system, but that would have some notable flaws:
+* It'd live in a different place from glean-core error reporting, making life difficult for testing, analysis, and tooling.
+* It has a Ping Problem: errors in glean-core are reported on all pings in which the offending metric is sent (and the "metrics" ping). That is straight up impossible to do with `labeled_counter`s.
+* It'd be limited to sixteen erroring metrics, which is a limit that glean-core errors doesn't seem to share.
+
+I suggest maybe we should open up core error reporting to the Language Binding layer.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -1213,6 +1213,7 @@ pub fn glean_enable_logging_to_fd(_fd: u64) {
+ #[allow(missing_docs)]
+ mod ffi {
+     use super::*;
++    use crate::metrics::MetricType;
+     uniffi::include_scaffolding!("glean");
+ 
+     type CowString = Cow<'static, str>;
+
+diff --git a/glean-core/src/metrics/mod.rs b/glean-core/src/metrics/mod.rs
+--- a/glean-core/src/metrics/mod.rs
++++ b/glean-core/src/metrics/mod.rs
+@@ -43,7 +43,7 @@ pub use crate::event_database::RecordedEvent;
+ use crate::histogram::{Functional, Histogram, PrecomputedExponential, PrecomputedLinear};
+ pub use crate::metrics::datetime::Datetime;
+ use crate::util::get_iso_time_string;
+-use crate::Glean;
++use crate::{error_recording, Glean};
+ 
+ pub use self::boolean::BooleanMetric;
+ pub use self::counter::CounterMetric;
+@@ -229,6 +229,14 @@ pub trait MetricType {
+         // Return a boolean indicating whether or not the metric should be recorded
+         current_disabled == 0
+     }
++
++    /// Record an error for this
++    fn record_error(&self, error: crate::ErrorType, count: i32) {
++        let meta = self.meta().clone();
++        crate::launch_with_glean(move |glean| {
++            error_recording::record_error(glean, &meta, error, "external error", count);
++        })
++    }
+ }
+ 
+ impl Metric {
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/mod.rs</Filename>
+<imports>use super::error_recording;
+use super::MetricType;
+use crate::core::Glean;
+use crate::metrics::counter::CounterMetric;
+use std::sync::atomic::{AtomicBool, Ordering};</imports>
+<Rust>#[test]
+fn test_record_error() {
+  let glean = Glean::new(Default::default()).unwrap();
+  let metric = CounterMetric::new(glean.storage()).unwrap();
+  let error = crate::ErrorType::InvalidValue;
+  let count = 1;
+  let recorded_error = AtomicBool::new(false);
+  metric.record_error(error, count);
+  std::thread::sleep(std::time::Duration::from_millis(100));
+  let meta = metric.meta().clone();
+  let expected_error = (meta, error, "external error", count);
+  glean.launch_with_glean(move |g| {
+    let errors = error_recording::get_recorded_errors(g);
+    for error in errors {
+      if error == expected_error {
+        recorded_error.store(true, Ordering::SeqCst);
+      }
+    }
+  });
+  assert!(recorded_error.load(Ordering::SeqCst));
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0425]: cannot find function `get_recorded_errors` in module `error_recording`
+   --> glean-core/src/metrics/mod.rs:324:35
+    |
+324 |     let errors = error_recording::get_recorded_errors(g);
+    |                                   ^^^^^^^^^^^^^^^^^^^ not found in `error_recording`
+
+error[E0277]: the trait bound `InternalConfiguration: Default` is not satisfied
+   --> glean-core/src/metrics/mod.rs:314:26
+    |
+314 |   let glean = Glean::new(Default::default()).unwrap();
+    |                          ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `InternalConfiguration`
+    |
+help: consider annotating `InternalConfiguration` with `#[derive(Default)]`
+   --> glean-core/src/lib.rs:109:1
+    |
+109 + #[derive(Default)]
+110 | pub struct InternalConfiguration {
+    |
+
+error[E0308]: mismatched types
+   --> glean-core/src/metrics/mod.rs:315:35
+    |
+315 |   let metric = CounterMetric::new(glean.storage()).unwrap();
+    |                ------------------ ^^^^^^^^^^^^^^^ expected `CommonMetricData`, found `&Database`
+    |                |
+    |                arguments to this function are incorrect
+    |
+note: associated function defined here
+   --> glean-core/src/metrics/counter.rs:53:12
+    |
+53  |     pub fn new(meta: CommonMetricData) -> Self {
+    |            ^^^ ----------------------
+
+error[E0599]: no method named `unwrap` found for struct `metrics::counter::CounterMetric` in the current scope
+   --> glean-core/src/metrics/mod.rs:315:52
+    |
+315 |   let metric = CounterMetric::new(glean.storage()).unwrap();
+    |                                                    ^^^^^^ method not found in `metrics::counter::CounterMetric`
+    |
+   ::: glean-core/src/metrics/counter.rs:21:1
+    |
+21  | pub struct CounterMetric {
+    | ------------------------ method `unwrap` not found for this struct
+
+error[E0599]: no method named `launch_with_glean` found for struct `core::Glean` in the current scope
+   --> glean-core/src/metrics/mod.rs:323:9
+    |
+323 |   glean.launch_with_glean(move |g| {
+    |   ------^^^^^^^^^^^^^^^^^ method not found in `core::Glean`
+    |
+   ::: glean-core/src/core/mod.rs:145:1
+    |
+145 | pub struct Glean {
+    | ---------------- method `launch_with_glean` not found for this struct
+</output>
+
+Function signatures
+<Signatures>
+pub fn glean_enable_logging_to_fd(fd: u64) -> ()
+
+pub fn glean_enable_logging_to_fd(_fd: u64) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

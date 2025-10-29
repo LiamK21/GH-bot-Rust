@@ -1,0 +1,183 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+object metric's test_get_value should return a JSON object
+From https://github.com/mozilla/glean/pull/2489#discussion_r1489563850:
+
+>It does strike me as... asymmetric that we set a JsonValue but get a String. I understand why get is a String: glean-core doesn't know the structure. And I'm guessing set is a JsonValue because it's the strongest type we can manage.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/object.rs b/glean-core/rlb/src/private/object.rs
+--- a/glean-core/rlb/src/private/object.rs
++++ b/glean-core/rlb/src/private/object.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::marker::PhantomData;
+ 
++use glean_core::metrics::JsonValue;
+ use glean_core::traits;
+ 
+ use crate::ErrorType;
+@@ -70,8 +71,7 @@ impl<K: traits::ObjectSerialize> ObjectMetric<K> {
+     /// Gets the currently stored value as JSON-encoded string.
+     ///
+     /// This doesn't clear the stored value.
+-    // TODO: Return the deserialized object instead.
+-    pub fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<String> {
++    pub fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<JsonValue> {
+         let ping_name = ping_name.into().map(|s| s.to_string());
+         self.inner.test_get_value(ping_name)
+     }
+@@ -98,6 +98,8 @@ mod test {
+     use crate::common_test::{lock_test, new_glean};
+     use crate::CommonMetricData;
+ 
++    use serde_json::json;
++
+     #[test]
+     fn simple_array() {
+         let _lock = lock_test();
+@@ -116,7 +118,8 @@ mod test {
+         metric.set(arr);
+ 
+         let data = metric.test_get_value(None).expect("no object recorded");
+-        assert_eq!("[1,2,3]", data);
++        let expected = json!([1, 2, 3]);
++        assert_eq!(expected, data);
+     }
+ 
+     #[test]
+@@ -158,9 +161,10 @@ mod test {
+         metric.set(balloons);
+ 
+         let data = metric.test_get_value(None).expect("no object recorded");
+-        assert_eq!(
+-            "[{\"colour\":\"red\",\"diameter\":5},{\"colour\":\"green\"}]",
+-            data
+-        );
++        let expected = json!([
++            { "colour": "red", "diameter": 5 },
++            { "colour": "green" },
++        ]);
++        assert_eq!(expected, data);
+     }
+ }
+
+diff --git a/glean-core/src/metrics/mod.rs b/glean-core/src/metrics/mod.rs
+--- a/glean-core/src/metrics/mod.rs
++++ b/glean-core/src/metrics/mod.rs
+@@ -9,7 +9,8 @@ use std::sync::atomic::Ordering;
+ 
+ use chrono::{DateTime, FixedOffset};
+ use serde::{Deserialize, Serialize};
+-use serde_json::{json, Value as JsonValue};
++use serde_json::json;
++pub use serde_json::Value as JsonValue;
+ 
+ mod boolean;
+ mod counter;
+
+diff --git a/glean-core/src/metrics/object.rs b/glean-core/src/metrics/object.rs
+--- a/glean-core/src/metrics/object.rs
++++ b/glean-core/src/metrics/object.rs
+@@ -6,14 +6,13 @@ use std::sync::Arc;
+ 
+ use crate::common_metric_data::CommonMetricDataInternal;
+ use crate::error_recording::{record_error, test_get_num_recorded_errors, ErrorType};
++use crate::metrics::JsonValue;
+ use crate::metrics::Metric;
+ use crate::metrics::MetricType;
+ use crate::storage::StorageManager;
+ use crate::CommonMetricData;
+ use crate::Glean;
+ 
+-use serde_json::Value as JsonValue;
+-
+ /// An object metric.
+ ///
+ /// Record structured data.
+@@ -124,12 +123,14 @@ impl ObjectMetric {
+ 
+     /// **Test-only API (exported for FFI purposes).**
+     ///
+-    /// Gets the currently stored value as JSON-encoded string.
++    /// Gets the currently stored value as JSON.
+     ///
+     /// This doesn't clear the stored value.
+-    pub fn test_get_value(&self, ping_name: Option<String>) -> Option<String> {
++    pub fn test_get_value(&self, ping_name: Option<String>) -> Option<JsonValue> {
+         crate::block_on_dispatcher();
+-        crate::core::with_glean(|glean| self.get_value(glean, ping_name.as_deref()))
++        let value = crate::core::with_glean(|glean| self.get_value(glean, ping_name.as_deref()));
++        // We only store valid JSON
++        value.map(|val| serde_json::from_str(&val).unwrap())
+     }
+ 
+     /// **Exported for test purposes.**
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/object.rs</Filename>
+<imports>use glean_core::metrics::JsonValue;</imports>
+<Rust>#[test]
+fn test_test_get_value_returns_json_value() {
+  let metric = ObjectMetric::new(glean_core::CommonMetricData::new("test", "object"));
+  let expected = json!({"key": "value"});
+  metric.set(expected.clone());
+  let actual = metric.test_get_value(None).unwrap();
+  assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `new` found for struct `glean_core::CommonMetricData` in the current scope
+   --> glean-core/rlb/src/private/object.rs:175:68
+    |
+175 |       let metric = ObjectMetric::new(glean_core::CommonMetricData::new("test", "object"));
+    |                                                                    ^^^ function or associated item not found in `glean_core::CommonMetricData`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

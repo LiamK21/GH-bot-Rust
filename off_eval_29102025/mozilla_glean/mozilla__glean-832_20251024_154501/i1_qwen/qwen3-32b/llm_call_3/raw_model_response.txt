@@ -1,0 +1,70 @@
+<think>
+Okay, let's take a look at the problem. The user provided a patch and a test that's failing after the patch. The test is supposed to verify that the `process_ping_upload_response` function correctly handles different upload results, including HTTP status codes, recoverable errors, and unrecoverable errors. However, the test is causing two errors related to unused let bindings on locks.
+
+The errors are about non-binding lets where the code is locking a mutex but not using the lock, leading to it being immediately dropped. The suggested fix is to use `drop()` instead of `let _ = ...` when clearing the ping queue.
+
+The task is to adjust the test so that it fails before the patch and passes after. The existing test in the patch's test block is `test_processes_correctly_unrecoverable_upload_response`, but the provided test in the <TEST> section is a different one. The user's test might be part of the same suite but causing issues now.
+
+Looking at the user's test in the <TEST> block, it's testing the handling of HTTP status codes. The problem is that in the setup, they're using `let _ = upload_manager.clear_ping_queue();`, which is the same pattern causing the error. The fix would be to replace that with `drop(upload_manager.clear_ping_queue());` to avoid the unused lock binding.
+
+But the original test in the patch's mod test already includes handling for different statuses, like 200, 404, 500, and the new UnrecoverableFailure. The user's test is similar, but the issue is the clear_ping_queue call.
+
+So, the test provided by the user is likely part of the new tests added, but they have the same problem. The error messages point to lines in the existing test code where `clear_ping_queue` is called with `let _ = ...`, which needs to be fixed.
+
+The user's test is intended to test that when an HTTP status is processed, the ping is deleted. However, the test itself has the same let binding issue in the setup phase when calling `clear_ping_queue`. To make the test pass after the patch, the test should use `drop` instead of `let _ = ...`.
+
+So, the correct approach is to adjust the existing test by replacing the problematic lines with `drop(...)` calls. Additionally, the test should verify that the upload result is correctly processed, which the patch now allows via the UploadResult enum.
+
+In the provided test code, the user's test uses `UploadResult::from(status)` where `status` is `UPLOAD_RESULT_HTTP_STATUS | 404`. This should correctly translate to `HttpStatus(404)`, which is in the 400 range, leading to deletion of the ping. The test checks that the file is deleted, which aligns with the existing code in `process_ping_upload_response` handling HttpStatus(400..=499) as unrecoverable.
+
+Before the patch, the function `process_ping_upload_response` took a `u16` status, which couldn't handle the new UploadResult enum. Therefore, before the patch, passing a value like `UPLOAD_RESULT_HTTP_STATUS | 404` (which is 0x8000 + 404) as a u32 would not be correctly interpreted, leading to a mismatch. After the patch, it's correctly handled via the UploadResult conversion.
+
+The existing test should pass after the patch if the setup correctly constructs the UploadResult. However, the test's setup must also avoid the let binding errors by using `drop(...)`.
+
+Therefore, modifying the user's test to fix the clear_ping_queue calls and ensuring that the UploadResult is correctly formed will make the test pass after the patch. Also, ensuring that the test uses the correct imports for UploadResult and the constants.
+
+The necessary imports for the test would include the UploadResult enum, the PingUploadManager, PingType, and other dependencies like new_glean. Also, the ffi_upload_result constants need to be accessible.
+
+Finally, the test should fail before the patch because the function expects a u16, and passing a u32 value (like 0x8000 | 404) would either cause a compilation error or be mishandled, leading to incorrect processing. After the patch, the UploadResult conversion handles it properly.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use crate::upload::result::UploadResult;
+use crate::upload::result::ffi_upload_result;
+use std::thread;
+use std::time::Duration;
+</imports>
+<Rust>
+#[test]
+fn test_process_ping_upload_response_with_noop_handling() {
+    let (mut glean, dir) = new_glean(None);
+    let ping_type = PingType::new("test", true, true, vec![]);
+    glean.register_ping_type(&ping_type);
+    glean.submit_ping(&ping_type, None).unwrap();
+
+    // Create a new upload manager to avoid using Glean's internal one
+    let upload_manager = PingUploadManager::new(&dir.path());
+    let mut upload_task = upload_manager.get_upload_task();
+    while upload_task == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+        upload_task = upload_manager.get_upload_task();
+    }
+
+    let pending_pings_dir = dir.path().join(PENDING_PINGS_DIRECTORY);
+    match upload_task {
+        PingUploadTask::Upload(request) => {
+            let uuid = request.uuid;
+            // Pre-patch: status was u16, can't encode HTTP status with flag
+            // Post-patch: UploadResult handles HTTP status with flag
+            let status = ffi_upload_result::UPLOAD_RESULT_HTTP_STATUS | 404;
+            let upload_result = UploadResult::from(status);
+            upload_manager.process_ping_upload_response(&uuid, upload_result);
+            assert!(!pending_pings_dir.join(uuid).exists());
+        }
+        _ => panic!("Expected upload task"),
+    }
+
+    assert_eq!(upload_manager.get_upload_task(), PingUploadTask::Done);
+}
+</Rust>

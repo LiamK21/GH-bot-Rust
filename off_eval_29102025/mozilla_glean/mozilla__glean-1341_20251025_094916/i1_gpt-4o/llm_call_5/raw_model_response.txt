@@ -1,0 +1,65 @@
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>
+use super::set_log_pings;
+use super::submit_ping_by_name;
+use super::was_initialize_called;
+use super::destroy_glean;
+use super::new_glean;
+use crate::Configuration;
+use crate::dispatcher::block_on_queue;
+use crossbeam_channel;
+use crate::net;
+use tempfile;
+use crate::test::lock_test;
+</imports>
+<Rust>
+#[test]
+fn test_setting_log_pings_before_initialization_should_not_crash() {
+    let _lock = lock_test();
+
+    destroy_glean(true);
+    assert!(!was_initialize_called());
+
+    let (s, r) = crossbeam_channel::bounded::<Vec<(String, String)>>(1);
+
+    #[derive(Debug)]
+    pub struct FakeUploader {
+        sender: crossbeam_channel::Sender<Vec<(String, String)>>,
+    };
+    impl net::PingUploader for FakeUploader {
+        fn upload(
+            &self,
+            _url: String,
+            _body: Vec<u8>,
+            headers: Vec<(String, String)>,
+        ) -> net::UploadResult {
+            self.sender.send(headers).unwrap();
+            net::UploadResult::HttpStatus(200)
+        }
+    }
+
+    set_log_pings(true);
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmpname = dir.path().display().to_string();
+
+    let cfg = Configuration {
+        data_path: tmpname,
+        application_id: "test-application-id".into(),
+        upload_enabled: true,
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: Some("testing".into()),
+        server_endpoint: Some("invalid-test-host".into()),
+        uploader: Some(Box::new(FakeUploader { sender: s })),
+    };
+
+    let _t = new_glean(Some(cfg), true);
+    block_on_queue();
+
+    submit_ping_by_name("baseline", Some("background"));
+
+    let headers = r.recv().unwrap();
+    assert!(headers.iter().any(|kv| kv.0 == "X-Log-Pings" && kv.1 == "true"));
+}
+</Rust>

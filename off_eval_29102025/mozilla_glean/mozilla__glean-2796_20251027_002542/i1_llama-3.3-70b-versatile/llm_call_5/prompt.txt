@@ -1,0 +1,231 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement object metric for all foreign languages
+Right now the new object metric is implemented only for Rust, with use in FOG.
+We should implement that for Kotlin, Swift and Python.
+
+This requires glean_parser changes to generate the right code.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -68,9 +68,9 @@ pub use crate::metrics::labeled::{
+ pub use crate::metrics::{
+     BooleanMetric, CounterMetric, CustomDistributionMetric, Datetime, DatetimeMetric,
+     DenominatorMetric, DistributionData, EventMetric, MemoryDistributionMetric, MemoryUnit,
+-    NumeratorMetric, PingType, QuantityMetric, Rate, RateMetric, RecordedEvent, RecordedExperiment,
+-    StringListMetric, StringMetric, TextMetric, TimeUnit, TimerId, TimespanMetric,
+-    TimingDistributionMetric, UrlMetric, UuidMetric,
++    NumeratorMetric, ObjectMetric, PingType, QuantityMetric, Rate, RateMetric, RecordedEvent,
++    RecordedExperiment, StringListMetric, StringMetric, TextMetric, TimeUnit, TimerId,
++    TimespanMetric, TimingDistributionMetric, UrlMetric, UuidMetric,
+ };
+ pub use crate::upload::{PingRequest, PingUploadTask, UploadResult, UploadTaskAction};
+ 
+@@ -1229,6 +1229,20 @@ mod ffi {
+             obj.into_owned()
+         }
+     }
++
++    type JsonValue = serde_json::Value;
++
++    impl UniffiCustomTypeConverter for JsonValue {
++        type Builtin = String;
++
++        fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
++            Ok(serde_json::from_str(&val)?)
++        }
++
++        fn from_custom(obj: Self) -> Self::Builtin {
++            serde_json::to_string(&obj).unwrap()
++        }
++    }
+ }
+ pub use ffi::*;
+
+diff --git a/glean-core/src/metrics/object.rs b/glean-core/src/metrics/object.rs
+--- a/glean-core/src/metrics/object.rs
++++ b/glean-core/src/metrics/object.rs
+@@ -48,6 +48,10 @@ impl ObjectMetric {
+     /// * `value` - the value to set.
+     #[doc(hidden)]
+     pub fn set_sync(&self, glean: &Glean, value: JsonValue) {
++        if !self.should_record(glean) {
++            return;
++        }
++
+         let value = Metric::Object(serde_json::to_string(&value).unwrap());
+         glean.storage().record(glean, &self.meta, &value)
+     }
+@@ -65,6 +69,31 @@ impl ObjectMetric {
+         crate::launch_with_glean(move |glean| metric.set_sync(glean, value))
+     }
+ 
++    /// Sets to the specified structure.
++    ///
++    /// Parses the passed JSON string.
++    /// If it can't be parsed into a valid object it records an invalid value error.
++    ///
++    /// Note: This does not check the structure. This needs to be done by the wrapper.
++    ///
++    /// # Arguments
++    ///
++    /// * `object` - JSON representation of the object to set.
++    pub fn set_string(&self, object: String) {
++        let metric = self.clone();
++        crate::launch_with_glean(move |glean| {
++            let object = match serde_json::from_str(&object) {
++                Ok(object) => object,
++                Err(_) => {
++                    let msg = "Value did not match predefined schema";
++                    record_error(glean, &metric.meta, ErrorType::InvalidValue, msg, None);
++                    return;
++                }
++            };
++            metric.set_sync(glean, object)
++        })
++    }
++
+     /// Record an `InvalidValue` error for this metric.
+     ///
+     /// Only to be used by the RLB.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/object.rs</Filename>
+<imports>use super::ObjectMetric;
+use serde_json::json;
+use crate::core::Glean;
+use crate::metrics::Metric;
+use crate::metrics::object::JsonValue;
+use crate::storage::Database;
+use crate::core::InternalConfiguration;
+use crate::metrics::CommonMetricData;</imports>
+<Rust>#[test]
+fn test_object_metric_set_string() {
+  let glean = Glean::new(InternalConfiguration::default());
+  let metric = ObjectMetric::new(CommonMetricData::new("test_object_metric", "test_object_metric"));
+  let object = json!({"key": "value"});
+  let object_str = serde_json::to_string(&object).unwrap();
+  metric.set_string(object_str.clone());
+  let stored_value = glean.storage().get(&metric.meta).unwrap();
+  let expected_value = Metric::Object(object_str);
+  assert_eq!(stored_value, expected_value);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::metrics::CommonMetricData`
+   --> glean-core/src/metrics/object.rs:175:5
+    |
+175 | use crate::metrics::CommonMetricData;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `CommonMetricData` in `metrics`
+    |
+help: consider importing this struct through its public re-export instead
+    |
+175 - use crate::metrics::CommonMetricData;
+175 + use crate::CommonMetricData;
+    |
+
+error[E0603]: struct import `Database` is private
+   --> glean-core/src/metrics/object.rs:173:21
+    |
+173 | use crate::storage::Database;
+    |                     ^^^^^^^^ private struct import
+    |
+note: the struct import `Database` is defined here...
+   --> glean-core/src/storage/mod.rs:14:5
+    |
+14  | use crate::database::Database;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `Database` which is defined here
+   --> glean-core/src/database/mod.rs:170:1
+    |
+170 | pub struct Database {
+    | ^^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `Database` through the re-export
+    |
+173 - use crate::storage::Database;
+173 + use database::Database;
+    |
+
+error[E0603]: struct import `InternalConfiguration` is private
+   --> glean-core/src/metrics/object.rs:174:18
+    |
+174 | use crate::core::InternalConfiguration;
+    |                  ^^^^^^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `InternalConfiguration` is defined here...
+   --> glean-core/src/core/mod.rs:26:53
+    |
+26  |     scheduler, system, CommonMetricData, ErrorKind, InternalConfiguration, Lifetime, PingRateLimit,
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `InternalConfiguration` which is defined here
+   --> glean-core/src/lib.rs:108:1
+    |
+108 | pub struct InternalConfiguration {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ you could import this directly
+
+error[E0599]: no method named `storage` found for enum `std::result::Result` in the current scope
+   --> glean-core/src/metrics/object.rs:184:28
+    |
+184 |   let stored_value = glean.storage().get(&metric.meta).unwrap();
+    |                            ^^^^^^^ method not found in `std::result::Result<core::Glean, error::Error>`
+    |
+note: the method `storage` exists on the type `core::Glean`
+   --> glean-core/src/core/mod.rs:573:5
+    |
+573 |     pub fn storage(&self) -> &Database {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider using `Result::expect` to unwrap the `core::Glean` value, panicking if the value is a `Result::Err`
+    |
+184 |   let stored_value = glean.expect("REASON").storage().get(&metric.meta).unwrap();
+    |                           +++++++++++++++++
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

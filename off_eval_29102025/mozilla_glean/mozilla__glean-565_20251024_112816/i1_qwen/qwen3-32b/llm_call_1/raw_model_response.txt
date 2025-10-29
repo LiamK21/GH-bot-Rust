@@ -1,0 +1,163 @@
+<think>
+Okay, let's see. The user wants me to create a regression test for the patch provided. The issue is about making 'ping' lifetime metrics crash-resistant when not stored to disk. The patch introduces a new function persist_ping_lifetime_data in the Database struct, which writes the in-memory ping data to disk. The existing test test_delayed_ping_lifetime_persistence checks that data is written when persist is called, but maybe there's another case where the data isn't persisted immediately and needs to be loaded back on restart.
+
+Wait, the patch also has a fix in the new function load_ping_lifetime_data. The Database's new() function now calls load_ping_lifetime_data to read existing data from disk into memory. So if the process crashes and restarts, the data should be there. The test test_load_ping_lifetime_data_from_memory in the patch does this by writing data, persisting it, then restarting the database and checking if it's loaded. But maybe there's another scenario where the data is only in memory and after a crash, when the database is reinitialized, it reloads the persisted data.
+
+But the user wants a test that fails before the patch and passes after. The existing tests in the patch include test_delayed_ping_lifetime_persistence and test_load_ping_lifetime_data_from_memory. The latter is part of the patch and checks that data persists across restarts. However, maybe there's a case where the data isn't reloaded on new database initialization. Let me think about possible missing test cases.
+
+Wait, the original issue was about crash resistance. So if the data is in memory (delay_ping_lifetime_io enabled), and the app crashes, then on restart, the data should be loaded from disk. The new load_ping_lifetime_data function in the Database's new() method should ensure that. The test in the patch already covers that by creating a new instance and checking the data. Maybe another test is needed where the data is not persisted yet, then the app crashes (simulated by closing the database without persisting), and then on restart, the data is there because it was persisted automatically. Wait, but the data is only persisted when persist_ping_lifetime_data is called. If the app crashes before that, the data is not saved. The patch allows data to be persisted when certain functions (like send_ping) are called, but the original patch's test checks that persist is called manually.
+
+Ah, but the issue mentioned providing crash resistance by persisting periodically. However, the current patch's code doesn't include a periodic saver; it's a follow-up. The existing test test_delayed_ping_lifetime_persistence shows that data is persisted when the function persist is called. The test test_load_ping_lifetime_data_from_memory shows that when a new database is created, it loads the persisted data. So if the data is persisted, then the crash won't lose it. But if the data hasn't been persisted yet (i.e., persist hasn't been called), then the in-memory data is lost on crash. However, the original bug's stretch goal was to do this periodically. The patch allows for bulk persisting on demand, but doesn't add the periodic saving. So the current test cases cover the manual persist case.
+
+Wait, but the user's patch is about crash resistance. So the idea is that if the data is not written to disk, then a crash would lose it. But the patch allows for persisting when send_ping is called. So maybe the test should verify that when the data is in memory, and the database is closed (simulating a crash), the data is not loaded upon restart, but if the data is persisted before closing, then it is loaded. However, in the existing test test_load_ping_lifetime_data_from_memory, the first instance persists the data, and the second instance loads it. That test would pass even before the patch if the data was being written automatically. But according to the patch, data is only written to disk when persist is called. So before the patch, the data would not be persisted, hence the test would fail. The existing test in the patch would have failed before the code changes.
+
+So the regression test needs to check that after calling persist, the data is written to disk and can be reloaded upon reinitializing the database. The existing test does that. However, maybe there's another scenario. For example, if the data is not persisted and the database is closed, then reopened, the data is gone. Which it should be before the patch. But if the data is persisted, then reopened, it's there. So the test should verify that after calling persist, the data survives a restart. That is what the existing test does. So maybe the user wants a test that wasn't present before the patch.
+
+In the provided code, the test test_load_ping_lifetime_data_from_memory simulates exactly that. Before the patch, when the database is created, it wouldn't load the data, so the second instance would have no data. So that test would fail before the patch but pass after. However, this test is part of the patch. The user is asking for a test that wasn't present before and can be added as a regression test. But since the test is already included in the patch, maybe there's another case to consider.
+
+Alternatively, maybe the test that needs to be added is for the clear_ping_lifetime_storage function. Let's check the patch. The clear_ping_lifetime_storage function now clears the ping_lifetime_data if it exists. Previously, it returned early. So maybe a test case where clearing the ping_lifetime_data is done correctly. For example, before the patch, if delay_ping_lifetime_io is true, clearing would do nothing in the test. But after the patch, it clears the in-memory data. So a test to verify that after clear, the in-memory data is cleared.
+
+But how to write a test for that. Let's think. Create two test cases: in the first case, when delay_ping_lifetime_io is true, after calling clear_ping_lifetime_storage, the in-memory data is also cleared. Before the patch, it would not be cleared. But in the existing code, in clear_ping_lifetime_storage, if ping_lifetime_data exists (i.e., delay is true), then it is cleared. So maybe the existing test covers this. Let me check the patch's code. The clear_ping_lifetime_storage function after the patch:
+
+If ping_lifetime_data exists, then it writes to the ping_lifetime_data's data.clear().
+
+So before the patch, in the same function, when delay is true, the clear would return early. So the test should verify that after clear, when delay is true, the in-memory data is cleared.
+
+So a possible test would be:
+
+Initialize the database with delay_ping_lifetime_io = true.
+
+Add some data.
+
+Call clear_ping_lifetime_storage.
+
+Check that the data is not in the ping_lifetime_data anymore.
+
+Before the patch, that test would pass? No. Wait, before the patch, in clear_ping_lifetime_storage function, if delay is true, it returns early. So after the test, the data would still be in the ping_lifetime_data. But after the patch, when delay is true, the clear would clear the in-memory data. So the test would have a data structure that after clear, the in-memory data is gone.
+
+So a test could be written to check that.
+
+Let me think about writing such a test. For example:
+
+Create a database with delay_ping_lifetime_io = true.
+
+Add a metric.
+
+Check that the ping_lifetime_data contains the metric.
+
+Call clear_ping_lifetime_storage.
+
+Check that the ping_lifetime_data no longer contains the metric.
+
+This test would fail before the patch and pass after.
+
+That would be a good regression test for the change in the clear_ping_lifetime_storage function.
+
+So how to implement that in Rust.
+
+The steps:
+
+1. Create a temp dir for the database.
+
+2. Initialize the database with delay_ping_lifetime_io = true.
+
+3. Record a metric with Lifetime::Ping.
+
+4. Access ping_lifetime_data and check that it contains the metric.
+
+5. Call clear_ping_lifetime_storage.
+
+6. Check that the metric is no longer in ping_lifetime_data.
+
+But how to access the ping_lifetime_data? Since it's a private member, maybe the test can use the public API. Wait, the clear_ping_lifetime_storage method is public. But the ping_lifetime_data is private to the Database struct. However, for testing purposes, in the test module, the code may have access to the internal members if they're in the same crate.
+
+Assuming that the Database struct is in a crate that's being tested, and the test is within the same crate, the test can create a Database instance and check the internal structure. But in the current patch, the ping_lifetime_data is Option<RwLock<...>>. So in the test, after creating the DB with delay_ping_lifetime_io = true, we can access the ping_lifetime_data (since it's in the same module), and check its contents.
+
+But in the test, perhaps the code uses the public API to record a metric, then uses code to check the in-memory data. For example:
+
+fn test_clear_ping_lifetime_data_after_clear() {
+    let dir = tempdir().unwrap();
+    let str_dir = dir.path().display().to_string();
+    let db = Database::new(&str_dir, true).unwrap();
+
+    // Record a metric.
+    let test_storage = "test-storage";
+    let test_metric_id = "test.metric";
+    let test_value = "value";
+    db.record_per_lifetime(
+        Lifetime::Ping,
+        test_storage,
+        test_metric_id,
+        &Metric::String(test_value.to_string()),
+    ).unwrap();
+
+    // Check that the metric is in ping_lifetime_data.
+    let key = format!("{}#{}", test_storage, test_metric_id);
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(ping_data.contains_key(&key));
+
+    // Call clear_ping_lifetime_storage.
+    db.clear_ping_lifetime_storage(test_storage).unwrap();
+
+    // Check that the metric is no longer present.
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(!ping_data.contains_key(&key));
+}
+
+This test would fail before the patch because clear_ping_lifetime_storage returns early if delay_ping_lifetime_io is true. After the patch, when delay_ping_lifetime_io is true, the ping_lifetime_data is cleared, so the test passes.
+
+Yes, that's a valid regression test for the change in the clear_ping_lifetime_storage function. The previous test already exists in the patch, so this is a new test case that wasn't there before but is needed.
+
+So the final step is to write this test.
+</think>
+
+<Filename>glean-core/src/database/mod.rs</Filename>
+<imports>
+use std::sync::Arc;
+use rkv::{Rkv, StoreOptions};
+use std::borrow::Cow;
+use super::Metric;
+use super::database::Database;
+use std::path::PathBuf;
+use std::fs;
+use std::sync::Mutex;
+use tempfile::{tempdir, TempDir};
+use rkv::SingleStore;
+use super::Lifetime;
+use super::Metric;
+</imports>
+<Rust>
+#[test]
+fn test_clear_ping_lifetime_data_after_clear() {
+    // Create a temporary directory and database with delay_ping_lifetime_io enabled.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_path_lossy().into_owned();
+    let db = Database::new(&db_path, true).unwrap();
+
+    let storage_name = "storage_name";
+    let metric_id = "metric_id";
+    let metric_value = Metric::String("value".to_string());
+
+    // Record a metric to ensure it's in memory.
+    db.record_per_lifetime(
+        Lifetime::Ping, 
+        storage_name, 
+        metric_id, 
+        &metric_value
+    ).unwrap();
+
+    // Get the expected key.
+    let key = format!("{}#{}", storage_name, metric_id);
+    
+    // Verify the metric exists in ping_lifetime_data.
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(ping_data.contains_key(&key), "Metric should be present before clear");
+
+    // Clear the storage.
+    db.clear_ping_lifetime_storage(storage_name).unwrap();
+
+    // Verify the metric is removed from ping_lifetime_data.
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(!ping_data.contains_key(&key), "Metric should be cleared after clear");
+}
+</Rust>

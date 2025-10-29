@@ -1,0 +1,285 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Instrument when we reject re-adding an already in-flight ping
+We now reject attempts to re-enqeue pings we are tracking as in-flight (by their doc ID).
+We should instrument this failure case to ensure we're not dropping data.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -110,6 +110,7 @@ pub struct UploadMetrics {
+     pub pending_pings: CounterMetric,
+     pub send_success: TimingDistributionMetric,
+     pub send_failure: TimingDistributionMetric,
++    pub in_flight_pings_dropped: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -198,6 +199,15 @@ impl UploadMetrics {
+                 },
+                 TimeUnit::Millisecond,
+             ),
++
++            in_flight_pings_dropped: CounterMetric::new(CommonMetricData {
++                name: "in_flight_pings_dropped".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -373,7 +373,9 @@ impl PingUploadManager {
+                     document_id,
+                     path
+                 );
+-                // TODO(bug 1816401): Instrument this failure case for monitoring.
++                self.upload_metrics
++                    .in_flight_pings_dropped
++                    .add_sync(glean, 0);
+                 return;
+             }
+         }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use crate::internal_metrics::UploadMetrics;
+use crate::Glean;
+use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, VecDeque};
+use crate::metrics::CounterMetric;
+use crate::core::InternalConfiguration;
+use crate::metrics::timing_distribution::TimerId;
+use std::sync::atomic::AtomicU32;
+use crate::upload::request::PingRequest;
+use crate::upload::directory::PingDirectoryManager;
+use crate::upload::PingPayloadsByDirectory;</imports>
+<Rust>#[test]
+fn test_in_flight_pings_dropped_metric() {
+    let glean = Arc::new(Glean::new(InternalConfiguration::default()).unwrap());
+    let upload_metrics = UploadMetrics::new();
+    let manager = PingUploadManager {
+        upload_metrics,
+        queue: RwLock::new(VecDeque::new()),
+        directory_manager: PingDirectoryManager::new(),
+        processed_pending_pings: Arc::new(AtomicU32::new(0)),
+        cached_pings: Arc::new(RwLock::new(PingPayloadsByDirectory::new())),
+        recoverable_failure_count: AtomicU32::new(0),
+        in_flight: RwLock::new(HashMap::new()),
+        wait_attempt_count: 0,
+        rate_limiter: None,
+        language_binding_name: None,
+        policy: None,
+    };
+
+    let document_id = "test_doc_id".to_string();
+    let path = "test_path".to_string();
+
+    manager.in_flight.write().unwrap().insert(document_id.clone(), (TimerId::new(), TimerId::new()));
+
+    manager.handle_ping_upload(glean.clone(), document_id, path);
+
+    let expected = Some(1);
+    let actual = manager.upload_metrics.in_flight_pings_dropped.test_get_value(Some("metrics".into()));
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0603]: module `timing_distribution` is private
+   --> glean-core/src/upload/mod.rs:847:25
+    |
+847 |     use crate::metrics::timing_distribution::TimerId;
+    |                         ^^^^^^^^^^^^^^^^^^^ private module
+    |
+note: the module `timing_distribution` is defined here
+   --> glean-core/src/metrics/mod.rs:35:1
+    |
+35  | mod timing_distribution;
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct import `InternalConfiguration` is private
+   --> glean-core/src/upload/mod.rs:846:22
+    |
+846 |     use crate::core::InternalConfiguration;
+    |                      ^^^^^^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `InternalConfiguration` is defined here...
+   --> glean-core/src/core/mod.rs:22:53
+    |
+22  |     scheduler, system, CommonMetricData, ErrorKind, InternalConfiguration, Lifetime, Result,
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `InternalConfiguration` which is defined here
+   --> glean-core/src/lib.rs:108:1
+    |
+108 | pub struct InternalConfiguration {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ you could import this directly
+
+error[E0061]: this function takes 1 argument but 0 arguments were supplied
+    --> glean-core/src/upload/mod.rs:1695:32
+     |
+1695 |             directory_manager: PingDirectoryManager::new(),
+     |                                ^^^^^^^^^^^^^^^^^^^^^^^^^-- argument #1 is missing
+     |
+note: associated function defined here
+    --> glean-core/src/upload/directory.rs:100:12
+     |
+100  |     pub fn new<P: Into<PathBuf>>(data_path: P) -> Self {
+     |            ^^^                   ------------
+help: provide the argument
+     |
+1695 |             directory_manager: PingDirectoryManager::new(/* data_path */),
+     |                                                          +++++++++++++++
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1696:47
+     |
+1696 |             processed_pending_pings: Arc::new(AtomicU32::new(0)),
+     |                                      -------- ^^^^^^^^^^^^^^^^^ expected `AtomicBool`, found `AtomicU32`
+     |                                      |
+     |                                      arguments to this function are incorrect
+     |
+note: associated function defined here
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/alloc/src/sync.rs:407:12
+
+error[E0599]: no function or associated item named `new` found for struct `PingPayloadsByDirectory` in the current scope
+    --> glean-core/src/upload/mod.rs:1697:73
+     |
+1697 |             cached_pings: Arc::new(RwLock::new(PingPayloadsByDirectory::new())),
+     |                                                                         ^^^ function or associated item not found in `PingPayloadsByDirectory`
+     |
+    ::: glean-core/src/upload/directory.rs:24:1
+     |
+24   | pub struct PingPayloadsByDirectory {
+     | ---------------------------------- function or associated item `new` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `new`, perhaps you need to implement it:
+             candidate #1: `BackendEnvironmentBuilder`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1700:33
+     |
+1700 |             wait_attempt_count: 0,
+     |                                 ^ expected `AtomicU32`, found integer
+     |
+help: call `Into::into` on this expression to convert `{integer}` into `AtomicU32`
+     |
+1700 |             wait_attempt_count: 0.into(),
+     |                                  +++++++
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1702:36
+     |
+1702 |             language_binding_name: None,
+     |                                    ^^^^ expected `String`, found `Option<_>`
+     |
+     = note: expected struct `std::string::String`
+                  found enum `std::option::Option<_>`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1703:21
+     |
+1703 |             policy: None,
+     |                     ^^^^ expected `Policy`, found `Option<_>`
+     |
+     = note: expected struct `Policy`
+                  found enum `std::option::Option<_>`
+
+error[E0599]: no function or associated item named `new` found for struct `metrics::timing_distribution::TimerId` in the current scope
+    --> glean-core/src/upload/mod.rs:1709:82
+     |
+1709 |         manager.in_flight.write().unwrap().insert(document_id.clone(), (TimerId::new(), TimerId::new()));
+     |                                                                                  ^^^ function or associated item not found in `metrics::timing_distribution::TimerId`
+     |
+    ::: glean-core/src/metrics/timing_distribution.rs:38:1
+     |
+38   | pub struct TimerId {
+     | ------------------ function or associated item `new` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `new`, perhaps you need to implement it:
+             candidate #1: `BackendEnvironmentBuilder`
+help: there is a method `ne` with a similar name, but with different arguments
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/cmp.rs:263:5
+
+error[E0599]: no function or associated item named `new` found for struct `metrics::timing_distribution::TimerId` in the current scope
+    --> glean-core/src/upload/mod.rs:1709:98
+     |
+1709 |         manager.in_flight.write().unwrap().insert(document_id.clone(), (TimerId::new(), TimerId::new()));
+     |                                                                                                  ^^^ function or associated item not found in `metrics::timing_distribution::TimerId`
+     |
+    ::: glean-core/src/metrics/timing_distribution.rs:38:1
+     |
+38   | pub struct TimerId {
+     | ------------------ function or associated item `new` not found for this struct
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `new`, perhaps you need to implement it:
+             candidate #1: `BackendEnvironmentBuilder`
+help: there is a method `ne` with a similar name, but with different arguments
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/core/src/cmp.rs:263:5
+
+error[E0599]: no method named `handle_ping_upload` found for struct `upload::PingUploadManager` in the current scope
+    --> glean-core/src/upload/mod.rs:1711:17
+     |
+184  | pub struct PingUploadManager {
+     | ---------------------------- method `handle_ping_upload` not found for this struct
+...
+1711 |         manager.handle_ping_upload(glean.clone(), document_id, path);
+     |                 ^^^^^^^^^^^^^^^^^^ method not found in `upload::PingUploadManager`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

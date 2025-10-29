@@ -1,0 +1,279 @@
+<think>
+Okay, let's see. The user is having an issue with their Rust tests failing on CI but not locally. The problem is in the upload test where the assertion fails because the left value is Upload(PingRequest...) and right is Done. The patch provided modifies the process_ping_upload_response method to include a debug_view_tag parameter.
+
+The existing test that's failing is test_processes_correctly_client_error_upload_response. The error in the test is due to the test expecting a certain behavior but the actual code path not matching, possibly because the queue isn't re-adding the ping correctly after a client error, or there's a race condition.
+
+Looking at the test that the user provided, the test_requeues_after_client_error_from_disk test is trying to check that after a client error (400), the ping is requeued from disk. However, the error says that it's comparing a Vec<u8> with a serde_json::Value. The body of the PingRequest is a Vec<u8>, but the test is using json!({ "test": "data" }) which is a serde_json::Value. So the types don't match.
+
+In the patch, the enqueue_ping method in the PingUploadManager has been updated to take a debug_view_tag. Also, in the process_ping_upload_response method, when handling a 400 status, it calls enqueue_ping with the debug_view_tag. But in the test, the enqueue_ping is called without the debug_view_tag. Wait, no, the test uses None for the debug_view_tag. But in the original code before the patch, the enqueue_ping didn't have that parameter.
+
+Wait, the problem comes from the PingRequest's body. In the test, the ping file is written with a JSON string, but the PingRequest.body is a Vec<u8> because it's gzip compressed. When the PingRequest is created in the test, the body is taken from the file as a JSON string, but the code compresses it into bytes. So the actual body in the test is compressed, but the test is expecting the JSON as a serde_json::Value, leading to a type mismatch.
+
+Ah, right. The body in the PingRequest is stored as a Vec<u8>, which is the compressed data. But the test is using json! to create a serde_json::Value and comparing it to the Vec<u8>, which isn't possible.
+
+So, to fix this, the test needs to assert that the decompressed body matches the expected JSON. However, decompressing might be complicated. Alternatively, perhaps the body should be checked as a string of the compressed data, but that's not straightforward.
+
+Wait, looking at the code: in the PingDirectoryManager's process_file, the body is parsed as a JsonValue from the file's content. Then, in the upload manager, when enqueuing, it's taking the JsonValue and creating a PingRequest. Wait, no. Let me check the patch again.
+
+In the directory.rs, process_file returns a (document_id, path, body), where body is a JsonValue. Then, in the upload manager's enqueue_ping, when processing the disk after a client error, it calls process_file which returns the (document_id, path, body) and then calls enqueue_ping with that body. The enqueue_ping method's parameters were changed to include the debug_view_tag, so in the patch, enqueue_ping is now passed the debug_view_tag from the manager's debug_view_tag() function.
+
+But in the test, the PingRequest's body is being compared to a JSON object. However, in the code's PingRequest::new, the body is passed as a JsonValue, but perhaps it's being stored as compressed bytes. So the actual body stored in the PingRequest is not the same as the JSON object.
+
+Wait, the PingRequest struct's body is stored as a Vec<u8> because in the PingRequest::new function, perhaps the body is serialized into a JSON string and then compressed. So when the test creates a file with the body as a JSON string, that body is parsed as a JsonValue, then when creating the PingRequest, it's serialized back to a string, and then compressed. Therefore, the body in the PingRequest is the compressed data as bytes.
+
+Therefore, the test's assertion that request.body equals json!({ "test": "data" }) is incorrect because the actual body is a compressed version of that JSON. Therefore, the test should instead check that the decompressed body equals the expected JSON.
+
+But decompressing in the test might be complicated. Alternatively, perhaps the test should store the body as a string and compare the JSON string before compression. Let's see:
+
+In the test, the code writes the ping file as:
+writeln!(file, "/submit/APP_ID/PING_NAME/1/{}", doc_id).unwrap();
+writeln!(file, "{{\"test\": \"data\"}}").unwrap();
+
+So the body is {"test": "data"}. When the PingDirectoryManager::process_file reads this, it parses the body as a JsonValue. Then, when enqueue_ping is called, it's using that body. The PingRequest is created with this body as a JsonValue, but perhaps in the actual code, the body is then converted into a gzip-compressed bytes. So the PingRequest's body is the compressed data. Therefore, in the test, comparing the body to the JSON value is incorrect.
+
+So, to fix the test, we need to check that the decompressed body of the PingRequest matches the expected JSON. However, that would require adding code to decompress the body and compare as JSON.
+
+Alternatively, maybe in the test, we can modify the PingRequest to have a method to get the decompressed body as a JSON string, or perhaps the test should compare the compressed data. But that's not straightforward.
+
+Alternatively, maybe the test should check that the body in the PingRequest is correctly formed. Since the compression is part of the actual implementation, the test should verify that the body, when decompressed, equals the expected JSON.
+
+But how to do that in the test? Well, we can take the body from the PingRequest, decompress it, and parse it as JSON.
+
+So, in the test, after getting the PingUploadTask::Upload(req), we can:
+
+- Decompress the req.body (which is Vec<u8>), then parse the JSON, and compare to the expected JSON.
+
+But how to decompress? The code that does the compressing might use a known method. For example, the code might use flate2 to compress the JSON.
+
+So in the test, we can take the expected JSON, compress it in the same way, and compare to the body.
+
+Alternatively, in the test, after creating the PingRequest, we can simulate the decompression.
+
+But that's a bit involved. Let me think.
+
+The problem in the current test is that the code is asserting that request.body (Vec<u8>) equals a JsonValue, which is not possible. So the test needs to be adjusted to check the decompressed data.
+
+In the code, the PingRequest's body is stored as a Vec<u8> which is the gzip-compressed JSON. Therefore, the test's current assertion is incorrect.
+
+To fix the test, we need to:
+
+1. Decompress the body.
+2. Parse the decompressed JSON.
+3. Compare it to the expected JSON.
+
+In the test, we can use theflate2 crate to decompress the gzipped data, just like the code would do.
+
+But since the code uses a specific compression library, perhaps we need to make sure the test uses the same compression settings.
+
+But in the test code, importing the necessary libraries would be needed. However, the current imports are:
+
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+
+But to decompress, we need to use theflate2 crate. However, in the current test, that's not imported. So perhaps the test needs to import theflate2 crate and decompress the body.
+
+Wait, but the code that compresses the data is part of the glean-core library. If the PingRequest is being compressed when it's prepared for upload, then the test must verify that the body is correctly compressed. However, the current test is trying to check the body's JSON, which is incorrect.
+
+So the test is not correctly asserting the body's content. Let's revise the test.
+
+The test creates a file with the JSON body. The PingRequest should be created using that JSON body. However, due to compression, the body is stored as bytes. Therefore, the test's assertion is invalid.
+
+To fix the test, we can check that when the PingRequest is sent, the body after decompression is correct. However, that's part of the upload process, which is beyond the current test's scope.
+
+Alternatively, perhaps the test should verify that the PingRequest's body was correctly created from the JSON data. If the code correctly compresses and decompresses, then the assertion in the test should check the decompressed data.
+
+So, in the test, we can take the request.body, decompress it, and parse it as JSON.
+
+Let's modify the test:
+
+First, add the necessary imports for decompression. For example, using theflate2 crate.
+
+In the test, useflate2::read::GzDecoder to decompress the body, then parse as JSON.
+
+But first, we need to include the necessary imports for flate2. However, in the provided imports, there's no mention of flate2. So we need to add that.
+
+So the imports should be updated to:
+
+<imports>
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use flate2::read::GzDecoder;
+use serde_json::json;
+</imports>
+
+Then, in the test, after getting the request.body (Vec<u8>), we can decompress it:
+
+let decompressed = GzDecoder::new(&request.body[..]);
+let body_str = String::from_utf8_lossy(&String::from_utf8(decompressor).unwrap());
+let body_json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+assert_eq!(body_json, json!({ "test": "data" }));
+
+But wait, the request.body is the compressed data. So:
+
+First, create a GzDecoder from the Vec<u8>:
+
+let mut decoder = GzDecoder::new(&request.body[..]);
+let mut buffer = String::new();
+decoder.read_to_string(&mut buffer)?; // Assuming this is in a context that can handle errors, but in a test we can use unwrap.
+
+Wait, but in code, using unwrap().
+
+So in the test:
+
+let mut decoder = GzDecoder::new(&request.body[..]);
+let mut buffer = Vec::new();
+std::io::Read::read_to_end(&mut decoder, &mut buffer)?;
+let decompressed_json: serde_json::Value = serde_json::from_slice(&buffer)?;
+
+But to avoid unwrapping everywhere, perhaps the test uses unwrap.
+
+So modifying the test's assertion:
+
+The current line is:
+
+assert_eq!(request.body, json!({ "test": "data" }));
+
+But that's incorrect. We need to decompress the body first.
+
+Let's adjust the test:
+
+After getting the request:
+
+match upload_manager.get_upload_task(false) {
+    PingUploadTask::Upload(ref req) => {
+        // Decompress the body
+        let mut decoder = GzDecoder::new(&req.body[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        let actual_json: Value = serde_json::from_str(&decompressed).unwrap();
+        assert_eq!(actual_json, json!({ "test": "data" }));
+    },
+    // ...
+}
+
+But we need to import serde_json::Value and flate2::read::GzDecoder.
+
+So, updating the test code accordingly.
+
+Therefore, the corrected test would include the decompression step and then compare the decompressed body to the expected JSON.
+
+Additionally, in the original code, the body in the PingRequest is the compressed data. So the test must account for that.
+
+Therefore, the current test's assertion is incorrect because it's comparing a Vec<u8> (compressed) to a JSON value. The fix is to decompress the body and compare the JSON.
+
+So the final test code would be adjusted to handle this decompression step.
+
+Thus, the solution is to modify the test to decompress the body before assertion.
+
+Now, applying this to the existing test code:
+
+The existing test has:
+
+assert_eq!(request.body, json!({ "test": "data" }));
+
+Which is wrong. We need to decompress the body and assert on the decompressed JSON.
+
+So, the corrected test would look something like:
+
+use flate2::read::GzDecoder;
+use serde_json::Value;
+
+...
+
+let request = match upload_manager.get_upload_task(false) {
+    PingUploadTask::Upload(req) => req,
+    _ => panic!("Expected requeued ping"),
+};
+
+// Decompress the body
+let mut decoder = GzDecoder::new(&request.body[..]);
+let mut decompressed = Vec::new();
+std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
+
+// Parse the decompressed body as JSON
+let actual_json: Value = serde_json::from_slice(&decompressed).unwrap();
+assert_eq!(actual_json, json!({ "test": "data" }));
+
+But we have to make sure that all required imports are present.
+
+So the corrected imports now include flate2 and serde_json's Value.
+
+Thus, the final test code would include the decompression step.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use flate2::read::GzDecoder;
+use serde_json::json;
+use serde_json::Value;
+use super::PingUploadTask;
+</imports>
+<Rust>
+#[test]
+fn test_requeues_after_client_error_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), false);
+    let ping_dir = dir.path().join(PENDING_PINGS_DIRECTORY);
+    fs::create_dir_all(&ping_dir).unwrap();
+
+    let doc_id = uuid::Uuid::new_v4().to_string();
+    let ping_path = ping_dir.join(format!("{}.incomplete", doc_id));
+    {
+        let mut file = File::create(&ping_path).unwrap();
+        writeln!(file, "/submit/APP_ID/PING_NAME/1/{}", doc_id).unwrap();
+        writeln!(file, r#"{"test": "data"}"#).unwrap();
+    }
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Simulate successful processing to trigger directory scanning
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(200), None);
+
+    // Wait for processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Simulate client error (400) response to force requeue from disk
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(400), None);
+
+    // Wait for requeue processing
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let request = match upload_manager.get_upload_task(false) {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected requeued ping"),
+    };
+
+    // Decompress body for comparison
+    let mut decoder = GzDecoder::new(&request.body[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+
+    let expected_json = json!({ "test": "data" });
+    let actual_json: Value = serde_json::from_slice(&decompressed).unwrap();
+
+    assert_eq!(request.document_id, doc_id);
+    assert_eq!(actual_json, expected_json);
+}
+</Rust>

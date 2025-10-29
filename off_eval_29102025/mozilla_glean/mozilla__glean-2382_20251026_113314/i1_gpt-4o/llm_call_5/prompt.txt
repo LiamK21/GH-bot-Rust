@@ -1,0 +1,209 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Instrument missing sending_success/sending_failure timer IDs.
+Introduced in https://github.com/mozilla/glean/pull/2376
+We handle the absence of those timer IDs when reporting upload status.
+
+ An absence would mean we previously already removed a specific doc ID.
+This would be an inconsistency. We should monitor if that ever happens.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -111,6 +111,7 @@ pub struct UploadMetrics {
+     pub send_success: TimingDistributionMetric,
+     pub send_failure: TimingDistributionMetric,
+     pub in_flight_pings_dropped: CounterMetric,
++    pub missing_send_ids: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -208,6 +209,15 @@ impl UploadMetrics {
+                 disabled: false,
+                 dynamic_label: None,
+             }),
++
++            missing_send_ids: CounterMetric::new(CommonMetricData {
++                name: "missing_send_ids".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -698,6 +698,10 @@ impl PingUploadManager {
+             lock.remove(document_id)
+         };
+ 
++        if send_ids.is_none() {
++            self.upload_metrics.missing_send_ids.add_sync(glean, 1);
++        }
++
+         match status {
+             HttpStatus { code } if (200..=299).contains(&code) => {
+                 log::info!("Ping {} successfully sent {}.", document_id, code);
+@@ -706,11 +710,6 @@ impl PingUploadManager {
+                         .send_success
+                         .set_stop_and_accumulate(glean, success_id, stop_time);
+                     self.upload_metrics.send_failure.cancel_sync(failure_id);
+-                } else {
+-                    // TODO(bug 1816400): Instrument missing IDs.
+-                    // Should be done here and further below.
+-                    // How did we remove the doc ID before we got here?
+-                    // That's an inconsistency.
+                 }
+                 self.directory_manager.delete_file(document_id);
+             }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use crate::internal_metrics::UploadMetrics;
+use crate::metrics::{CounterMetric, TimingDistributionMetric};
+use crate::CommonMetricData;
+use crate::Glean;
+use crate::Lifetime;
+use crate::upload::UploadResult;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};</imports>
+<Rust>#[test]
+fn test_missing_send_ids_increments_counter() {
+    let glean = Glean::new(Default::default()).unwrap();
+    let upload_metrics = UploadMetrics {
+        send_success: TimingDistributionMetric::new(CommonMetricData::default(), crate::TimeUnit::Second),
+        send_failure: TimingDistributionMetric::new(CommonMetricData::default(), crate::TimeUnit::Second),
+        in_flight_pings_dropped: CounterMetric::new(CommonMetricData::default()),
+        missing_send_ids: CounterMetric::new(CommonMetricData {
+            name: "missing_send_ids".into(),
+            category: "glean.upload".into(),
+            send_in_pings: vec!["metrics".into()],
+            lifetime: Lifetime::Ping,
+            disabled: false,
+            dynamic_label: None,
+        }),
+    };
+    let mut ping_upload_manager = PingUploadManager {
+        upload_metrics,
+        cached_pings: Default::default(),
+        directory_manager: Default::default(),
+        in_flight: Default::default(),
+        queue: Default::default(),
+        processed_pending_pings: Default::default(),
+        recoverable_failure_count: Default::default(),
+        wait_attempt_count: Default::default(),
+        rate_limiter: Default::default(),
+    };
+    let document_id = "test_doc_id";
+    let status = UploadResult::HttpStatus { code: 404 };
+    let mut lock = HashMap::new();
+
+    ping_upload_manager.handle_upload_status(&glean, document_id, status, &mut lock);
+
+    let expected = Some(1);
+    let actual = ping_upload_manager.upload_metrics.missing_send_ids.test_get_value(Some("metrics".into()));
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0277]: the trait bound `InternalConfiguration: Default` is not satisfied
+    --> glean-core/src/upload/mod.rs:1686:32
+     |
+1686 |         let glean = Glean::new(Default::default()).unwrap();
+     |                                ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `InternalConfiguration`
+     |
+help: consider annotating `InternalConfiguration` with `#[derive(Default)]`
+    -->  glean-core/src/lib.rs:108:1
+     |
+108  + #[derive(Default)]
+109  | pub struct InternalConfiguration {
+     |
+
+error[E0063]: missing fields `deleted_pings_after_quota_hit`, `discarded_exceeding_pings_size`, `pending_pings` and 2 other fields in initializer of `UploadMetrics`
+    --> glean-core/src/upload/mod.rs:1687:30
+     |
+1687 |         let upload_metrics = UploadMetrics {
+     |                              ^^^^^^^^^^^^^ missing `deleted_pings_after_quota_hit`, `discarded_exceeding_pings_size`, `pending_pings` and 2 other fields
+
+error[E0277]: the trait bound `directory::PingDirectoryManager: Default` is not satisfied
+    --> glean-core/src/upload/mod.rs:1703:32
+     |
+1703 |             directory_manager: Default::default(),
+     |                                ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `directory::PingDirectoryManager`
+     |
+help: consider annotating `directory::PingDirectoryManager` with `#[derive(Default)]`
+    -->  glean-core/src/upload/directory.rs:87:1
+     |
+87   + #[derive(Default)]
+88   | pub struct PingDirectoryManager {
+     |
+
+error[E0063]: missing fields `language_binding_name` and `policy` in initializer of `upload::PingUploadManager`
+    --> glean-core/src/upload/mod.rs:1700:39
+     |
+1700 |         let mut ping_upload_manager = PingUploadManager {
+     |                                       ^^^^^^^^^^^^^^^^^ missing `language_binding_name` and `policy`
+
+error[E0599]: no method named `handle_upload_status` found for struct `upload::PingUploadManager` in the current scope
+    --> glean-core/src/upload/mod.rs:1715:29
+     |
+184  | pub struct PingUploadManager {
+     | ---------------------------- method `handle_upload_status` not found for this struct
+...
+1715 |         ping_upload_manager.handle_upload_status(&glean, document_id, status, &mut lock);
+     |                             ^^^^^^^^^^^^^^^^^^^^ method not found in `upload::PingUploadManager`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

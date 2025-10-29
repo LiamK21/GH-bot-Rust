@@ -1,0 +1,391 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Support upload error reporting in the Python bindings
+Since Python doesn't initialize a full Glean in the upload process, it also won't access the new error recording mechanism added to Glean.
+
+See: https://github.com/mozilla/glean/pull/948#discussion_r436688294
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/lib.rs b/glean-core/ffi/src/lib.rs
+--- a/glean-core/ffi/src/lib.rs
++++ b/glean-core/ffi/src/lib.rs
+@@ -12,7 +12,6 @@ use ffi_support::{define_string_destructor, ConcurrentHandleMap, FfiStr, IntoFfi
+ pub use glean_core::metrics::MemoryUnit;
+ pub use glean_core::metrics::TimeUnit;
+ pub use glean_core::upload::ffi_upload_result::*;
+-use glean_core::upload::PingUploadManager;
+ use glean_core::Glean;
+ pub use glean_core::Lifetime;
+ 
+@@ -128,48 +127,6 @@ where
+     with_glean_mut(|glean| Ok(callback(glean)))
+ }
+ 
+-/// Execute the callback with a reference to the PingUploadManager singleton,
+-/// returning a `Result`.
+-///
+-/// The callback returns a `Result<T, E>` while:
+-///
+-/// - Catching panics, and logging them.
+-/// - Converting `T` to a C-compatible type using [`IntoFfi`].
+-/// - Logging `E` and returning a default value.
+-pub(crate) fn with_standalone_uploader<R, F>(callback: F) -> R::Value
+-where
+-    F: UnwindSafe + FnOnce(&PingUploadManager) -> Result<R, glean_core::Error>,
+-    R: IntoFfi,
+-{
+-    let mut error = ffi_support::ExternError::success();
+-    let res = ffi_support::abort_on_panic::call_with_result(&mut error, || {
+-        match glean_core::upload::global_upload_manager() {
+-            Some(upload_manager) => {
+-                let upload_manager = upload_manager.lock().unwrap();
+-                callback(&upload_manager)
+-            }
+-            None => Err(glean_core::Error::not_initialized()),
+-        }
+-    });
+-    handlemap_ext::log_if_error(error);
+-    res
+-}
+-
+-/// Execute the callback with a reference to the PingUploadManager singleton,
+-/// returning a value.
+-///
+-/// The callback returns a value while:
+-///
+-/// - Catching panics, and logging them.
+-/// - Converting the returned value to a C-compatible type using [`IntoFfi`].
+-pub(crate) fn with_standalone_uploader_value<R, F>(callback: F) -> R::Value
+-where
+-    F: UnwindSafe + FnOnce(&PingUploadManager) -> R,
+-    R: IntoFfi,
+-{
+-    with_standalone_uploader(|ping_uploader| Ok(callback(ping_uploader)))
+-}
+-
+ /// Initialize the logging system based on the target platform. This ensures
+ /// that logging is shown when executing the Glean SDK unit tests.
+ #[no_mangle]
+@@ -402,19 +359,6 @@ pub extern "C" fn glean_is_first_run() -> u8 {
+ // * `result`: the object the output task will be written to.
+ #[no_mangle]
+ pub extern "C" fn glean_get_upload_task(result: *mut FfiPingUploadTask, log_ping: u8) {
+-    // If an upload manager instance is available, use that (it should only happen
+-    // in processes which do not initialize Glean).
+-    if glean_core::upload::global_upload_manager().is_some() {
+-        with_standalone_uploader_value(|ping_uploader| {
+-            let ffi_task = FfiPingUploadTask::from(ping_uploader.get_upload_task(log_ping != 0));
+-            unsafe {
+-                std::ptr::write(result, ffi_task);
+-            }
+-        });
+-        return;
+-    }
+-
+-    // Otherwise
+     with_glean_value(|glean| {
+         let ffi_task = FfiPingUploadTask::from(glean.get_upload_task(log_ping != 0));
+         unsafe {
+@@ -451,22 +395,6 @@ pub unsafe extern "C" fn glean_process_ping_upload_response(
+     // but as it controls the memory, we put something valid in place, just in case.
+     let task = std::ptr::replace(task, FfiPingUploadTask::Done);
+ 
+-    // If an upload manager instance is available, use that (it should only happen
+-    // in processes which do not initialize Glean).
+-    if glean_core::upload::global_upload_manager().is_some() {
+-        with_standalone_uploader(|ping_uploader| {
+-            if let FfiPingUploadTask::Upload { document_id, .. } = task {
+-                assert!(!document_id.is_null());
+-                let document_id_str = CStr::from_ptr(document_id)
+-                    .to_str()
+-                    .map_err(|_| glean_core::Error::utf8_error())?;
+-                ping_uploader.process_ping_upload_response(document_id_str, status.into());
+-            };
+-            Ok(())
+-        });
+-        return;
+-    }
+-
+     with_glean(|glean| {
+         if let FfiPingUploadTask::Upload { document_id, .. } = task {
+             assert!(!document_id.is_null());
+@@ -479,25 +407,22 @@ pub unsafe extern "C" fn glean_process_ping_upload_response(
+     });
+ }
+ 
++/// # Safety
++///
++/// A valid and non-null configuration object is required for this function.
+ #[no_mangle]
+-pub extern "C" fn glean_initialize_standalone_uploader(
+-    data_dir: FfiStr,
+-    language_binding_name: FfiStr,
+-) -> u8 {
++pub unsafe extern "C" fn glean_initialize_for_subprocess(cfg: *const FfiConfiguration) -> u8 {
++    assert!(!cfg.is_null());
++
+     handlemap_ext::handle_result(|| {
+-        // Init the upload manager to perform a synchronous ping directory scan.
+-        // Since this method is meant to be called from a process used exclusively
+-        // for uploading, this is fine.
+-        let mut upload_manager = PingUploadManager::new(
+-            data_dir.to_string_fallible()?,
+-            &language_binding_name.to_string_fallible()?,
+-            true,
+-        );
+-        upload_manager.set_rate_limiter(
+-            /* seconds per interval */ 60, /* max tasks per interval */ 10,
+-        );
+-        glean_core::upload::setup_upload_manager(upload_manager)?;
+-        log::info!("Glean initialized in upload-only mode");
++        // We can create a reference to the FfiConfiguration struct:
++        // 1. We did a null check
++        // 2. We're not holding on to it beyond this function
++        //    and we copy out all data when needed.
++        let glean_cfg = glean_core::Configuration::try_from(&*cfg)?;
++        let glean = Glean::new_for_subprocess(&glean_cfg)?;
++        glean_core::setup_glean(glean)?;
++        log::info!("Glean initialized for subprocess");
+         Ok(true)
+     })
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -180,11 +180,10 @@ pub struct Glean {
+ }
+ 
+ impl Glean {
+-    /// Create and initialize a new Glean object.
+-    ///
+-    /// This will create the necessary directories and files in `data_path`.
+-    /// This will also initialize the core metrics.
+-    pub fn new(cfg: Configuration) -> Result<Self> {
++    /// Create and initialize a new Glean object for use in a subprocess.
++    /// Importantly, this will not send any pings at startup, since that
++    /// sort of management should only happen in the main process.
++    pub fn new_for_subprocess(cfg: &Configuration) -> Result<Self> {
+         log::info!("Creating new Glean v{}", GLEAN_VERSION);
+ 
+         let application_id = sanitize_application_id(&cfg.application_id);
+@@ -204,21 +203,29 @@ impl Glean {
+             /* seconds per interval */ 60, /* max tasks per interval */ 10,
+         );
+ 
+-        let mut glean = Self {
++        Ok(Self {
+             upload_enabled: cfg.upload_enabled,
+             data_store,
+             event_data_store,
+             core_metrics: CoreMetrics::new(),
+             internal_pings: InternalPings::new(),
+             upload_manager,
+-            data_path: PathBuf::from(cfg.data_path),
++            data_path: PathBuf::from(&cfg.data_path),
+             application_id,
+             ping_registry: HashMap::new(),
+             start_time: local_now_with_offset(),
+             max_events: cfg.max_events.unwrap_or(DEFAULT_MAX_EVENTS),
+             is_first_run: false,
+             debug_view_tag: None,
+-        };
++        })
++    }
++
++    /// Create and initialize a new Glean object.
++    ///
++    /// This will create the necessary directories and files in `data_path`.
++    /// This will also initialize the core metrics.
++    pub fn new(cfg: Configuration) -> Result<Self> {
++        let mut glean = Self::new_for_subprocess(&cfg)?;
+ 
+         // The upload enabled flag may have changed since the last run, for
+         // example by the changing of a config file.
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -12,13 +12,10 @@
+ use std::collections::VecDeque;
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
++use std::sync::{Arc, RwLock, RwLockWriteGuard};
+ use std::thread;
+ use std::time::{Duration, Instant};
+ 
+-use once_cell::sync::OnceCell;
+-
+-use crate::error::Result;
+ use directory::PingDirectoryManager;
+ pub use request::{HeaderMap, PingRequest};
+ pub use result::{ffi_upload_result, UploadResult};
+@@ -27,43 +24,6 @@ mod directory;
+ mod request;
+ mod result;
+ 
+-/// A global Glean upload manager instance.
+-///
+-/// This is only used by processes who exclusively need to manage
+-/// ping upload and do not want to perform a full Glean initialization.
+-static UPLOAD_MANAGER: OnceCell<Mutex<PingUploadManager>> = OnceCell::new();
+-
+-/// Get a reference to the global Upload Manager object.
+-pub fn global_upload_manager() -> Option<&'static Mutex<PingUploadManager>> {
+-    UPLOAD_MANAGER.get()
+-}
+-
+-/// Set or replace the global Glean object.
+-pub fn setup_upload_manager(upload_manager: PingUploadManager) -> Result<()> {
+-    // The `OnceCell` type wrapping our PingUploadManager is thread-safe and can only be set once.
+-    // Therefore even if our check for it being empty succeeds, setting it could fail if a
+-    // concurrent thread is quicker in setting it.
+-    // However this will not cause a bigger problem, as the second `set` operation will just fail.
+-    // We can log it and move on.
+-    //
+-    // For all wrappers this is not a problem, as the uploader object is intialized exactly once on
+-    // calling the FFI `glean_standalone_uploader`.
+-    if UPLOAD_MANAGER.get().is_none() {
+-        if UPLOAD_MANAGER.set(Mutex::new(upload_manager)).is_err() {
+-            log::error!(
+-                "Global Upload Manager object is initialized already. This probably happened concurrently."
+-            )
+-        }
+-    } else {
+-        // We allow overriding the global upload manager object to support test mode.
+-        // In test mode the upload manager object is fully destroyed and recreated.
+-        // This all happens behind a mutex and is therefore also thread-safe..
+-        let mut lock = UPLOAD_MANAGER.get().unwrap().lock().unwrap();
+-        *lock = upload_manager;
+-    }
+-    Ok(())
+-}
+-
+ #[derive(Debug)]
+ struct RateLimiter {
+     /// The instant the current interval has started.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/ffi/src/lib.rs</Filename>
+<imports>use std::ffi::CString;
+use std::os::raw::c_char;
+use std::ptr;
+use crate::FfiConfiguration;
+use crate::glean_initialize_for_subprocess;
+use crate::glean_get_upload_task;
+use crate::glean_process_ping_upload_response;
+use crate::FfiPingUploadTask;</imports>
+<Rust>#[test]
+fn test_subprocess_upload_handling() {
+    // Create a valid configuration that will be used by the subprocess.
+    let config = FfiConfiguration {
+        data_path: CString::new("/tmp/glean-test").unwrap().into_raw() as *const c_char,
+        application_id: CString::new("test-app").unwrap().into_raw() as *const c_char,
+        upload_enabled: 1,
+        max_events: 0,
+    };
+
+    unsafe {
+        // Initialize Glean for subprocess
+        let init_result = glean_initialize_for_subprocess(&config);
+        assert_eq!(init_result, 1);
+
+        // Get upload task
+        let mut task: FfiPingUploadTask = ptr::null_mut();
+        glean_get_upload_task(&mut task, 1);
+
+        // Process a successful ping response (status code 200)
+        glean_process_ping_upload_response(&mut task, 200);
+    }
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0560]: struct `FfiConfiguration<'_>` has no field named `data_path`
+   --> glean-core/ffi/src/lib.rs:455:9
+    |
+455 |         data_path: CString::new("/tmp/glean-test").unwrap().into_raw() as *const c_char,
+    |         ^^^^^^^^^ `FfiConfiguration<'_>` does not have this field
+    |
+    = note: available fields are: `data_dir`, `package_name`, `language_binding_name`, `delay_ping_lifetime_io`
+
+error[E0560]: struct `FfiConfiguration<'_>` has no field named `application_id`
+   --> glean-core/ffi/src/lib.rs:456:9
+    |
+456 |         application_id: CString::new("test-app").unwrap().into_raw() as *const c_char,
+    |         ^^^^^^^^^^^^^^ `FfiConfiguration<'_>` does not have this field
+    |
+    = note: available fields are: `data_dir`, `package_name`, `language_binding_name`, `delay_ping_lifetime_io`
+
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/lib.rs:467:43
+    |
+467 |         let mut task: FfiPingUploadTask = ptr::null_mut();
+    |                       -----------------   ^^^^^^^^^^^^^^^ expected `FfiPingUploadTask`, found `*mut _`
+    |                       |
+    |                       expected due to this
+    |
+    = note:     expected enum `FfiPingUploadTask`
+            found raw pointer `*mut _`
+
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/lib.rs:458:21
+    |
+458 |         max_events: 0,
+    |                     ^ expected `Option<&i32>`, found integer
+    |
+    = note: expected enum `Option<&i32>`
+               found type `{integer}`
+</output>
+
+Function signatures
+<Signatures>
+fn glean_process_ping_upload_response(
+task: *mut FfiPingUploadTask,
+status: u32) -> ()
+
+fn glean_is_first_run() -> u8
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

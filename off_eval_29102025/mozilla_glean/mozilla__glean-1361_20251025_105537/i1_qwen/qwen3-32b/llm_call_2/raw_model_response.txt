@@ -1,0 +1,62 @@
+<think>
+Okay, let's see. The user provided a test that's failing after the patch. The errors are about unresolved imports and missing traits. My job is to fix the test so it fails before the patch and passes after.
+
+First, the error mentions that `crate::CommonTest` isn't found. Looking at the original code, there's a `mod common_test` in `test.rs`, and they probably use `CommonTest` from there. The correct import would be `crate::common_test::CommonTest`, but the test currently tries to use `crate::CommonTest`. So I need to fix that import.
+
+Next, the error says `ExtraKeys` can't be found. The `ExtraKeys` trait is defined in the `glean-core/src/traits/event.rs` and is part of the `glean_core::traits` module. So the test should import it from there.
+
+In the test, they're trying to implement `ExtraKeys` for `TestExtra`. So the correct import would be `use glean_core::traits::ExtraKeys;`.
+
+Another thing: the original test uses `new_glean` which is defined in `common_test`. So I need to import that function correctly. The original code might have `new_glean` in `common_test.rs`, so the import should be `use crate::common_test::new_glean;`.
+
+So updating the imports:
+- Replace `use crate::CommonTest` with `use crate::common_test::CommonTest`
+- Replace `use crate::CommonTest` for `new_glean` with `use crate::common_test::new_glean`
+- Add `use glean_core::traits::ExtraKeys;`
+
+Now, in the test code, the `TestExtra` enum is implemented with `ExtraKeys`. The `record` function is called with a HashMap using a string key not present in allowed keys. The expectation is that this records an error of type `InvalidExtraKey`.
+
+After fixing the imports, the test should compile. Now, to ensure that the test fails before the patch and passes after. Before the patch, the EventMetric wouldn't have the EventRecordingError handling for invalid keys. After the patch, the error should be recorded properly, so the test should pass.
+
+Also, the `test_get_num_recorded_errors` function is part of the Event trait. Since the original code in the patch uses `glean_core::traits::Event`, the test should import that trait. Wait, the test is in `glean-core/rlb/src/private/event.rs`, which already uses `super::*` in the test module. So perhaps `ErrorType` is from `crate::ErrorType`, which is defined in the same crate.
+
+Putting all together, the corrected test should import the necessary items and check for the error count correctly.
+</think>
+
+<Filename>glean-core/rlb/src/private/event.rs</Filename>
+<imports>
+use crate::common_test::CommonTest;
+use crate::common_test::new_glean;
+use glean_core::traits::ExtraKeys;
+</imports>
+<Rust>
+#[test]
+fn test_invalid_extra_key_records_error() {
+    let _lock = CommonTest::lock_test();
+    let _t = new_glean(None, true);
+
+    #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+    enum TestExtra {
+        ValidKey,
+    }
+
+    impl ExtraKeys for TestExtra {
+        const ALLOWED_KEYS: &'static [&'static str] = &["valid_key"];
+        fn index(self) -> i32 { self as i32 }
+    }
+
+    let metric: EventMetric<TestExtra> = EventMetric::new(crate::CommonMetricData {
+        name: "event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["test1".into()],
+        ..Default::default()
+    });
+
+    let mut invalid_map = HashMap::new();
+    invalid_map.insert("other_key", "value".into()); // Not in allowed_keys
+    metric.record(invalid_map);
+
+    let errors = metric.test_get_num_recorded_errors(crate::ErrorType::InvalidExtraKey, None);
+    assert_eq!(1, errors);
+}
+</Rust>

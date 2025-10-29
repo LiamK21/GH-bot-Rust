@@ -1,0 +1,313 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+`test_reset_glean` on the RLB does not clear the stores even when clear_stores: true
+See discussion: https://github.com/mozilla-mobile/mozilla-vpn-client/pull/4919/files/95e93a0a3440141b35dbd64cc01ba1e056121098#r1021917910
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -37,6 +37,7 @@
+ //! ```
+ 
+ use std::collections::HashMap;
++use std::path::Path;
+ 
+ pub use configuration::Configuration;
+ use configuration::DEFAULT_GLEAN_ENDPOINT;
+@@ -203,14 +204,15 @@ pub fn test_get_experiment_data(experiment_id: String) -> Option<RecordedExperim
+ }
+ 
+ /// Destroy the global Glean state.
+-pub(crate) fn destroy_glean(clear_stores: bool) {
+-    glean_core::glean_test_destroy_glean(clear_stores)
++pub(crate) fn destroy_glean(clear_stores: bool, data_path: &Path) {
++    let data_path = data_path.display().to_string();
++    glean_core::glean_test_destroy_glean(clear_stores, Some(data_path))
+ }
+ 
+ /// TEST ONLY FUNCTION.
+ /// Resets the Glean state and triggers init again.
+ pub fn test_reset_glean(cfg: Configuration, client_info: ClientInfoMetrics, clear_stores: bool) {
+-    destroy_glean(clear_stores);
++    destroy_glean(clear_stores, &cfg.data_path);
+     initialize_internal(cfg, client_info);
+     glean_core::join_init();
+ }
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -109,8 +109,10 @@ fn test_experiments_recording() {
+ #[test]
+ fn test_experiments_recording_before_glean_inits() {
+     let _lock = lock_test();
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
+ 
+-    destroy_glean(true);
++    destroy_glean(true, &tmpname);
+ 
+     set_experiment_active(
+         "experiment_set_preinit".to_string(),
+@@ -124,9 +126,6 @@ fn test_experiments_recording_before_glean_inits() {
+     );
+     set_experiment_inactive("experiment_preinit_disabled".to_string());
+ 
+-    let dir = tempfile::tempdir().unwrap();
+-    let tmpname = dir.path().to_path_buf();
+-
+     test_reset_glean(
+         Configuration {
+             data_path: tmpname,
+@@ -375,8 +374,10 @@ fn initialize_must_not_crash_if_data_dir_is_messed_up() {
+ #[test]
+ fn queued_recorded_metrics_correctly_record_during_init() {
+     let _lock = lock_test();
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
+ 
+-    destroy_glean(true);
++    destroy_glean(true, &tmpname);
+ 
+     let metric = CounterMetric::new(CommonMetricData {
+         name: "counter_metric".into(),
+@@ -398,7 +399,17 @@ fn queued_recorded_metrics_correctly_record_during_init() {
+ 
+     // Calling `new_glean` here will cause Glean to be initialized and should cause the queued
+     // tasks recording metrics to execute
+-    let _t = new_glean(None, false);
++    let cfg = Configuration {
++        data_path: tmpname,
++        application_id: GLOBAL_APPLICATION_ID.into(),
++        upload_enabled: true,
++        max_events: None,
++        delay_ping_lifetime_io: false,
++        server_endpoint: Some("invalid-test-host".into()),
++        uploader: None,
++        use_core_mps: false,
++    };
++    let _t = new_glean(Some(cfg), false);
+ 
+     // Verify that the callback was executed by testing for the correct value
+     assert!(metric.test_get_value(None).is_some(), "Value must exist");
+@@ -738,8 +749,10 @@ fn test_dirty_flag_is_reset_to_false() {
+ #[test]
+ fn setting_debug_view_tag_before_initialization_should_not_crash() {
+     let _lock = lock_test();
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
+ 
+-    destroy_glean(true);
++    destroy_glean(true, &tmpname);
+ 
+     // Define a fake uploader that reports back the submission headers
+     // using a crossbeam channel.
+@@ -765,9 +778,6 @@ fn setting_debug_view_tag_before_initialization_should_not_crash() {
+     set_debug_view_tag("valid-tag");
+ 
+     // Create a custom configuration to use a fake uploader.
+-    let dir = tempfile::tempdir().unwrap();
+-    let tmpname = dir.path().to_path_buf();
+-
+     let cfg = Configuration {
+         data_path: tmpname,
+         application_id: GLOBAL_APPLICATION_ID.into(),
+@@ -795,8 +805,10 @@ fn setting_debug_view_tag_before_initialization_should_not_crash() {
+ #[test]
+ fn setting_source_tags_before_initialization_should_not_crash() {
+     let _lock = lock_test();
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
+ 
+-    destroy_glean(true);
++    destroy_glean(true, &tmpname);
+     //assert!(!was_initialize_called());
+ 
+     // Define a fake uploader that reports back the submission headers
+@@ -823,9 +835,6 @@ fn setting_source_tags_before_initialization_should_not_crash() {
+     set_source_tags(vec!["valid-tag1".to_string(), "valid-tag2".to_string()]);
+ 
+     // Create a custom configuration to use a fake uploader.
+-    let dir = tempfile::tempdir().unwrap();
+-    let tmpname = dir.path().to_path_buf();
+-
+     let cfg = Configuration {
+         data_path: tmpname,
+         application_id: GLOBAL_APPLICATION_ID.into(),
+@@ -858,9 +867,6 @@ fn setting_source_tags_before_initialization_should_not_crash() {
+ fn setting_source_tags_after_initialization_should_not_crash() {
+     let _lock = lock_test();
+ 
+-    destroy_glean(true);
+-    //assert!(!was_initialize_called());
+-
+     // Define a fake uploader that reports back the submission headers
+     // using a crossbeam channel.
+     let (s, r) = crossbeam_channel::bounded::<Vec<(String, String)>>(1);
+@@ -995,9 +1001,6 @@ fn flipping_upload_enabled_respects_order_of_events() {
+ fn registering_pings_before_init_must_work() {
+     let _lock = lock_test();
+ 
+-    destroy_glean(true);
+-    //assert!(!was_initialize_called());
+-
+     // Define a fake uploader that reports back the submission headers
+     // using a crossbeam channel.
+     let (s, r) = crossbeam_channel::bounded::<String>(1);
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -861,7 +861,7 @@ pub fn glean_set_test_mode(enabled: bool) {
+ /// **TEST-ONLY Method**
+ ///
+ /// Destroy the underlying database.
+-pub fn glean_test_destroy_glean(clear_stores: bool) {
++pub fn glean_test_destroy_glean(clear_stores: bool, data_path: Option<String>) {
+     if was_initialize_called() {
+         // Just because initialize was called doesn't mean it's done.
+         join_init();
+@@ -879,6 +879,12 @@ pub fn glean_test_destroy_glean(clear_stores: bool) {
+ 
+         // Allow us to go through initialization again.
+         INITIALIZE_CALLED.store(false, Ordering::SeqCst);
++    } else if clear_stores {
++        if let Some(data_path) = data_path {
++            let _ = remove_dir_all::remove_dir_all(data_path).ok();
++        } else {
++            log::warn!("Asked to clear stores before initialization, but no data path given.");
++        }
+     }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use super::test_reset_glean;
+use super::Configuration;
+use super::ClientInfoMetrics;
+use glean_core::glean_test_destroy_glean;
+use tempfile::tempdir;</imports>
+<Rust>#[test]
+fn test_reset_glean_clears_stores() {
+    let dir = tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let cfg = Configuration {
+        data_path: tmpname.clone(),
+        application_id: "test_app".into(),
+        upload_enabled: true,
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        server_endpoint: Some("invalid-test-host".into()),
+        uploader: None,
+        use_core_mps: false,
+    };
+
+    let client_info = ClientInfoMetrics {
+        app_build: "1.0".into(),
+        app_display_version: "1.0".into(),
+        app_channel: "test".into(),
+        architecture: "x86".into(),
+        os: "test_os".into(),
+        os_version: "1.0".into(),
+        device_manufacturer: "test_manufacturer".into(),
+        device_model: "test_model".into(),
+    };
+
+    test_reset_glean(cfg.clone(), client_info.clone(), true);
+
+    let data_path = Some(tmpname.to_str().unwrap().to_string());
+    glean_test_destroy_glean(true, data_path);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+    --> /app/testbed/target/debug/build/glean-core-43535c79ce28c0b9/out/glean.uniffi.rs:1313:5
+     |
+1313 |       r#glean_test_destroy_glean(
+     |  _____^^^^^^^^^^^^^^^^^^^^^^^^^^-
+1314 | |         match<bool as uniffi::FfiConverter>::try_lift(r#clear_stores) {
+1315 | |             Ok(val) => val,
+...    |
+1319 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "clear_stores", err),
+1320 | |         })
+     | |__________- argument #2 of type `std::option::Option<std::string::String>` is missing
+     |
+note: function defined here
+    --> glean-core/src/lib.rs:864:8
+     |
+864  | pub fn glean_test_destroy_glean(clear_stores: bool, data_path: Option<String>) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^                     -------------------------
+help: provide the argument
+     |
+1313 ~     r#glean_test_destroy_glean(match<bool as uniffi::FfiConverter>::try_lift(r#clear_stores) {
+1314 +             Ok(val) => val,
+1315 +         
+1316 + 
+1317 +         
+1318 +             Err(err) => panic!("Failed to convert arg '{}': {}", "clear_stores", err),
+1319 +         }, /* std::option::Option<std::string::String> */)
+     |
+</output>
+
+Function signatures
+<Signatures>
+fn queued_recorded_metrics_correctly_record_during_init() -> ()
+
+fn setting_debug_view_tag_before_initialization_should_not_crash() -> ()
+
+fn flipping_upload_enabled_respects_order_of_events() -> ()
+
+fn initialize_must_not_crash_if_data_dir_is_messed_up() -> ()
+
+fn setting_source_tags_before_initialization_should_not_crash() -> ()
+
+pub fn glean_set_test_mode(enabled: bool) -> ()
+
+pub fn glean_test_destroy_glean(clear_stores: bool, data_path: Option<String>) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

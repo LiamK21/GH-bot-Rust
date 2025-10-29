@@ -1,0 +1,73 @@
+#[test]
+fn test_scheduled_pings_after_disabled_ping() {
+    let _lock = lock_test();
+
+    let (s, r) = crossbeam_channel::bounded::<String>(1);
+
+    #[derive(Debug)]
+    struct FakeUploader {
+        sender: crossbeam_channel::Sender<String>,
+    }
+
+    impl net::PingUploader for FakeUploader {
+        fn upload(&self, request: net::CapablePingUploadRequest) -> net::UploadResult {
+            let request = request.capable(|_| true).unwrap();
+            self.sender.send(request.url).unwrap();
+            net::UploadResult::http_status(200)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let ping_schedule = HashMap::from([("parent".to_string(), vec!["child".to_string()])]);
+
+    let cfg = ConfigurationBuilder::new(false, tmpname, GLOBAL_APPLICATION_ID)
+        .with_server_endpoint("invalid-test-host")
+        .with_uploader(FakeUploader { sender: s })
+        .with_ping_schedule(ping_schedule)
+        .build();
+
+    let _glean = new_glean(Some(cfg), true);
+
+    let parent_ping = PingType::new(
+        "parent",
+        false, // explicitly disabled
+        true,
+        false,
+        true,
+        false,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+    parent_ping.set_enabled(false);
+
+    let child_ping = PingType::new(
+        "child",
+        true,
+        true,
+        true,
+        true,
+        true,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+    child_ping.set_enabled(true);
+
+    parent_ping.register(&_glean);
+    child_ping.register(&_glean);
+
+    // Submit disabled parent ping
+    parent_ping.submit(&_glean, None);
+
+    // Before patch: expect no message
+    // After patch: expect message with child
+    match r.recv_timeout(Duration::from_millis(100)) {
+        Ok(url) => assert!(url.contains("child")),
+        Err(e) => panic!("Expected channel to receive child ping URL, got: {:?}", e),
+    }
+}

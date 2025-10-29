@@ -1,0 +1,187 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Upgrade rkv to the latest version to accomodate storage changes
+Newer rkv comes with different storage backends (the ldmb backend we're currently using and a pure Rust storage driver).
+As a first step we should upgrade our use of rkv, while still using the LMDB backend.
+This allows us to test out the other backend and switch to it if necessary.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/database/mod.rs b/glean-core/src/database/mod.rs
+--- a/glean-core/src/database/mod.rs
++++ b/glean-core/src/database/mod.rs
+@@ -10,13 +10,48 @@ use std::path::Path;
+ use std::str;
+ use std::sync::RwLock;
+ 
+-use rkv::{Rkv, SingleStore, StoreOptions};
++use rkv::StoreOptions;
++
++// Select the LMDB-powered storage backend when the feature is not activated.
++#[cfg(not(feature = "rkv-safe-mode"))]
++mod backend {
++    use std::path::Path;
++
++    /// cbindgen:ignore
++    pub type Rkv = rkv::Rkv<rkv::backend::LmdbEnvironment>;
++    /// cbindgen:ignore
++    pub type SingleStore = rkv::SingleStore<rkv::backend::LmdbDatabase>;
++    /// cbindgen:ignore
++    pub type Writer<'t> = rkv::Writer<rkv::backend::LmdbRwTransaction<'t>>;
++
++    pub fn rkv_new(path: &Path) -> Result<Rkv, rkv::StoreError> {
++        Rkv::new::<rkv::backend::Lmdb>(path)
++    }
++}
++
++// Select the "safe mode" storage backend when the feature is activated.
++#[cfg(feature = "rkv-safe-mode")]
++mod backend {
++    use std::path::Path;
++
++    /// cbindgen:ignore
++    pub type Rkv = rkv::Rkv<rkv::backend::SafeModeEnvironment>;
++    /// cbindgen:ignore
++    pub type SingleStore = rkv::SingleStore<rkv::backend::SafeModeDatabase>;
++    /// cbindgen:ignore
++    pub type Writer<'t> = rkv::Writer<rkv::backend::SafeModeRwTransaction<'t>>;
++
++    pub fn rkv_new(path: &Path) -> Result<Rkv, rkv::StoreError> {
++        Rkv::new::<rkv::backend::SafeMode>(path)
++    }
++}
+ 
+ use crate::metrics::Metric;
+ use crate::CommonMetricData;
+ use crate::Glean;
+ use crate::Lifetime;
+ use crate::Result;
++use backend::*;
+ 
+ pub struct Database {
+     /// Handle to the database environment.
+@@ -81,7 +116,13 @@ impl Database {
+         let path = Path::new(data_path).join("db");
+         log::debug!("Database path: {:?}", path.display());
+ 
++        // FIXME(bug 1670634): This is probably more knowledge
++        // than we should have about the database internals.
++        // We could instead iterate over the directory and sum up the file sizes.
++        #[cfg(not(feature = "rkv-safe-mode"))]
+         let file_size = file_size(&path.join("data.mdb"));
++        #[cfg(feature = "rkv-safe-mode")]
++        let file_size = file_size(&path.join("data.safe.bin"));
+ 
+         let rkv = Self::open_rkv(&path)?;
+         let user_store = rkv.open_single(Lifetime::User.as_str(), StoreOptions::create())?;
+@@ -125,7 +166,7 @@ impl Database {
+     fn open_rkv(path: &Path) -> Result<Rkv> {
+         fs::create_dir_all(&path)?;
+ 
+-        let rkv = Rkv::new(&path)?;
++        let rkv = rkv_new(&path)?;
+         log::info!("Database initialized");
+         Ok(rkv)
+     }
+@@ -168,7 +209,7 @@ impl Database {
+                     Ok(metric_id) => metric_id.to_string(),
+                     _ => continue,
+                 };
+-                let metric: Metric = match value.expect("Value missing in iteration") {
++                let metric: Metric = match value {
+                     rkv::Value::Blob(blob) => unwrap_or!(bincode::deserialize(blob), continue),
+                     _ => continue,
+                 };
+@@ -241,7 +282,7 @@ impl Database {
+             }
+ 
+             let metric_id = &metric_id[len..];
+-            let metric: Metric = match value.expect("Value missing in iteration") {
++            let metric: Metric = match value {
+                 rkv::Value::Blob(blob) => unwrap_or!(bincode::deserialize(blob), continue),
+                 _ => continue,
+             };
+@@ -297,7 +338,7 @@ impl Database {
+     /// * This function will **not** panic on database errors.
+     fn write_with_store<F>(&self, store_name: Lifetime, mut transaction_fn: F) -> Result<()>
+     where
+-        F: FnMut(rkv::Writer, &SingleStore) -> Result<()>,
++        F: FnMut(Writer, &SingleStore) -> Result<()>,
+     {
+         let writer = self.rkv.write().unwrap();
+         let store = self.get_store(store_name);
+
+diff --git a/glean-core/src/error.rs b/glean-core/src/error.rs
+--- a/glean-core/src/error.rs
++++ b/glean-core/src/error.rs
+@@ -9,7 +9,7 @@ use std::result;
+ 
+ use ffi_support::{handle_map::HandleError, ExternError};
+ 
+-use rkv::error::StoreError;
++use rkv::StoreError;
+ 
+ /// A specialized [`Result`] type for this crate's operations.
+ ///
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/database/mod.rs</Filename>
+<imports>use std::path::Path;
+use std::fs;
+use rkv::StoreOptions;</imports>
+<Rust>#[test]
+fn test_open_rkv() {
+  let path = Path::new("test_db");
+  fs::create_dir_all(&path).unwrap();
+  let result_before_patch = rkv::Rkv::new(&path);
+  let result_after_patch = Database::open_rkv(&path);
+  assert!(result_before_patch.is_ok());
+  assert!(result_after_patch.is_ok());
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

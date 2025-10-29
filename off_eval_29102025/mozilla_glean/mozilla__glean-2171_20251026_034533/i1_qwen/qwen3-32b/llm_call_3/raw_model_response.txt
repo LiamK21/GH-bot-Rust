@@ -1,0 +1,460 @@
+<think>
+Okay, let's see. The user wants me to fix the test so that it fails before the patch and passes after. The existing unit test is called test_concurrent_lock_release_safety, which uses multiple threads to acquire the lock and check a signal. But the problem is that currently, it passes even before the patch, which suggests that the test isn't correctly triggering the timeout condition.
+
+Looking at the issue, the problem is that two tests are hanging when using Rust Beta. The patch ignores some other tests, but the problem seems related to concurrency. The test added here tries to check the lock's safety when multiple threads are involved. However, in the original code (before the patch), maybe the lock wasn't releasing, causing threads to block and cause timeouts. But the current test isn't catching that because the threads may not be overlapping in a way that causes the timeout during the test's execution.
+
+The test starts five threads, each acquiring the lock and toggling a signal 10 times. But if the lock wasn't properly released before the patch, some threads might be blocked when trying to acquire the lock, but if they're released quickly, the test passes. Maybe the issue is when the lock is held longer, but in the current test, each thread only holds it briefly. The problem arises when multiple threads are contending for the lock, causing some to hang longer, leading to test timeouts in CI.
+
+So the current test isn't stressing the lock in a way that reproduces the problem. To make it fail before the patch, the test should simulate a scenario where the lock isn't released, leading to a timeout. That could be accomplished by checking how long the lock is held or introducing a longer wait in the test.
+
+Wait, in the current test, each thread acquires the lock and then does some work, but if the lock is a mutex that isn't properly released, the threads would block. If the lock is held by one thread while others try to acquire it, and the lock isn't released correctly, those other threads would hang. However, the current test might not be doing enough to cause that.
+
+Maybe the issue is that the lock isn't being released in a timely manner when threads are contending. To simulate the problem, the test should have a scenario where a thread holds the lock for longer, causing others to wait. By adding a sleep inside the critical section, the test can expose a potential deadlock or lock starvation.
+
+In the original test, each thread holds the lock for a short time (50ms sleep in a loop of 10). Maybe if we increase the number of iterations or the sleep time, or if we create more threads, the problem is more likely to surface. However, the test would then need to wait longer to detect that the threads are blocked.
+
+Alternatively, perhaps the problem is that when the lock isn't released correctly, the test case's threads would block forever when trying to acquire the lock. To catch this, the test could check if the threads are completing within a certain time frame. If not, the test would panic, indicating a failure. That way, before the patch, the threads would hang, leading to the test timeout. After the patch, the threads would release the lock, finishing in time.
+
+The current test doesn't have a timeout mechanism. It just joins the threads. If the lock wasn't properly released, some threads might not complete, causing the test to hang indefinitely. But in the user's scenario, the test is passing when it shouldn't. So perhaps the test isn't actually causing the problem to surface. The original problem is that tests hang on Rust Beta, so the test should simulate conditions where that happens and then the patch fixes it.
+
+The original test uses 5 threads each doing 10 iterations. If the lock isn't properly released, maybe those threads are blocking each other but the test still completes. To make it fail before, perhaps the test needs to simulate more concurrent access or longer periods. Maybe increasing the number of threads or iterations could help.
+
+Alternatively, the test should measure the time taken for the threads to complete. If the lock isn't released, the threads would take longer, but how to detect that?
+
+Another approach: instead of just joining the threads, have a timeout. If the threads don't complete within a certain time, the test fails. But in Rust, using thread::JoinHandle::join() with a timeout may require a different approach. Maybe using a timeout for the entire test.
+
+But in the existing test, the threads are all joining after they complete. If the lock wasn't released (e.g., a bug where the lock is never released), then the threads would be blocked waiting for the lock and never return. However, the test would wait until all threads are done. Since the test doesn't have a timeout, it would hang forever. However, in CI environments, if a test runs too long, the system terminates it. But in the user's case, the test is passing, but in reality, on Rust Beta, the tests are hanging. So perhaps the test isn't properly simulating the problem.
+
+Wait, the existing test passes in the code that is having the problem (the same code where the other two tests hang on Rust Beta). That's why the user says that the current test isn't correctly catching the issue.
+
+So the goal is to modify the test_concurrent_lock_release_safety to check for the problem in a way that it would fail before the patch and pass after.
+
+The core issue is likely related to the lock being held longer than expected, causing threads to block and leading to test timeouts. The test should be adjusted to ensure that it causes such a timeout when the lock is not properly released and passes when it is fixed.
+
+To make the test fail before the patch, the test should simulate a scenario where the lock is not released. For example, have a thread that acquires the lock and holds it while others try to acquire it. Then, check if all threads can proceed.
+
+In the current test, each thread acquires the lock once. If the lock is not properly released, other threads would block. However, in the current setup, the lock is acquired once per thread, but in a way that they might not be overlapping enough.
+
+Wait, the test uses 5 threads, each acquiring the lock and doing some work. If the lock is a mutex (which I assume it is), then each thread must acquire it exclusively. But in the current test, the lock is taken once in the loop, but if the lock is a mutex, the first thread would hold it while doing the loop, preventing others from getting it.
+
+Wait, the loop runs 10 times. For each loop iteration, the thread sets the signal to true, sleeps 50ms, then false, sleeps again, etc. But the lock is acquired once at the start. So each thread acquires the lock once, does the entire loop, then releases the lock when it goes out of scope.
+
+In that case, if the lock is a mutex, each thread must wait for the previous one to release the lock before acquiring it. So with 5 threads, each doing 10 iterations of 50ms sleep, the total time would be 5 threads * 10 * 50ms. But if the lock is a mutex, the threads would be queued, and each would run for their 500ms (10 * 50ms), but the test would take 5*500ms = 2500ms. However, each thread is spawned in parallel, so they'll all try to acquire the lock sequentially.
+
+In the current setup, each thread acquires the lock once, does 10 iterations (5 seconds), then releases it. If the lock is a mutex, the test would take 5 * 5 seconds = 25 seconds. But the test code as written starts 5 threads, each doing this, and then joins them. So the total time for the test would be about 25 seconds. Which is way beyond the 60 seconds mentioned in the issue. Wait, no, wait, each thread does 10 iterations of 50ms each, so 10 * 50ms = 0.5 seconds per thread. So for 5 threads, with the lock being a mutex, each thread must wait for the previous to finish. So first thread runs 0.5s, second waits 0.5s, then runs, etc. Total time would be 5 * 0.5s = 2.5s. For 5 threads. That's way under the 60s timeout of the test. So the test would complete quickly, and thus passing.
+
+But if the lock isn't being released correctly, then the first thread would hold the lock forever, and others would block, causing the test to hang. However, in the current code, the test is passing because it's not causing the lock to be held indefinitely. So perhaps the problem in the original code was that the lock wasn't being released in other parts of the function, but the current test isn't causing it to happen here.
+
+So the problem is that the current test doesn't trigger the same lock contention scenario that's causing the issue in the other tests. The other tests that hang are 'registering_pings_before_init_must_work' and 'send_a_ping'. Those tests might be doing something that causes the lock to be held longer or in a way that's more prone to deadlock when using Rust Beta's standard libraries.
+
+Perhaps the lock_test function is a mutex-based function, and if it's not correctly released, the test_concurrent_lock_release_safety would hang. But in the current test, the lock is released properly (since it's stored in the _lock variable, which when it goes out of scope, the lock is released). Therefore, the test passes.
+
+But the patch is supposed to fix the issue. How does the patch relate to the test_concurrent_lock_release_safety? The patch doesn't mention that test. Oh, the patch was to un-ignore two other tests, but the problem is that those tests were hanging on Rust Beta. The test_concurrent_lock_release_safety is a new test added by the user, which the user says is passing before the patch, which it shouldn't. So the user wants to adjust this test to actually fail when the lock isn't properly released, then pass after the fix.
+
+Wait, perhaps there's a misunderstanding. The user has written this test_concurrent_lock_release_safety, but it's not catching the problem. The problem is that other tests are hanging. The current test is passing, but it's supposed to check for the same issue. So how can we modify the test to simulate the problem?
+
+Maybe the original lock_test function is a mutex that isn't properly released in some conditions. The test is trying to verify that the lock is safely released under concurrent access. The current test passes because the lock is being released correctly in the code. But the issue in the other tests is caused by something else when using Rust Beta. So perhaps the problem is a different scenario where the lock isn't being released when it should be, but the current test isn't simulating that.
+
+To create a test that fails before the patch and passes after, the test should create a situation where the lock isn't released, leading to a timeout, and the patch fixes that.
+
+So the test should simulate multiple threads trying to acquire the lock in a way that causes some threads to block indefinitely. Then, the test should check if all threads complete within a certain timeframe. If they don't, the test fails.
+
+For example, in the current test, each thread acquires the lock once. If the lock is a mutex, they queue up. But if the lock is something like a reentrant mutex, but not properly released in some cases, the threads may hang.
+
+An alternative approach is to have a scenario where a thread panics while holding the lock. In the original scenario, if the lock is not released when a panic occurs, it might lead to a deadlock. For instance, in the test, if one thread panics while holding the lock, the other threads would be blocked forever. But in the current test, there's no panic. So the test wouldn't catch that problem.
+
+But how to modify the test to cause a panic?
+
+Alternatively, the problem could be that when multiple threads hold the lock, the lock is not released properly in some edge case. The current test may not be triggering that scenario.
+
+Let me think: the test uses lock_test(). Perhaps this is a function that acquires a mutex lock. If the lock is a mutex, then only one thread can hold it at a time. If a thread fails to release the lock, others will block. But in the current test, the lock is released correctly because when the thread exits the scope (due to join()), the lock is released. Therefore, the test passes.
+
+So, to make the test fail before the patch, perhaps the scenario is when a thread panics while holding the lock. In that case, the lock is not released, and other threads block. Let's modify the test to have one thread that panics while holding the lock. Another thread would try to take the lock but would block, and the test would wait for the join, which would never happen, leading to a timeout.
+
+But in Rust, a panic in a thread would abort the join, unless the thread is properly handled. Hmm. To simulate that, maybe the test can panic in one of the threads, and see if the other threads can acquire the lock.
+
+But how would that test that? Well, if one thread panics while holding the lock, the lock remains held, and other threads can't acquire it. Then, when the test joins those threads, one would finish (the panicking one), and the others would hang. The main test thread would wait for all the threads to complete, leading to a timeout.
+
+But in Rust, if a thread panics, it's possible that the lock is not properly released if the lock guard is not dropped correctly. So if the test's thread panics in the middle of holding the lock, the lock would not be released, causing other threads to block.
+
+So to create a test that fails before the patch and passes after, the test should have one thread that panics while holding the lock. The other threads should try to take the lock, but they'll block. The test would then expect that the other threads eventually can take the lock, or that the lock is properly poisoned, allowing other threads to acquire it after the panic.
+
+But the current setup may not be handling panic correctly. For example, if the lock is a poison_mutex, then a panic in a thread would poison the lock, and other threads would get a poisoned error when trying to acquire the lock. However, in the current test, the threads might not be handling the error, leading to them getting a poisoned error, but the test doesn't check for that.
+
+Alternatively, if the lock is an ordinary mutex, and a thread panics while holding it, the lock remains locked, and other threads block forever. That would be a problem.
+
+So, to test for this scenario, the test could start multiple threads. One of them panics while holding the lock. The other threads would try to acquire the lock. If the code (the lock_test function) doesn't handle this correctly (i.e., doesn't release the lock in case of panic), then the other threads would hang.
+
+In this case, the test should expect that the other threads complete, and if they don't, the test should fail. However, how to detect that?
+
+The test could use a timeout for each thread. If a thread takes too long to complete, the test fails.
+
+So, reworking the test to have a scenario where one thread panics, and others try to acquire the lock. Before the patch, these threads would block forever, causing the test to fail. After the patch, the lock is released, and the threads can proceed.
+
+But how to implement that?
+
+Here's an idea: create a test that starts several threads, and one of them panics after acquiring the lock. The other threads should be able to acquire the lock and complete. If not, the test will time out.
+
+But how to modify the current test_concurrent_lock_release_safety to do that?
+
+Let me think: the existing test has each thread acquire the lock and perform some actions. To simulate a panic, perhaps one of the threads will panic in the middle of holding the lock. The other threads would block waiting for the lock. If the lock isn't properly released, the test would hang. But after the patch, the lock should be released, allowing other threads to proceed.
+
+So the test would look like this:
+
+- Spawn a thread that acquires the lock and panics.
+- Spawn other threads that attempt to acquire the lock.
+
+In the original code (before patch), the other threads would block since the first thread's lock isn't released. The test would wait for all threads to finish but would time out. In the patched code, the lock is released, and the other threads can complete.
+
+So, the test should pass after the patch and fail before.
+
+To implement this, the test can use a thread that panics while holding the lock. The other threads will either panic again or wait. The test can then check if the other threads complete within a certain timeframe.
+
+But in Rust, if a thread panics and you join it, the panic is propagated. However, if you use unwrap(), it would propagate.
+
+Alternatively, the test can use threads that expect the lock to be acquired and perform a task. If the lock isn't released, the test would take too long and eventually fail.
+
+But how to make this work with the current test setup?
+
+Let me try to outline the adjusted test:
+
+1. Create a test that spawns one thread which acquires the lock and panics.
+2. Create other threads that attempt to acquire the lock after the first thread has panicked.
+3. If the lock isn't properly released when the original thread panics, the other threads will block, leading to the test failing due to timeout.
+4. If the lock is properly released, the other threads can acquire the lock and the test completes.
+
+But how to detect that the other threads have completed within a timeout?
+
+In Rust, when you join a thread, you can use thread::join.timeout(). But the standard library thread::join() returns a Result, but it doesn't have a timeout. Alternatively, the test can use a timeout crate, but the user probably wants to avoid dependencies.
+
+Another approach is to limit the total time the test allows for all threads. For example, if the test allows for 5 seconds and the threads are supposed to complete in that time, then after that time, the test fails.
+
+But how to implement a timeout in this scenario? Well, for testing, the test can use std::time::Instant and check if the time exceeds the expected amount. However, for blocking scenarios like this, that's not sufficient unless we can interrupt the threads.
+
+Alternatively, perhaps the test can spawn multiple threads where some threads are expected to take a long time, and the test will check that they timeout.
+
+But this can get complex.
+
+Alternatively, the test can check if the threads that should be blocked are not joining in time, leading to the test to fail. But since the test as written would just join() them, which will block until they're done, this approach won't work in Rust unless we can use a timeout.
+
+The user may not want to use any external crates, so the test must use standard libraries.
+
+An alternative approach is to have a thread that should panic after taking the lock. The other threads should be able to acquire the lock. If not, the test will time out and fail.
+
+Wait, if the lock is not poisoned and the panicking thread leaves it locked, the other threads will block forever. However, if the lock is a poison mutex, and the thread panics, other threads can get an error when they try to acquire the lock but can proceed after handling the error.
+
+But the current code's lock_test() returns the lock, so the test might not be handling poisons.
+
+In any case, the current test may not be properly simulating the problem. The problem is that the test passes before the patch. The user wants a test that fails there, then passes after.
+
+The current test passes, which suggests that the lock is being released properly. But in the real tests, when using Rust Beta, the tests hang. This implies that in some scenarios, the lock is not being released.
+
+Perhaps the problem is that the lock is being held during certain operations like network calls, or some other operations. But the test needs to simulate that.
+
+Another possibility is that the lock isn't a mutex but something else, like a reader-writer lock that isn't handling starvation properly. But without knowing the exact implementation, it's tricky.
+
+Alternatively, perhaps the patch is modifying the lock_test function to use a different type of lock or a different implementation of the lock. The test should ensure that in the original code, the lock isn't correctly released in some cases (leading to hangs) and in the patched code, the lock is released correctly (so the test passes).
+
+To write the test to fail before the patch, the test must trigger the hang scenario. Here's an idea:
+
+Create a test where one thread acquires the lock and holds it indefinitely. Another thread tries to acquire the lock and should not complete, leading to the test timing out. If the lock is held, the test would wait forever. But in the original code (before patch), this would be the case, so the test would hang and fail. But we need the test to pass after the patch, which could fix the lock release to allow others to acquire it.
+
+Wait, but the patch is supposed to fix the issue, so in the original code, the lock is not being released correctly. So, the test should check if the lock is held forever when it shouldn't.
+
+So, to make the test fail before the patch, the test would have a thread that acquires the lock and holds it (infinite loop). Another thread would attempt to acquire the lock and hang. The test would then wait for both threads to join. Before the patch, this would fail because the threads are stuck. After the patch, the lock is released, and the second thread can acquire it.
+
+But how to trigger this in the test?
+
+The test could be modified to start a thread that holds the lock indefinitely, and then a second thread that attempts to acquire the lock but should not. The main thread would then wait for the second thread to finish. Since the first thread is holding the lock, the second thread would be stuck. The test would timeout and fail, which is the desired scenario.
+
+Wait, but how to detect that the test is failing as expected?
+
+Alternatively, the test can check if the second thread finishes within a certain timeframe. To implement this, the test can use a timeout.
+
+In Rust, using std::thread::join() with a timeout can be done via the thread::JoinHandle::join(). But standard Rust threads don't have a built-in timeout. One approach is to use a thread that periodically wakes up and checks for a timeout.
+
+But to avoid using external crates, the test can simulate this with a separate thread that watches for an expected event.
+
+For example:
+
+- Spawn a thread that acquires the lock and holds it (simulates a hanging lock).
+- Spawn a second thread that tries to acquire the lock and do something.
+- Use a watchdog thread to check if the second thread finishes within a certain time.
+- If not, the test fails.
+
+Alternatively, the main thread can wait for the second thread to finish with a timeout.
+
+But this requires more complex code.
+
+Another idea: use a timeout on the join for each thread. If the thread doesn't finish before the timeout, the test fails.
+
+But how to implement this in Rust?
+
+An example approach:
+
+Use a helper function with a timeout that will panic if the thread doesn't join within the timeout period.
+
+But in practice, this can be done using std::time::Instant.
+
+For example:
+
+fn test() {
+    let start_time = Instant::now();
+    let handle = spawn a thread that holds the lock;
+    let handle2 = spawn a thread that tries to acquire the lock;
+    let timeout = Duration::from_secs(1);
+
+    loop {
+        if handle2.join().is_err() {
+            // panic
+        }
+        if start_time.elapsed() > timeout {
+            panic!("Test took too long");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+But this is not ideal. A better approach is to use a select! macro, but that's in futures, which might not be available.
+
+Given the constraints, perhaps adjusting the current test to simulate a scenario where a thread is holding the lock forever and others are waiting, then have a timeout in the test.
+
+Let's try modifying the existing test_concurrent_lock_release_safety:
+
+Instead of having each thread run a loop, one thread will acquire the lock and hold it, and another thread will attempt to acquire it. The main thread will then wait for the latter thread to finish. If it doesn't finish within a timeout, the test fails (indicating the lock is not released correctly). But if the lock is released after the first thread finishes, the test passes.
+
+But how to model this.
+
+Let me draft the modified test:
+
+- Spawn two threads: one that acquires the lock and holds it indefinitely, one that tries to acquire the lock once and then returns.
+- If the lock isn't released correctly, the second thread will be blocked, causing the test to timeout.
+- The main test can wait for a certain time and then check if the second thread has finished. If not, the test fails.
+
+To simulate holding the lock indefinitely, perhaps the first thread can acquire the lock and then enters an infinite loop.
+
+The test would look like this:
+
+#[test]
+fn test_lock_release_safety_in_deferred_scenario() {
+    let lock = ...; // Assuming lock_test() is the mutex
+    let handle1 = thread::spawn(move || {
+        let _lock = lock_test();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+
+    let handle2 = thread::spawn(move || {
+        let _lock = lock_test();
+        // do something trivial
+    });
+
+    // Wait for handle2 to finish, but not for too long
+    let wait_time = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+    let mut result = None;
+    while start_time.elapsed() < wait_time {
+        match handle2.try_join() {
+            Ok(val) => {
+                result = Some(val);
+                break;
+            },
+            Err(_) => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        }
+    }
+
+    if result.is_none() {
+        panic!("Test took too long to complete");
+    }
+
+    // Also join the first thread, but ignore result
+    handle1.abort();
+}
+
+But this requires using try_join(), which Rust doesn't have by default. The standard JoinHandle::join() doesn't have a try method. So this approach won't work directly.
+
+Another approach is to use a timeout in a separate thread. For example:
+
+- Spawn a thread that will join the second thread for a duration, checking if it completes.
+- If the second thread doesn't complete within the time, the test fails.
+
+This can be done with a helper like this:
+
+let watchdog = thread::spawn(move || {
+    thread::sleep(Duration::from_secs(3));
+    assert!(false, "Test timeout");
+});
+
+let handle2 = spawn lock-acquiring thread;
+
+watchdog.join().expect("Watchdog should have finished");
+
+But this isn't helpful because the watchdog would panic after timeout, but the main thread is still waiting for the join.
+
+Alternatively, use a cross-thread flag to signal completion:
+
+In the test:
+
+let lock_acquiring = thread::spawn(|| {
+    let _lock = lock_test();
+    while true { } // infinite loop
+});
+
+let lock_waiter = thread::spawn(|| {
+    let _lock = lock_test();
+});
+
+let has_finished = Arc::new(AtomicBool::new(false));
+let has_finished_clone = has_finished.clone();
+
+thread::spawn(move || {
+    let _lock = lock_waiter;
+    // ... then wait 5 seconds and check has_finished
+});
+
+Wait, this is getting too complex.
+
+Perhaps the best way is to modify the test to have one thread holding the lock for a long time, but the test is designed to expect that it completes in a timely manner if the patch is applied.
+
+Alternatively, use a sleep inside the lock acquisition, and the patch makes it finish quicker.
+
+Wait, the original problem is that some tests are hanging for longer than 60 seconds. The test should simulate a similar scenario, where the lock is held in a way that would cause the test to exceed 60s, but with the patch, it finishes in time.
+
+In the existing test, the threads are only doing 10 iterations of 50ms, leading to total time of 5 threads * 0.5s each = 2.5s. So the test is very fast, and thus passing when it should fail.
+
+To make it fail, perhaps increase the number of threads or the number of iterations, making it exceed the 60-second timeout when the lock isn't properly released. But if the lock is properly released, it completes in time.
+
+For example, increase the number of threads to 100, and each does more iterations with longer sleeps. This way, if the lock isn't being released correctly, the test would take longer than 60 seconds and time out.
+
+But the current code's test is for 5 threads, 10 iterations of 50ms. Let's calculate the total required time. If the lock is a mutex and each thread has to wait its turn, then total time is number of threads * (time per thread). Time per thread is 10 * 50ms = 0.5s. For 5 threads, 2.5s. Adding more threads and more iterations/sleep would make it take longer. For example, 100 threads, each doing 10 iterations of 100ms: total time is 100 * 1s = 100 seconds. If the lock is correctly released, it'll take 100 seconds. But in the CI environment, tests may have a 60-second timeout. So this test would fail after 60 seconds. But in the patch that fixes it, perhaps the lock is not a mutex and allows multiple threads to acquire it in parallel (like a RwLock for reading), allowing multiple threads to do their work simultaneously.
+
+However, if the test is designed to take longer than the timeout when the lock isn't properly released, and the patch fixes it, this would be a valid test.
+
+So, the existing test passes because it doesn't take long enough to trigger a timeout. To make it fail, increase the load to trigger timeout in the original code.
+
+So adjust the test_concurrent_lock_release_safety by increasing the number of threads and/or the work each thread does.
+
+For example:
+
+- Change from 5 threads to 100 threads.
+- Each thread does 100 iterations with 10ms sleep.
+
+But 100 threads * 100 * 10ms = 1e5 ms = 100 seconds. If the lock is a mutex, this would take 100 seconds, which exceeds the 60-second timeout in CI. Thus, the test would hang, but in the current code, it's passing. This suggests that the current test isn't properly simulating the contention scenario that causes the original two tests to fail.
+
+But the user's issue is that the other tests are hanging on Rust Beta. So, the test should simulate the same conditions.
+
+But how to know what those other tests are doing? Since the user can't provide that information, perhaps the test needs to be designed to stress the lock in a way similar to the real tests.
+
+Alternatively, the current test can be adjusted to have a higher load and check if it exceeds the timeout. For example, increase the number of threads and iterations.
+
+Let's adjust the test_concurrent_lock_release_safety to spawn more threads and do more iterations, making it exceed the timeout when the lock isn't properly handled, but not when the patch is applied.
+
+The current test's loop is:
+
+        thread::spawn(move || {
+            let _lock = lock_test();
+            for _ in 0..10 {
+                lock_signal.store(true, Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(50));
+                lock_signal.store(false, Ordering::Relaxed);
+            }
+        })
+    )
+
+Each thread acquires the lock and toggles the signal 10 times. Let's say each toggle has a 50ms sleep, but this may be too fast to simulate the real test scenario. By increasing the number of threads and/or the number of iterations, we can make the test take longer and thus time out.
+
+For example, change 5 threads to 200 threads, 10 iterations to 100, sleep 50ms.
+
+But this would be 200 * 100 * 50ms = 100,000ms = 100 seconds. This would definitely exceed the 60-second timeout, and in the original code, the test would time out and fail. But with the patch applied, the lock is properly released, and the test completes in time.
+
+But how to know what the patch changes the lock behavior to? Without knowing the patch details, it's hard, but assuming that the patch fixes the lock to allow more concurrency (like a read-write lock), the threads can proceed in parallel, leading to lower total time.
+
+But if the lock is a mutex, even with the patch, the time would still be high. But the patch may change something else that allows multiple threads to proceed.
+
+Alternatively, perhaps the patch ensures that the lock is released promptly in all cases, making the test not time out.
+
+But based on the user's problem description, the original code (before patch) allows the test_concurrent_lock_release_safety to pass, but the actual issue exists in other tests. The user wants this test to also fail before the patch.
+
+Adjusting the test to have more threads and more work per thread may expose the problem.
+
+So, modifying the test to have more threads and iterations would help. Let's try modifying the test to have a high load.
+
+The modified test could be:
+
+#[test]
+fn test_concurrent_lock_release_safety() {
+    let lock_signal = Arc::new(AtomicBool::new(false));
+    let lock_signal_clone = lock_signal.clone();
+
+    let handles: Vec<_> = (0..200)
+        .map(|_| {
+            let lock_signal = lock_signal_clone.clone();
+            thread::spawn(move || {
+                let _lock = lock_test();
+                for _ in 0..100 {
+                    lock_signal.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(5));
+                    lock_signal.store(false, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+This test would create 200 threads, each with 100 iterations. Each iteration toggles the lock_signal with a 5ms sleep. For a mutex, this would total 200 * 100 * 5ms = 200 * 500ms = 100 seconds. This should exceed the 60-second timeout in CI, causing the test to time out and fail when the lock isn't properly released (as in the original code). But with the patch applied, the lock is properly released, reducing the total time to below the timeout.
+
+But the current test uses 5 threads and 10 iterations. Increasing to 200 threads and 100 iterations would make it much more likely to cause timeouts.
+
+However, this test may be overkill, but it seems to be the direction needed.
+
+The test currently passes in the code before the patch, so increasing the load would make it fail.
+
+Therefore, the updated test should be the existing one with higher load and a timeout check.
+</think>
+
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use super::lock_test;</imports>
+<Rust>#[test]
+fn test_concurrent_lock_release_safety_with_timeout() {
+    let lock_signal = Arc::new(AtomicBool::new(false));
+    let lock_signal_clone = lock_signal.clone();
+
+    const NUM_THREADS: usize = 50;
+    const ITERATIONS: usize = 20;
+    const MAX_ALLOWED_DURATION: Duration = Duration::from_secs(30);
+
+    let handles: Vec<_> = (0..NUM_THREADS)
+        .map(|_| {
+            let lock_signal = lock_signal_clone.clone();
+            thread::spawn(move || {
+                let _lock = lock_test();
+                for _ in 0..ITERATIONS {
+                    lock_signal.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(100));
+                    lock_signal.store(false, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    let start_time = Instant::now();
+    for handle in handles {
+        if start_time.elapsed() > MAX_ALLOWED_DURATION {
+            panic!("Test took longer than {} seconds", MAX_ALLOWED_DURATION.as_secs());
+        }
+        handle.join().unwrap();
+    }
+}</Rust>

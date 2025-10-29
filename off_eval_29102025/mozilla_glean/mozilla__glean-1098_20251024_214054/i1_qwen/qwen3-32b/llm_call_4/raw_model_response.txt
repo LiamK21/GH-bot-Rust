@@ -1,0 +1,146 @@
+<think>
+Okay, I need to figure out why the existing test is failing and fix it. Let's look at the errors.
+
+The first error says that there's no method named `is_some` on the `DistributionData` struct. The test is trying to do `samples.is_some()` but that struct doesn't have this method. Similarly, `unwrap()` is being called on `DistributionData`, which doesn't exist either.
+
+Looking at the test code, the line in question is:
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+
+Assuming that `test_get_value` returns an `Option<DistributionData>`, the current test code is trying to check if it's some. But in the patched code, maybe `test_get_value` returns `DistributionData` directly, or maybe the structure of the tests has changed.
+
+Wait, in the patch, the metric is called `discarded_exceeding_pings_size`, which is of type `MemoryDistributionMetric`. The `test_get_value` method for metrics might now return the actual data instead of an Option. So the previous test used `Option::unwrap` but now it's not an option anymore. Or maybe `test_get_value` was changed to return a result that needs different handling.
+
+Looking at the test code in the patch's test block, in the `test_ping_over_1mb_rejected` function, the test does:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+assert!(samples.is_some());
+
+But the error says that `samples` is of type `DistributionData`, which doesn't have `is_some`. So maybe `test_get_value` now returns `Option<DistributionData>`? No, the error suggests that `samples` is a `DistributionData`, not an Option. Or perhaps `test_get_value` returns a DistributionData, and the `DistributionData` has a `count` field, which is the number of samples.
+
+So perhaps the test should directly assert that `samples.count == 1`, without using `is_some()` and `unwrap()`.
+
+In the test code, after getting `samples` (which is now a `DistributionData`), the test should check that the count is 1, not that it's some. So the correct code would be:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics");
+assert_eq!(samples.count, 1);
+
+But in the previous code, the test did `samples.unwrap().count`, expecting it to be an Option. So maybe in the new code, `test_get_value` is not an Option anymore. So the correct way is to call `test_get_value` and check the fields directly.
+
+So the fixed test would remove the `is_some` and `unwrap()` parts. Let me adjust the test accordingly.
+
+Additionally, I need to make sure that the test initializes the metric correctly in the code under test. So, the `UploadMetrics` struct's `discarded_exceeding_pings_size` is a `MemoryDistributionMetric`, and `test_get_value` is a method on it that returns something that has `count` as a field.
+
+So, in the corrected test, after triggering the ping, the test should call `test_get_value`, which now returns a `DistributionData` struct, and then assert the `count` field is 1.
+
+Now, in the current test code, after the line:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+
+It's trying to call `is_some` on the result, but `samples` is actually a `DistributionData` which has a `count` field. So the correct assertion is:
+
+assert_eq!(samples.count, 1);
+
+Therefore, the test should be adjusted to:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics").expect("Metric should be set");
+assert_eq!(samples.count, 1);
+
+But wait, the original patch's test uses `test_get_value` and then asserts on the count. The problem is that the current test incorrectly uses `unwrap` and checks for `is_some` which is unnecessary.
+
+So the corrected test would be to check `samples.count == 1` directly, without the `is_some` and `unwrap`. Let me adjust that in the test.
+
+So the final test code would be:
+
+let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+assert_eq!(samples.count, 1);
+
+Wait, but if `test_get_value` returns something that is an Option<DistributionData>, then the `unwrap` is okay. But if in the new code, `test_get_value` returns the DistributionData directly (assuming it's always present), then `unwrap` may not be needed. However, the error suggests that `test_get_value` now returns a DistributionData, not an Option, leading to the error. Therefore, the test should not unwrap an Option anymore.
+
+Alternatively, maybe the `test_get_value` method for memory distribution metrics returns a `DistributionData` struct, which has a count of the number of samples.
+
+So, the correct test code is:
+
+let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = discarded_metric.test_get_value(&glean, "metrics");
+assert_eq!(samples.count, 1);
+
+But in the existing test code, after the line where `samples` is assigned, it uses `unwrap()` which may not be necessary. So the correct line would be to remove the `unwrap()` and directly assert on the `count`.
+
+Therefore, the test code for the line should be:
+
+let samples = discarded_metric.test_get_value(&glean, "metrics");
+assert_eq!(samples.count, 1);
+
+Thus, the corrected test will pass once the metric is set properly by uploading a ping over 1MB.
+
+I need to adjust the test to avoid the `is_some()` and `unwrap()` and directly check the `count` field of the retrieved distribution data.
+
+So the final corrected test code would be:
+
+// Verify discard metric was recorded in the correct storage
+let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+let samples = discarded_metric.test_get_value(&glean, "metrics");
+assert_eq!(samples.count, 1);
+
+That way, the test checks that the count is 1, which would indicate that one ping was discarded.
+
+This should resolve the errors mentioned in the output.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::io::Write;
+use crate::upload::PingDirectoryManager;
+use crate::upload::PingUploadManager;
+use crate::Glean;
+use crate::error::ErrorKind;
+use crate::internal_metrics::UploadMetrics;
+use tempfile;
+</imports>
+<Rust>
+#[test]
+fn test_ping_over_1mb_rejected() {
+    let (glean, _) = new_glean(None);
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Create a ping payload with body size just over 1MB
+    let doc_id = "over_1mb";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body_size = 1024 * 1024 + 1;
+    let body = "x".repeat(body_size);
+
+    // Add the payload to pending pings
+    upload_manager.pending_pings.write().unwrap().push((
+        doc_id.to_string(),
+        path,
+        body,
+        None,
+    ));
+
+    // Process pending pings
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Verify ping was not enqueued
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => {}
+        _ => panic!("Unexpected upload task"),
+    }
+
+    // Verify discard metric was recorded in the correct storage
+    let discarded_metric = &upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    let samples = discarded_metric.test_get_value(&glean, "metrics").unwrap();
+    assert_eq!(samples.count, 1);
+}
+</Rust>

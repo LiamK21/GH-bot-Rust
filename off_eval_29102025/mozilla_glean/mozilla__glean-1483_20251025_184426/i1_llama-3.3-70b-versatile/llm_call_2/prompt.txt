@@ -1,0 +1,200 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Clear the dirty bit when shutting down in the RLB
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -352,6 +352,12 @@ pub fn shutdown() {
+         return;
+     }
+ 
++    dispatcher::launch(move || {
++        with_glean_mut(|glean| {
++            glean.set_dirty_flag(false);
++        })
++    });
++
+     if let Err(e) = dispatcher::shutdown() {
+         log::error!("Can't shutdown dispatcher thread: {:?}", e);
+     }
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -310,6 +310,67 @@ fn sending_of_startup_baseline_ping() {
+     assert_eq!(url.contains("baseline"), true);
+ }
+ 
++#[test]
++fn no_dirty_baseline_on_clean_shutdowns() {
++    let _lock = lock_test();
++
++    // Create an instance of Glean, wait for init and then flip the dirty
++    // bit to true.
++    let data_dir = new_glean(None, true);
++
++    crate::block_on_dispatcher();
++
++    with_glean_mut(|glean| glean.set_dirty_flag(true));
++
++    crate::shutdown();
++
++    // Restart glean and wait for a baseline ping to be generated.
++    let (s, r) = crossbeam_channel::bounded::<String>(1);
++
++    // Define a fake uploader that reports back the submission URL
++    // using a crossbeam channel.
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<String>,
++    }
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            url: String,
++            _body: Vec<u8>,
++            _headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            self.sender.send(url).unwrap();
++            net::UploadResult::HttpStatus(200)
++        }
++    }
++
++    // Create a custom configuration to use a fake uploader.
++    let tmpname = data_dir.path().display().to_string();
++
++    // Now reset Glean: it should not send a baseline ping, because
++    // we cleared the dirty bit.
++    test_reset_glean(
++        Configuration {
++            data_path: tmpname,
++            application_id: GLOBAL_APPLICATION_ID.into(),
++            upload_enabled: true,
++            max_events: None,
++            delay_ping_lifetime_io: false,
++            channel: Some("testing".into()),
++            server_endpoint: Some("invalid-test-host".into()),
++            uploader: Some(Box::new(FakeUploader { sender: s })),
++        },
++        ClientInfoMetrics::unknown(),
++        false,
++    );
++
++    crate::block_on_dispatcher();
++
++    // We don't expect a startup ping.
++    assert_eq!(r.try_recv(), Err(crossbeam_channel::TryRecvError::Empty));
++}
++
+ #[test]
+ fn initialize_must_not_crash_if_data_dir_is_messed_up() {
+     let _lock = lock_test();
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use super::shutdown;
+use super::with_glean_mut;
+use crate::block_on_dispatcher;
+use crossbeam_channel::bounded;
+use crossbeam_channel::TryRecvError;
+use glean_core::rlb::dispatcher;
+use glean_core::rlb::net;
+use std::thread;</imports>
+<Rust>#[test]
+fn test_shutdown_clears_dirty_bit() {
+  let (s, r) = bounded(1);
+  let data_dir = std::path::Path::new("/tmp/glean_test");
+  std::fs::create_dir_all(data_dir).unwrap();
+  dispatcher::launch(move || {
+    with_glean_mut(|glean| {
+      glean.set_dirty_flag(true);
+    })
+  });
+  block_on_dispatcher();
+  shutdown();
+  dispatcher::launch(move || {
+    with_glean_mut(|glean| {
+      assert_eq!(glean.get_dirty_flag(), false);
+    })
+  });
+  block_on_dispatcher();
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `glean_core::rlb`
+   --> glean-core/rlb/src/test.rs:989:17
+    |
+989 | use glean_core::rlb::dispatcher;
+    |                 ^^^ could not find `rlb` in `glean_core`
+
+error[E0432]: unresolved import `glean_core::rlb`
+   --> glean-core/rlb/src/test.rs:990:17
+    |
+990 | use glean_core::rlb::net;
+    |                 ^^^ could not find `rlb` in `glean_core`
+
+error[E0599]: no method named `get_dirty_flag` found for mutable reference `&mut Glean` in the current scope
+    --> glean-core/rlb/src/test.rs:1007:24
+     |
+1007 |       assert_eq!(glean.get_dirty_flag(), false);
+     |                        ^^^^^^^^^^^^^^
+     |
+help: there is a method `set_dirty_flag` with a similar name, but with different arguments
+    --> /app/testbed/glean-core/src/lib.rs:865:5
+     |
+865  |     pub fn set_dirty_flag(&self, new_value: bool) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</output>
+
+Function signatures
+<Signatures>
+pub fn shutdown() -> ()
+
+fn sending_of_startup_baseline_ping() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

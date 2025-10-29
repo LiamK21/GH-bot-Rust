@@ -1,0 +1,157 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Enable uploading of gzipped ping payloads on iOS
+This is to use the work of bug 1635794 to enable gzip ping upload in Glean for iOS.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/upload.rs b/glean-core/ffi/src/upload.rs
+--- a/glean-core/ffi/src/upload.rs
++++ b/glean-core/ffi/src/upload.rs
+@@ -10,7 +10,7 @@
+ use std::ffi::CString;
+ use std::os::raw::c_char;
+ 
+-use ffi_support::IntoFfi;
++use ffi_support::{ByteBuffer, IntoFfi};
+ 
+ use crate::glean_str_free;
+ use glean_core::upload::PingUploadTask;
+@@ -101,7 +101,7 @@ pub enum FfiPingUploadTask {
+     Upload {
+         document_id: *mut c_char,
+         path: *mut c_char,
+-        body: *mut c_char,
++        body: ByteBuffer,
+         headers: *mut c_char,
+     },
+     Wait,
+@@ -114,17 +114,15 @@ impl From<PingUploadTask> for FfiPingUploadTask {
+             PingUploadTask::Upload(request) => {
+                 // Safe unwraps:
+                 // 1. CString::new(..) should not fail as we are the ones that created the strings being transformed;
+-                // 2. serde_json::to_string(&request.body) should not fail as request.body is a JsonValue;
+-                // 3. serde_json::to_string(&request.headers) should not fail as request.headers is a HashMap of Strings.
++                // 2. serde_json::to_string(&request.headers) should not fail as request.headers is a HashMap of Strings.
+                 let document_id = CString::new(request.document_id.to_owned()).unwrap();
+                 let path = CString::new(request.path.to_owned()).unwrap();
+-                let body = CString::new(serde_json::to_string(&request.body).unwrap()).unwrap();
+                 let headers =
+                     CString::new(serde_json::to_string(&request.headers).unwrap()).unwrap();
+                 FfiPingUploadTask::Upload {
+                     document_id: document_id.into_raw(),
+                     path: path.into_raw(),
+-                    body: body.into_raw(),
++                    body: ByteBuffer::from_vec(request.body),
+                     headers: headers.into_raw(),
+                 }
+             }
+@@ -147,9 +145,14 @@ impl Drop for FfiPingUploadTask {
+             unsafe {
+                 glean_str_free(*document_id);
+                 glean_str_free(*path);
+-                glean_str_free(*body);
+                 glean_str_free(*headers);
+             }
++            // Unfortunately, we cannot directly call `body.destroy();` as
++            // we're behind a mutable reference, so we have to manually take the
++            // ownership and drop. Moreover, `ByteBuffer::new_with_size(0)`
++            // does not allocate, so we are not leaking memory.
++            let body = std::mem::replace(body, ByteBuffer::new_with_size(0));
++            body.destroy();
+         }
+     }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/ffi/src/upload.rs</Filename>
+<imports>use ffi_support::ByteBuffer;
+use std::ffi::CString;
+use std::os::raw::c_char;</imports>
+<Rust>#[test]
+fn test_gzip_ping_upload() {
+    let document_id = CString::new("test_document_id").unwrap();
+    let path = CString::new("/test/path").unwrap();
+    let body_data = vec![1, 2, 3, 4, 5]; // Example gzipped data
+    let headers = CString::new("{\"Content-Encoding\": \"gzip\"}").unwrap();
+
+    let task = FfiPingUploadTask::Upload {
+        document_id: document_id.into_raw(),
+        path: path.into_raw(),
+        body: ByteBuffer::from_vec(body_data.clone()),
+        headers: headers.into_raw(),
+    };
+
+    if let FfiPingUploadTask::Upload { body, .. } = task {
+        let actual_body = unsafe { Vec::from_raw_parts(body.data, body.len, body.capacity) };
+        assert_eq!(actual_body, body_data);
+    } else {
+        panic!("Expected FfiPingUploadTask::Upload variant");
+    }
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/upload.rs:125:48
+    |
+125 |                     body: ByteBuffer::from_vec(request.body),
+    |                           -------------------- ^^^^^^^^^^^^ expected `Vec<u8>`, found `Value`
+    |                           |
+    |                           arguments to this function are incorrect
+    |
+    = note: expected struct `Vec<u8>`
+                 found enum `Value`
+note: associated function defined here
+   --> /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ffi-support-0.4.0/src/lib.rs:428:12
+    |
+428 |     pub fn from_vec(bytes: Vec<u8>) -> Self {
+    |            ^^^^^^^^
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

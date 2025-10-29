@@ -1,0 +1,245 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Extend Glean's RLB `PingType` impl to support retrieving metadata
+We would like to be able to record gecko profiler markers whenever a `Glean::Ping` is sent by FoG. Unfortunately, at present, we do not have access to any of the `Ping` metadata that would be needed to record a useful marker. 
+
+We would like to record a marker during `Ping::submit`, [here]([ping::private::Ping::Ping::submit](https://searchfox.org/mozilla-central/rev/f41e8cacb8e8ce254204e2526e98d49d024f1674/toolkit/components/glean/api/src/private/ping.rs#92)). At this point we have both a reason (an `Option<&str>`), and `&self`. The latter contains a `glean::private::PingType` [member]([ping::private::Parent](https://searchfox.org/mozilla-central/rev/f41e8cacb8e8ce254204e2526e98d49d024f1674/toolkit/components/glean/api/src/private/ping.rs#14)), which in turn contains a member of an (internal to Glean) [`glean_core::metrics::PingType`]([ping::private::PingType](https://searchfox.org/mozilla-central/rev/f41e8cacb8e8ce254204e2526e98d49d024f1674/third_party/rust/glean/src/private/ping.rs#13)). As this member is only accessible within the internal Glean APIs and RLB, we cannot access it, nor its details. (This is good design).
+
+However, we still would like to get some of these details, as we need them when we record a marker! This bug proposes that the `ping::private::PingType` [impl]([ping::private::PingType](https://searchfox.org/mozilla-central/rev/f41e8cacb8e8ce254204e2526e98d49d024f1674/third_party/rust/glean/src/private/ping.rs#22)) be extended to add a full panopoly of methods allowing access to `Ping` metadata. This should probably include (but may not be limited to): 
+
+```
+// Get the name of the ping
+fn get_name(&'a self) -> &'a str
+
+// Does the ping include a client ID?
+fn includes_client_id(&self) -> bool
+
+// Should we send the ping if it's empty?
+fn should_send_if_empty(&self) -> bool
+
+// Does the ping include precise timestamps? 
+fn includes_precise_timestamps(&self) -> bool
+
+// Does the ping include info sections?
+fn includes_info_sections(&self) -> bool
+
+// Whether or not the ping is enabled
+fn is_enabled(&self) -> bool
+
+// An iterator over the pings that this ping schedules
+fn get_schedules_pings(&'a self) -> Iter<'a str, T>
+
+// An iterator over the reason codes for this ping
+fn get_reason_codes(&'a self) -> Iter<'a str, T>
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/ping.rs b/glean-core/rlb/src/private/ping.rs
+--- a/glean-core/rlb/src/private/ping.rs
++++ b/glean-core/rlb/src/private/ping.rs
+@@ -94,6 +94,55 @@ impl PingType {
+         self.inner.submit(reason.map(|s| s.to_string()))
+     }
+ 
++    /// Get the name of this Ping
++    pub fn name(&self) -> &str {
++        self.inner.name()
++    }
++
++    /// Whether the client ID will be included in the assembled ping when submitting.
++    pub fn include_client_id(&self) -> bool {
++        self.inner.include_client_id()
++    }
++
++    /// Whether the ping should be sent if empty.
++    pub fn send_if_empty(&self) -> bool {
++        self.inner.send_if_empty()
++    }
++
++    /// Whether the ping will include precise timestamps for the start/end time.
++    pub fn precise_timestamps(&self) -> bool {
++        self.inner.precise_timestamps()
++    }
++
++    /// Whether client/ping_info sections will be included in this ping.
++    pub fn include_info_sections(&self) -> bool {
++        self.inner.include_info_sections()
++    }
++
++    /// Whether the `enabled` field of this ping is set. Note that whether or
++    /// not a ping is actually enabled is dependent upon the underlying glean
++    /// instance settings, and `follows_collection_enabled`. In other words,
++    /// a Ping might actually be enabled even if the enabled field is not
++    /// set (with this function returning `false`).
++    pub fn naively_enabled(&self) -> bool {
++        self.inner.naively_enabled()
++    }
++
++    /// Whether this ping follows the `collection_enabled` (aka `upload_enabled`) flag.
++    pub fn follows_collection_enabled(&self) -> bool {
++        self.inner.follows_collection_enabled()
++    }
++
++    /// Other pings that should be scheduled when this ping is sent.
++    pub fn schedules_pings(&self) -> &[String] {
++        self.inner.schedules_pings()
++    }
++
++    /// Reason codes that this ping can send.
++    pub fn reason_codes(&self) -> &[String] {
++        self.inner.reason_codes()
++    }
++
+     /// **Test-only API**
+     ///
+     /// Attach a callback to be called right before a new ping is submitted.
+
+diff --git a/glean-core/src/metrics/ping.rs b/glean-core/src/metrics/ping.rs
+--- a/glean-core/src/metrics/ping.rs
++++ b/glean-core/src/metrics/ping.rs
+@@ -135,23 +135,28 @@ impl PingType {
+         this
+     }
+ 
+-    pub(crate) fn name(&self) -> &str {
++    /// Get the name of this Ping
++    pub fn name(&self) -> &str {
+         &self.0.name
+     }
+ 
+-    pub(crate) fn include_client_id(&self) -> bool {
++    /// Whether the client ID will be included in the assembled ping when submitting.
++    pub fn include_client_id(&self) -> bool {
+         self.0.include_client_id
+     }
+ 
+-    pub(crate) fn send_if_empty(&self) -> bool {
++    /// Whether the ping should be sent if empty.
++    pub fn send_if_empty(&self) -> bool {
+         self.0.send_if_empty
+     }
+ 
+-    pub(crate) fn precise_timestamps(&self) -> bool {
++    /// Whether the ping will include precise timestamps for the start/end time.
++    pub fn precise_timestamps(&self) -> bool {
+         self.0.precise_timestamps
+     }
+ 
+-    pub(crate) fn include_info_sections(&self) -> bool {
++    /// Whether client/ping_info sections will be included in this ping.
++    pub fn include_info_sections(&self) -> bool {
+         self.0.include_info_sections
+     }
+ 
+@@ -194,14 +199,29 @@ impl PingType {
+         self.0.enabled.load(Ordering::Relaxed)
+     }
+ 
+-    pub(crate) fn follows_collection_enabled(&self) -> bool {
++    /// Whether the `enabled` field of this ping is set. Note that there are
++    /// multiple other reasons why a ping may or may not be enabled. See
++    /// `PingType::new` and `PingType::enabled` for more details.
++    pub fn naively_enabled(&self) -> bool {
++        self.0.enabled.load(Ordering::Relaxed)
++    }
++
++    /// Whether this ping follows the `collection_enabled` flag
++    /// See InnerPing member documentation for further details.
++    pub fn follows_collection_enabled(&self) -> bool {
+         self.0.follows_collection_enabled.load(Ordering::Relaxed)
+     }
+ 
+-    pub(crate) fn schedules_pings(&self) -> &[String] {
++    /// Other pings that should be scheduled when this ping is sent.
++    pub fn schedules_pings(&self) -> &[String] {
+         &self.0.schedules_pings
+     }
+ 
++    /// Reason codes that this ping can send.
++    pub fn reason_codes(&self) -> &[String] {
++        &self.0.reason_codes
++    }
++
+     /// Submits the ping for eventual uploading.
+     ///
+     /// The ping content is assembled as soon as possible, but upload is not
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/ping.rs</Filename>
+<imports>use glean_core::PingType as CorePingType;
+use glean_core::PingConfiguration;</imports>
+<Rust>#[test]
+fn test_ping_type_metadata_access() {
+    let core_ping = CorePingType::new(
+        "test_name",
+        &PingConfiguration {
+            include_client_id: true,
+            send_if_empty: false,
+            precise_timestamps: true,
+            include_info_sections: false,
+            enabled: true,
+            follows_collection_enabled: true,
+            schedules_pings: vec![String::from("scheduled_ping")],
+            reason_codes: vec![String::from("reason_code")],
+        },
+    );
+    let ping = super::PingType { inner: std::sync::Rc::new(core_ping) };
+
+    assert_eq!(ping.name(), "test_name");
+    assert!(ping.include_client_id());
+    assert!(!ping.send_if_empty());
+    assert!(ping.precise_timestamps());
+    assert!(!ping.include_info_sections());
+    assert!(ping.naively_enabled());
+    assert!(ping.follows_collection_enabled());
+    assert_eq!(ping.schedules_pings(), &["scheduled_ping"]);
+    assert_eq!(ping.reason_codes(), &["reason_code"]);
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

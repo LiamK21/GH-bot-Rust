@@ -1,0 +1,213 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Fix lock order inversion in RLB Timing Distribution
+[TSan found a lock order inversion in Timing Distribution](https://treeherder.mozilla.org/logviewer?job_id=326625964&repo=try&lineNumber=3015-3188), which we need to fix.
+
+Should be a matter of doing [the same thing we did for events and timespans](https://github.com/mozilla/glean/pull/1378).
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/timing_distribution.rs b/glean-core/rlb/src/private/timing_distribution.rs
+--- a/glean-core/rlb/src/private/timing_distribution.rs
++++ b/glean-core/rlb/src/private/timing_distribution.rs
+@@ -65,12 +65,18 @@ impl glean_core::traits::TimingDistribution for TimingDistributionMetric {
+     ) -> Option<DistributionData> {
+         crate::block_on_dispatcher();
+ 
+-        let inner = self.0.read().unwrap();
+-        let queried_ping_name = ping_name
+-            .into()
+-            .unwrap_or_else(|| &inner.meta().send_in_pings[0]);
++        crate::with_glean(|glean| {
++            // The order of taking these locks matter. Glean must be first.
++            let inner = self
++                .0
++                .read()
++                .expect("Lock poisoned for timing distribution metric on test_get_value.");
++            let queried_ping_name = ping_name
++                .into()
++                .unwrap_or_else(|| &inner.meta().send_in_pings[0]);
+ 
+-        crate::with_glean(|glean| inner.test_get_value(glean, queried_ping_name))
++            inner.test_get_value(glean, queried_ping_name)
++        })
+     }
+ 
+     fn test_get_num_recorded_errors<'a, S: Into<Option<&'a str>>>(
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/timing_distribution.rs</Filename>
+<imports>use super::TimingDistributionMetric;
+use crate::test_with_glean;
+use glean_core::DistributionData;</imports>
+<Rust>#[test]
+fn test_get_value_lock_order_regression() {
+    test_with_glean(|glean| {
+        // Create a metric with some recorded values
+        let metric = TimingDistributionMetric::new("test".into(), "category", true);
+        metric.record(100);
+
+        // Access the test_get_value function which exercises the lock order
+        let value = metric.test_get_value::<&str>(None);
+
+        // Verify the structure, ensuring the code path executed without lock inversion
+        assert!(value.is_some());
+        let data = value.unwrap();
+        assert_eq!(data.min.unwrap(), 100);
+        assert_eq!(data.max.unwrap(), 100);
+        assert_eq!(data.sum.unwrap(), 100);
+    });
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `glean_core::DistributionData`
+   --> glean-core/rlb/src/private/timing_distribution.rs:105:5
+    |
+105 | use glean_core::DistributionData;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `DistributionData` in the root
+    |
+help: consider importing one of these structs instead
+    |
+105 - use glean_core::DistributionData;
+105 + use crate::DistributionData;
+    |
+105 | use glean_core::metrics::DistributionData;
+    |                 +++++++++
+
+error[E0432]: unresolved import `crate::test_with_glean`
+   --> glean-core/rlb/src/private/timing_distribution.rs:104:5
+    |
+104 | use crate::test_with_glean;
+    |     ^^^^^^^---------------
+    |     |      |
+    |     |      help: a similar name exists in the module: `with_glean`
+    |     no `test_with_glean` in the root
+
+error[E0277]: the trait bound `glean_core::CommonMetricData: From<&str>` is not satisfied
+   --> glean-core/rlb/src/private/timing_distribution.rs:111:59
+    |
+111 |         let metric = TimingDistributionMetric::new("test".into(), "category", true);
+    |                                                           ^^^^ the trait `From<&str>` is not implemented for `glean_core::CommonMetricData`
+    |
+    = note: required for `&str` to implement `Into<glean_core::CommonMetricData>`
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+   --> glean-core/rlb/src/private/timing_distribution.rs:111:22
+    |
+111 |         let metric = TimingDistributionMetric::new("test".into(), "category", true);
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                ----------  ---- unexpected argument #3 of type `bool`
+    |                                                                   |
+    |                                                                   expected `TimeUnit`, found `&str`
+    |
+note: associated function defined here
+   --> glean-core/rlb/src/private/timing_distribution.rs:30:12
+    |
+30  |     pub fn new(meta: glean_core::CommonMetricData, time_unit: TimeUnit) -> Self {
+    |            ^^^                                     -------------------
+help: remove the extra argument
+    |
+111 -         let metric = TimingDistributionMetric::new("test".into(), "category", true);
+111 +         let metric = TimingDistributionMetric::new("test".into(), /* glean_core::metrics::TimeUnit */);
+    |
+
+error[E0599]: no method named `record` found for struct `timing_distribution::TimingDistributionMetric` in the current scope
+   --> glean-core/rlb/src/private/timing_distribution.rs:112:16
+    |
+24  | pub struct TimingDistributionMetric(
+    | ----------------------------------- method `record` not found for this struct
+...
+112 |         metric.record(100);
+    |                ^^^^^^ method not found in `timing_distribution::TimingDistributionMetric`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `record`, perhaps you need to implement it:
+            candidate #1: `Event`
+
+error[E0308]: mismatched types
+   --> glean-core/rlb/src/private/timing_distribution.rs:115:51
+    |
+115 |         let value = metric.test_get_value::<&str>(None);
+    |                            ---------------------- ^^^^ expected `&str`, found `Option<_>`
+    |                            |
+    |                            arguments to this method are incorrect
+    |
+    = note: expected reference `&str`
+                    found enum `std::option::Option<_>`
+note: method defined here
+   --> glean-core/rlb/src/private/timing_distribution.rs:62:8
+    |
+37  | #[inherent(pub)]
+    | ----------------
+...
+62  |     fn test_get_value<'a, S: Into<Option<&'a str>>>(
+    |        ^^^^^^^^^^^^^^
+
+error[E0609]: no field `min` on type `DistributionData`
+   --> glean-core/rlb/src/private/timing_distribution.rs:120:25
+    |
+120 |         assert_eq!(data.min.unwrap(), 100);
+    |                         ^^^ unknown field
+    |
+    = note: available fields are: `values`, `sum`
+
+error[E0609]: no field `max` on type `DistributionData`
+   --> glean-core/rlb/src/private/timing_distribution.rs:121:25
+    |
+121 |         assert_eq!(data.max.unwrap(), 100);
+    |                         ^^^ unknown field
+    |
+    = note: available fields are: `values`, `sum`
+
+error[E0599]: no method named `unwrap` found for type `u64` in the current scope
+   --> glean-core/rlb/src/private/timing_distribution.rs:122:29
+    |
+122 |         assert_eq!(data.sum.unwrap(), 100);
+    |                             ^^^^^^ method not found in `u64`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

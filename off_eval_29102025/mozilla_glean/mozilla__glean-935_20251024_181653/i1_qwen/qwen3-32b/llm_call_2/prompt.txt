@@ -1,0 +1,211 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Pings not uploading with mozregression-gui on Windows w/ 32-bit python if glean db created on a different architecture
+Steps to reproduce:
+
+* Download this build of mozregression on Windows, install and run: https://ci.appveyor.com/project/wlach/mozregression/builds/33053623/artifacts (corresponding to this PR: https://github.com/mozilla/mozregression/pull/626)
+* Right-click on the log view and select "debug"
+* Run a single build
+
+Expected:
+* Should see some lines indicating glean pings were sent e.g.:
+
+```
+2020-05-22T07:33:10.001000: DEBUG : glean.net.http_client: Ping upload: 200
+2020-05-22T07:33:10.001000: DEBUG : glean.net.http_client: Ping successfully sent (200)
+2020-05-22T07:33:10.001000: DEBUG : glean.net.ping_upload_worker: 50eb7324-9c42-4b87-8a15-c303b1bfb539 was deleted
+```
+
+Actual:
+
+No Glean lines indicating they were sent.
+
+Strangely, if I run this in my local development (even a pyinstaller version built using `python gui\build.py bundle`), this works fine. I'm using a PR with the latest branch as an example, but master is also broken: it appears that this broke sometime since I released mozregression 4.0.4, but not sure when.
+
+Incidentally it would be nice if the glean python bindings printed at least a few lines of debug output indicating e.g. that the SDK has been initialized, a ping has been requested to be sent, etc. My guess is that the problem's with the lower-level machinery here, but I can't know that for certain.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/handlemap_ext.rs b/glean-core/ffi/src/handlemap_ext.rs
+--- a/glean-core/ffi/src/handlemap_ext.rs
++++ b/glean-core/ffi/src/handlemap_ext.rs
+@@ -41,7 +41,7 @@ pub fn log_if_error(error: ExternError) {
+     if !error.get_code().is_success() {
+         // in practice this should never panic, but you never know...
+         ffi_support::abort_on_panic::call_with_output(|| {
+-            log::warn!(
++            log::error!(
+                 "Glean failed ({:?}): {}",
+                 error.get_code(),
+                 error.get_message().as_str()
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/ffi/src/handlemap_ext.rs</Filename>
+<imports>use log::error;
+use log::Level;
+use log::Log;
+use log::Record;
+use log::SetLoggerError;
+use std::io::Write;
+use log::Logger;</imports>
+<Rust>#[test]
+fn test_log_if_error_logs_error_correctly() {
+    // Simple logger to capture logs
+    static mut LOGGER: TestLogger = TestLogger { output: String::new() };
+
+    struct TestLogger {
+        output: String,
+    }
+
+    impl TestLogger {
+        fn new() -> Self {
+            TestLogger { output: String::new() }
+        }
+    }
+
+    impl Log for TestLogger {
+        fn enabled(&self, _: &Record) -> bool { true }
+
+        fn log(&self, record: &Record) {
+            if record.level() == Level::Error {
+                self.output.push_str(record.args().to_string().as_str());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    // Set up environment logger
+    unsafe {
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Error);
+    }
+
+    // Simulate a non-success error
+    // (Assuming ExternError is a mocked type here for test)
+    let error = ExternError {
+        code: 1, // Non-success code
+        message: "Test message".to_string(),
+    };
+
+    // Call the function under test
+    log_if_error(error);
+
+    // Check that the log contains the error message
+    unsafe {
+        assert!(LOGGER.output.contains("Glean failed (1): Test message"));
+    }
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `log::Logger`
+   --> glean-core/ffi/src/handlemap_ext.rs:160:5
+    |
+160 | use log::Logger;
+    |     ^^^^^^^^^^^ no `Logger` in the root
+    |
+help: a similar name exists in the module
+    |
+160 - use log::Logger;
+160 + use log::LOGGER;
+    |
+help: consider importing this struct instead
+    |
+160 - use log::Logger;
+160 + use env_logger::Logger;
+    |
+
+error[E0422]: cannot find struct, variant or union type `ExternError` in this scope
+   --> glean-core/ffi/src/handlemap_ext.rs:197:17
+    |
+197 |     let error = ExternError {
+    |                 ^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing one of these structs
+    |
+154 + use crate::handlemap_ext::ExternError;
+    |
+154 + use ffi_support::ExternError;
+    |
+
+error[E0425]: cannot find function `log_if_error` in this scope
+   --> glean-core/ffi/src/handlemap_ext.rs:203:5
+    |
+203 |     log_if_error(error);
+    |     ^^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+154 + use crate::handlemap_ext::log_if_error;
+    |
+
+error[E0053]: method `enabled` has an incompatible type for trait
+   --> glean-core/ffi/src/handlemap_ext.rs:178:30
+    |
+178 |         fn enabled(&self, _: &Record) -> bool { true }
+    |                              ^^^^^^^ expected `log::Metadata<'_>`, found `Record<'_>`
+    |
+    = note: expected signature `fn(&TestLogger, &log::Metadata<'_>) -> _`
+               found signature `fn(&TestLogger, &Record<'_>) -> _`
+help: change the parameter type to match the trait
+    |
+178 -         fn enabled(&self, _: &Record) -> bool { true }
+178 +         fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
+    |
+
+error[E0596]: cannot borrow `self.output` as mutable, as it is behind a `&` reference
+   --> glean-core/ffi/src/handlemap_ext.rs:182:17
+    |
+180 |         fn log(&self, record: &Record) {
+    |                ----- this is an immutable reference
+181 |             if record.level() == Level::Error {
+182 |                 self.output.push_str(record.args().to_string().as_str());
+    |                 ^^^^^^^^^^^ `self` is a `&` reference, so the data it refers to cannot be borrowed as mutable
+</output>
+
+Function signatures
+<Signatures>
+pub fn log_if_error(error: ExternError) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

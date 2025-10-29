@@ -1,0 +1,243 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the new format for Event extra keys
+This is a bug for implementing the recommendations from the proposal in bug 1613944 in the Glean SDK.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/event.rs b/glean-core/rlb/src/private/event.rs
+--- a/glean-core/rlb/src/private/event.rs
++++ b/glean-core/rlb/src/private/event.rs
+@@ -56,13 +56,11 @@ impl<K: traits::ExtraKeys> EventMetric<K> {
+ impl<K: traits::ExtraKeys> traits::Event for EventMetric<K> {
+     type Extra = K;
+ 
+-    fn record<M: Into<Option<HashMap<<Self as traits::Event>::Extra, String>>>>(&self, extra: M) {
++    fn record<M: Into<Option<<Self as traits::Event>::Extra>>>(&self, extra: M) {
+         let now = crate::get_timestamp_ms();
+ 
+-        // Translate from [ExtraKey -> String] to a [Int -> String] map
+-        let extra = extra
+-            .into()
+-            .map(|h| h.into_iter().map(|(k, v)| (k.index(), v)).collect());
++        // Translate from {ExtraKey -> String} to a [Int -> String] map
++        let extra = extra.into().map(|e| e.into_ffi_extra());
+         let metric = Arc::clone(&self.inner);
+         crate::launch_with_glean(move |glean| metric.record(glean, now, extra));
+     }
+@@ -130,17 +128,20 @@ mod test {
+         let _lock = lock_test();
+         let _t = new_glean(None, true);
+ 
+-        #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+-        enum SomeExtra {
+-            Key1,
+-            Key2,
++        #[derive(Default, Debug, Clone, Hash, Eq, PartialEq)]
++        struct SomeExtra {
++            key1: Option<String>,
++            key2: Option<String>,
+         }
+ 
+         impl glean_core::traits::ExtraKeys for SomeExtra {
+             const ALLOWED_KEYS: &'static [&'static str] = &["key1", "key2"];
+ 
+-            fn index(self) -> i32 {
+-                self as i32
++            fn into_ffi_extra(self) -> HashMap<i32, String> {
++                let mut map = HashMap::new();
++                self.key1.and_then(|key1| map.insert(0, key1));
++                self.key2.and_then(|key2| map.insert(1, key2));
++                map
+             }
+         }
+ 
+@@ -151,13 +152,16 @@ mod test {
+             ..Default::default()
+         });
+ 
+-        let mut map1 = HashMap::new();
+-        map1.insert(SomeExtra::Key1, "1".into());
++        let map1 = SomeExtra {
++            key1: Some("1".into()),
++            ..Default::default()
++        };
+         metric.record(map1);
+ 
+-        let mut map2 = HashMap::new();
+-        map2.insert(SomeExtra::Key1, "1".into());
+-        map2.insert(SomeExtra::Key2, "2".into());
++        let map2 = SomeExtra {
++            key1: Some("1".into()),
++            key2: Some("2".into()),
++        };
+         metric.record(map2);
+ 
+         metric.record(None);
+
+diff --git a/glean-core/src/traits/event.rs b/glean-core/src/traits/event.rs
+--- a/glean-core/src/traits/event.rs
++++ b/glean-core/src/traits/event.rs
+@@ -13,23 +13,22 @@ use crate::ErrorType;
+ ///
+ /// Extra keys need to be pre-defined and map to a string representation.
+ ///
+-/// For user-defined `EventMetric`s these will be defined as `enums`.
+-/// Each variant will correspond to an entry in the `ALLOWED_KEYS` list.
++/// For user-defined `EventMetric`s these will be defined as `struct`s.
++/// Each extra key will be a field in that struct.
++/// Each field will correspond to an entry in the `ALLOWED_KEYS` list.
+ /// The Glean SDK requires the keys as strings for submission in pings,
+ /// whereas in code we want to provide users a type to work with
+ /// (e.g. to avoid typos or misuse of the API).
+-pub trait ExtraKeys: Hash + Eq + PartialEq + Copy {
++pub trait ExtraKeys {
+     /// List of allowed extra keys as strings.
+     const ALLOWED_KEYS: &'static [&'static str];
+ 
+-    /// The index of the extra key.
++    /// Convert the event extras into 2 lists:
+     ///
+-    /// It corresponds to its position in the associated `ALLOWED_KEYS` list.
+-    ///
+-    /// *Note*: An index of `-1` indicates an invalid / non-existing extra key.
+-    /// Invalid / non-existing extra keys will be recorded as an error.
+-    /// This cannot happen for generated code.
+-    fn index(self) -> i32;
++    /// 1. The list of extra key indices.
++    ///    Unset keys will be skipped.
++    /// 2. The list of extra values.
++    fn into_ffi_extra(self) -> HashMap<i32, String>;
+ }
+ 
+ /// Default of no extra keys for events.
+@@ -45,9 +44,8 @@ pub enum NoExtraKeys {}
+ impl ExtraKeys for NoExtraKeys {
+     const ALLOWED_KEYS: &'static [&'static str] = &[];
+ 
+-    fn index(self) -> i32 {
+-        // This index will never be used.
+-        -1
++    fn into_ffi_extra(self) -> HashMap<i32, String> {
++        unimplemented!("non-existing extra keys can't be turned into a list")
+     }
+ }
+ 
+@@ -87,11 +85,8 @@ pub trait Event {
+     ///
+     /// # Arguments
+     ///
+-    /// * `extra` - A [`HashMap`] of (key, value) pairs. The key is one of the allowed extra keys as
+-    ///             set in the metric defintion.
+-    ///             If a wrong key is used or a value is larger than allowed, an error is reported
+-    ///             and no event is recorded.
+-    fn record<M: Into<Option<HashMap<Self::Extra, String>>>>(&self, extra: M);
++    /// * `extra` - (optional) An object for the extra keys.
++    fn record<M: Into<Option<Self::Extra>>>(&self, extra: M);
+ 
+     /// **Exported for test purposes.**
+     ///
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/event.rs</Filename>
+<imports>use glean_core::traits::ExtraKeys;
+use glean_core::traits::Event;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_event_record_with_extra_keys() {
+  // Initialize required variables
+  struct SomeExtra {
+    key1: Option<String>,
+    key2: Option<String>,
+  }
+
+  impl glean_core::traits::ExtraKeys for SomeExtra {
+    const ALLOWED_KEYS: &'static [&'static str] = &["key1", "key2"];
+
+    fn into_ffi_extra(self) -> HashMap<i32, String> {
+      let mut map = HashMap::new();
+      self.key1.and_then(|key1| map.insert(0, key1));
+      self.key2.and_then(|key2| map.insert(1, key2));
+      map
+    }
+  }
+
+  // Define expected variable
+  let expected = HashMap::from([(0, "1".to_string()), (1, "2".to_string())]);
+
+  // Generate actual variables
+  let actual = SomeExtra {
+    key1: Some("1".to_string()),
+    key2: Some("2".to_string()),
+  };
+
+  // Compare expected with actual
+  let metric: EventMetric<SomeExtra> = EventMetric { inner: Arc::new(()) };
+  metric.record(Some(actual));
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> glean-core/rlb/src/private/event.rs:219:74
+    |
+219 |       let metric: EventMetric<SomeExtra> = EventMetric { inner: Arc::new(()) };
+    |                                                                 -------- ^^ expected `EventMetric`, found `()`
+    |                                                                 |
+    |                                                                 arguments to this function are incorrect
+    |
+note: associated function defined here
+   --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/alloc/src/sync.rs:407:12
+
+error[E0063]: missing field `extra_keys` in initializer of `event::EventMetric<_>`
+   --> glean-core/rlb/src/private/event.rs:219:44
+    |
+219 |       let metric: EventMetric<SomeExtra> = EventMetric { inner: Arc::new(()) };
+    |                                            ^^^^^^^^^^^ missing `extra_keys`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,256 @@
+<think>
+Okay, let's see. The user provided a patch where they replaced the += operator with saturating_add in the merge methods of the Histogram struct. The issue was about inconsistency between accumulate and merge methods regarding overflow handling.
+
+The existing test test_merge_saturating_addition is failing with an error that LinearOrExponential doesn't have a clone method. Looking at the test code, in the line bucketing.clone(), the compiler is complaining because LinearOrExponential doesn't implement Clone. So, the problem is that the test is trying to clone the bucketing enum, but it's not Clone.
+
+To fix this, I need to figure out how to create another instance of LinearOrExponential without cloning. The original code probably used a PrecomputedLinear struct. Since the test is creating a PrecomputedLinear with OnceCell, maybe the bucketing can be cloned if the PrecomputedLinear is Clone. But wait, PrecomputedLinear contains a OnceCell, which is not Clone. Oh, right, because the original bucketing for h1 is initialized with OnceCell::from, and then h2 is trying to clone it. That's the root of the problem.
+
+So how can I create two separate instances of PrecomputedLinear without cloning? The PrecomputedLinear struct has a OnceCell, which is not Clone, but maybe I can create two separate PrecomputedLinear instances that share the same data. For example, by creating a new PrecomputedLinear with the same bucket_ranges but not using OnceCell. Wait, the OnceCell in PrecomputedLinear is already initialized with a value. If I create another PrecomputedLinear instance with the same bucket_ranges, maybe using OnceCell::from again, that would work.
+
+So instead of using clone on the LinearOrExponential, I can create two separate PrecomputedLinear instances. Let me adjust the test code. The original test creates a LinearOrExponential with a PrecomputedLinear. So in the test, instead of cloning the bucketing, create a new one. For h1 and h2, both have the same bucketing structure but as separate instances.
+
+Looking at the original test code:
+
+let precomputed_bucketing = PrecomputedLinear { ... };
+let bucketing = LinearOrExponential::Linear(precomputed_bucketing);
+let mut h1 = Histogram { ... bucketing: bucketing.clone(), ... };
+let h2 = Histogram { bucketing: bucketing, ... };
+
+The problem is that LinearOrExponential doesn't implement Clone, so bucketing.clone() is invalid. Instead, I can create a new PrecomputedLinear instance with the same parameters for h1 and h2. Since PrecomputedLinear is a struct, maybe it's Copy or Clone? Wait, the PrecomputedLinear struct has a OnceCell, which isn't Clone. So creating a new instance would require reconstructing it. So instead of cloning, create a new PrecomputedLinear with the same bucket_ranges, min, max, etc.
+
+So modifying the test code to create two separate PrecomputedLinear instances. Let me adjust the setup for h1 and h2's bucketing:
+
+Original test setup:
+
+let precomputed_bucketing = PrecomputedLinear { ... };
+let bucketing = LinearOrExponential::Linear(precomputed_bucketing);
+let mut h1 = Histogram { bucketing: bucketing.clone(), ... };
+let h2 = Histogram { bucketing: bucketing, ... };
+
+But LinearOrExponential::Linear can't be cloned. So instead, create another PrecomputedLinear for h1. Wait, but the original precomputed_bucketing is already created. So for h1, can't we use a new LinearOrExponential::Linear(created from the same precomputed_bucketing values)? Wait, but the PrecomputedLinear has a OnceCell which is already initialized. OnceCell is not Clone, but creating a new PrecomputedLinear with the same bucket_ranges is possible.
+
+So perhaps in the test, create two separate instances of PrecomputedLinear. But the original code uses OnceCell, which is a sync::OnceCell. To create a new PrecomputedLinear, we can do:
+
+let precomputed_bucketing = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, ...].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+
+Then, for h1's bucketing, create a new LinearOrExponential which is another PrecomputedLinear with the same setup. Wait, but how can we do that? The test code may need to create two separate PrecomputedLinear instances. However, since bucket_ranges is a OnceCell, creating a new one would require initializing it again.
+
+So perhaps the test code should create two separate LinearOrExponential instances. For example:
+
+let precomputed_bucketing1 = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, 20, ...].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let bucketing1 = LinearOrExponential::Linear(precomputed_bucketing1);
+let mut h1 = Histogram {
+    bucketing: bucketing1,
+    sum: u64::MAX,
+    count: u64::MAX,
+    values: Default::default(),
+};
+
+Then create another precomputed_bucketing2 with the same values.
+
+But then both precomputed_bucketing1 and precomputed_bucketing2 have the same bucket_ranges. This is possible. So in the test, we can create two separate instances of PrecomputedLinear and assign them to h1 and h2. Wait, but in the original test, the h2's bucketing is the same as the original bucketing variable, which was created from precomputed_bucketing. So maybe h2's bucketing is the same as h1's?
+
+No, the original test code was trying to have h1 and h2 use the same bucketing. But since the original code tried to clone the LinearOrExponential enum, which is not possible, perhaps the test can be adjusted by creating two separate PrecomputedLinear instances with the same data. However, because PrecomputedLinear is a struct that implements Clone? Wait, if PrecomputedLinear is not Clone, then we can't just clone it. But if the struct is manually Cloneable, perhaps the user can implement Clone for it. But that's not part of the test's problem here. Alternatively, the test can create two separate instances.
+
+So for the test, perhaps we can create h1 and h2 with the same PrecomputedLinear data but as separate instances. For example:
+
+let precomputed = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, ...].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let mut h1 = Histogram {
+    bucketing: LinearOrExponential::Linear(precomputed.clone()), // but if PrecomputedLinear is not Cloneable...
+Wait, but OnceCell isn't Clone. So creating a new PrecomputedLinear with OnceCell::from again. The test can create two PrecomputedLinear instances with the same bucket_ranges, etc., but each with their own OnceCell.
+
+So, for the test, the code can be modified to:
+
+// For h1's bucketing
+let precomputed_bucketing_h1 = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let bucketing_h1 = LinearOrExponential::Linear(precomputed_bucketing_h1);
+let mut h1 = Histogram {
+    bucketing: bucketing_h1,
+    ...
+};
+
+// For h2's bucketing
+let precomputed_bucketing_h2 = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let bucketing_h2 = LinearOrExponential::Linear(precomputed_bucketing_h2);
+let h2 = Histogram {
+    bucketing: bucketing_h2,
+    ...
+};
+
+But this way, h1 and h2 have separate PrecomputedLinear instances, each with their own OnceCell, but the same data. This avoids cloning LinearOrExponential. So the error in the original test is due to trying to clone the enum, which isn't Clone, but by creating separate instances, the test can pass.
+
+Therefore, modifying the test code to avoid cloning the bucketing but instead creating two separate instances.
+
+Now, adjusting the test code accordingly.
+
+In the original test, the line bucketing: bucketing.clone() was causing the error. To fix this, replace it by creating a new PrecomputedLinear for h1's bucketing.
+
+So in the test code:
+
+let precomputed_bucketing1 = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let bucketing_h1 = LinearOrExponential::Linear(precomputed_bucketing1);
+let mut h1 = Histogram {
+    bucketing: bucketing_h1,
+    sum: u64::MAX,
+    count: u64::MAX,
+    values: Default::default(),
+};
+
+let precomputed_bucketing2 = PrecomputedLinear {
+    bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+    bucket_count: 11,
+    min: 0,
+    max: 100,
+};
+let bucketing_h2 = LinearOrExponential::Linear(precomputed_bucketing2);
+let h2 = Histogram {
+    bucketing: bucketing_h2,
+    sum: 1,
+    count: 1,
+    values: [(10, 1)].iter().cloned().collect(),
+};
+
+This way, h1 and h2 have separate bucketing instances, avoiding the need to clone the LinearOrExponential enum.
+
+Now, the test should compile because the clone method is no longer used. Also, the test checks that when merging h2 into h1, which has sum and count set to u64::MAX, the sum and count remain u64::MAX after a saturating add (since u64::MAX + 1 would overflow to u64::MAX).
+
+This test would fail before the patch because the previous code used +=, which would panic on overflow. After the patch, the code uses saturating_add, so the overflow is handled, and the test passes.
+
+So the corrected test code creates two separate PrecomputedLinear instances for h1 and h2, avoiding the clone method. Also, the imports need to include the necessary structures.
+
+The imports in the <TEST> block need to include PrecomputedLinear and OnceCell. The original imports already have use super::Histogram; and use super::LinearOrExponential;. But PrecomputedLinear and OnceCell may need to be imported. Wait, the original imports are:
+
+use super::Histogram;
+use super::LinearOrExponential;
+use super::PrecomputedLinear; <!-- This was missing before? -->
+use once_cell::sync::OnceCell;
+
+Looking at the original code, PrecomputedLinear is part of the histogram module. So the test imports should include use super::PrecomputedLinear;. So the imports block should be updated to include that.
+
+In the original <imports> block, the user had:
+
+use super::Histogram;
+use super::LinearOrExponential;
+use once_cell::sync::OnceCell;
+
+Need to add use super::PrecomputedLinear; because the test code creates instances of PrecomputedLinear.
+
+So the corrected test code includes the necessary imports and creates two separate PrecomputedLinear instances for h1 and h2.
+
+Putting it all together, the test code would look like:
+
+<Filename>glean-core/src/histogram/mod.rs</Filename>
+<imports>use super::Histogram;
+use super::LinearOrExponential;
+use super::PrecomputedLinear;
+use once_cell::sync::OnceCell;</imports>
+<Rust>#[test]
+fn test_merge_saturating_addition() {
+    let precomputed_bucketing1 = PrecomputedLinear {
+        bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+        bucket_count: 11,
+        min: 0,
+        max: 100,
+    };
+    let bucketing1 = LinearOrExponential::Linear(precomputed_bucketing1);
+    let mut h1 = Histogram {
+        bucketing: bucketing1,
+        sum: u64::MAX,
+        count: u64::MAX,
+        values: Default::default(),
+    };
+
+    let precomputed_bucketing2 = PrecomputedLinear {
+        bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+        bucket_count: 11,
+        min: 0,
+        max: 100,
+    };
+    let bucketing2 = LinearOrExponential::Linear(precomputed_bucketing2);
+    let h2 = Histogram {
+        bucketing: bucketing2,
+        sum: 1,
+        count: 1,
+        values: [(10, 1)].iter().cloned().collect(),
+    };
+
+    h1.merge(&h2);
+    assert_eq!(h1.sum, u64::MAX);
+    assert_eq!(h1.count, u64::MAX);
+    assert_eq!(h1.values.get(&10).copied(), Some(1));
+}
+</Rust>
+</think>
+
+<Filename>glean-core/src/histogram/mod.rs</Filename>
+<imports>use super::Histogram;
+use super::LinearOrExponential;
+use super::PrecomputedLinear;
+use once_cell::sync::OnceCell;</imports>
+<Rust>
+#[test]
+fn test_merge_saturating_addition() {
+    let precomputed_bucketing1 = PrecomputedLinear {
+        bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+        bucket_count: 11,
+        min: 0,
+        max: 100,
+    };
+    let bucketing1 = LinearOrExponential::Linear(precomputed_bucketing1);
+    let mut h1 = Histogram {
+        bucketing: bucketing1,
+        sum: u64::MAX,
+        count: u64::MAX,
+        values: Default::default(),
+    };
+
+    let precomputed_bucketing2 = PrecomputedLinear {
+        bucket_ranges: OnceCell::from([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100].to_vec()),
+        bucket_count: 11,
+        min: 0,
+        max: 100,
+    };
+    let bucketing2 = LinearOrExponential::Linear(precomputed_bucketing2);
+    let h2 = Histogram {
+        bucketing: bucketing2,
+        sum: 1,
+        count: 1,
+        values: [(10, 1)].iter().cloned().collect(),
+    };
+
+    h1.merge(&h2);
+    assert_eq!(h1.sum, u64::MAX);
+    assert_eq!(h1.count, u64::MAX);
+    assert_eq!(h1.values.get(&10).copied(), Some(1));
+}
+</Rust>

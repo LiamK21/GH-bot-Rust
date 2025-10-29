@@ -1,0 +1,52 @@
+#[test]
+fn test_requeues_after_client_error_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), false);
+    let ping_dir = dir.path().join(PENDING_PINGS_DIRECTORY);
+    fs::create_dir_all(&ping_dir).unwrap();
+
+    let doc_id = uuid::Uuid::new_v4().to_string();
+    let ping_path = ping_dir.join(format!("{}.incomplete", doc_id));
+    {
+        let mut file = File::create(&ping_path).unwrap();
+        writeln!(file, "/submit/APP_ID/PING_NAME/1/{}", doc_id).unwrap();
+        writeln!(file, r#"{"test": "data"}"#).unwrap();
+    }
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Simulate successful processing to trigger directory scanning
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(200), None);
+
+    // Wait for processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Simulate client error (400) response to force requeue from disk
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(400), None);
+
+    // Wait for requeue processing
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let request = match upload_manager.get_upload_task(false) {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Expected requeued ping"),
+    };
+
+    // Decompress body for comparison
+    let mut decoder = GzDecoder::new(&request.body[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+
+    let expected_json = json!({ "test": "data" });
+    let actual_json: Value = serde_json::from_slice(&decompressed).unwrap();
+
+    assert_eq!(request.document_id, doc_id);
+    assert_eq!(actual_json, expected_json);
+}

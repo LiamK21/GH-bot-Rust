@@ -1,0 +1,756 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Consider removing ping name from test_get_num_recorded_errors
+We don't actually need that: errors always also go to the metrics ping on top of whatever ping this metric normally goes in. So we could be safe just removing the ping name parameter and always assuming `metrics`.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/event.rs b/glean-core/rlb/src/private/event.rs
+--- a/glean-core/rlb/src/private/event.rs
++++ b/glean-core/rlb/src/private/event.rs
+@@ -154,12 +154,7 @@ impl<K: traits::ExtraKeys> traits::Event for EventMetric<K> {
+         self.inner.test_get_value(ping_name)
+     }
+ 
+-    pub fn test_get_num_recorded_errors<'a, S: Into<Option<&'a str>>>(
+-        &self,
+-        error: ErrorType,
+-        ping_name: S,
+-    ) -> i32 {
+-        let ping_name = ping_name.into().map(|s| s.to_string());
+-        self.inner.test_get_num_recorded_errors(error, ping_name)
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
++        self.inner.test_get_num_recorded_errors(error)
+     }
+ }
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -1127,7 +1127,7 @@ fn test_boolean_get_num_errors() {
+     });
+ 
+     // Check specifically for an invalid label
+-    let result = metric.test_get_num_recorded_errors(ErrorType::InvalidLabel, None);
++    let result = metric.test_get_num_recorded_errors(ErrorType::InvalidLabel);
+ 
+     assert_eq!(result, 0);
+ }
+
+diff --git a/glean-core/src/error_recording.rs b/glean-core/src/error_recording.rs
+--- a/glean-core/src/error_recording.rs
++++ b/glean-core/src/error_recording.rs
+@@ -157,16 +157,13 @@ pub fn test_get_num_recorded_errors(
+     glean: &Glean,
+     meta: &CommonMetricData,
+     error: ErrorType,
+-    ping_name: Option<&str>,
+ ) -> Result<i32, String> {
+-    let use_ping_name = ping_name.unwrap_or(&meta.send_in_pings[0]);
+     let metric = get_error_metric_for_metric(meta, error);
+ 
+-    metric.get_value(glean, Some(use_ping_name)).ok_or_else(|| {
++    metric.get_value(glean, Some("metrics")).ok_or_else(|| {
+         format!(
+-            "No error recorded for {} in '{}' store",
++            "No error recorded for {} in 'metrics' store",
+             meta.base_identifier(),
+-            use_ping_name
+         )
+     })
+ }
+@@ -221,24 +218,19 @@ mod test {
+             expected_invalid_labels_errors,
+         );
+ 
+-        for store in &["store1", "store2", "metrics"] {
++        let invalid_val =
++            get_error_metric_for_metric(string_metric.meta(), ErrorType::InvalidValue);
++        let invalid_label =
++            get_error_metric_for_metric(string_metric.meta(), ErrorType::InvalidLabel);
++        for &store in &["store1", "store2", "metrics"] {
+             assert_eq!(
+-                Ok(expected_invalid_values_errors),
+-                test_get_num_recorded_errors(
+-                    &glean,
+-                    string_metric.meta(),
+-                    ErrorType::InvalidValue,
+-                    Some(store)
+-                )
++                Some(expected_invalid_values_errors),
++                invalid_val.get_value(&glean, Some(store))
+             );
++
+             assert_eq!(
+-                Ok(expected_invalid_labels_errors),
+-                test_get_num_recorded_errors(
+-                    &glean,
+-                    string_metric.meta(),
+-                    ErrorType::InvalidLabel,
+-                    Some(store)
+-                )
++                Some(expected_invalid_labels_errors),
++                invalid_label.get_value(&glean, Some(store))
+             );
+         }
+     }
+
+diff --git a/glean-core/src/metrics/boolean.rs b/glean-core/src/metrics/boolean.rs
+--- a/glean-core/src/metrics/boolean.rs
++++ b/glean-core/src/metrics/boolean.rs
+@@ -123,12 +123,11 @@ impl BooleanMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/counter.rs b/glean-core/src/metrics/counter.rs
+--- a/glean-core/src/metrics/counter.rs
++++ b/glean-core/src/metrics/counter.rs
+@@ -152,12 +152,11 @@ impl CounterMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/custom_distribution.rs b/glean-core/src/metrics/custom_distribution.rs
+--- a/glean-core/src/metrics/custom_distribution.rs
++++ b/glean-core/src/metrics/custom_distribution.rs
+@@ -210,12 +210,11 @@ impl CustomDistributionMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/datetime.rs b/glean-core/src/metrics/datetime.rs
+--- a/glean-core/src/metrics/datetime.rs
++++ b/glean-core/src/metrics/datetime.rs
+@@ -316,12 +316,11 @@ impl DatetimeMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/denominator.rs b/glean-core/src/metrics/denominator.rs
+--- a/glean-core/src/metrics/denominator.rs
++++ b/glean-core/src/metrics/denominator.rs
+@@ -129,12 +129,11 @@ impl DenominatorMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/event.rs b/glean-core/src/metrics/event.rs
+--- a/glean-core/src/metrics/event.rs
++++ b/glean-core/src/metrics/event.rs
+@@ -160,12 +160,11 @@ impl EventMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/labeled.rs b/glean-core/src/metrics/labeled.rs
+--- a/glean-core/src/metrics/labeled.rs
++++ b/glean-core/src/metrics/labeled.rs
+@@ -270,11 +270,10 @@ where
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.submetric.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.submetric.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+diff --git a/glean-core/src/metrics/memory_distribution.rs b/glean-core/src/metrics/memory_distribution.rs
+--- a/glean-core/src/metrics/memory_distribution.rs
++++ b/glean-core/src/metrics/memory_distribution.rs
+@@ -259,12 +259,11 @@ impl MemoryDistributionMetric {
+     /// # Returns
+     ///
+     /// The number of errors reported.
+-    pub fn test_get_num_recorded_errors(&self, error: ErrorType, ping_name: Option<String>) -> i32 {
++    pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+         crate::block_on_dispatcher();
+ 
+         crate::core::with_glean(|glean| {
+-            test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+-                .unwrap_or(0)
++            test_get_num_recorded_errors(glean, self.meta(), error).unwrap_or(0)
+         })
+     }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/error_recording.rs</Filename>
+<imports>use crate::Glean;
+use crate::ErrorType;</imports>
+<Rust>#[test]
+fn test_get_num_recorded_errors_assumes_metrics_store() {
+    let glean = Glean::new();
+    let meta = CommonMetricData::new("test_category", "test_name", vec!["test_send_in_pings"], false, false, None, None, None);
+    let error = ErrorType::InvalidValue;
+
+    let expected = Err("No error recorded for test_category.test_name in 'metrics' store".to_string());
+    let actual = test_get_num_recorded_errors(&glean, &meta, error);
+
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/quantity.rs:122:13
+    |
+122 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+122 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+122 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/rate.rs:187:13
+    |
+187 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+187 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+187 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/string.rs:136:13
+    |
+136 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+136 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+136 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/string_list.rs:195:13
+    |
+195 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+195 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+195 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/text.rs:140:13
+    |
+140 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+140 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+140 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/timespan.rs:304:13
+    |
+304 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+304 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+304 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/timing_distribution.rs:468:13
+    |
+468 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+468 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+468 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/url.rs:163:13
+    |
+163 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+163 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+163 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 3 arguments but 4 arguments were supplied
+   --> glean-core/src/metrics/uuid.rs:155:13
+    |
+155 |             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                            -------------------- unexpected argument #4 of type `std::option::Option<&str>`
+    |
+note: function defined here
+   --> glean-core/src/error_recording.rs:156:8
+    |
+156 | pub fn test_get_num_recorded_errors(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+155 -             test_get_num_recorded_errors(glean, self.meta(), error, ping_name.as_deref())
+155 +             test_get_num_recorded_errors(glean, self.meta(), error)
+    |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:1554:18
+     |
+1554 |       let retval = r#CounterMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1569 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+1570 | |             Ok(val) => val,
+...    |
+1574 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+1575 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/counter.rs:155:12
+     |
+155  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+1568 -         }, 
+1569 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+1570 -             Ok(val) => val,
+1571 -         
+1572 - 
+1573 -         
+1574 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:1953:18
+     |
+1953 |       let retval = r#BooleanMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1968 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+1969 | |             Ok(val) => val,
+...    |
+1973 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+1974 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/boolean.rs:126:12
+     |
+126  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+1967 -         }, 
+1968 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+1969 -             Ok(val) => val,
+1970 -         
+1971 - 
+1972 -         
+1973 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:2252:18
+     |
+2252 |       let retval = r#LabeledCounter::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2267 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2268 | |             Ok(val) => val,
+...    |
+2272 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+2273 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/labeled.rs:273:12
+     |
+273  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+2266 -         }, 
+2267 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2268 -             Ok(val) => val,
+2269 -         
+2270 - 
+2271 -         
+2272 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:2390:18
+     |
+2390 |       let retval = r#LabeledBoolean::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2405 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2406 | |             Ok(val) => val,
+...    |
+2410 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+2411 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/labeled.rs:273:12
+     |
+273  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+2404 -         }, 
+2405 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2406 -             Ok(val) => val,
+2407 -         
+2408 - 
+2409 -         
+2410 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:2528:18
+     |
+2528 |       let retval = r#LabeledString::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2543 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2544 | |             Ok(val) => val,
+...    |
+2548 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+2549 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/labeled.rs:273:12
+     |
+273  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+2542 -         }, 
+2543 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+2544 -             Ok(val) => val,
+2545 -         
+2546 - 
+2547 -         
+2548 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:3682:18
+     |
+3682 |       let retval = r#MemoryDistributionMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3697 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+3698 | |             Ok(val) => val,
+...    |
+3702 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+3703 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/memory_distribution.rs:262:12
+     |
+262  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+3696 -         }, 
+3697 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+3698 -             Ok(val) => val,
+3699 -         
+3700 - 
+3701 -         
+3702 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:3875:18
+     |
+3875 |       let retval = r#CustomDistributionMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+3890 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+3891 | |             Ok(val) => val,
+...    |
+3895 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+3896 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/custom_distribution.rs:213:12
+     |
+213  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+3889 -         }, 
+3890 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+3891 -             Ok(val) => val,
+3892 -         
+3893 - 
+3894 -         
+3895 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:4076:18
+     |
+4076 |       let retval = r#DatetimeMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4091 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4092 | |             Ok(val) => val,
+...    |
+4096 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+4097 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/datetime.rs:319:12
+     |
+319  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+4090 -         }, 
+4091 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4092 -             Ok(val) => val,
+4093 -         
+4094 - 
+4095 -         
+4096 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:4245:18
+     |
+4245 |       let retval = r#EventMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4260 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4261 | |             Ok(val) => val,
+...    |
+4265 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+4266 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/event.rs:163:12
+     |
+163  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+4259 -         }, 
+4260 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4261 -             Ok(val) => val,
+4262 -         
+4263 - 
+4264 -         
+4265 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+    --> /app/testbed/target/debug/build/glean-core-c375e6e4301ed968/out/glean.uniffi.rs:4606:18
+     |
+4606 |       let retval = r#DenominatorMetric::r#test_get_num_recorded_errors(
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4621 | /         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4622 | |             Ok(val) => val,
+...    |
+4626 | |             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+4627 | |         });
+     | |_________- unexpected argument #3 of type `std::option::Option<std::string::String>`
+     |
+note: method defined here
+    --> glean-core/src/metrics/denominator.rs:132:12
+     |
+132  |     pub fn test_get_num_recorded_errors(&self, error: ErrorType) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: remove the extra argument
+     |
+4620 -         }, 
+4621 -         match<std::option::Option<r#String> as uniffi::FfiConverter>::try_lift(r#ping_name) {
+4622 -             Ok(val) => val,
+4623 -         
+4624 - 
+4625 -         
+4626 -             Err(err) => panic!("Failed to convert arg '{}': {}", "ping_name", err),
+     |
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

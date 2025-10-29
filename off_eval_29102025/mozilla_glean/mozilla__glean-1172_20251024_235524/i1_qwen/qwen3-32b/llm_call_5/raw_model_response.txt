@@ -1,0 +1,114 @@
+<think>
+Okay, let's see what the problem is here. The user provided a failing test in the <TEST> block for the TimingDistribution metric. The test is supposed to check that when upload is disabled, the metric doesn't record any samples. But the test is currently failing due to unresolved type 'Lifetime' in the error messages.
+
+Looking at the test code, the lines where 'Lifetime::Ping' is used are the issue. The 'Lifetime' enum isn't imported. The error messages suggest that 'Lifetime' is part of the public API, so it's probably under a different module path.
+
+First, I need to find where 'Lifetime' is located. The original database code mentions 'Lifetime' in the Glean codebase. In Rust, enums like this are usually defined in a specific module. Since the user is using 'glean-core/src/metrics/timing_distribution.rs', I should check if 'Lifetime' is in the same crate's structure. 
+
+In the Glean code, 'Lifetime' is likely in the 'store' module or perhaps under 'database'. The user's patch shows that 'Lifetime' is used in the 'Database' struct, which is in 'database/mod.rs'. Looking at the code, 'Lifetime' is probably an enum in the 'store' module or as a public enum in the crate. So, to fix the missing import, the test should import 'Lifetime' from the correct path.
+
+In the Glean crate, the 'Lifetime' is defined in 'src/database.rs' and exported. So, in the test code, we need to import it as 'use glean_core::Lifetime;' or a similar path. However, the test might be in a different module and needs to pull in 'Lifetime' from the correct crate module. But since this is a unit test within the same crate, the correct path would be 'use crate::Lifetime;'. Wait, the original test code includes 'use crate::CommonMetricData;' but 'Lifetime' isn't among the public exports if it's only exported in the 'database' module. 
+
+Looking at the patch provided, in 'glean-core/src/database/mod.rs', there's a 'pub enum Lifetime { ... }'. Wait, actually in the code, 'Lifetime' is a public enum in the 'database' module. Wait, the 'pub enum Lifetime' in 'database/mod.rs'? If that's the case, then the correct import would be 'use crate::database::Lifetime;'.
+
+So the test code is in 'metrics/timing_distribution.rs', and the 'Lifetime' is in 'database/mod.rs'. Therefore, the correct path would be 'use crate::database::Lifetime;'.
+
+But in the provided test code, the user has 'use crate::CommonMetricData;' and 'use crate::Database;'. So 'Database' is imported from the crate root. So for 'Lifetime' to be used, maybe 'use crate::database::Lifetime;' is needed.
+
+So in the test, adding 'use crate::database::Lifetime;' should resolve the error. However, the test's imports block is within 'crates/metrics/timing_distribution.rs', which is part of the same crate. Therefore, the correct import would be 'use crate::database::Lifetime;'.
+
+Wait, the original test code in the <TEST> block starts with:
+
+<imports>use crate::CommonMetricData;
+use crate::Database;
+use crate::Glean;
+use crate::tests::new_glean;
+use std::path::Path;</imports>
+
+So the 'use crate::database::Lifetime;' is missing. The test uses 'Lifetime::Ping' but doesn't import it. Therefore, adding 'use crate::database::Lifetime;' to the imports should fix the failure.
+
+But the user's existing code in the test doesn't include that import. Therefore, the test code should include 'use crate::database::Lifetime;'.
+
+So the fix is to add that import line to the <imports> block.
+
+Now, the original test is designed to verify that when upload is disabled, the TimingDistributionMetric doesn't record samples. The test creates a metric, enables upload, records samples, checks the database for the stored data, disables upload, and then records more samples, then checks that the data hasn't changed.
+
+The test should fail before the patch because the accumulate_samples_signed function doesn't have the should_record check. But after adding the check in the patch, the test should pass. However, the test as written is missing the import for 'Lifetime', which is why the compile errors are occurring.
+
+Therefore, the correction is to add 'use crate::database::Lifetime;' to the imports. Once that is done, the code will compile, and the test should run.
+
+So, in the <TEST> block's <imports>, adding the line:
+
+use crate::database::Lifetime;
+
+Then, the test should compile and run. Also, the rest of the test code is correct. Let me check the actual code again.
+
+Yes, the test code in the <Rust> block uses 'Lifetime::Ping' in two call sites to db.iter_store_from, which requires that enum. So importing 'Lifetime' from 'crate::database' is the right fix.
+
+Therefore, the updated <imports> should include that line. Additionally, if 'Database' is in the same crate, perhaps the 'database' module is the right place.
+
+So the corrected test will have:
+
+<imports>use crate::CommonMetricData;
+use crate::Database;
+use crate::Glean;
+use crate::tests::new_glean;
+use crate::database::Lifetime;
+use std::path::Path;</imports>
+
+And the test code proceeds as before. That should fix the missing imports and allow the test to run. Then, the test should fail under the code before the patch (since accumulate_samples_signed doesn't check upload status) and passes after the patch (since it does).
+</think>
+
+<Filename>glean-core/src/metrics/timing_distribution.rs</Filename>
+<imports>use crate::CommonMetricData;
+use crate::Database;
+use crate::Glean;
+use crate::tests::new_glean;
+use crate::database::Lifetime;
+use crate::metrics::time_unit::TimeUnit;</imports>
+<Rust>
+#[test]
+fn test_timing_distribution_doesnt_record_when_upload_disabled() {
+    let (mut glean, dir) = new_glean(None);
+    let db = Database::new(dir.path().to_str().unwrap(), true).unwrap();
+
+    let store_name = "timing_test_store";
+    let metric_id = "test.timing";
+    let metric_data = CommonMetricData::new("test", "timing", store_name);
+    let mut metric = TimingDistributionMetric::new(metric_data, TimeUnit::Nanosecond);
+
+    // Initial metric with upload enabled.
+    glean.set_upload_enabled(true);
+    metric.accumulate_samples_signed(&glean, vec![100, 200]);
+
+    let mut initial_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, &value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                initial_data = Some(dist);
+            }
+        }
+    });
+
+    let initial = initial_data.unwrap();
+    assert_eq!(initial.count(), 2);
+    assert_eq!(initial.sum(), 300);
+
+    // Disable upload and add more samples.
+    glean.set_upload_enabled(false);
+    metric.accumulate_samples_signed(&glean, vec![300, 400]);
+
+    let mut final_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, &value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                final_data = Some(dist);
+            }
+        }
+    });
+
+    let final_dist = final_data.unwrap();
+    assert_eq!(final_dist.count(), 2);
+    assert_eq!(final_dist.sum(), 300);
+}
+</Rust>

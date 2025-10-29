@@ -1,0 +1,813 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Enforce disk quota on pending pings
+Glean does not currently check how much space is taken by pending pings, but we should, and should also have telemetry about how many times quota is hit. We should probably copy Firefox desktop mechanism as a starting point.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -51,6 +51,8 @@ impl CoreMetrics {
+ pub struct UploadMetrics {
+     pub ping_upload_failure: LabeledMetric<CounterMetric>,
+     pub discarded_exceeding_pings_size: MemoryDistributionMetric,
++    pub pending_pings_directory_size: MemoryDistributionMetric,
++    pub deleted_pings_after_quota_hit: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -85,6 +87,27 @@ impl UploadMetrics {
+                 },
+                 MemoryUnit::Kilobyte,
+             ),
++
++            pending_pings_directory_size: MemoryDistributionMetric::new(
++                CommonMetricData {
++                    name: "pending_pings_directory_size".into(),
++                    category: "glean.upload".into(),
++                    send_in_pings: vec!["metrics".into()],
++                    lifetime: Lifetime::Ping,
++                    disabled: false,
++                    dynamic_label: None,
++                },
++                MemoryUnit::Kilobyte,
++            ),
++
++            deleted_pings_after_quota_hit: CounterMetric::new(CommonMetricData {
++                name: "deleted_pings_after_quota_hit".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/directory.rs b/glean-core/src/upload/directory.rs
+--- a/glean-core/src/upload/directory.rs
++++ b/glean-core/src/upload/directory.rs
+@@ -19,6 +19,23 @@ use crate::{DELETION_REQUEST_PINGS_DIRECTORY, PENDING_PINGS_DIRECTORY};
+ /// this will contain the document_id, path, JSON encoded body of a ping and the persisted headers.
+ pub type PingPayload = (String, String, String, Option<HeaderMap>);
+ 
++/// A struct to hold the result of scanning all pings directories.
++#[derive(Clone, Debug, Default)]
++pub struct PingPayloadsByDirectory {
++    pub pending_pings: Vec<(u64, PingPayload)>,
++    pub deletion_request_pings: Vec<(u64, PingPayload)>,
++}
++
++impl PingPayloadsByDirectory {
++    /// Extend the data of this instance of PingPayloadsByDirectory
++    /// with the data from another instance of PingPayloadsByDirectory.
++    pub fn extend(&mut self, other: PingPayloadsByDirectory) {
++        self.pending_pings.extend(other.pending_pings);
++        self.deletion_request_pings
++            .extend(other.deletion_request_pings);
++    }
++}
++
+ /// Get the file name from a path as a &str.
+ ///
+ /// # Panics
+@@ -60,11 +77,13 @@ fn process_metadata(path: &str, metadata: &str) -> Option<HeaderMap> {
+     None
+ }
+ 
+-/// Manages the pending pings directories.
++/// Manages the pings directories.
+ #[derive(Debug, Clone)]
+ pub struct PingDirectoryManager {
+-    /// Paths to the pings directories.
+-    pings_dirs: [PathBuf; 2],
++    /// Path to the pending pings directory.
++    pending_pings_dir: PathBuf,
++    /// Path to the deletion-request pings directory.
++    deletion_request_pings_dir: PathBuf,
+ }
+ 
+ impl PingDirectoryManager {
+@@ -76,41 +95,49 @@ impl PingDirectoryManager {
+     pub fn new<P: Into<PathBuf>>(data_path: P) -> Self {
+         let data_path = data_path.into();
+         Self {
+-            pings_dirs: [
+-                data_path.join(PENDING_PINGS_DIRECTORY),
+-                data_path.join(DELETION_REQUEST_PINGS_DIRECTORY),
+-            ],
++            pending_pings_dir: data_path.join(PENDING_PINGS_DIRECTORY),
++            deletion_request_pings_dir: data_path.join(DELETION_REQUEST_PINGS_DIRECTORY),
+         }
+     }
+ 
+     /// Attempts to delete a ping file.
+     ///
+-    /// ## Arguments
++    /// # Arguments
+     ///
+     /// * `uuid` - The UUID of the ping file to be deleted
+     ///
+-    /// ## Panics
++    /// # Return value
++    ///
++    /// Returns `true` if the file was deleted succesfully and `false` otherwise.
++    ///
++    /// # Panics
+     ///
+     /// Won't panic if unable to delete the file.
+-    pub fn delete_file(&self, uuid: &str) {
++    pub fn delete_file(&self, uuid: &str) -> bool {
+         let path = match self.get_file_path(uuid) {
+             Some(path) => path,
+             None => {
+                 log::error!("Cannot find ping file to delete {}", uuid);
+-                return;
++                return false;
+             }
+         };
++
+         match fs::remove_file(&path) {
+-            Err(e) => log::error!("Error deleting file {}. {}", path.display(), e),
++            Err(e) => {
++                log::error!("Error deleting file {}. {}", path.display(), e);
++                return false;
++            }
+             _ => log::info!("File was deleted {}", path.display()),
+         };
++
++        true
+     }
+ 
+     /// Reads a ping file and returns the data from it.
+     ///
+     /// If the file is not properly formatted, it will be deleted and `None` will be returned.
+     ///
+-    /// ## Arguments
++    /// # Arguments
+     ///
+     /// * `document_id` - The UUID of the ping file to be processed
+     pub fn process_file(&self, document_id: &str) -> Option<PingPayload> {
+@@ -151,29 +178,39 @@ impl PingDirectoryManager {
+         None
+     }
+ 
+-    /// Process the pings directory and return a vector with the ping data
++    /// Process both ping directories.
++    pub fn process_dirs(&self) -> PingPayloadsByDirectory {
++        PingPayloadsByDirectory {
++            pending_pings: self.process_dir(&self.pending_pings_dir),
++            deletion_request_pings: self.process_dir(&self.deletion_request_pings_dir),
++        }
++    }
++
++    /// Process one of the pings directory and return a vector with the ping data
+     /// corresponding to each valid ping file in the directory.
+     /// This vector will be ordered by file `modified_date`.
+     ///
+     /// Any files that don't match the UUID regex will be deleted
+     /// to prevent files from polluting the pings directory.
+     ///
+-    /// Files that are not correctly formatted will also be deleted.
+-    ///
+     /// # Return value
+     ///
+-    /// `Vec<(String, String, JsonValue, HeaderMap)>` -
+-    ///     a vector of tuples containing the document_id, path, body and headers of each request.
+-    pub fn process_dir(&self) -> Vec<PingPayload> {
++    /// Returns a vector of tuples with the file size
++    /// and payload of each ping file in the directory.
++    fn process_dir(&self, dir: &Path) -> Vec<(u64, PingPayload)> {
+         log::info!("Processing persisted pings.");
+ 
+-        // Walk the pings directory and process each file in it,
+-        // deleting invalid ones and ignoring unreadable ones.
+-        // Create a vector of tuples: (modified_date, PingRequest)
+-        // using the contents and metadata of all valid files.
+-        let mut pending_pings: Vec<_> = self
+-            .get_ping_entries()
+-            .into_iter()
++        let entries = match dir.read_dir() {
++            Ok(entries) => entries,
++            Err(_) => {
++                // This may error simply because the directory doesn't exist,
++                // which is expected if no pings were stored yet.
++                return Vec::new();
++            }
++        };
++
++        let mut pending_pings: Vec<_> = entries
++            .filter_map(|entry| entry.ok())
+             .filter_map(|entry| {
+                 let path = entry.path();
+                 if let Some(file_name) = get_file_name_as_str(&path) {
+@@ -183,42 +220,35 @@ impl PingDirectoryManager {
+                         self.delete_file(file_name);
+                         return None;
+                     }
+-                    // In case we can't process the file we just ignore it.
+                     if let Some(data) = self.process_file(file_name) {
+-                        // Get the modified date of the file, which will later be used
+-                        // for sorting the resulting vector.
+-                        let modified_date = fs::metadata(&path).and_then(|data| data.modified());
+-                        return Some((modified_date, data));
++                        // This may panic in case the path does not exist
++                        // or the user does not have permissions to read the file.
++                        // Both are extremely unlike so we can panic! here if that happens.
++                        let metadata = fs::metadata(&path).unwrap_or_else(|_| {
++                            panic!("Unable to read metadata for file: {}", path.display())
++                        });
++                        return Some((metadata, data));
+                     }
+                 };
+                 None
+             })
+             .collect();
+ 
+-        // Sort by `modified_date`.
++        // This will sort the pings by date in ascending order (oldest -> newest).
+         pending_pings.sort_by(|(a, _), (b, _)| {
+             // We might not be able to get the modified date for a given file,
+             // in which case we just put it at the end.
+-            if let (Ok(a), Ok(b)) = (a, b) {
+-                a.cmp(b)
++            if let (Ok(a), Ok(b)) = (a.modified(), b.modified()) {
++                a.cmp(&b)
+             } else {
+                 Ordering::Less
+             }
+         });
+ 
+-        // Return the vector leaving only the `PingPayload`s in it
+-        pending_pings.into_iter().map(|(_, data)| data).collect()
+-    }
+-
+-    /// Get all the ping entries in all ping directories.
+-    fn get_ping_entries(&self) -> Vec<fs::DirEntry> {
+-        let mut result = Vec::new();
+-        for dir in &self.pings_dirs {
+-            if let Ok(entries) = dir.read_dir() {
+-                result.extend(entries.filter_map(|entry| entry.ok()))
+-            };
+-        }
+-        result
++        pending_pings
++            .into_iter()
++            .map(|(metadata, data)| (metadata.len(), data))
++            .collect()
+     }
+ 
+     /// Get the path for a ping file based on its document_id.
+@@ -226,7 +256,7 @@ impl PingDirectoryManager {
+     /// Will look for files in each ping directory until something is found.
+     /// If nothing is found, returns `None`.
+     fn get_file_path(&self, document_id: &str) -> Option<PathBuf> {
+-        for dir in &self.pings_dirs {
++        for dir in [&self.pending_pings_dir, &self.deletion_request_pings_dir].iter() {
+             let path = dir.join(document_id);
+             if path.exists() {
+                 return Some(path);
+@@ -250,7 +280,9 @@ mod test {
+         let directory_manager = PingDirectoryManager::new(dir.path());
+ 
+         // Verify that processing the directory didn't panic
+-        assert_eq!(directory_manager.process_dir().len(), 0);
++        let data = directory_manager.process_dirs();
++        assert_eq!(data.pending_pings.len(), 0);
++        assert_eq!(data.deletion_request_pings.len(), 0);
+     }
+ 
+     #[test]
+@@ -266,14 +298,16 @@ mod test {
+ 
+         let directory_manager = PingDirectoryManager::new(dir.path());
+ 
+-        // Try and process the pings folder
+-        let data = directory_manager.process_dir();
++        // Try and process the pings directories
++        let data = directory_manager.process_dirs();
+ 
+         // Verify there is just the one request
+-        assert_eq!(data.len(), 1);
++        assert_eq!(data.pending_pings.len(), 1);
++        assert_eq!(data.deletion_request_pings.len(), 0);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = data[0].1.split('/').nth(3).unwrap();
++        let ping = &data.pending_pings[0].1;
++        let request_ping_type = ping.1.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+     }
+ 
+@@ -296,14 +330,16 @@ mod test {
+             .join("not-uuid-file-name.txt");
+         File::create(&not_uuid_path).unwrap();
+ 
+-        // Try and process the pings folder
+-        let data = directory_manager.process_dir();
++        // Try and process the pings directories
++        let data = directory_manager.process_dirs();
+ 
+         // Verify there is just the one request
+-        assert_eq!(data.len(), 1);
++        assert_eq!(data.pending_pings.len(), 1);
++        assert_eq!(data.deletion_request_pings.len(), 0);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = data[0].1.split('/').nth(3).unwrap();
++        let ping = &data.pending_pings[0].1;
++        let request_ping_type = ping.1.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+ 
+         // Verify that file was indeed deleted
+@@ -329,14 +365,16 @@ mod test {
+             .join(Uuid::new_v4().to_string());
+         File::create(&wrong_contents_file_path).unwrap();
+ 
+-        // Try and process the pings folder
+-        let data = directory_manager.process_dir();
++        // Try and process the pings directories
++        let data = directory_manager.process_dirs();
+ 
+         // Verify there is just the one request
+-        assert_eq!(data.len(), 1);
++        assert_eq!(data.pending_pings.len(), 1);
++        assert_eq!(data.deletion_request_pings.len(), 0);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = data[0].1.split('/').nth(3).unwrap();
++        let ping = &data.pending_pings[0].1;
++        let request_ping_type = ping.1.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+ 
+         // Verify that file was indeed deleted
+@@ -356,13 +394,15 @@ mod test {
+ 
+         let directory_manager = PingDirectoryManager::new(dir.path());
+ 
+-        // Try and process the pings folder
+-        let data = directory_manager.process_dir();
++        // Try and process the pings directories
++        let data = directory_manager.process_dirs();
+ 
+-        assert_eq!(data.len(), 1);
++        assert_eq!(data.pending_pings.len(), 0);
++        assert_eq!(data.deletion_request_pings.len(), 1);
+ 
+         // Verify request was returned for the "deletion-request" ping
+-        let request_ping_type = data[0].1.split('/').nth(3).unwrap();
++        let ping = &data.deletion_request_pings[0].1;
++        let request_ping_type = ping.1.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "deletion-request");
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
+ 
+ use crate::error::ErrorKind;
+ use crate::{internal_metrics::UploadMetrics, Glean};
+-use directory::{PingDirectoryManager, PingPayload};
++use directory::{PingDirectoryManager, PingPayloadsByDirectory};
+ pub use request::{HeaderMap, PingRequest};
+ pub use result::{ffi_upload_result, UploadResult};
+ 
+@@ -34,6 +34,9 @@ const MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW: u32 = 3;
+ // The maximum size in bytes a ping body may have to be eligible for upload.
+ const PING_BODY_MAX_SIZE: usize = 1024 * 1024; // 1 MB
+ 
++// The maximum size in byte the pending pings directory may have on disk.
++const PENDING_PINGS_DIRECTORY_QUOTA: u64 = 10 * 1024 * 1024; // 10 MB
++
+ #[derive(Debug)]
+ struct RateLimiter {
+     /// The instant the current interval has started.
+@@ -140,7 +143,7 @@ pub struct PingUploadManager {
+     /// A flag signaling if we are done processing the pending pings directories.
+     processed_pending_pings: Arc<AtomicBool>,
+     /// A vector to store the pending pings processed off-thread.
+-    pending_pings: Arc<RwLock<Vec<PingPayload>>>,
++    cached_pings: Arc<RwLock<PingPayloadsByDirectory>>,
+     /// The number of upload failures for the current uploading window.
+     recoverable_failure_count: AtomicU32,
+     /// A ping counter to help rate limit the ping uploads.
+@@ -179,18 +182,18 @@ impl PingUploadManager {
+         let directory_manager = PingDirectoryManager::new(data_path);
+ 
+         let processed_pending_pings = Arc::new(AtomicBool::new(false));
+-        let pending_pings = Arc::new(RwLock::new(Vec::new()));
++        let cached_pings = Arc::new(RwLock::new(PingPayloadsByDirectory::default()));
+ 
+         let local_manager = directory_manager.clone();
+-        let local_pending_pings = pending_pings.clone();
++        let local_cached_pings = cached_pings.clone();
+         let local_flag = processed_pending_pings.clone();
+         let ping_scanning_thread = thread::Builder::new()
+             .name("glean.ping_directory_manager.process_dir".to_string())
+             .spawn(move || {
+-                let mut local_pending_pings = local_pending_pings
++                let mut local_cached_pings = local_cached_pings
+                     .write()
+                     .expect("Can't write to pending pings cache.");
+-                local_pending_pings.extend(local_manager.process_dir());
++                local_cached_pings.extend(local_manager.process_dirs());
+                 local_flag.store(true, Ordering::SeqCst);
+             })
+             .expect("Unable to spawn thread to process pings directories.");
+@@ -205,7 +208,7 @@ impl PingUploadManager {
+             queue,
+             directory_manager,
+             processed_pending_pings,
+-            pending_pings,
++            cached_pings,
+             recoverable_failure_count: AtomicU32::new(0),
+             rate_limiter: None,
+             language_binding_name: language_binding_name.into(),
+@@ -228,7 +231,7 @@ impl PingUploadManager {
+     /// Attempts to build a ping request from a ping file payload.
+     ///
+     /// Returns the `PingRequest` or `None` if unable to build,
+-    /// in which case it will delete the ping file and records an error.
++    /// in which case it will delete the ping file and record an error.
+     fn build_ping_request(
+         &self,
+         glean: &Glean,
+@@ -297,6 +300,75 @@ impl PingUploadManager {
+         }
+     }
+ 
++    /// Enqueue pings that might have been cached.
++    ///
++    /// The size of the PENDING_PINGS_DIRECTORY directory will be calculated
++    /// (by accumulating each ping's size in that directory)
++    /// and in case we exceed the quota, defined by the `quota` arg,
++    /// outstanding pings get deleted and are not enqueued.
++    ///
++    /// The size of the DELETION_REQUEST_PINGS_DIRECTORY will not be calculated
++    /// and no deletion-request pings will be deleted. Deletion request pings
++    /// are not very common and usually don't contain any data,
++    /// we don't expect that directory to ever reach quota.
++    /// Most importantly, we don't want to ever delete deletion-request pings.
++    ///
++    /// # Arguments
++    ///
++    /// * `glean` - The Glean object holding the database.
++    /// * `quota` - The quota, in bytes, for the size of the pending pings directory.
++    fn enqueue_cached_pings(&self, glean: &Glean, quota: u64) {
++        let mut cached_pings = self
++            .cached_pings
++            .write()
++            .expect("Can't write to pending pings cache.");
++
++        let mut pending_pings_directory_size: u64 = 0;
++        let mut deleting = false;
++        // The pending pings vector is sorted by date in ascending order (oldest -> newest).
++        // We need to calculate the size of the pending pings directory
++        // and delete the **oldest** pings in case quota is reached.
++        // Thus, we reverse the order of the pending pings vector,
++        // so that we iterate in descending order (newest -> oldest).
++        cached_pings.pending_pings.reverse();
++        cached_pings.pending_pings.retain(|(file_size, (document_id, _, _, _))| {
++            pending_pings_directory_size += file_size;
++            if pending_pings_directory_size > quota {
++                log::warn!(
++                    "Pending pings directory has reached the size quota of {} bytes, outstanding pings will be deleted.",
++                    PENDING_PINGS_DIRECTORY_QUOTA
++                );
++                deleting = true;
++            }
++
++            if deleting && self.directory_manager.delete_file(&document_id) {
++                self.upload_metrics
++                    .deleted_pings_after_quota_hit
++                    .add(glean, 1);
++                return false;
++            }
++
++            true
++        });
++        // After calculating the size of the pending pings directory,
++        // we record the calculated number and reverse the pings array back for enqueueing.
++        cached_pings.pending_pings.reverse();
++        self.upload_metrics
++            .pending_pings_directory_size
++            .accumulate(glean, pending_pings_directory_size as u64);
++
++        // Enqueue the remaining pending pings and
++        // enqueue all deletion-request pings.
++        let deletion_request_pings = cached_pings.deletion_request_pings.drain(..);
++        for (_, (document_id, path, body, headers)) in deletion_request_pings {
++            self.enqueue_ping(glean, &document_id, &path, &body, headers);
++        }
++        let pending_pings = cached_pings.pending_pings.drain(..);
++        for (_, (document_id, path, body, headers)) in pending_pings {
++            self.enqueue_ping(glean, &document_id, &path, &body, headers);
++        }
++    }
++
+     /// Adds rate limiting capability to this upload manager. The rate limiter
+     /// will limit the amount of calls to `get_upload_task` per interval.
+     ///
+@@ -354,14 +426,7 @@ impl PingUploadManager {
+             );
+             return PingUploadTask::Wait;
+         }
+-
+-        let mut pending_pings = self
+-            .pending_pings
+-            .write()
+-            .expect("Can't write to pending pings cache.");
+-        for (document_id, path, body, headers) in pending_pings.drain(..) {
+-            self.enqueue_ping(glean, &document_id, &path, &body, headers);
+-        }
++        self.enqueue_cached_pings(glean, PENDING_PINGS_DIRECTORY_QUOTA);
+ 
+         if self.recoverable_failure_count() >= MAX_RECOVERABLE_FAILURES_PER_UPLOADING_WINDOW {
+             log::warn!(
+@@ -787,12 +852,7 @@ mod test {
+ 
+     #[test]
+     fn fills_up_queue_successfully_from_disk() {
+-        let (mut glean, _) = new_glean(None);
+-
+-        // Wait for processing of pending pings directory to finish.
+-        while glean.get_upload_task() == PingUploadTask::Wait {
+-            thread::sleep(Duration::from_millis(10));
+-        }
++        let (mut glean, tmpdir) = new_glean(None);
+ 
+         // Register a ping for testing
+         let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
+@@ -804,25 +864,22 @@ mod test {
+             glean.submit_ping(&ping_type, None).unwrap();
+         }
+ 
+-        // Wait for processing of pending pings directory to finish.
+-        let mut upload_task = glean.get_upload_task();
+-        while upload_task == PingUploadTask::Wait {
+-            thread::sleep(Duration::from_millis(10));
+-            upload_task = glean.get_upload_task();
+-        }
++        // Create a new upload manager pointing to the same data_path as the glean instance.
++        let upload_manager = PingUploadManager::new(tmpdir.path(), "Rust", true);
+ 
+         // Verify the requests were properly enqueued
+         for _ in 0..n {
+-            match upload_task {
++            match upload_manager.get_upload_task(&glean, false) {
+                 PingUploadTask::Upload(_) => {}
+                 _ => panic!("Expected upload manager to return the next request!"),
+             }
+-
+-            upload_task = glean.get_upload_task();
+         }
+ 
+         // Verify that after all requests are returned, none are left
+-        assert_eq!(glean.get_upload_task(), PingUploadTask::Done);
++        assert_eq!(
++            upload_manager.get_upload_task(&glean, false),
++            PingUploadTask::Done
++        );
+     }
+ 
+     #[test]
+@@ -1136,4 +1193,62 @@ mod test {
+             }
+         }
+     }
++
++    #[test]
++    fn quota_is_enforced_when_enqueueing_cached_pings() {
++        let (mut glean, tmpdir) = new_glean(None);
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping multiple times
++        let n = 10;
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        let directory_manager = PingDirectoryManager::new(tmpdir.path());
++        let pending_pings = directory_manager.process_dirs().pending_pings;
++        // The pending pings array is sorted by date in ascending order,
++        // the newest element is the last one.
++        let (_, newest_ping) = &pending_pings.last().unwrap();
++        let (newest_ping_id, _, _, _) = &newest_ping;
++
++        // Create a new upload manager pointing to the same data_path as the glean instance.
++        let upload_manager = PingUploadManager::new(tmpdir.path(), "Rust", true);
++
++        // Enqueue cached pings and set the quota to just a little over the size on an empty ping file.
++        // This way we can check that one ping is kept and all others are deleted.
++        //
++        // From manual testing I figured out an empty ping file is 324bytes,
++        // I am setting this a little over just so that minor changes to the ping structure
++        // don't immediatelly break this.
++        upload_manager.enqueue_cached_pings(&glean, 500);
++
++        // Get a task once
++        // One ping should have been enqueued.
++        // Make sure it is the newest ping.
++        match upload_manager.get_upload_task(&glean, false) {
++            PingUploadTask::Upload(request) => assert_eq!(&request.document_id, newest_ping_id),
++            _ => panic!("Expected upload manager to return the next request!"),
++        }
++
++        // Verify that no other requests were returned,
++        // they should all have been deleted because pending pings quota was hit.
++        assert_eq!(
++            upload_manager.get_upload_task(&glean, false),
++            PingUploadTask::Done
++        );
++
++        // Verify that the correct number of deleted pings was recorded
++        assert_eq!(
++            n - 1,
++            upload_manager
++                .upload_metrics
++                .deleted_pings_after_quota_hit
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        )
++    }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::tempdir;
+use glean::core::upload::{PingUploadManager, PingUploadTask, PingType};
+use glean::core::upload::directory::PingDirectoryManager;
+use glean::core::Glean;
+use glean::internal_metrics::UploadMetrics;
+use glean::core::upload::{PingDirectoryManager, PingPayloadsByDirectory};</imports>
+<Rust>#[test]
+fn test_pending_pings_directory_size_is_recorded() {
+    let (mut glean, tmpdir) = new_glean(None);
+    let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
+    glean.register_ping_type(&ping_type);
+
+    // Submit the ping twice
+    for _ in 0..2 {
+        glean.submit_ping(&ping_type, None).unwrap();
+    }
+
+    // Get the ping file paths and adjust sizes
+    let manager = PingDirectoryManager::new(tmpdir.path());
+    let pings = manager.process_dirs().pending_pings;
+    assert_eq!(pings.len(), 2);
+
+    // Adjust file sizes to exactly 1 KiB and 2 KiB
+    for (i, (_, (doc_id, path_str, _, _))) in pings.iter().enumerate() {
+        let path = Path::new(path_str);
+        let mut file = fs::File::create(path).unwrap();
+        let size_bytes = if i == 0 { 1024 } else { 2048 };
+        let bytes = vec![b'a'; size_bytes as usize];
+        file.write_all(&bytes).unwrap();
+    }
+
+    // Create the upload manager
+    let upload_manager = PingUploadManager::new(tmpdir.path(), "Rust", true);
+    // Use a quota larger than the total size to avoid deletions
+    upload_manager.enqueue_cached_pings(&glean, 10_000_000); // 10 MiB
+
+    // Check the metric recorded the correct size (3 KiB)
+    let metric_value = upload_manager.upload_metrics
+        .pending_pings_directory_size
+        .test_get_value(&glean, "metrics")
+        .unwrap();
+
+    // The sample should be 3 KiB (3072 bytes)
+    assert_eq!(metric_value, "{\"sum\":3}");
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean`
+   --> glean-core/src/upload/mod.rs:661:9
+    |
+661 |     use glean::core::upload::{PingUploadManager, PingUploadTask, PingType};
+    |         ^^^^^ use of unresolved module or unlinked crate `glean`
+    |
+    = help: if you wanted to use a crate named `glean`, use `cargo add glean` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean`
+   --> glean-core/src/upload/mod.rs:662:9
+    |
+662 |     use glean::core::upload::directory::PingDirectoryManager;
+    |         ^^^^^ use of unresolved module or unlinked crate `glean`
+    |
+    = help: if you wanted to use a crate named `glean`, use `cargo add glean` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean`
+   --> glean-core/src/upload/mod.rs:663:9
+    |
+663 |     use glean::core::Glean;
+    |         ^^^^^ use of unresolved module or unlinked crate `glean`
+    |
+    = help: if you wanted to use a crate named `glean`, use `cargo add glean` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean`
+   --> glean-core/src/upload/mod.rs:664:9
+    |
+664 |     use glean::internal_metrics::UploadMetrics;
+    |         ^^^^^ use of unresolved module or unlinked crate `glean`
+    |
+    = help: if you wanted to use a crate named `glean`, use `cargo add glean` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean`
+   --> glean-core/src/upload/mod.rs:665:9
+    |
+665 |     use glean::core::upload::{PingDirectoryManager, PingPayloadsByDirectory};
+    |         ^^^^^ use of unresolved module or unlinked crate `glean`
+    |
+    = help: if you wanted to use a crate named `glean`, use `cargo add glean` to add it to your `Cargo.toml`
+
+error[E0599]: no method named `write_all` found for struct `File` in the current scope
+    --> glean-core/src/upload/mod.rs:1287:18
+     |
+1287 |             file.write_all(&bytes).unwrap();
+     |                  ^^^^^^^^^
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/io/mod.rs:1835:8
+     |
+     = note: the method is available for `File` here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: there is a method `write_all_at` with a similar name, but with different arguments
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/os/unix/fs.rs:244:5
+help: trait `Write` which provides `write_all` is implemented but not in scope; perhaps you want to import it
+     |
+647  +     use std::io::Write;
+     |
+
+error[E0369]: binary operation `==` cannot be applied to type `DistributionData`
+    --> glean-core/src/upload/mod.rs:1302:9
+     |
+1302 |         assert_eq!(metric_value, "{\"sum\":3}");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |         |
+     |         DistributionData
+     |         &str
+     |
+note: an implementation of `PartialEq<&str>` might be missing for `DistributionData`
+    --> glean-core/src/metrics/mod.rs:68:1
+     |
+68   | pub struct DistributionData {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ must implement `PartialEq<&str>`
+     = note: this error originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)
+</output>
+
+Function signatures
+<Signatures>
+fn process_metadata(path: &str, metadata: &str) -> Option<HeaderMap>
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,239 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Instrument missing sending_success/sending_failure timer IDs.
+Introduced in https://github.com/mozilla/glean/pull/2376
+We handle the absence of those timer IDs when reporting upload status.
+
+ An absence would mean we previously already removed a specific doc ID.
+This would be an inconsistency. We should monitor if that ever happens.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -111,6 +111,7 @@ pub struct UploadMetrics {
+     pub send_success: TimingDistributionMetric,
+     pub send_failure: TimingDistributionMetric,
+     pub in_flight_pings_dropped: CounterMetric,
++    pub missing_send_ids: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -208,6 +209,15 @@ impl UploadMetrics {
+                 disabled: false,
+                 dynamic_label: None,
+             }),
++
++            missing_send_ids: CounterMetric::new(CommonMetricData {
++                name: "missing_send_ids".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -698,6 +698,10 @@ impl PingUploadManager {
+             lock.remove(document_id)
+         };
+ 
++        if send_ids.is_none() {
++            self.upload_metrics.missing_send_ids.add_sync(glean, 1);
++        }
++
+         match status {
+             HttpStatus { code } if (200..=299).contains(&code) => {
+                 log::info!("Ping {} successfully sent {}.", document_id, code);
+@@ -706,11 +710,6 @@ impl PingUploadManager {
+                         .send_success
+                         .set_stop_and_accumulate(glean, success_id, stop_time);
+                     self.upload_metrics.send_failure.cancel_sync(failure_id);
+-                } else {
+-                    // TODO(bug 1816400): Instrument missing IDs.
+-                    // Should be done here and further below.
+-                    // How did we remove the doc ID before we got here?
+-                    // That's an inconsistency.
+                 }
+                 self.directory_manager.delete_file(document_id);
+             }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use glean_core::internal_metrics::UploadMetrics;
+use glean_core::upload::PingUploadManager;
+use glean_core::upload::HttpStatus;</imports>
+<Rust>#[test]
+fn test_upload_metrics_missing_send_ids() {
+  let mut upload_metrics = UploadMetrics::new();
+  let mut ping_upload_manager = PingUploadManager::new(upload_metrics);
+  let document_id = "test_document_id";
+  let status = HttpStatus { code: 200 };
+  let send_ids = None;
+  let stop_time = Duration::from_millis(100);
+  let success_id = "success_id";
+  let failure_id = "failure_id";
+  let expected_missing_send_ids = 1;
+  ping_upload_manager.upload_status(document_id, status, send_ids, stop_time, success_id, failure_id);
+  assert_eq!(ping_upload_manager.upload_metrics.missing_send_ids.get_value(), expected_missing_send_ids);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean_core`
+   --> glean-core/src/upload/mod.rs:840:9
+    |
+840 |     use glean_core::internal_metrics::UploadMetrics;
+    |         ^^^^^^^^^^ use of unresolved module or unlinked crate `glean_core`
+    |
+    = help: if you wanted to use a crate named `glean_core`, use `cargo add glean_core` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean_core`
+   --> glean-core/src/upload/mod.rs:841:9
+    |
+841 |     use glean_core::upload::PingUploadManager;
+    |         ^^^^^^^^^^ use of unresolved module or unlinked crate `glean_core`
+    |
+    = help: if you wanted to use a crate named `glean_core`, use `cargo add glean_core` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `glean_core`
+   --> glean-core/src/upload/mod.rs:842:9
+    |
+842 |     use glean_core::upload::HttpStatus;
+    |         ^^^^^^^^^^ use of unresolved module or unlinked crate `glean_core`
+    |
+    = help: if you wanted to use a crate named `glean_core`, use `cargo add glean_core` to add it to your `Cargo.toml`
+
+error[E0277]: the trait bound `PathBuf: From<internal_metrics::UploadMetrics>` is not satisfied
+    --> glean-core/src/upload/mod.rs:1682:60
+     |
+1682 |       let mut ping_upload_manager = PingUploadManager::new(upload_metrics);
+     |                                     ---------------------- ^^^^^^^^^^^^^^ the trait `From<internal_metrics::UploadMetrics>` is not implemented for `PathBuf`
+     |                                     |
+     |                                     required by a bound introduced by this call
+     |
+     = help: the following other types implement trait `From<T>`:
+               `PathBuf` implements `From<&T>`
+               `PathBuf` implements `From<Box<Path>>`
+               `PathBuf` implements `From<camino::Utf8PathBuf>`
+               `PathBuf` implements `From<std::borrow::Cow<'_, Path>>`
+               `PathBuf` implements `From<std::ffi::OsString>`
+               `PathBuf` implements `From<std::string::String>`
+     = note: required for `internal_metrics::UploadMetrics` to implement `Into<PathBuf>`
+note: required by a bound in `upload::PingUploadManager::new`
+    --> glean-core/src/upload/mod.rs:225:19
+     |
+225  |     pub fn new<P: Into<PathBuf>>(data_path: P, language_binding_name: &str) -> Self {
+     |                   ^^^^^^^^^^^^^ required by this bound in `PingUploadManager::new`
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+    --> glean-core/src/upload/mod.rs:1682:37
+     |
+1682 |       let mut ping_upload_manager = PingUploadManager::new(upload_metrics);
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^---------------- argument #2 of type `&str` is missing
+     |
+note: associated function defined here
+    --> glean-core/src/upload/mod.rs:225:12
+     |
+225  |     pub fn new<P: Into<PathBuf>>(data_path: P, language_binding_name: &str) -> Self {
+     |            ^^^                                 ---------------------------
+help: provide the argument
+     |
+1682 |       let mut ping_upload_manager = PingUploadManager::new(upload_metrics, /* &str */);
+     |                                                                          ++++++++++++
+
+error[E0599]: no method named `upload_status` found for struct `upload::PingUploadManager` in the current scope
+    --> glean-core/src/upload/mod.rs:1690:27
+     |
+184  | pub struct PingUploadManager {
+     | ---------------------------- method `upload_status` not found for this struct
+...
+1690 |       ping_upload_manager.upload_status(document_id, status, send_ids, stop_time, success_id, failure_id);
+     |                           ^^^^^^^^^^^^^ method not found in `upload::PingUploadManager`
+
+error[E0061]: this method takes 2 arguments but 0 arguments were supplied
+    --> glean-core/src/upload/mod.rs:1691:70
+     |
+1691 |       assert_eq!(ping_upload_manager.upload_metrics.missing_send_ids.get_value(), expected_missing_send_ids);
+     |                                                                      ^^^^^^^^^-- two arguments are missing
+     |
+note: method defined here
+    --> glean-core/src/metrics/counter.rs:113:12
+     |
+113  |     pub fn get_value<'a, S: Into<Option<&'a str>>>(
+     |            ^^^^^^^^^
+114  |         &self,
+115  |         glean: &Glean,
+     |         -------------
+116  |         ping_name: S,
+     |         ------------
+help: provide the arguments
+     |
+1691 |       assert_eq!(ping_upload_manager.upload_metrics.missing_send_ids.get_value(/* &core::Glean */, /* ping_name */), expected_missing_send_ids);
+     |                                                                                +++++++++++++++++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1691:83
+     |
+1691 |       assert_eq!(ping_upload_manager.upload_metrics.missing_send_ids.get_value(), expected_missing_send_ids);
+     |                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<i32>`, found integer
+     |
+     = note: expected enum `std::option::Option<i32>`
+                found type `{integer}`
+help: try wrapping the expression in `Some`
+     |
+1691 |       assert_eq!(ping_upload_manager.upload_metrics.missing_send_ids.get_value(), Some(expected_missing_send_ids));
+     |                                                                                   +++++                         +
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,166 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Use a unbounded queue for preinit, but have it act like a bounded queue
+We would like to evaluate making the pre-init queue considerably larger (for example, to ameliorate https://bugzilla.mozilla.org/show_bug.cgi?id=1780035), but bounded queues are fully preallocated.
+
+Unbounded queues are linked lists that add 32 nodes at a time. In fact, for most glean initializations, this will create smaller queues, which is great, and also in the case of large pre-init queues, it can grow rather than be pre-allocated.
+
+The only drawback is that if Glean never finishes initializing, it could grow indefinitely. 
+
+We will move the size checking to Glean to allow for the potential increase of the preinit maximum queue size.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/dispatcher/mod.rs b/glean-core/src/dispatcher/mod.rs
+--- a/glean-core/src/dispatcher/mod.rs
++++ b/glean-core/src/dispatcher/mod.rs
+@@ -35,7 +35,7 @@ use std::{
+     thread::{self, JoinHandle},
+ };
+ 
+-use crossbeam_channel::{bounded, unbounded, SendError, Sender, TrySendError};
++use crossbeam_channel::{bounded, unbounded, SendError, Sender};
+ use thiserror::Error;
+ 
+ pub use global::*;
+@@ -86,15 +86,6 @@ pub enum DispatchError {
+     RecvError(#[from] crossbeam_channel::RecvError),
+ }
+ 
+-impl From<TrySendError<Command>> for DispatchError {
+-    fn from(err: TrySendError<Command>) -> Self {
+-        match err {
+-            TrySendError::Full(_) => DispatchError::QueueFull,
+-            _ => DispatchError::SendError,
+-        }
+-    }
+-}
+-
+ impl<T> From<SendError<T>> for DispatchError {
+     fn from(_: SendError<T>) -> Self {
+         DispatchError::SendError
+@@ -110,6 +101,9 @@ struct DispatchGuard {
+     /// The number of items that were added to the queue after it filled up.
+     overflow_count: Arc<AtomicUsize>,
+ 
++    /// The maximum pre-init queue size
++    max_queue_size: usize,
++
+     /// Used to unblock the worker thread initially.
+     block_sender: Sender<Blocked>,
+ 
+@@ -135,20 +129,15 @@ impl DispatchGuard {
+ 
+     fn send(&self, task: Command) -> Result<(), DispatchError> {
+         if self.queue_preinit.load(Ordering::SeqCst) {
+-            match self
+-                .preinit_sender
+-                .try_send(task)
+-                .map_err(DispatchError::from)
+-            {
+-                Err(err @ DispatchError::QueueFull) => {
+-                    // This value ends up in the `preinit_tasks_overflow` metric, but we
+-                    // can't record directly there, because that would only add
+-                    // the recording to an already-overflowing task queue and would be
+-                    // silently dropped.
+-                    self.overflow_count.fetch_add(1, Ordering::SeqCst);
+-                    Err(err)
+-                }
+-                err => err,
++            if self.preinit_sender.len() < self.max_queue_size {
++                self.preinit_sender.send(task)?;
++                Ok(())
++            } else {
++                self.overflow_count.fetch_add(1, Ordering::SeqCst);
++                // Instead of using a bounded queue, we are handling the bounds
++                // checking ourselves. If a bounded queue were full, we would return
++                // a QueueFull DispatchError, so we do the same here.
++                Err(DispatchError::QueueFull)
+             }
+         } else {
+             self.sender.send(task)?;
+@@ -245,7 +234,7 @@ impl Dispatcher {
+     /// [`flush_init`]: #method.flush_init
+     pub fn new(max_queue_size: usize) -> Self {
+         let (block_sender, block_receiver) = bounded(1);
+-        let (preinit_sender, preinit_receiver) = bounded(max_queue_size);
++        let (preinit_sender, preinit_receiver) = unbounded();
+         let (sender, mut unbounded_receiver) = unbounded();
+ 
+         let queue_preinit = Arc::new(AtomicBool::new(true));
+@@ -315,6 +304,7 @@ impl Dispatcher {
+         let guard = DispatchGuard {
+             queue_preinit,
+             overflow_count,
++            max_queue_size,
+             block_sender,
+             preinit_sender,
+             sender,
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/dispatcher/mod.rs</Filename>
+<imports></imports>
+<Rust>#[test]
+fn test_preinit_queue_size() {
+  let max_queue_size = 10;
+  let dispatcher = Dispatcher::new(max_queue_size);
+  let mut tasks = vec![];
+  for _ in 0..max_queue_size + 1 {
+    tasks.push(Command::Task(Box::new(|| ())));
+  }
+  let mut errors = 0;
+  for task in tasks {
+    match DispatchGuard::send(&dispatcher.guard, task) {
+      Err(DispatchError::QueueFull) => errors += 1,
+      _ => (),
+    }
+  }
+  assert_eq!(errors, 1);
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

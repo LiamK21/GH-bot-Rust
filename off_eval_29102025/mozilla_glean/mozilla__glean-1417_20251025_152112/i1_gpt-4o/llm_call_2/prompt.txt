@@ -1,0 +1,194 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+RLB traits methods cannot take mutable references to self
+Generated metrics instances in Rust are public statics, so in order to not require `unsafe{}` around all uses of a `pub static mut`, we must make operations on the instances not require a mutable reference.
+
+The only current trait that does not satisfy this is Timing Distribution. This bug will fix that.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/timing_distribution.rs b/glean-core/rlb/src/private/timing_distribution.rs
+--- a/glean-core/rlb/src/private/timing_distribution.rs
++++ b/glean-core/rlb/src/private/timing_distribution.rs
+@@ -36,12 +36,12 @@ impl TimingDistributionMetric {
+ 
+ #[inherent(pub)]
+ impl glean_core::traits::TimingDistribution for TimingDistributionMetric {
+-    fn start(&mut self) -> TimerId {
++    fn start(&self) -> TimerId {
+         let start_time = time::precise_time_ns();
+         self.0.write().unwrap().set_start(start_time)
+     }
+ 
+-    fn stop_and_accumulate(&mut self, id: TimerId) {
++    fn stop_and_accumulate(&self, id: TimerId) {
+         let stop_time = time::precise_time_ns();
+         let metric = Arc::clone(&self.0);
+         dispatcher::launch(move || {
+@@ -54,7 +54,7 @@ impl glean_core::traits::TimingDistribution for TimingDistributionMetric {
+         });
+     }
+ 
+-    fn cancel(&mut self, id: TimerId) {
++    fn cancel(&self, id: TimerId) {
+         let metric = Arc::clone(&self.0);
+         dispatcher::launch(move || metric.write().unwrap().cancel(id));
+     }
+
+diff --git a/glean-core/src/traits/timing_distribution.rs b/glean-core/src/traits/timing_distribution.rs
+--- a/glean-core/src/traits/timing_distribution.rs
++++ b/glean-core/src/traits/timing_distribution.rs
+@@ -21,7 +21,7 @@ pub trait TimingDistribution {
+     /// # Returns
+     ///
+     /// A unique [`TimerId`] for the new timer.
+-    fn start(&mut self) -> TimerId;
++    fn start(&self) -> TimerId;
+ 
+     /// Stops tracking time for the provided metric and associated timer id.
+     ///
+@@ -34,7 +34,7 @@ pub trait TimingDistribution {
+     /// * `id` - The [`TimerId`] to associate with this timing. This allows
+     ///   for concurrent timing of events associated with different ids to the
+     ///   same timespan metric.
+-    fn stop_and_accumulate(&mut self, id: TimerId);
++    fn stop_and_accumulate(&self, id: TimerId);
+ 
+     /// Aborts a previous [`start`](TimingDistribution::start) call. No
+     /// error is recorded if no [`start`](TimingDistribution::start) was
+@@ -45,11 +45,11 @@ pub trait TimingDistribution {
+     /// * `id` - The [`TimerId`] to associate with this timing. This allows
+     ///   for concurrent timing of events associated with different ids to the
+     ///   same timing distribution metric.
+-    fn cancel(&mut self, id: TimerId);
++    fn cancel(&self, id: TimerId);
+ 
+     /// **Exported for test purposes.**
+     ///
+-    /// Gets the currently stored value as an integer.
++    /// Gets the currently stored value of the metric.
+     ///
+     /// This doesn't clear the stored value.
+     ///
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/timing_distribution.rs</Filename>
+<imports>use super::TimingDistributionMetric;
+use glean_core::traits::TimingDistribution;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use std::thread::sleep;</imports>
+<Rust>#[test]
+fn test_timing_distribution_methods() {
+    let metric = TimingDistributionMetric(Arc::new(RwLock::new(MockMetric::new())));
+
+    let timer_id = metric.start();
+    sleep(Duration::from_millis(10));
+    metric.stop_and_accumulate(timer_id);
+
+    let expected = 1; // Assuming the mock metric increments a counter on stop_and_accumulate
+    let actual = metric.0.read().unwrap().get_value();
+
+    assert_eq!(expected, actual);
+}
+
+struct MockMetric {
+    value: usize,
+}
+
+impl MockMetric {
+    fn new() -> Self {
+        MockMetric { value: 0 }
+    }
+
+    fn set_start(&mut self, _start_time: u64) -> TimerId {
+        TimerId(0)
+    }
+
+    fn cancel(&mut self, _id: TimerId) {}
+
+    fn get_value(&self) -> usize {
+        self.value
+    }
+}
+
+impl MockMetric {
+    fn stop_and_accumulate(&mut self, _id: TimerId) {
+        self.value += 1;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TimerId(u64);
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> glean-core/rlb/src/private/timing_distribution.rs:105:64
+    |
+105 |     let metric = TimingDistributionMetric(Arc::new(RwLock::new(MockMetric::new())));
+    |                                                    ----------- ^^^^^^^^^^^^^^^^^ expected `TimingDistributionMetric`, found `MockMetric`
+    |                                                    |
+    |                                                    arguments to this function are incorrect
+    |
+note: associated function defined here
+   --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/sync/poison/rwlock.rs:221:18
+
+error[E0599]: no method named `get_value` found for struct `RwLockReadGuard<'_, glean_core::metrics::TimingDistributionMetric>` in the current scope
+   --> glean-core/rlb/src/private/timing_distribution.rs:112:43
+    |
+112 |     let actual = metric.0.read().unwrap().get_value();
+    |                                           ^^^^^^^^^
+    |
+help: there is a method `test_get_value` with a similar name, but with different arguments
+   --> /app/testbed/glean-core/src/metrics/timing_distribution.rs:321:5
+    |
+321 |     pub fn test_get_value(&self, glean: &Glean, storage_name: &str) -> Option<DistributionData> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

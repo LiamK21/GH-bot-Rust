@@ -1,0 +1,46 @@
+#[test]
+fn test_ping_over_1mb_rejected() {
+    let (glean, _) = new_glean(None);
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), "Rust", false);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Create a ping file with body size just over 1MB (1024*1024 + 1 bytes)
+    let doc_id = "over_1mb";
+    let path = format!("/submit/app_id/test/1/{}", doc_id);
+    let body_size = 1024 * 1024 + 1;
+    let file_path = dir.path().join(doc_id);
+    let mut file = std::fs::File::create(file_path).unwrap();
+    writeln!(file, "x").unwrap(); // Write a minimal body
+    upload_manager
+        .pending_pings
+        .write()
+        .unwrap()
+        .push((
+            doc_id.to_string(),
+            path,
+            "x".repeat(body_size),
+            None,
+        ));
+
+    // Process pending pings
+    while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Verify ping was not enqueued
+    match upload_manager.get_upload_task(&glean, false) {
+        PingUploadTask::Done => {}
+        _ => panic!("Unexpected upload task"),
+    }
+
+    // Verify discard metric was recorded
+    let discarded_metric = upload_manager.upload_metrics.discarded_exceeding_pings_size;
+    let samples = discarded_metric.test_get_value(&glean, None).unwrap();
+    assert_ne!(samples, None);
+    assert_eq!(samples.unwrap().count, 1);
+}

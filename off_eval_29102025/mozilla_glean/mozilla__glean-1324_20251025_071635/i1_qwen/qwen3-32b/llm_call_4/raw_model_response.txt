@@ -1,0 +1,388 @@
+<think>
+Okay, I need to figure out why the existing test is failing after the patch. Let's look at the error message: "Global Glean object not initialized". The test is trying to use 'with_glean' but maybe that's not setting up the Glean instance properly in the test environment.
+
+Looking at the test code:
+
+The test uses 'with_glean(|glean| { ... })' which might be attempting to pass the Glean instance into the closure. But the error suggests that Glean isn't initialized when the test runs. Hmm, maybe the 'with_glean' function isn't actually initializing Glean first. Or perhaps the way the test is structured, the closure isn't being executed in a context where Glean is set up correctly.
+
+Wait, in the 'StringMetric::set' method, there's a call to 'dispatcher::launch' which dispatches the actual operation to a queue. So when the test calls 'metric.set("test_value")', it schedules the action, but the 'test_get_value' might not wait for it to complete. The test might be checking the value before it's been recorded.
+
+Looking at the 'test_get_value' method in the StringMetric: it calls 'dispatcher::block_on_queue()' to wait for all tasks to finish. Wait, the test uses 'metric.test_get_value("store0")' but maybe the 'with_glean' setup isn't the right way here. Or perhaps the 'with_glean' in the test isn't properly creating the Glean instance in a way that's accessible during the metric operations.
+
+Wait, in the patch for 'glean-core/src/metrics/string.rs', there's a test called 'setting_a_long_string_records_an_error' that uses 'new_glean' to set up Glean. Maybe the 'with_glean' function used in the current test isn't creating or initializing the Glean instance properly. The new test in the patch uses 'new_glean' which returns a Glean instance and a temporary directory. Perhaps the 'with_glean' in the existing test is a thread-local variable that's not set up correctly in the test environment.
+
+So, the existing test's 'with_glean(|glean| ...)' might not be properly initializing Glean for the metric to work. Instead, maybe the test should use 'new_glean' to set up the Glean instance and then pass it to the metric.
+
+But in the current test, 'with_glean' is using 'with_glean' which may not be the same as initializing Glean properly. The 'with_glean' function might be a helper that's supposed to pass a Glean instance, but maybe in the test environment, the Glean singleton isn't set up. Therefore, when the metric's 'set' is called, it's not actually having a Glean instance to work with, leading to the panic.
+
+To fix this, perhaps the test should use the 'new_glean' approach to create the Glean instance, then pass it to the metric. But how is the metric set up in the test? The 'StringMetric::new' requires a CommonMetricData. The test creates the metric with that data, but when calling 'set', it directly uses the metric's 'set' method, which in the patched code uses the 'glean-core' Glean instance.
+
+Wait, the 'StringMetric' in the RLB (reference library for the product) wraps the 'glean_core::metrics::StringMetric'. The 'set' method in the RLB's StringMetric is using the 'crate::with_glean(|glean| ...)' to access the Glean core's API. But in the test, when the user of the RLB creates the metric, the Glean instance must be initialized in the RLB's context. If the test doesn't initialize Glean properly, the metric can't operate.
+
+The test's current use of 'with_glean' is perhaps part of the RLB's own setup, which might not be initializing Glean as required. The 'with_glean' might be a function in the RLB that is supposed to retrieve the Glean singleton, but if that singleton isn't initialized in the test setup, then it will panic.
+
+Therefore, the correct approach might be to initialize Glean before the test runs. Looking at the patch's new test in 'glean-core/src/metrics/string.rs', the test uses 'new_glean' to create a Glean instance. However, in the RLB's test, the 'with_glean' function might be a different mechanism. Perhaps the RLB doesn't have a 'new_glean' function, but needs to set up the Glean singleton via some other means.
+
+Wait, the error message suggests that the global Glean is not initialized. So the test needs to ensure that the global Glean instance is created. The existing test's 'with_glean' is perhaps not the right way to do that. Maybe the RLB tests are supposed to use their own setup, including initializing Glean.
+
+In the 'glean-core' tests, 'new_glean' is a helper function that sets up the Glean instance. The RLB's 'with_glean' might be a function that allows the test to pass a Glean instance. Wait, in the RLB's 'with_glean' function, perhaps the test needs to create a Glean instance and pass it into the RLB's context.
+
+Alternatively, the RLB's tests might need to use the same 'new_glean' function from 'glean-core' to set up the Glean singleton. But the RLB's tests might not have access to that. Hmm.
+
+Looking at the imports in the test: the test uses 'use super::StringMetric;' and 'use crate::CommonMetricData;'. But if the RLB has its own way of initializing Glean, perhaps the test should use a function similar to 'new_glean' to set up the global Glean instance before using the metric.
+
+Wait, the RLB's StringMetric's 'set' method uses 'dispatcher::launch', which enqueues a task. The 'test_get_value' method in the RLB's StringMetric calls 'dispatcher::block_on_queue()' to wait for all tasks to complete. However, the 'with_glean(|glean| { ... })' in the test might not be initializing Glean properly.
+
+So, the test should probably create a Glean instance, set it as the global one, and then call the metric's methods. But how is that done in the RLB's test context?
+
+In the 'glean-core' test, 'new_glean' returns a Glean instance and temp directory. The test then uses that instance directly. For the RLB's test, perhaps the equivalent is to initialize Glean before creating the metric, and pass the Glean instance into the RLB's API.
+
+But looking at how the RLB's StringMetric is constructed: the 'new' method takes a 'CommonMetricData' and creates the metric. The 'set' method in the RLB's StringMetric is supposed to work with the Glean instance.
+
+In the current test, the 'with_glean' function is called with a closure that receives a 'glean' variable. But if the Glean singleton isn't initialized, this would panic. Therefore, the test should ensure that the Glean singleton is set up before the test runs.
+
+Perhaps the RLB's test setup doesn't initialize Glean, so the test should do that first. The problem is that the current test doesn't know how to initialize the Glean instance. The existing test uses 'with_glean', which may not do that. Instead, the test should create the Glean instance and pass it into the RLB's context.
+
+In the 'glean-core' test, the 'new_glean' function is used to create the Glean instance. So perhaps in the RLB's test, a similar approach is needed. However, the RLB's test might not have access to 'new_glean'. Wait, the RLB is part of the 'glean-core/rlb' project. So maybe the tests in 'glean-core/rlb' should use their own setup functions.
+
+But looking at the code in thepatch, the RLB's tests may be using 'with_glean' which is a function that's supposed to handle the Glean instance. However, if that function isn't setting up the Glean singleton, then the test would fail.
+
+Therefore, the issue is that the test doesn't properly initialize Glean before the metric is used. To fix the test, we need to ensure that the Glean singleton is initialized before the metric is created and used.
+
+The solution would be to create a Glean instance and set it up properly before running the test. However, the current test uses 'with_glean' to obtain the Glean instance, which might not be initializing it.
+
+Looking at the RLB's 'with_glean' function: perhaps it's a macro or a function that allows the test to pass a Glean instance into the closure, but without setting it as the global singleton. Therefore, the test needs to create a Glean instance and pass it to the metric's methods.
+
+Wait, the 'with_glean' in the RLB's code might be a helper that wraps the Glean singleton. So if the test doesn't initialize the Glean singleton first, it would panic. So perhaps the test needs to create a Glean instance and set it as the global one, then call 'with_glean' to access it.
+
+But how to do that in the RLB's test? The existing test tries to use 'with_glean(|glean| { ... })', but if the Glean singleton isn't initialized, then this would panic.
+
+So, the fix is to create a Glean instance and set it in the global context before the test runs, then proceed with the metric operations.
+
+But the RLB's code might not have a 'new_glean' function like 'glean-core' has. Therefore, the test might need to simulate the creation of a Glean instance and set it up.
+
+Alternatively, perhaps the RLB's 'with_glean' function is intended to be used with a test setup that initializes Glean. So maybe the test needs to use a setup that creates the Glean instance and passes it into the closure.
+
+Alternatively, the test may need to use the 'new_glean' function from 'glean-core' to create the Glean instance, set it as the global one, then call the metric's functions.
+
+But in the RLB's test, if the imports are from the RLB's crate, then perhaps the test should access the necessary functions from the RLB crate, or from 'glean-core' if needed.
+
+Alternatively, the 'with_glean' function in the RLB might be a macro that takes a closure and initializes the Glean singleton for that closure. However, in the test, the 'with_glean' isn't being used correctly.
+
+The existing test code:
+
+with_glean(|glean| {
+    let metric = ...;
+    metric.set(...);
+    ...
+});
+
+But if the Glean singleton is not initialized before 'with_glean' is called, this would panic. Therefore, the test must ensure that the Glean singleton is initialized before the metric is used.
+
+Wait, perhaps 'with_glean' is a function that creates the Glean singleton and passes it into the closure. Let's assume that 'with_glean' is a function that initializes Glean correctly. So if the test uses 'with_glean' and passes the Glean instance to the metric, then the metric's 'set' can use that instance.
+
+Wait, in the RLB's 'StringMetric' code, the 'set' method is defined as:
+
+fn set<S: Into<std::string::String>>(&self, value: S) {
+    let metric = Arc::clone(&self.0);
+    let new_value = value.into();
+    dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, new_value)));
+}
+
+So the metric's 'set' method calls 'with_glean' to get the Glean instance. Therefore, when the test calls 'metric.set("test_value")', it will call 'with_glean' again, which must have the Glean instance properly initialized.
+
+But in the current test, the 'with_glean' is being used as part of the test itself. So the test's 'with_glean' should be the same as the one used by the metric's code. Therefore, if the test's 'with_glean' properly initializes Glean, then the metric's 'set' can work.
+
+But the error message is "Global Glean object not initialized". So in the test's 'with_glean' call, the Glean singleton is not being initialized.
+
+This suggests that the 'with_glean' function used in the test is not actually setting up the Glean singleton. Perhaps the 'with_glean' in the RLB's tests is not the right way to do that. Maybe the RLB's tests should use a similar 'new_glean' setup as 'glean-core' does.
+
+Therefore, the test should be modified to create a Glean instance, set it as the global one, then proceed with the test.
+
+But how is this done in the RLB's context?
+
+Looking at the patch, in 'glean-core/src/metrics/string.rs', the test uses 'new_glean' to get the Glean instance. In the RLB's tests, perhaps the equivalent is to call 'new_glean' from the 'glean-core' crate, then use that Glean instance in the test.
+
+But the test in the RLB is in a different crate, so it might need to import the 'glean-core' functions.
+
+Alternatively, the 'with_glean' function in the RLB is supposed to handle the initialization. But the test's current code isn't doing it correctly.
+
+Another possibility: the 'with_glean' function in the RLB is a macro or function that's supposed to run with a temporary setup, but the test code is not setting up the environment properly.
+
+In the existing test, the 'with_glean' call is inside the test function. But if the 'with_glean' function is supposed to create a new Glean instance for the duration of the closure, then perhaps the test should not use 'with_glean' at all. Instead, the metric's 'set' method should handle getting the Glean instance via its own 'with_glean'.
+
+Wait, but the metric's 'set' method also uses 'with_glean', which implies that the Glean instance is available as a global singleton. So if the test's code is not creating the Glean singleton, the metric's 'set' will panic.
+
+So the test must create the Glean singleton before calling the metric's methods. The test's own 'with_glean' function should handle that.
+
+Therefore, the problem is that the current test's 'with_glean' isn't initializing the Glean singleton, leading to the panic. The test needs to use a setup that initializes the Glean singleton.
+
+Looking back at the 'glean-core' test, they use 'new_glean' to create a Glean instance. The RLB's test might need to do something similar. Perhaps the 'with_glean' function in the RLB's test is not sufficient, and the test needs to call 'new_glean' directly.
+
+But how to do that? If the RLB's test is in 'glean-core/rlb', then it can depend on 'glean-core' and call 'new_glean' from there.
+
+Assuming that, the test should be modified to use 'new_glean' to set up the Glean instance and then pass it into the metric's logic.
+
+But the current test doesn't have access to 'new_glean'. Wait, the 'glean-core/src/metrics/string.rs' uses 'new_glean', which is a test helper. The RLB's tests might have their own way of setting up the Glean instance.
+
+Alternatively, perhaps the issue is that the metric's 'test_get_value' in the RLB is not being called with the correct Glean instance. The existing test calls 'metric.test_get_value("store0")', but in the RLB's code, 'test_get_value' is called with a Glean instance in the 'glean-core/src' test. So perhaps the test is missing the Glean instance.
+
+Looking at the 'test_get_value' method in the RLB's StringMetric:
+
+fn test_get_value<'a, S: Into<Option<&'a str>>>(
+    &self,
+    ping_name: S,
+) -> Option<std::string::String> {
+    dispatcher::block_on_queue();
+    let queried_ping_name = ...;
+    crate::with_glean(|glean| self.0.test_get_value(glean, queried_ping_name))
+}
+
+Wait, the test_get_value method in the RLB's StringMetric still uses 'crate::with_glean' to get the Glean instance. So when the test calls 'metric.test_get_value("store0")', it relies on the Glean singleton being initialized. If the test doesn't initialize it, this will panic.
+
+Therefore, the current test's 'with_glean' is not properly initializing the Glean singleton, leading to the panic.
+
+To fix this, the test should use the same setup as the 'glean-core' test: initialize a Glean instance and pass it to the closure.
+
+But how to do that within the RLB's crate? If the RLB's tests can access 'glean-core' functions, then perhaps the test can call 'glean_core::tests::new_glean' to create the Glean instance.
+
+Assuming that the test can import 'glean_core::tests::new_glean', the test can create a Glean instance and pass it to the metric's operations.
+
+So the modified test would look like:
+
+#[test]
+fn test_string_metric_set_and_get() {
+    let (glean, _) = glean_core::tests::new_glean(None);
+    let metric = StringMetric::new(CommonMetricData {
+        name: "test_string".into(),
+        category: "test".into(),
+        send_in_pings: vec!["store0".into()],
+        lifetime: Lifetime::Application,
+        disabled: false,
+        dynamic_label: None,
+    });
+    metric.set(&glean, "test_value"); // passing the Glean instance here, but in the RLB's StringMetric::set doesn't take 'glean' as an argument.
+}
+
+Wait, this is a problem. Looking at the RLB's StringMetric::set method in the patch:
+
+The 'set' method is part of the 'glean_core::traits::String' trait, and the implementation in RLB's StringMetric is:
+
+fn set<S: Into<std::string::String>>(&self, value: S) {
+    // ... then uses with_glean to get the Glean instance.
+}
+
+But the 'set' method doesn't take a 'glean' parameter. It relies on the global instance. Therefore, in the test, the Glean singleton must be initialized, and the closure must have access to it.
+
+Therefore, the test should set up the Glean singleton in the same way that 'with_glean' would do. So the test's 'with_glean' function should be the one that initializes the singleton.
+
+If the current 'with_glean' isn't doing that, then the test should modify how it's used.
+
+But perhaps the issue is that the 'with_glean' function in the RLB's tests is not the correct one. Maybe the 'with_glean' is a macro that's supposed to run the closure in a context where Glean is initialized.
+
+In that case, the test needs to ensure that 'with_glean' is correctly initializing the Glean instance.
+
+But the existing test's 'with_glean' is not doing that. So the test needs to be restructured.
+
+An alternative approach is to use the 'glean_core' functions to create the Glean instance and then use that in the metric's operations. But the RLB's StringMetric's 'set' method does not take the 'glean' parameter—so perhaps the 'with_glean' in the metric's code is supposed to get the Glean instance from somewhere else.
+
+This suggests that the 'with_glean' function in the RLB is not functioning correctly. Perhaps the RLB's 'with_glean' is a function that doesn't actually initialize the singleton, leading to the test failing.
+
+Given that the error is that the Glean singleton isn't initialized, the solution is to initialize the singleton before the test runs.
+
+So the test should import a function like 'new_glean' from 'glean-core' and use it to set up the Glean instance before calling the metric's methods.
+
+Assuming that the RLB's test can access 'glean_core::tests::new_glean', the test can be modified to use that.
+
+But the current test's imports are:
+
+use super::StringMetric;
+use crate::CommonMetricData;
+use crate::Lifetime;
+use crate::with_glean;
+
+So, perhaps the 'crate' here refers to the 'glean-core/rlb' crate. However, the 'glean-core' is a different crate, so the test might not have access to its 'new_glean' function.
+
+This complicates things. If the test is in the 'glean-core/rlb' crate, it can't directly use the 'glean-core' functions that are private unless they're made public.
+
+In the 'glean-core' test, the 'new_glean' function is in the 'glean_core' crate's tests module. Therefore, the RLB's test might not have access to it.
+
+This suggests that the RLB's tests need to find a way to initialize the Glean singleton without directly relying on the 'glean-core::tests::new_glean' function.
+
+Perhaps the solution is to mock or setup the Glean instance in the RLB's test.
+
+But how to do that?
+
+Alternatively, the RLB's 'with_glean' function may be a helper that is supposed to initialize the singleton. But in the current test, the 'with_glean' function is being called as a higher-order function that takes a closure. However, the error indicates that the singleton is not initialized, so perhaps the 'with_glean' function isn't doing that correctly.
+
+Therefore, the test should be rewritten to use a setup that initializes the Glean singleton properly.
+
+Another angle: perhaps the 'set' method in the RLB's StringMetric is supposed to work without the Glean singleton being initialized, but relies on a passed parameter. Wait, no—the 'set' method is using 'with_glean' internally to get the Glean instance. So the Glean singleton must be available when 'set' is called.
+
+Therefore, the test must ensure that the Glean singleton is initialized before the metric's 'set' or 'test_get_value' is called.
+
+So, the correct approach for the test is:
+
+1. Initialize the Glean singleton.
+2. Create the StringMetric.
+3. Call 'set' on the metric.
+4. Call 'test_get_value' to verify the value.
+
+The problem is step 1. The current test uses 'with_glean' which may not be initializing the singleton.
+
+Assuming that 'with_glean' is part of the RLB's code that creates the singleton, and that the test's 'with_glean' call is supposed to do that, but for some reason, the setup isn't working.
+
+Alternatively, perhaps the 'with_glean' in the test is not a function but a macro that runs in a context where the Glean singleton is initialized for the duration of the closure. If that's the case, the test code should correctly initialize it.
+
+But the error happens during the test's 'with_glean' call, which suggests that the initialization is not happening.
+
+Looking at the error message again:
+
+thread 'private::string::tests::test_string_metric_set_and_get' panicked at glean-core/rlb/src/lib.rs:147:32:
+Global Glean object not initialized
+
+This points to the RLB's 'with_glean' function or the way the test is using it not initializing the singleton.
+
+This suggests that the test is not properly setting up the Glean singleton. The fix would be to use a correct setup that initializes Glean first.
+
+Perhaps the 'with_glean' function in the test is not the right way to do it. Instead, the test should directly create a Glean instance.
+
+But how to do that? If the RLB's code allows creating a Glean instance and the test can access those methods, then the test could do that.
+
+Alternatively, if the RLB's code is supposed to use the Glean singleton from 'glean-core', then the test needs to ensure that the singleton is initialized via the 'glean-core' setup.
+
+But this is a bit tangled. Since the 'glean-core' test is able to create and use the Glean instance with 'new_glean', perhaps the RLB's test should also do that, and the RLB's 'with_glean' is just a convenience for the metric's code.
+
+So, in the RLB's test, the test should create a Glean instance using the 'glean-core' functions, then pass that Glean instance to the metric's methods.
+
+But wait, the RLB's StringMetric's 'set' method doesn't take a Glean instance as a parameter. It relies on the 'with_glean' function to get the instance. Therefore, the test must ensure that the Glean singleton is initialized before the 'set' method is called.
+
+To achieve that, maybe the test should use the 'glean-core' setup functions, but the RLB's test doesn't have access to them because they're in the 'glean-core' crate.
+
+An alternative solution is to mock the 'with_glean' function for the test or to initialize the singleton via some other means.
+
+But given the time constraints and the need to produce a fixed test, perhaps the correct approach is to modify the test to pass the Glean instance to the metrics.
+
+Wait, in the 'glean-core' test, the 'set' method is part of the 'glean_core::traits::String' trait, and the test uses the metric's 'set' method that takes a 'glean' parameter. But in the RLB's StringMetric, the 'set' method doesn't take a 'glean' parameter, as it's part of the inherent implementation (via#[inherent(pub)]). So the RLB's 'StringMetric' has a 'set' method that takes only the value, and uses 'with_glean' internally to get the Glean instance.
+
+In this case, the test must ensure that the Glean singleton is initialized. So the test should use the 'glean_core::tests::new_glean' function to create the Glean instance and set it as the singleton.
+
+But if the test can't access that function, perhaps because it's in a different crate, this is a problem.
+
+In that case, the RLB's test code would need to depend on the 'glean_core' crate's public functions to initialize the Glean singleton.
+
+Assuming that the RLB's code can import 'glean_core::private::glean::Glean' and other necessary types, the test might need to manually initialize the Glean singleton.
+
+But this seems complicated.
+
+Alternatively, maybe the RLB's 'with_glean' function is a wrapper around the 'new_glean' function, but it's not being called correctly in the test.
+
+Given the time constraints, the best approach is to adjust the test to initialize the Glean singleton properly. Assuming that the 'with_glean' function in the RLB's crate is supposed to handle this, the current test should be modified to ensure that the singleton is initialized.
+
+But the current test is failing because the Glean singleton isn't initialized. So the test needs to create the Glean instance before the metric's methods are called.
+
+Another possibility is that the 'with_glean' function in the RLB's code is intended to pass a temporary Glean instance to the closure, but the way it's implemented in the test is incorrect.
+
+Perhaps the test should create a Glean instance and pass it to the metric's methods directly.
+
+But since the RLB's StringMetric's 'set' method doesn't take 'glean' as an argument, this isn't feasible. The 'set' method relies on the global Glean instance, which needs to be initialized.
+
+Therefore, the test must correctly initialize the global Glean instance.
+
+Putting this together, the correct test would:
+
+1. Initialize the Glean singleton.
+2. Create a StringMetric with valid CommonMetricData.
+3. Call 'set' on the metric with a string.
+4. Call 'test_get_value' to verify the string is stored.
+5. Check that no errors are recorded if the string is within limits.
+
+But the error suggests that the Glean singleton isn't initialized in the test. The current test uses 'with_glean' to attempt to initialize it, but that's not working.
+
+Perhaps the test should use the same setup as the 'glean-core' test, which uses 'new_glean' to create the instance. However, the RLB's test may not have access to 'new_glean' directly.
+
+But if the 'glean-core/src/metrics' has the 'new_glean' function, and the RLB's test has access to 'glean_core::tests::new_glean', then the test can be modified to use that.
+
+Assuming that this is possible, the test should be modified as follows:
+
+- Use 'glean_core::tests::new_glean(None)' to create a Glean instance and temporary directory.
+- Assign the Glean instance to the global singleton.
+- Proceed with the test.
+
+However, in practice, the way the Glean singleton is managed may vary. If the Glean singleton is a static variable, the test must assign it during setup.
+
+But this is getting complicated. Given the context and the error, the key is that the test needs to ensure that the Glean singleton is initialized before any metric methods are called.
+
+So the correct test should be adjusted to use 'new_glean' and pass the Glean instance wherever needed.
+
+But in the RLB's StringMetric 'set' method, the 'glean' instance is obtained via 'with_glean', so the test must ensure that the singleton is initialized.
+
+Given all this, the test should be restructured to use 'new_glean' from 'glean-core', assuming that the RLB's test can import it. So the imports would need to include 'glean_core::tests::new_glean', and 'glean_core::CommonMetricData' as well.
+
+But the current imports in the test are:
+
+use super::StringMetric;
+use crate::CommonMetricData;
+use crate::Lifetime;
+use crate::with_glean;
+
+If the 'CommonMetricData' is from the 'glean-core' crate, then maybe the test can import 'glean_core::tests::new_glean' as well.
+
+Therefore, the corrected test would look something like this:
+
+<Filename>glean-core/rlb/src/private/string.rs</Filename>
+<imports>use super::StringMetric;
+use crate::CommonMetricData;
+use crate::Lifetime;
+use crate::with_glean;
+use glean_core::tests::new_glean;</imports>
+<Rust>
+#[test]
+fn test_string_metric_set_and_get() {
+    let (glean, _) = new_glean(None, None);
+    let metric = StringMetric::new(CommonMetricData {
+        name: "test_string".into(),
+        category: "test".into(),
+        send_in_pings: vec!["store0".into()],
+        lifetime: Lifetime::Application,
+        disabled: false,
+        dynamic_label: None,
+    });
+    metric.set("test_value");
+    assert_eq!(Some("test_value".to_string()), metric.test_get_value("store0"));
+}
+</Rust>
+
+But wait, the 'set' method in the RLB's StringMetric doesn't take the Glean instance as a parameter, so the 'set' call would rely on the singleton being initialized.
+
+The 'new_glean(None, None)' would set up the Glean singleton, and the 'metric.set(...)' would work because the 'with_glean' in the 'set' method can now access the initialized singleton.
+
+However, in the patch, the 'glean_core::tests::new_glean' function is defined in 'glean-core/src/tests/mod.rs' and returns (Glean, _)—so the RLB's test can import it.
+
+The current test uses 'with_glean', which perhaps wraps the Glean singleton. But by using 'new_glean', the singleton is initialized, and the 'with_glean' closures can access it.
+
+This should resolve the error, as the Glean singleton is properly initialized before the test runs.
+</think>
+
+<Filename>glean-core/rlb/src/private/string.rs</Filename>
+<imports>use super::StringMetric;
+use crate::CommonMetricData;
+use crate::Lifetime;
+use crate::with_glean;
+use glean_core::tests::new_glean;</imports>
+<Rust>
+#[test]
+fn test_string_metric_set_and_get() {
+    let (glean, _) = new_glean(None, None);
+    let metric = StringMetric::new(CommonMetricData {
+        name: "test_string".into(),
+        category: "test".into(),
+        send_in_pings: vec!["store0".into()],
+        lifetime: Lifetime::Application,
+        disabled: false,
+        dynamic_label: None,
+    });
+    metric.set("test_value");
+    assert_eq!(Some("test_value".to_string()), metric.test_get_value("store0"));
+}
+</Rust>

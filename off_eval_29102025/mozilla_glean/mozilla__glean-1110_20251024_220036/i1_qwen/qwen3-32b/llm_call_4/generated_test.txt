@@ -1,0 +1,60 @@
+#[test]
+fn test_pending_pings_directory_size_is_recorded() {
+    let tmp_dir = tempdir().expect("Could not create temporary directory");
+    let data_path = tmp_dir.path().to_path_buf();
+
+    let mut glean = Glean::new(Configuration {
+        data_path: data_path.to_str().unwrap().to_string(),
+        application_id: "test".into(),
+        upload_enabled: true,
+        language_binding_name: "Rust",
+        max_events: Some(100),
+        delay_ping_lifetime_io: false,
+    }).expect("Could not initialize Glean instance");
+
+    let upload_manager = PingUploadManager::new(data_path.clone(), "Rust", true);
+    let manager = PingDirectoryManager::new(data_path.clone());
+
+    // Register a test ping type
+    let ping_type = PingType::new("test", true, true, Vec::new());
+    glean.register_ping_type(&ping_type);
+
+    // Submit the ping twice
+    glean.submit_ping(&ping_type, None).expect("Failed to submit ping");
+    glean.submit_ping(&ping_type, None).expect("Failed to submit ping");
+
+    // Get the ping file paths and adjust sizes
+    let pings = manager.process_dirs().pending_pings;
+    assert_eq!(pings.len(), 2);
+
+    for (i, (_, (doc_id, path_str, _, _))) in pings.iter().enumerate() {
+        let path = Path::new(path_str);
+        let mut file = File::create(path).expect("Failed to create file");
+        let size_bytes = if i == 0 { 1024 } else { 2048 };
+        let bytes = vec![b'a'; size_bytes];
+        file.write_all(&bytes).expect("Failed to write to file");
+    }
+
+    // Enqueue with large quota to avoid deletion
+    upload_manager.enqueue_cached_pings(&glean, 200_000);
+
+    // Get the recorded metric value
+    let metric_value = upload_manager.upload_metrics
+        .pending_pings_directory_size
+        .test_get_value(&glean, "metrics")
+        .expect("Failed to get metric value");
+
+    // Check that the sum of bytes was correctly converted to KiB
+    assert_eq!(upload_manager.upload_metrics
+        .pending_pings_directory_size
+        .test_get_num_recorded_errors(&glean, "metrics")
+        .unwrap_or(0), 0);
+
+    // Expected total size in bytes: 1024 + 2048 = 3072 bytes = 3 KiB
+    let expected_kib = 3072 / 1024;
+    assert_eq!(metric_value, Some(DistributionData {
+        values: [(expected_kib as u64, 1)].into_iter().collect(),
+        sum: expected_kib as u64,
+        count: 1,
+    }));
+}

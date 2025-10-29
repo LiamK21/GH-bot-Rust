@@ -1,0 +1,38 @@
+#[test]
+fn test_requeues_after_client_error_with_disk_ping() {
+    let dir = tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path(), false);
+
+    let doc_id = Uuid::new_v4().to_string();
+    let ping_dir = dir.path().join(PENDING_PINGS_DIRECTORY);
+    fs::create_dir_all(&ping_dir).unwrap();
+
+    let ping_path = ping_dir.join(format!("{}.incomplete", doc_id));
+    let mut file = File::create(&ping_path).unwrap();
+    writeln!(file, "/submit/APP_ID/PING_NAME/1/{}", doc_id).unwrap();
+    writeln!(file, "{{}}").unwrap();
+    file.sync_all().unwrap();
+
+    let dir_manager = PingDirectoryManager::new(dir.path());
+    let upload_manager = PingUploadManager::new(dir.path(), false);
+
+    // Wait for initial processing to finish
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let queue = upload_manager.queue.read().unwrap();
+    assert!(queue.is_empty(), "Queue shouldn't contain any requests after startup");
+
+    upload_manager.process_ping_upload_response(&doc_id, UploadResult::HttpStatus(400), None);
+
+    // Wait for directory processing to complete
+    while upload_manager.get_upload_task(false) == PingUploadTask::Wait {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    match upload_manager.get_upload_task(false) {
+        PingUploadTask::Upload(_) => {}
+        _ => panic!("Expected requeued ping"),
+    }
+}

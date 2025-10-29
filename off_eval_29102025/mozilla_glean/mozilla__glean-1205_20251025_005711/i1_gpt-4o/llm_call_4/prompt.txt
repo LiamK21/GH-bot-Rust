@@ -1,0 +1,454 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+`non-deletion-pings are not  uploaded` is intermittently failing
+This is an extract of the logs:
+
+> [task 2020-08-03T16:10:43.809Z] mozilla.telemetry.glean.scheduler.DeletionPingTest > non-deletion-pings are not uploaded when upload disabled FAILED
+> [task 2020-08-03T16:10:43.809Z]     java.lang.AssertionError at DeletionPingTest.kt:147
+
+The full log is [available here](https://firefox-ci-tc.services.mozilla.com/tasks/d8XMXIfATjWYo_g0M7nW_A/runs/0/logs/https%3A%2F%2Ffirefox-ci-tc.services.mozilla.com%2Fapi%2Fqueue%2Fv1%2Ftask%2Fd8XMXIfATjWYo_g0M7nW_A%2Fruns%2F0%2Fartifacts%2Fpublic%2Flogs%2Flive.log). The offending line is [this one](https://searchfox.org/glean/rev/cdcdc1d2d9f71e2dd815e875ad96a0fb89a6e2ad/glean-core/android/src/test/java/mozilla/telemetry/glean/pings/DeletionPingTest.kt#147).
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/lib.rs b/glean-core/ffi/src/lib.rs
+--- a/glean-core/ffi/src/lib.rs
++++ b/glean-core/ffi/src/lib.rs
+@@ -460,7 +460,7 @@ pub unsafe extern "C" fn glean_initialize_for_subprocess(cfg: *const FfiConfigur
+         // 2. We're not holding on to it beyond this function
+         //    and we copy out all data when needed.
+         let glean_cfg = glean_core::Configuration::try_from(&*cfg)?;
+-        let glean = Glean::new_for_subprocess(&glean_cfg)?;
++        let glean = Glean::new_for_subprocess(&glean_cfg, true)?;
+         glean_core::setup_glean(glean)?;
+         log::info!("Glean initialized for subprocess");
+         Ok(true)
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -187,7 +187,7 @@ impl Glean {
+     ///
+     /// Importantly, this will not send any pings at startup, since that
+     /// sort of management should only happen in the main process.
+-    pub fn new_for_subprocess(cfg: &Configuration) -> Result<Self> {
++    pub fn new_for_subprocess(cfg: &Configuration, scan_directories: bool) -> Result<Self> {
+         log::info!("Creating new Glean v{}", GLEAN_VERSION);
+ 
+         let application_id = sanitize_application_id(&cfg.application_id);
+@@ -201,12 +201,17 @@ impl Glean {
+         let event_data_store = EventDatabase::new(&cfg.data_path)?;
+ 
+         // Create an upload manager with rate limiting of 10 pings every 60 seconds.
+-        let mut upload_manager =
+-            PingUploadManager::new(&cfg.data_path, &cfg.language_binding_name, false);
++        let mut upload_manager = PingUploadManager::new(&cfg.data_path, &cfg.language_binding_name);
+         upload_manager.set_rate_limiter(
+             /* seconds per interval */ 60, /* max tasks per interval */ 15,
+         );
+ 
++        // We only scan the pending ping sdirectories when calling this from a subprocess,
++        // when calling this from ::new we need to scan the directories after dealing with the upload state.
++        if scan_directories {
++            let _scanning_thread = upload_manager.scan_pending_pings_directories();
++        }
++
+         Ok(Self {
+             upload_enabled: cfg.upload_enabled,
+             data_store,
+@@ -230,7 +235,7 @@ impl Glean {
+     /// This will create the necessary directories and files in `data_path`.
+     /// This will also initialize the core metrics.
+     pub fn new(cfg: Configuration) -> Result<Self> {
+-        let mut glean = Self::new_for_subprocess(&cfg)?;
++        let mut glean = Self::new_for_subprocess(&cfg, false)?;
+ 
+         // The upload enabled flag may have changed since the last run, for
+         // example by the changing of a config file.
+@@ -263,6 +268,12 @@ impl Glean {
+             }
+         }
+ 
++        // We only scan the pendings pings directories **after** dealing with the upload state.
++        // If upload is disabled, we delete all pending pings files
++        // and we need to do that **before** scanning the pending pings folder
++        // to ensure we don't enqueue pings before their files are deleted.
++        let _scanning_thread = glean.upload_manager.scan_pending_pings_directories();
++
+         Ok(glean)
+     }
+ 
+@@ -285,8 +296,7 @@ impl Glean {
+         let mut glean = Self::new(cfg).unwrap();
+ 
+         // Disable all upload manager policies for testing
+-        // and make the upload manager scan the pings directories synchronously.
+-        glean.upload_manager = PingUploadManager::no_policy(data_path, true);
++        glean.upload_manager = PingUploadManager::no_policy(data_path);
+ 
+         glean
+     }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -163,54 +163,20 @@ pub struct PingUploadManager {
+ impl PingUploadManager {
+     /// Creates a new PingUploadManager.
+     ///
+-    /// Spawns a new thread and processes the pending pings directory,
+-    /// filling up the queue with whatever pings are in there.
+-    ///
+     /// # Arguments
+     ///
+     /// * `data_path` - Path to the pending pings directory.
+     /// * `language_binding_name` - The name of the language binding calling this managers instance.
+-    /// * `sync_scan` - Whether or not ping directory scanning should be synchronous.
+     ///
+     /// # Panics
+     ///
+     /// Will panic if unable to spawn a new thread.
+-    pub fn new<P: Into<PathBuf>>(
+-        data_path: P,
+-        language_binding_name: &str,
+-        sync_scan: bool,
+-    ) -> Self {
+-        let queue = RwLock::new(VecDeque::new());
+-        let directory_manager = PingDirectoryManager::new(data_path);
+-
+-        let processed_pending_pings = Arc::new(AtomicBool::new(false));
+-        let cached_pings = Arc::new(RwLock::new(PingPayloadsByDirectory::default()));
+-
+-        let local_manager = directory_manager.clone();
+-        let local_cached_pings = cached_pings.clone();
+-        let local_flag = processed_pending_pings.clone();
+-        let ping_scanning_thread = thread::Builder::new()
+-            .name("glean.ping_directory_manager.process_dir".to_string())
+-            .spawn(move || {
+-                let mut local_cached_pings = local_cached_pings
+-                    .write()
+-                    .expect("Can't write to pending pings cache.");
+-                local_cached_pings.extend(local_manager.process_dirs());
+-                local_flag.store(true, Ordering::SeqCst);
+-            })
+-            .expect("Unable to spawn thread to process pings directories.");
+-
+-        if sync_scan {
+-            ping_scanning_thread
+-                .join()
+-                .expect("Unable to wait for startup ping processing to finish.");
+-        }
+-
++    pub fn new<P: Into<PathBuf>>(data_path: P, language_binding_name: &str) -> Self {
+         Self {
+-            queue,
+-            directory_manager,
+-            processed_pending_pings,
+-            cached_pings,
++            queue: RwLock::new(VecDeque::new()),
++            directory_manager: PingDirectoryManager::new(data_path),
++            processed_pending_pings: Arc::new(AtomicBool::new(false)),
++            cached_pings: Arc::new(RwLock::new(PingPayloadsByDirectory::default())),
+             recoverable_failure_count: AtomicU32::new(0),
+             wait_attempt_count: AtomicU32::new(0),
+             rate_limiter: None,
+@@ -220,10 +186,32 @@ impl PingUploadManager {
+         }
+     }
+ 
++    /// Spawns a new thread and processes the pending pings directories,
++    /// filling up the queue with whatever pings are in there.
++    ///
++    /// # Returns
++    ///
++    /// The `JoinHandle` to the spawned thread
++    pub fn scan_pending_pings_directories(&self) -> std::thread::JoinHandle<()> {
++        let local_manager = self.directory_manager.clone();
++        let local_cached_pings = self.cached_pings.clone();
++        let local_flag = self.processed_pending_pings.clone();
++        thread::Builder::new()
++            .name("glean.ping_directory_manager.process_dir".to_string())
++            .spawn(move || {
++                let mut local_cached_pings = local_cached_pings
++                    .write()
++                    .expect("Can't write to pending pings cache.");
++                local_cached_pings.extend(local_manager.process_dirs());
++                local_flag.store(true, Ordering::SeqCst);
++            })
++            .expect("Unable to spawn thread to process pings directories.")
++    }
++
+     /// Creates a new upload manager with no limitations, for tests.
+     #[cfg(test)]
+-    pub fn no_policy<P: Into<PathBuf>>(data_path: P, sync_scan: bool) -> Self {
+-        let mut upload_manager = Self::new(data_path, "Test", sync_scan);
++    pub fn no_policy<P: Into<PathBuf>>(data_path: P) -> Self {
++        let mut upload_manager = Self::new(data_path, "Test");
+ 
+         // Disable all policies for tests, if necessary individuals tests can re-enable them.
+         upload_manager.policy.set_max_recoverable_failures(None);
+@@ -233,6 +221,12 @@ impl PingUploadManager {
+             .policy
+             .set_max_pending_pings_directory_size(None);
+ 
++        // When building for tests, always scan the pending pings directories and do it sync.
++        upload_manager
++            .scan_pending_pings_directories()
++            .join()
++            .unwrap();
++
+         upload_manager
+     }
+ 
+@@ -715,9 +709,7 @@ mod test {
+     fn returns_ping_request_when_there_is_one() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Enqueue a ping
+         upload_manager.enqueue_ping(&glean, &Uuid::new_v4().to_string(), PATH, "", None);
+@@ -734,9 +726,7 @@ mod test {
+     fn returns_as_many_ping_requests_as_there_are() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Enqueue a ping multiple times
+         let n = 10;
+@@ -763,10 +753,7 @@ mod test {
+     fn limits_the_number_of_pings_when_there_is_rate_limiting() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let mut upload_manager =
+-            PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Add a rate limiter to the upload mangager with max of 10 pings every 3 seconds.
+         let secs_per_interval = 3;
+@@ -808,9 +795,7 @@ mod test {
+     fn clearing_the_queue_works_correctly() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Enqueue a ping multiple times
+         for _ in 0..10 {
+@@ -875,7 +860,7 @@ mod test {
+         }
+ 
+         // Create a new upload manager pointing to the same data_path as the glean instance.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Verify the requests were properly enqueued
+         for _ in 0..n {
+@@ -1018,12 +1003,7 @@ mod test {
+     fn new_pings_are_added_while_upload_in_progress() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
+-        while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+-            thread::sleep(Duration::from_millis(10));
+-        }
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         let doc1 = Uuid::new_v4().to_string();
+         let path1 = format!("/submit/app_id/test-ping/1/{}", doc1);
+@@ -1064,27 +1044,6 @@ mod test {
+         );
+     }
+ 
+-    #[test]
+-    fn async_ping_directories_scanning_works() {
+-        let (glean, dir) = new_glean(None);
+-
+-        // Create a new upload_manager, with a asynchronous ping dir scan,
+-        // all other tests do this synchronously.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ false);
+-
+-        // Wait for processing of pending pings directory to finish.
+-        while upload_manager.get_upload_task(&glean, false) == PingUploadTask::Wait {
+-            thread::sleep(Duration::from_millis(10));
+-        }
+-
+-        // Since the scan was synchronous and the directory was empty,
+-        // we expect the upload task to always be `Done`.
+-        assert_eq!(
+-            PingUploadTask::Done,
+-            upload_manager.get_upload_task(&glean, false)
+-        )
+-    }
+-
+     #[test]
+     fn adds_debug_view_header_to_requests_when_tag_is_set() {
+         let (mut glean, _) = new_glean(None);
+@@ -1113,7 +1072,7 @@ mod test {
+ 
+         // Create a new upload manager so that we have access to its functions directly,
+         // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let upload_manager = PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         let doc_id = Uuid::new_v4().to_string();
+         let path = format!("/submit/app_id/test-ping/1/{}", doc_id);
+@@ -1149,10 +1108,7 @@ mod test {
+             glean.submit_ping(&ping_type, None).unwrap();
+         }
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let mut upload_manager =
+-            PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Set a policy for max recoverable failures, this is usually disabled for tests.
+         let max_recoverable_failures = 3;
+@@ -1210,8 +1166,7 @@ mod test {
+         let (newest_ping_id, _, _, _) = &newest_ping;
+ 
+         // Create a new upload manager pointing to the same data_path as the glean instance.
+-        let mut upload_manager =
+-            PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Set the quota to just a little over the size on an empty ping file.
+         // This way we can check that one ping is kept and all others are deleted.
+@@ -1253,10 +1208,7 @@ mod test {
+     fn maximum_wait_attemps_is_enforced() {
+         let (glean, dir) = new_glean(None);
+ 
+-        // Create a new upload manager so that we have access to its functions directly,
+-        // make it synchronous so we don't have to manually wait for the scanning to finish.
+-        let mut upload_manager =
+-            PingUploadManager::no_policy(dir.path(), /* sync_scan */ true);
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
+ 
+         // Define a max_wait_attemps policy, this is disabled for tests by default.
+         let max_wait_attempts = 3;
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/ffi/src/lib.rs</Filename>
+<imports>use super::glean_initialize_for_subprocess;
+use std::ptr;
+use crate::FfiConfiguration;</imports>
+<Rust>#[test]
+fn test_glean_initialize_for_subprocess_upload_disabled() {
+    let config = FfiConfiguration {
+        data_path: "test_path".into(),
+        application_id: "test_app".into(),
+        upload_enabled: false,
+        language_binding_name: "test_binding".into(),
+        delay_ping_lifetime_io: false,
+        max_events: 0,
+    };
+    let config_ptr = &config as *const FfiConfiguration;
+    let result = unsafe { glean_initialize_for_subprocess(config_ptr) };
+    assert_eq!(result, 1);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0560]: struct `FfiConfiguration<'_>` has no field named `data_path`
+   --> glean-core/ffi/src/lib.rs:502:9
+    |
+502 |         data_path: "test_path".into(),
+    |         ^^^^^^^^^ `FfiConfiguration<'_>` does not have this field
+    |
+    = note: available fields are: `data_dir`, `package_name`
+
+error[E0560]: struct `FfiConfiguration<'_>` has no field named `application_id`
+   --> glean-core/ffi/src/lib.rs:503:9
+    |
+503 |         application_id: "test_app".into(),
+    |         ^^^^^^^^^^^^^^ `FfiConfiguration<'_>` does not have this field
+    |
+    = note: available fields are: `data_dir`, `package_name`
+
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/lib.rs:504:25
+    |
+504 |         upload_enabled: false,
+    |                         ^^^^^ expected `u8`, found `bool`
+
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/lib.rs:506:33
+    |
+506 |         delay_ping_lifetime_io: false,
+    |                                 ^^^^^ expected `u8`, found `bool`
+
+error[E0277]: the trait bound `ffi_support::FfiStr<'_>: From<&str>` is not satisfied
+   --> glean-core/ffi/src/lib.rs:505:47
+    |
+505 |         language_binding_name: "test_binding".into(),
+    |                                               ^^^^ the trait `From<&str>` is not implemented for `ffi_support::FfiStr<'_>`
+    |
+    = note: required for `&str` to implement `Into<ffi_support::FfiStr<'_>>`
+
+error[E0308]: mismatched types
+   --> glean-core/ffi/src/lib.rs:507:21
+    |
+507 |         max_events: 0,
+    |                     ^ expected `Option<&i32>`, found integer
+    |
+    = note: expected enum `std::option::Option<&i32>`
+               found type `{integer}`
+</output>
+
+Function signatures
+<Signatures>
+fn glean_initialize_for_subprocess(cfg: *const FfiConfiguration) -> u8
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

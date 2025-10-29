@@ -1,0 +1,208 @@
+<think>
+Okay, I need to figure out what test to write for this patch. The issue is about moving ping logging back to Rust core, specifically handling the logging when a ping is uploaded. The patch adds a new parameter `log_ping` to several functions so that logging occurs when requested.
+
+Looking at the code changes, the `get_upload_task` functions now take a `log_ping: bool` argument. When this is true, the code checks if the ping should be logged, especially on Android where chunking is needed. The test in `upload/mod.rs` already has some tests, but they probably don't cover the logging functionality yet.
+
+The key is to write a test that verifies whether the logging is performed correctly when `log_ping` is set to true. Since the patch introduces `chunked_log_info` for Android and uses it conditionally, I need to test if that logging function is called with the right parameters. But since Rust tests can't directly test whether a log entry is generated (without using a logging framework setup), perhaps the test can check if the logging code is triggered by ensuring that the `pretty_body` method is called and the chunks are properly formatted.
+
+Alternatively, since the logging is done via the `log::info!` macro, which might not be captured in unit tests unless a logger is set up, this complicates things. However, maybe the patch's test already includes some logic that can be checked indirectly. Wait, in the patch, the `get_upload_task` function has a `log_ping` argument, which when true, calls `chunked_log_info`. So, the test should verify that when `log_ping` is true, the logging happens.
+
+But how to mock or verify this in a unit test? Maybe by creating a mock logger or checking if the `pretty_body` returns the expected string, but in practice, setting up a logger might be tricky. However, the test can check if the `pretty_body` method is correctly implemented, which is part of the logging process.
+
+Looking at the `PingRequest.pretty_body()` function, it's supposed to decompress the payload and pretty-print the JSON. A test could create a PingRequest with a known compressed body, check if `pretty_body()` correctly decompresses and formats it.
+
+Wait, but the main issue here is the logging. The test needs to ensure that when `log_ping` is set to true, the logging occurs. Since we can't directly test the logging output in a test without a logger, perhaps the test should focus on the `pretty_body` functionality, which is crucial for logging to work correctly.
+
+The `PingRequest.pretty_body()` returns an Option<String>. So a test could create a PingRequest with a Gzipped JSON payload and verify that `pretty_body` correctly decompresses it, converts it to pretty JSON, and returns it as a Some(String). This would ensure that when logging is enabled, the correct payload is logged.
+
+In the provided patch, the `PingRequest.pretty_body` uses GzDecoder to decompress the payload, then converts it to a string and pretty-prints it. So, the test should verify that this works.
+
+So, writing a test for `pretty_body` makes sense. The original code might not have had a test for this function, so this test would check that the new code correctly decompresses and formats the payload.
+
+Let me outline the test steps:
+
+1. Create a sample JSON string.
+2. Compress it into a Vec<u8> using GzEncoder.
+3. Create a PingRequest with the compressed data.
+4. Call pretty_body() and check if it returns the pretty-printed JSON.
+
+This test would fail if the decompression or pretty-printing is not handled correctly. Since the patch adds the decompression step for logging, this test ensures that part works.
+
+Now, considering that the patch modified the `upload_manager.get_upload_task()` function to call `chunked_log_info`, but the `chunked_log_info` itself is not yet tested. However, the `chunked_log_info` function is responsible for splitting the log message into chunks. Testing that would require more setup, perhaps with mocks, but the user mentioned to avoid using external mock libraries. So, focusing on the `pretty_body` seems feasible.
+
+So, the test should be in `glean-core/src/upload/request.rs` where the `pretty_body` method is defined. Let's look at the existing tests in `request.rs`—the patch doesn't show any existing tests for that file. So, adding a new test there.
+
+The test needs to:
+
+- Use a sample JSON payload.
+- Compress it into a Gzipped byte slice.
+- Create a PingRequest with a sample path and that body.
+- Call `pretty_body()` and verify the output.
+
+This would ensure that when `log_ping` is true, the payload is correctly decompressed and formatted for logging.
+
+Another thing to note is that the `PingRequest::gzip_content` function is used to create the Gzipped body. So in the test, we can use that to generate the compressed data.
+
+So, the test code would look something like this:
+
+1. Create a JSON string like `{"example": "data"}`
+2. Compress it using `PingRequest::gzip_content("path", bytes)` to get the compressed body.
+3. Create a `PingRequest` with that body.
+4. Call `pretty_body()` and check if it returns Some(pretty_json).
+
+If the `gzip_content` returns the compressed Vec<u8>, then the test can proceed.
+
+In the test, we need to import the necessary modules. Since `gzip_content` is part of the `PingRequest` module, maybe it's accessible via super::...
+
+Now, putting this into a test function.
+
+But need to make sure that the test is self-contained, not relying on external mock libraries. Also, need to handle the compression correctly.
+
+Let me sketch the test code:
+
+use super::PingRequest;
+use flate2::Compression;
+
+#[test]
+fn test_pretty_body() {
+    let original_json = r#"{"a":true,"b":0}"#;
+    let original_bytes = original_json.as_bytes();
+    let compressed_body = PingRequest::gzip_content("test-path", original_bytes).unwrap();
+    let request = PingRequest {
+        body: compressed_body,
+        path: "test-path".to_string(),
+        is_deletion_request: false,
+        // other fields can be defaults
+        // but need to fill them
+        document_id: None,
+    };
+
+    // Now call pretty_body
+    let pretty = request.pretty_body().unwrap();
+    // Check that the pretty JSON is formatted correctly
+    assert!(pretty.contains("\n  \"a\": true,\n  \"b\": 0\n"));
+}
+
+Wait, but the PingRequest struct requires other fields. For example, in the test, the `PingRequest` is a struct with fields like `body`, `path`, `is_deletion_request`, and `document_id`. So in the test, need to initialize all fields. But the test may only care about the `body` and `path`, so the other fields can be set to default.
+
+The `gzip_content` function returns an Option<Vec<u8>>, so we can use that.
+
+In the test, after decompression, the `pretty_body` should use `serde_json` to parse into aJsonValue and then serialize with pretty formatting. So the expected pretty JSON would have newlines and spaces.
+
+But need to make sure that the original JSON is compressed properly, and then decompressed correctly.
+
+This test should pass on the patched code, but fail if the `gzip_content` isn't properly handled, or if the `pretty_body` doesn't decompress or format correctly.
+
+If the code before the patch didn't have the `pretty_body` function, then before applying the patch, the test would fail because that function wouldn't exist. Hence, this test would fail before the patch and pass after.
+
+So, the correct filename is `glean-core/src/upload/request.rs`, and the test tests the `pretty_body` method introduced in the patch.
+
+The imports would need to include `use super::PingRequest;` and possibly `use super::gzip_content` if it's public. However, in the current code, `gzip_content` is a private method. Wait, in the patch, `gzip_content` is `fn gzip_content(...)` so not public. But in the `pretty_body` method, it uses `gzip_content` in its implementation. Wait, no—`gzip_content` is used in the `PingRequest` struct's implementation. Wait no, the `gzip_content` is a private method of `PingRequest`? Let me check:
+
+Looking at the code in `request.rs`, `gzip_content` is defined as:
+
+    fn gzip_content(path: &str, content: &[u8]) -> Option<Vec<u8>> {
+        let mut gzipper = GzEncoder::new(Vec::new(), Compression::default());
+
+So it's a private method. Therefore, in the test, we can't use it directly. But in the test, we need to generate a compressed body. So how to do that? Maybe the test can use the same logic as `gzip_content`, or use the `flate2` library to create the compressed data.
+
+In the test, instead of using `PingRequest::gzip_content`, we can manually create the compressed data using `flate2`.
+
+So, in the test:
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+encoder.write_all(original_bytes).unwrap();
+let compressed = encoder.finish().unwrap();
+
+But in the test, the code would be:
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+So the `gzip_content` is not used in the test, but the test uses `flate2` directly to compress the original data.
+
+Therefore, the test can be written without depending on the `gzip_content` function.
+
+So the test code would be:
+
+use super::PingRequest;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+#[test]
+fn test_pretty_body() {
+    let original_json = r#"{"a":true,"b":0}"#;
+    let original_bytes = original_json.as_bytes();
+
+    // Compress the original JSON
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(original_bytes).unwrap();
+    let compressed_data = encoder.finish().unwrap();
+
+    // Create a PingRequest with the compressed data
+    let request = PingRequest {
+        body: compressed_data,
+        path: "test-path".to_string(),
+        is_deletion_request: false,
+        document_id: None,
+    };
+
+    // Call pretty_body and check the result
+    let pretty = request.pretty_body().unwrap();
+    let expected = r#"{
+  "a": true,
+  "b": 0
+}"#;
+
+    // Check that the pretty body is formatted correctly
+    assert_eq!(pretty, expected);
+}
+
+But the `PingRequest` struct might require some other fields, but for the sake of the test, setting them to default or None.
+
+This test should pass after applying the patch, since the `pretty_body` function properly decompresses the data and formats it. Before the patch, the `pretty_body` function doesn't exist, so the test would fail, making this a regression test that confirms the patch is applied.
+
+So the correct filename is `glean-core/src/upload/request.rs`, the imports include `flate2` components and `super::PingRequest`, and the test function checks that the decompression and formatting work.
+</think>
+
+<Filename>glean-core/src/upload/request.rs</Filename>
+<imports>
+use super::PingRequest;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+</imports>
+<Rust>
+#[test]
+fn test_pretty_body() {
+    let original_json = r#"{"a":true,"b":0}"#;
+    let original_bytes = original_json.as_bytes();
+
+    // Gzip-compress the original JSON
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(original_bytes).unwrap();
+    let compressed_data = encoder.finish().unwrap();
+
+    // Build a PingRequest for this test
+    let request = PingRequest {
+        body: compressed_data,
+        path: "test-path".to_string(),
+        is_deletion_request: false,
+        document_id: None,
+    };
+
+    // Get the pretty-printed string
+    let pretty = request.pretty_body().unwrap();
+
+    let expected = r#"
+{
+  "a": true,
+  "b": 0
+}"#;
+
+    // Ensure pretty formatting worked
+    assert_eq!(pretty, expected.trim());
+}
+</Rust>

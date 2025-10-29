@@ -1,0 +1,245 @@
+<think>
+Okay, I need to figure out why the current test is passing before the patch and adjust it so that it fails with the old code but passes with the new patch. Let's start by understanding the problem.
+
+The issue is that on Windows, std::fs::remove_dir_all can panic when trying to delete read-only directories. The fix is to use the remove_dir_all crate instead. The test provided creates a read-only file in the pings directory and checks if clear_pending_pings handles it without error.
+
+In the current test, even with the old code using std::fs::remove_dir_all, the test passes. Why? Maybe because the test is not simulating a situation where std::fs::remove_dir_all would actually panic. Let's look at the test setup.
+
+The test creates a temporary directory, then a 'pings' subdirectory, and a read-only file 'readonly.txt'. On Windows, the file is set to read-only. Then, clear_pending_pings is called, and the test asserts that it returns Ok.
+
+But why would the old code (using std::fs::remove_dir_all) handle this correctly? Maybe because when you delete a read-only file, it's allowed in some contexts. Wait, but on Windows, deleting a read-only file shouldn't be an issue. The real problem might be when the directory itself is read-only, but the test is making the file read-only, not the directory. The original patch might be intended to fix cases where directories are read-only, not files. Or perhaps the old code isn't encountering an error because the test isn't replicating the actual error scenario correctly.
+
+Wait, the original issue (rust issue 104530) mentions that on Windows, remove_dir_all can panic. Maybe the panic occurs when trying to remove a directory that's read-only, but in the test, we're making a file read-only. So perhaps the test is testing the wrong scenario. If the problem is with directories being read-only, the test should make the directory read-only, not the file.
+
+Ah, there's the mistake. The current test is making a file in the target directory read-only. However, the original issue is about directories, not files. So when the old code (std) tries to remove the directory, maybe it's able to proceed because the file is read-only but not blocked. The actual problem would occur if the directory itself is read-only, for example, or if there are other permission issues.
+
+So the test's current setup doesn't simulate the actual scenario that would cause std's remove_dir_all to panic. Therefore, the test passes before the patch because the code isn't hitting the error case. To make the test fail before the patch, we need to simulate a situation where std's remove_dir_all would actually fail, and the new remove_dir_all crate handles it.
+
+So, how can we adjust the test? Maybe instead of making a file read-only, make the directory itself read-only. That way, when trying to remove it, the standard library's function may fail, but the remove_dir_all crate's implementation would handle it.
+
+Let's adjust the test to set the permissions of the pings_dir directory to read-only. On Windows, setting a directory to read-only might prevent its deletion, causing std::fs::remove_dir_all to panic or return an error. Then, with the patch, using remove_dir_all from the crate would handle it properly.
+
+So, modifying the test to set the directory's permissions to read-only instead of the file's. Let's adjust the test code accordingly.
+
+In the current test, the code is:
+
+    let pings_dir = dir.path().join("pings");
+    fs::create_dir_all(&pings_dir).unwrap();
+    let test_file = pings_dir.join("readonly.txt");
+    fs::File::create(&test_file).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&test_file).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&test_file, permissions).unwrap();
+    }
+
+We should instead set the directory's permissions. So after creating the pings_dir, we set its permissions to read-only. Also, maybe remove the file part, as the directory itself might be the problem.
+
+So in the adjusted test:
+
+After creating the pings_dir, set its permissions to read-only. Then, when trying to remove it, the std implementation may fail, but the crate's may handle it.
+
+So the test should:
+
+- Create a directory (pings_dir).
+- Make that directory read-only.
+- Call clear_pending_pings on that directory.
+- Check that the function returns Ok().
+
+But wait, on Windows, making a directory read-only. Does that actually prevent its removal? Let's think: If a directory is set to read-only, but not marked as a system directory or something else, attempting to delete it might still be possible if it's empty. But if it's not empty, perhaps the standard library's remove_dir_all fails. Or perhaps the problem is that the directory contains read-only files or subdirectories, making the removal difficult.
+
+Alternatively, maybe the issue is that when you have a directory tree with read-only subdirectories or files, the std function panics. But the current test only makes a file read-only, which is not sufficient to trigger the problem in the old code.
+
+So the correct approach is to adjust the test to make the directory itself read-only. Let's try modifying the test accordingly.
+
+Changing the code in the test:
+
+Instead of creating a test_file and making it read-only, set the pings_dir's permissions to read-only.
+
+So in the test, after creating pings_dir:
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&pings_dir).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&pings_dir, permissions).unwrap();
+    }
+
+But wait, can we set a directory's attributes to read-only on Windows? Yes, setting the directory's read-only attribute. However, on Windows, deleting a directory might not be affected by the read-only attribute in the same way as files. But if the directory is not empty, and cannot be accessed, perhaps the std::fs::remove_dir_all would fail. The problem is that the original code may panic or return an error in such cases, and the patch (using remove_dir_all crate) would handle it.
+
+But if making the directory read-only doesn't actually interfere with deletion, then perhaps the test isn't triggering the error. Maybe the actual problem is when the directory contains read-only subdirectories or files. But in that case, the current test may not simulate that.
+
+Alternatively, maybe the test should create a nested directory structure with a read-only subdirectory. But that's more complex.
+
+Alternatively, perhaps the panic occurs when trying to remove a directory that the user doesn't have permissions to, but that's more about permissions than read-only.
+
+Alternatively, perhaps the problem in the original code is when a directory is locked by another process, but that's not part of the test scenario.
+
+Hmm. To make the test fail with the old code (i.e., when using std::fs::remove_dir_all), the test needs to create a scenario where the directory cannot be deleted by the standard library but can be deleted by the new crate.
+
+Therefore, if making the directory read-only on Windows is something that causes std::fs::remove_dir_all to panic or return an error, then the test should simulate that.
+
+In the current test, perhaps the error scenario is not properly simulated, so the test passes with the old code. By adjusting the test to make the directory read-only, we may trigger an error in the old code but not in the patched code.
+
+So let's adjust the test code. Here's the approach:
+
+1. Create a temporary directory (dir).
+2. Create a pings_dir inside it.
+3. Set pings_dir to be read-only (on Windows).
+4. Call clear_pending_pings with dir.path().
+5. Assert that the function returns Ok.
+
+If pings_dir is read-only, and std::fs::remove_dir_all fails to delete it, then the test will fail. But when using the patch, remove_dir_all::remove_dir_all would handle it.
+
+But wait, the original code (before the patch) uses std::fs::remove_dir_all. Let's simulate that. When the pings_dir is read-only, does std::fs::remove_dir_all delete it successfully?
+
+On Windows, setting a directory to read-only may not prevent deletion, especially if it's empty. But if the directory is not empty and the user has permissions, maybe it's still possible. However, if the directory is marked as read-only and cannot be accessed, then std::fs::remove_dir_all might return an error.
+
+Alternatively, perhaps the problem is that when the directory has read-only attributes, std::fs::remove_dir_all panics or returns an error on Windows. The new crate's implementation handles that.
+
+But I'm not entirely sure. Maybe I need to refer to the original issue. The original Rust issue 104530 says that std::fs::remove_dir_all panics on Windows sometimes. The patch uses the remove_dir_all crate to avoid this.
+
+So, to simulate the scenario where std::fs::remove_dir_all panics, the test should trigger that. If making the directory read-only causes that panic, then the test should set up the directory with read-only attributes.
+
+But in code terms, when std::fs::remove_dir_all is called on a read-only directory, what happens? If it panics, then the test would have to catch that panic. But since the function is called within a ? operator, which converts errors to Result, perhaps it's returning an error instead of panicking. So maybe the panic is under certain circumstances that aren't being triggered here.
+
+Alternatively, perhaps the panic is the result of an internal error in the standard library's remove_dir_all implementation, like when traversing directories. If the directory is read-only, it might not be traversable, leading to an error or panic.
+
+But since I can't test this right now, I have to make the test pass after the patch and fail before. The current test isn't doing that.
+
+So the approach is to modify the test to make the directory, not the file, read-only. Then, in the code before the patch, using std::fs::remove_dir_all would attempt to remove the directory. If that directory is read-only and cannot be removed, the std implementation may return an error, which the patch would fix.
+
+So, modifying the test's permission setting to the directory rather than the file.
+
+Therefore, in the test:
+
+Move the permission setting code from the file to the pings_dir.
+
+Original code in test:
+
+    let pings_dir = dir.path().join("pings");
+    fs::create_dir_all(&pings_dir).unwrap();
+    let test_file = pings_dir.join("readonly.txt");
+    fs::File::create(&test_file).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&test_file).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&test_file, permissions).unwrap();
+    }
+
+Change that to:
+
+    let pings_dir = dir.path().join("pings");
+    fs::create_dir_all(&pings_dir).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&pings_dir).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&pings_dir, permissions).unwrap();
+    }
+
+    // Maybe create a file to ensure the directory isn't empty?
+    let test_file = pings_dir.join("readonly.txt");
+    fs::File::create(&test_file).unwrap();
+
+Wait, but if the directory is non-empty, then deleting it may require traversing into it. If the directory is read-only, but empty, maybe it's easier to delete. But if it's not empty, perhaps the permissions are causing issues.
+
+But let's think: On Windows, trying to delete a directory that's read-only and contains files. The std::fs::remove_dir_all would attempt to delete it. If the directory is read-only, the operation might fail in the standard implementation, causing an error. The patch would use a crate that handles that.
+
+So by making the pings_dir read-only (which is non-empty, since it has a file), the test would trigger an error with the old code but not with the new.
+
+Therefore, modifying the test as described.
+
+In the current code, the test is making a file read-only, which may not be causing the problem in std's code. By making the directory read-only, we may trigger the error.
+
+So, the updated test code should:
+
+1. Create pings_dir.
+2. Make pings_dir read-only on Windows.
+3. Create a file inside it to make it non-empty (required for remove_dir_all to work).
+4. Call clear_pending_pings, which then calls remove_dir_all.
+5. Check if it returns Ok().
+
+This way, with the old code (using std's remove_dir_all), this might fail, and with the new code (using the crate's), it passes.
+
+Thus, the updated test would be:
+
+In the test code, instead of setting permissions on the file, set permissions on the pings_dir.
+
+Also, maybe the directory needs to have some files in it so that remove_dir_all is called. In the original code, after removing the directory, it tries to recreate it.
+
+But in the test, after setting the directory's read-only attribute, the code creates a file in the directory. Let me adjust the code accordingly.
+
+So the test code becomes:
+
+    let dir = tempdir().unwrap();
+    let pings_dir = dir.path().join("pings");
+    fs::create_dir_all(&pings_dir).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&pings_dir).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&pings_dir, permissions).unwrap();
+    }
+
+    // Create a file inside the directory to make it non-empty
+    let test_file = pings_dir.join("test.txt");
+    fs::File::create(&test_file).unwrap();
+
+    let ping_maker = PingMaker::default();
+
+    let result = ping_maker.clear_pending_pings(dir.path());
+
+    assert!(result.is_ok());
+
+This way, the directory is non-empty and read-only. The std::fs::remove_dir_all may fail to remove it on Windows, causing the function to return an error before the patch. With the patch, it should pass.
+
+But wait, when you set the directory to read-only on Windows, does it affect the ability to remove it? Let's think: On Windows, the read-only attribute for a directory doesn't actually prevent deletion if you have the right permissions. However, the standard remove_dir_all function might not handle directories with read-only attributes correctly, leading to a panic or error.
+
+If this is the case, then the test should fail on the old code but pass with the new code.
+
+Therefore, modifying the test as described should make it fail before the patch and pass after.
+</think>
+
+<Filename>glean-core/src/ping/mod.rs</Filename>
+<imports>use std::fs;
+use std::io;
+use std::path::Path;
+use tempfile::tempdir;
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::PermissionsExt;</imports>
+<Rust>
+#[test]
+fn test_clear_pending_pings_handles_readonly_dir() {
+    let dir = tempdir().unwrap();
+    let pings_dir = dir.path().join("pings");
+    fs::create_dir_all(&pings_dir).unwrap();
+    let test_file = pings_dir.join("test.txt");
+    fs::File::create(&test_file).unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        let metadata = fs::metadata(&pings_dir).unwrap();
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&pings_dir, permissions).unwrap();
+    }
+
+    let ping_maker = PingMaker::default();
+
+    let result = ping_maker.clear_pending_pings(dir.path());
+
+    assert!(result.is_ok());
+}
+</Rust>

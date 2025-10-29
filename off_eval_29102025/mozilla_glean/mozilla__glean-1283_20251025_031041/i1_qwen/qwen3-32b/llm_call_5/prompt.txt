@@ -1,0 +1,213 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Recoverable network errors in upload module are flooding Sentry for Fx-iOS
+We recently got a report from nishant that their Sentry project is getting flooded with recoverable network errors:
+`[RUST][glean_core::upload] Recoverable upload failure while attempting to send ping 957090b3-4e26-4cfc-bfd8-00cbbac42524, will retry. Error was RecoverableFailure`
+
+We could/should downgrade the recoverable error to an info log level to reduce the noise from this.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -630,7 +630,7 @@ impl PingUploadManager {
+             }
+ 
+             RecoverableFailure | HttpStatus(_) => {
+-                log::error!(
++                log::info!(
+                     "Recoverable upload failure while attempting to send ping {}, will retry. Error was {:?}",
+                     document_id,
+                     status
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use http::Response;
+use http::StatusCode;
+use futures::executor::block_on;
+use tempfile::TempDir;
+use log::Level;</imports>
+<Rust>#[test]
+fn test_recoverable_failure_logs_info_level() {
+    struct TestLogger {
+        last_level: Option<Level>,
+        last_message: Option<String>,
+    }
+
+    impl TestLogger {
+        fn new() -> Self {
+            Self { last_level: None, last_message: None }
+        }
+
+        fn assert(&self, level: Level, msg: &str) {
+            assert_eq!(self.last_level, Some(level));
+            assert!(self.last_message.as_ref().unwrap().contains(msg));
+        }
+    }
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            self.last_level = Some(record.metadata().level());
+            self.last_message = Some(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    let temp_dir = TempDir::new("glean-test").unwrap();
+    let data_path = temp_dir.path().to_path_buf();
+
+    // Set up the custom logger
+    log::set_max_level(log::LevelFilter::Info);
+    let logger = TestLogger::new();
+    log::set_boxed_logger(Box::new(logger.clone())).unwrap();
+
+    let manager = PingUploadManager::new(data_path, "test-frontend");
+
+    let response = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .body(vec![])
+        .unwrap();
+
+    let document_id = "test_document_id";
+    block_on(manager.upload(document_id, &response));
+
+    logger.assert(
+        Level::Info,
+        &format!("Recoverable upload failure while attempting to send ping {}, will retry. Error was HttpStatus(429)", document_id)
+    );
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `http`
+   --> glean-core/src/upload/mod.rs:724:9
+    |
+724 |     use http::Response;
+    |         ^^^^ use of unresolved module or unlinked crate `http`
+    |
+    = help: if you wanted to use a crate named `http`, use `cargo add http` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `futures`
+   --> glean-core/src/upload/mod.rs:726:9
+    |
+726 |     use futures::executor::block_on;
+    |         ^^^^^^^ use of unresolved module or unlinked crate `futures`
+    |
+    = help: if you wanted to use a crate named `futures`, use `cargo add futures` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `http`
+   --> glean-core/src/upload/mod.rs:725:9
+    |
+725 |     use http::StatusCode;
+    |         ^^^^ use of unresolved module or unlinked crate `http`
+    |
+    = help: if you wanted to use a crate named `http`, use `cargo add http` to add it to your `Cargo.toml`
+
+error[E0061]: this function takes 0 arguments but 1 argument was supplied
+    --> glean-core/src/upload/mod.rs:1563:24
+     |
+1563 |         let temp_dir = TempDir::new("glean-test").unwrap();
+     |                        ^^^^^^^^^^^^ ------------ unexpected argument of type `&'static str`
+     |
+note: associated function defined here
+    --> /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tempfile-3.1.0/src/dir.rs:233:12
+     |
+233  |     pub fn new() -> io::Result<TempDir> {
+     |            ^^^
+help: remove the extra argument
+     |
+1563 -         let temp_dir = TempDir::new("glean-test").unwrap();
+1563 +         let temp_dir = TempDir::new().unwrap();
+     |
+
+error[E0599]: no method named `clone` found for struct `TestLogger` in the current scope
+    --> glean-core/src/upload/mod.rs:1569:47
+     |
+1534 |         struct TestLogger {
+     |         ----------------- method `clone` not found for this struct
+...
+1569 |         log::set_boxed_logger(Box::new(logger.clone())).unwrap();
+     |                                               ^^^^^ method not found in `TestLogger`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `clone`, perhaps you need to implement it:
+             candidate #1: `Clone`
+
+error[E0599]: no method named `upload` found for struct `upload::PingUploadManager` in the current scope
+    --> glean-core/src/upload/mod.rs:1579:26
+     |
+136  | pub struct PingUploadManager {
+     | ---------------------------- method `upload` not found for this struct
+...
+1579 |         block_on(manager.upload(document_id, &response));
+     |                          ^^^^^^ method not found in `upload::PingUploadManager`
+
+error[E0594]: cannot assign to `self.last_level`, which is behind a `&` reference
+    --> glean-core/src/upload/mod.rs:1556:17
+     |
+1555 |             fn log(&self, record: &log::Record) {
+     |                    ----- this is an immutable reference
+1556 |                 self.last_level = Some(record.metadata().level());
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `self` is a `&` reference, so the data it refers to cannot be written
+
+error[E0594]: cannot assign to `self.last_message`, which is behind a `&` reference
+    --> glean-core/src/upload/mod.rs:1557:17
+     |
+1555 |             fn log(&self, record: &log::Record) {
+     |                    ----- this is an immutable reference
+1556 |                 self.last_level = Some(record.metadata().level());
+1557 |                 self.last_message = Some(record.args().to_string());
+     |                 ^^^^^^^^^^^^^^^^^ `self` is a `&` reference, so the data it refers to cannot be written
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

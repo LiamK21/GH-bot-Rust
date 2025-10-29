@@ -1,0 +1,167 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Intermittent RLB failure: `tasks_after_shutdown_are_not_processed `
+[See this](https://app.circleci.com/pipelines/github/mozilla/glean/6140/workflows/03fd3ef2-6e0a-49df-bec2-5665351303f6/jobs/100483).
+
+> 
+> failures:
+> 
+> ---- dispatcher::test::tasks_after_shutdown_are_not_processed stdout ----
+> thread 'dispatcher::test::tasks_after_shutdown_are_not_processed' panicked at 'called `Result::unwrap()` on an `Err` value: SendError', glean-core/rlb/src/dispatcher/mod.rs:411:18
+> stack backtrace:
+>    0: rust_begin_unwind
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/std/src/panicking.rs:475
+>    1: core::panicking::panic_fmt
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/core/src/panicking.rs:85
+>    2: core::option::expect_none_failed
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/core/src/option.rs:1221
+>    3: core::result::Result<T,E>::unwrap
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/core/src/result.rs:973
+>    4: glean::dispatcher::test::tasks_after_shutdown_are_not_processed
+>              at ./src/dispatcher/mod.rs:406
+>    5: glean::dispatcher::test::tasks_after_shutdown_are_not_processed::{{closure}}
+>              at ./src/dispatcher/mod.rs:394
+>    6: core::ops::function::FnOnce::call_once
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/core/src/ops/function.rs:227
+>    7: core::ops::function::FnOnce::call_once
+>              at /rustc/18bf6b4f01a6feaf7259ba7cdae58031af1b7b39/library/core/src/ops/function.rs:227
+> note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+> 
+> 
+> failures:
+>     dispatcher::test::tasks_after_shutdown_are_not_processed
+> 
+> test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+> 
+> error: test failed, to rerun pass '-p glean --lib'
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/dispatcher/mod.rs b/glean-core/rlb/src/dispatcher/mod.rs
+--- a/glean-core/rlb/src/dispatcher/mod.rs
++++ b/glean-core/rlb/src/dispatcher/mod.rs
+@@ -414,12 +414,12 @@ mod test {
+         dispatcher.guard().shutdown().unwrap();
+         {
+             let result = Arc::clone(&result);
+-            dispatcher
+-                .guard()
+-                .launch(move || {
+-                    result.lock().unwrap().push(0);
+-                })
+-                .unwrap();
++            // This might fail because the shutdown is quick enough,
++            // or it might succeed and still send the task.
++            // In any case that task should not be executed.
++            let _ = dispatcher.guard().launch(move || {
++                result.lock().unwrap().push(0);
++            });
+         }
+ 
+         dispatcher.join().unwrap();
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/dispatcher/mod.rs</Filename>
+<imports>use std::sync::{Arc, Mutex};</imports>
+<Rust>#[test]
+fn test_tasks_after_shutdown_do_not_execute() {
+    let (dispatcher, _guard) = new_dispatcher();
+    let result = Arc::new(Mutex::new(Vec::new()));
+    let result_cloned = Arc::clone(&result);
+
+    // Spawn a background thread to attempt task submission after shutdown
+    let handle = thread::spawn(move || {
+        let guard = dispatcher.guard();
+        guard.shutdown().unwrap();
+        let _ = guard.launch(move || {
+            result_cloned.lock().unwrap().push(0);
+        });
+    });
+
+    // Ensure the task is processed and dispatcher is joined
+    handle.join().unwrap();
+
+    // Verify no task was executed
+    assert!(result.lock().unwrap().is_empty());
+    dispatcher.join().unwrap();
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0252]: the name `Arc` is defined multiple times
+   --> glean-core/rlb/src/dispatcher/mod.rs:295:21
+    |
+292 |     use std::sync::{Arc, Mutex};
+    |                     --- previous import of the type `Arc` here
+...
+295 |     use std::sync::{Arc, Mutex};
+    |                     ^^^--
+    |                     |
+    |                     `Arc` reimported here
+    |                     help: remove unnecessary import
+    |
+    = note: `Arc` must be defined only once in the type namespace of this module
+
+error[E0252]: the name `Mutex` is defined multiple times
+   --> glean-core/rlb/src/dispatcher/mod.rs:295:26
+    |
+292 |     use std::sync::{Arc, Mutex};
+    |                          ----- previous import of the type `Mutex` here
+...
+295 |     use std::sync::{Arc, Mutex};
+    |                          ^^^^^ `Mutex` reimported here
+    |
+    = note: `Mutex` must be defined only once in the type namespace of this module
+
+error[E0425]: cannot find function `new_dispatcher` in this scope
+   --> glean-core/rlb/src/dispatcher/mod.rs:522:36
+    |
+522 |         let (dispatcher, _guard) = new_dispatcher();
+    |                                    ^^^^^^^^^^^^^^ not found in this scope
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,276 @@
+<think>
+Okay, let's see. The issue here is about a race condition in the Glean initialization. The problem arises when the initialize function is called, but the global Glean object hasn't been set up yet. The patch adds a check for core::global_glean().is_some() in several functions, which should resolve the race by ensuring the Glean object is ready before proceeding.
+
+I need to write a regression test that will fail before the patch and pass after. The test should simulate the scenario where initialize is called, but the global Glean isn't yet initialized. So maybe create a situation where we call a function that uses the PRE_INIT data before the Glean setup is complete.
+
+Looking at the modified functions, perhaps set_ping_enabled is a good candidate. Let's think: before the patch, if was_initialize_called is true but global_glean is None, the code would try to process with_glean_mut, which might not be safe. After the patch, it would wait until global_glean is Some.
+
+So the test would need to mock or control the state of was_initialize_called and global_glean. Maybe using a test that sets was_initialize_called to true but leaves global_glean as None, then calls a function like register_ping_type. Then check if the pre-init data is stored correctly, which it should be before the patch (since the code would process it incorrectly) and after the patch, it would defer processing until Glean is initialized.
+
+Wait, the patch adds the check for global_glean being Some. So before the patch, in the scenario where initialize is called (so was_initialize_called is true) but the Glean object isn't setup yet (global_glean is None), the code would attempt to launch_with_glean_mut, which would do nothing because there's no Glean instance. But maybe the PRE_INIT data isn't stored correctly.
+
+Wait, in the original code, like in set_ping_enabled, if was_initialize_called is true, but global_glean is not yet Some, then the code would try to call launch_with_glean_mut. But if the Glean hasn't been initialized yet, that code might not run properly. The patch ensures that the code only processes if both was_initialize_called is true and global_glean is Some.
+
+So, for the test, we need to force was_initialize_called to true, but global_glean to be None, then call a function that would have tried to process, but with the patch, it would fall back to the pre-init storage.
+
+So, how to test this?
+
+Maybe create a function that sets was_initialize_called() to true, then calls register_ping_type() with a fake ping. Then check if the PRE_INIT_REGISTERED_PINGS is recorded. But before the patch, when was_initialize_called is true, it would try to process it via launch_with_glean_mut, which might not have a glean instance yet. So maybe the processing doesn't happen, and the pre-init data is not stored. After the patch, since global_glean is None, the code would store the ping in the pre-init data.
+
+So the test would be: set initialize_called to true, make sure global_glean is None, call register_ping_type. Then check if the pre-init data has the ping.
+
+But how to check the pre-init data? The PRE_INIT_REGISTERED_PINGS in the patch is a static variable. So in the test, we can check if that static is updated.
+
+So for the test:
+
+Use the register_ping_type function. Normally, if initialize is not called, it stores to PRE_INIT_REGISTER. If initialize is called but Glean hasn't been set up yet, after the patch, it should store to the pre-init data.
+
+In the test, we need to manipulate the was_initialize_called() to return true. But how? The was_initialize_called is probably a static variable. Let's assume that in the code, there's a function to set it (maybe in testing). But since the user is writing a test, perhaps they can use the patch's PRE_INIT_ variables or some internal test functions.
+
+Wait, the user can't directly modify statics in Rust unless they're using a mutex or similar. Hmm. Maybe the test will use a helper function that sets the was_initialize_called flag. But since that's not provided, perhaps the test can simulate it by using a fake initialize or mocking.
+
+Alternatively, maybe the test can use the internal functions or variables. For example, in the patch, the register_ping_type function has a check for was_initialize_called and global_glean. The test can set was_initialize_called to true (maybe via a function) and then call register_ping_type before the global_glean is set.
+
+But how to do that in code.
+
+Assuming that in the test, we can use some internal functions. Suppose there's a way to set the was_initialize_called flag. For example, maybe in glean_core's test module, there's a function to set that static variable.
+
+Alternatively, perhaps the test can use a mock or a test-specific setup.
+
+But since the user is writing a test for this scenario, perhaps they can use the patch's PRE_INIT_REGISTERED_PINGS and check whether it was updated.
+
+So here's the plan for the test:
+
+1. Create a PingType that can be cloned.
+
+2. Use some method to set was_initialize_called to true (like calling a test-only function, or by using a helper).
+
+3. Ensure that global_glean() returns None.
+
+4. Call register_ping_type with the PingType.
+
+5. Check that the ping is stored in the PRE_INIT_REGISTERED_PINGS list.
+
+After the patch, since was_initialize_called is true but global_glean() is None, the code will store the ping in the pre-init data. Before the patch, since was_initialize_called is true, the code would attempt to launch_with_glean_mut, but since there's no Glean instance, perhaps it's done nothing, and the ping is not stored, leading to a different state.
+
+So, the test would check that after the patch, the ping is stored, whereas before the patch, it might not be.
+
+So in Rust code:
+
+We can create a test that uses the register_ping_type function. But to control was_initialize_called, perhaps the test uses a helper function. Since the actual implementation of was_initialize_called is not given, but the user can assume that they can set it via some test infrastructure, maybe using a function from the core module.
+
+But given the constraints, the user must write a test that uses the existing functions. Let's assume that there's a test_util::set_was_initialized function that allows setting this.
+
+Alternatively, since in the code, the initialize function sets this flag, perhaps the test can simulate calling initialize and then manipulate the global_glean.
+
+So the steps:
+
+- Create a mock Glean state where was_initialize_called is true, but global_glean is None.
+
+But how to do that in code. Let's assume that in the test, we can call a function that simulates the initialize being called but not yet setup.
+
+Perhaps the test can use something like:
+
+core::initialize(); // which sets was_initialize_called to true, but then the global_glean is still None.
+
+Then call register_ping_type, and check if it's stored.
+
+So in code:
+
+use core::test_utils::{reset_globals, set_was_initialized}; // Assuming these exist.
+
+But these functions are not part of the standard library. However, the user might have access to test utilities.
+
+But given the user's instruction, they have to write the test using only standard library or without external mocks. Since the instruction says If need additional testing resources beyond the Rust standard library, return <NO>, but in this case, maybe it's possible.
+
+Alternatively, perhaps the test can use a test-specific function that allows setting the was_initialize_called state.
+
+But since the user can't assume the existence of such functions, maybe the test can simulate the scenario by using the actual initialize function.
+
+Wait, in the patch's example, there's a test in the existing code. Let's see if any existing tests have imports and functions that can help.
+
+But given the user's instruction to NOT include imports from the existing mod tests blocks, so the user must define all required imports in the <imports> section.
+
+So for the test, we need to:
+
+- Use register_ping_type.
+
+But to trigger the scenario, the test must ensure that was_initialize_called is true, and global_glean is None.
+
+Assuming that there's a way to manipulate these for testing. Let's suppose that in the test, we can use some helper functions.
+
+But perhaps the user can use the fact that during initialization, the setup_glean function is run in a thread. So perhaps the test can call the initialize function, but then delay the setup of the global_glean, so that when register_ping_type is called, the global_glean is still None.
+
+But without concurrency, maybe the test can simulate this by setting the was_initialize_called to true, and not setting the global_glean yet.
+
+So in the test:
+
+1. Create a PingType.
+
+2. Call a function that sets was_initialized to true.
+
+3. Call register_ping_type with the PingType.
+
+4. Check that the ping is in the PRE_INIT_REGISTERED_PINGS.
+
+After the patch, this would be true. Before the patch, the code would try to process it with with_glean_mut, but since the global_glean is None, nothing is stored, and the ping is not in PRE_INIT.
+
+So the test needs to check the state of the PRE_INIT_REGISTERED_PINGS.
+
+But how to access that in the test? It's likely a static variable in the code. So in the test, perhaps the user can access a test-only accessor function.
+
+But given the user's constraints, perhaps they can use a function like get_pre_init_registered_pings() for the test.
+
+Assuming that the test can access such a function.
+
+So putting this all together.
+
+The test function would be:
+
+#[test]
+fn test_register_ping_before_glean_initialized() {
+    // Prepare a PingType
+    let ping = PingType::new("test_ping", true, true, false, None);
+    // Set initialize called to true, but global_glean is None
+    unsafe {
+        // Hypothetically, set was_initialize_called to true
+        core::WAS_INITIALIZE_CALLED = true;
+    }
+    // Now call register_ping_type
+    register_ping_type(&ping);
+    // Check that the ping is in the pre-init list
+    let pre_init_pings = unsafe { &PRE_INIT_REGISTERED_PINGS };
+    assert!(pre_init_pings.read().contains(&ping));
+}
+
+But this is all unsafe code, and depends on internal variables. The user can't be sure, but given the patch, perhaps they can make this test. However, the user needs to figure out the actual names of the pre-init variables. In the patch, the first modified function is register_ping_type, and in the code, there's a PRE_INIT_REGISTERED_PINGS static. The test would need to check that the ping is added to that static.
+
+So the test would need to:
+
+- Create a PingType.
+
+- Set was_initialize_called to true.
+
+- Call register_ping_type, which should add it to the pre-init list.
+
+Then verify that the ping is in the list.
+
+But in reality, the PRE_INIT_REGISTERED_PINGS is a static, perhaps a Mutex<Vec<...>>. To read it, the test would need to lock it.
+
+But since the user is writing a test that is supposed to be self-contained and to-the-point, perhaps they can use unsafe code to access the static.
+
+But the user's code must not assume that the pre-init variable is named PRE_INIT_REGISTERED_PINGS, but according to the patch, the function register_ping_type appends to PRE_INIT_REGISTERED_PINGS.
+
+In the original code (before the patch):
+
+pub fn register_ping_type(ping: &PingType) {
+    // we dispatch ping registration on the thread pool.
+    // Registering a ping should not block the application.
+    // Submission itself is also dispatched, so it will always come after the registration.
+    if was_initialize_called() {
+        let ping = ping.clone();
+        crate::launch_with_glean_mut(move |glean| {
+            glean.register_ping_type(&ping);
+        });
+    } else {
+        let m = &PRE_INIT_REGISTERED_PINGS;
+        m.lock().unwrap().push(ping.clone());
+    }
+}
+
+So after the patch, the check becomes:
+
+if was_initialize_called() && core::global_glean().is_some() {
+
+Therefore, in the test scenario where was_initialize_called is true and global_glean is None, the ping is added to the PRE_INIT_REGISTERED_PINGS.
+
+Therefore, the test can simulate this state and check.
+
+So the test would:
+
+- Set was_initialize_called to true (maybe by calling initialize, but not yet completing setup).
+
+- Create a PingType.
+
+- Call register_ping_type, which should now append to PRE_INIT_REGISTERED_PINGS.
+
+Then, check if the ping is in PRE_INIT_REGISTERED_PINGS.
+
+But how to access that variable in the test?
+
+Assuming that the test can access the PRE_INIT_REGISTERED_PINGS as a static variable in the code.
+
+In Rust, the test would need to import it. So the imports would include the path to that variable.
+
+But in the code, the statics are likely defined in the same module.
+
+So the test would have to use something like:
+
+use crate::PRE_INIT_REGISTERED_PINGS;
+
+But the user has to find the correct import path.
+
+Given that the user's patch modifies the functions in glean-core/src/lib.rs, the test would be in that same file.
+
+Assuming that the test can access PRE_INIT_REGISTERED_PINGS as a static variable, the test can check its contents.
+
+Putting this together, the test code would look like this:
+
+Use the register_ping_type function, create a PingType, set was_initialize_called to true, call register_ping_type, then check if the PingType is in the PRE_INIT_REGISTERED_PINGS list.
+
+But how to set was_initialize_called to true. In the code, was_initialize_called is a static variable, likely a bool. To set it, the test would need to modify it directly, but in Rust, static mut variables are considered unsafe to mutate. So the test would use unsafe code.
+
+Thus, the test would involve unsafe code.
+
+But the user is allowed to do that for the test.
+
+So the test code would be something like:
+
+#[test]
+fn test_register_ping_before_global_glean_initialized() {
+    let ping = PingType::new("test_ping", true, true, false, None);
+    unsafe {
+        crate::WAS_INITIALIZE_CALLED = true;
+    }
+    // global_glean is None, so the check (is_some()) will be false
+    register_ping_type(&ping);
+    let pre_init = unsafe { crate::PRE_INIT_REGISTERED_PINGS.lock().unwrap() };
+    assert!(pre_init.contains(&ping));
+}
+
+But this assumes that WAS_INITIALIZE_CALLED is a mutable static bool in the code. If the actual code uses a different method, like a thread-local or other, the test would need to adjust. However, based on the issue description, WAS_INITIALIZE_CALLED is a static variable.
+
+So the imports would need to include the PingType and the static variables.
+
+The PingType is likely defined in the same crate, so the test can use it.
+
+Thus, the final test would be structured as such.
+</think>
+
+<Filename>glean-core/src/lib.rs</Filename>
+<imports>
+use crate::register_ping_type;
+use crate::PingType;
+use crate::global_glean;
+use crate::was_initialize_called;
+</imports>
+<Rust>
+#[test]
+fn test_register_ping_before_global_glean_initialized() {
+    unsafe {
+        let ping = PingType::new("preinit-test", true, true, false, None);
+        let was_init = was_initialize_called();
+        // Emulate `initialize` being called (race condition)
+        crate::WAS_INITIALIZE_CALLED = true;
+        
+        register_ping_type(&ping);
+        
+        // Verify ping is stored in pre-init data
+        let preinit_pings = crate::PRE_INIT_REGISTERED_PINGS.lock().unwrap();
+        assert!(preinit_pings.contains(&ping));
+        
+        // Restore original state for other tests
+        crate::WAS_INITIALIZE_CALLED = was_init;
+    }
+}
+</Rust>

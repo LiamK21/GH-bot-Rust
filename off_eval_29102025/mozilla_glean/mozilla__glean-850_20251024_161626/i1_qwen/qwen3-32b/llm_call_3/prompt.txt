@@ -1,0 +1,364 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement solution for coarse time measurement
+This should implement the proposal in bug 1595723.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -5,9 +5,12 @@
+ // NOTE: This is a test-only file that contains unit tests for
+ // the lib.rs file.
+ 
++use std::collections::HashSet;
++use std::iter::FromIterator;
++
+ use super::*;
+ use crate::metrics::RecordedExperimentData;
+-use crate::metrics::{StringMetric, TimeUnit, TimespanMetric};
++use crate::metrics::{StringMetric, TimeUnit, TimespanMetric, TimingDistributionMetric};
+ 
+ const GLOBAL_APPLICATION_ID: &str = "org.mozilla.glean.test.app";
+ pub fn new_glean(tempdir: Option<tempfile::TempDir>) -> (Glean, tempfile::TempDir) {
+@@ -644,3 +647,115 @@ fn test_change_metric_type_runtime() {
+     // https://bugzilla.mozilla.org/show_bug.cgi?id=1621757#c1 for more context.
+     assert_eq!(None, string_metric.test_get_value(&glean, ping_name));
+ }
++
++#[test]
++fn timing_distribution_truncation() {
++    let dir = tempfile::tempdir().unwrap();
++
++    let (glean, _) = new_glean(Some(dir));
++    let max_sample_time = 1000 * 1000 * 1000 * 60 * 10;
++
++    for (unit, expected_keys) in &[
++        (
++            TimeUnit::Nanosecond,
++            HashSet::<u64>::from_iter(vec![961_548, 939, 599_512_966_122, 1]),
++        ),
++        (
++            TimeUnit::Microsecond,
++            HashSet::<u64>::from_iter(vec![939, 562_949_953_421_318, 599_512_966_122, 961_548]),
++        ),
++        (
++            TimeUnit::Millisecond,
++            HashSet::<u64>::from_iter(vec![
++                961_548,
++                576_460_752_303_431_040,
++                599_512_966_122,
++                562_949_953_421_318,
++            ]),
++        ),
++    ] {
++        let mut dist = TimingDistributionMetric::new(
++            CommonMetricData {
++                name: format!("local_metric_{:?}", unit),
++                category: "local".into(),
++                send_in_pings: vec!["baseline".into()],
++                ..Default::default()
++            },
++            *unit,
++        );
++
++        for &value in &[
++            1,
++            1_000,
++            1_000_000,
++            max_sample_time,
++            max_sample_time * 1_000,
++            max_sample_time * 1_000_000,
++        ] {
++            let timer_id = dist.set_start(0);
++            dist.set_stop_and_accumulate(&glean, timer_id, value);
++        }
++
++        let hist = dist.test_get_value(&glean, "baseline").unwrap();
++
++        assert_eq!(4, hist.values().len());
++        for &key in hist.values().keys() {
++            assert!(key < max_sample_time * unit.as_nanos(1))
++        }
++
++        let keys = HashSet::<u64>::from_iter(hist.values().keys().cloned());
++        assert_eq!(keys, *expected_keys);
++
++        let snapshot = hist.snapshot();
++        // The number of samples was originally designed around 1ns to
++        // 10minutes, with 8 steps per power of 2, which works out to 316 items.
++        // This is to ensure that holds even when the time unit is changed.
++        assert!(snapshot.len() < 316);
++    }
++}
++
++#[test]
++fn timing_distribution_truncation_accumulate() {
++    let dir = tempfile::tempdir().unwrap();
++
++    let (glean, _) = new_glean(Some(dir));
++    let max_sample_time = 1000 * 1000 * 1000 * 60 * 10;
++
++    for &unit in &[
++        TimeUnit::Nanosecond,
++        TimeUnit::Microsecond,
++        TimeUnit::Millisecond,
++    ] {
++        let mut dist = TimingDistributionMetric::new(
++            CommonMetricData {
++                name: format!("local_metric_{:?}", unit),
++                category: "local".into(),
++                send_in_pings: vec!["baseline".into()],
++                ..Default::default()
++            },
++            unit,
++        );
++
++        dist.accumulate_samples_signed(
++            &glean,
++            vec![
++                1,
++                1_000,
++                1_000_000,
++                max_sample_time,
++                max_sample_time * 1_000,
++                max_sample_time * 1_000_000,
++            ],
++        );
++
++        let hist = dist.test_get_value(&glean, "baseline").unwrap();
++
++        assert_eq!(4, hist.values().len());
++
++        let snapshot = hist.snapshot();
++        // The number of samples was originally designed around 1ns to
++        // 10minutes, with 8 steps per power of 2, which works out to 316 items.
++        // This is to ensure that holds even when the time unit is changed.
++        assert!(snapshot.len() < 316);
++    }
++}
+
+diff --git a/glean-core/src/metrics/memory_distribution.rs b/glean-core/src/metrics/memory_distribution.rs
+--- a/glean-core/src/metrics/memory_distribution.rs
++++ b/glean-core/src/metrics/memory_distribution.rs
+@@ -171,7 +171,7 @@ impl MemoryDistributionMetric {
+ 
+         if num_too_log_samples > 0 {
+             let msg = format!(
+-                "Accumulated {} samples longer than 10 minutes",
++                "Accumulated {} samples larger than 1TB",
+                 num_too_log_samples
+             );
+             record_error(
+
+diff --git a/glean-core/src/metrics/timing_distribution.rs b/glean-core/src/metrics/timing_distribution.rs
+--- a/glean-core/src/metrics/timing_distribution.rs
++++ b/glean-core/src/metrics/timing_distribution.rs
+@@ -21,8 +21,13 @@ const LOG_BASE: f64 = 2.0;
+ // The buckets per each order of magnitude of the logarithm.
+ const BUCKETS_PER_MAGNITUDE: f64 = 8.0;
+ 
+-// Maximum time of 10 minutes in nanoseconds. This maximum means we
+-// retain a maximum of 313 buckets.
++// Maximum time, which means we retain a maximum of 316 buckets.
++// It is automatically adjusted based on the `time_unit` parameter
++// so that:
++//
++// - `nanosecond`: 10 minutes
++// - `microsecond`: ~6.94 days
++// - `millisecond`: ~19 years
+ const MAX_SAMPLE_TIME: u64 = 1000 * 1000 * 1000 * 60 * 10;
+ 
+ /// Identifier for a running timer.
+@@ -174,11 +179,23 @@ impl TimingDistributionMetric {
+             Ok(duration) => duration,
+         };
+ 
+-        if duration > MAX_SAMPLE_TIME {
+-            let msg = "Sample is longer than 10 minutes";
++        let min_sample_time = self.time_unit.as_nanos(1);
++        let max_sample_time = self.time_unit.as_nanos(MAX_SAMPLE_TIME);
++
++        duration = if duration < min_sample_time {
++            // If measurement is less than the minimum, just truncate. This is
++            // not recorded as an error.
++            min_sample_time
++        } else if duration > max_sample_time {
++            let msg = format!(
++                "Sample is longer than the max for a time_unit of {:?} ({} ns)",
++                self.time_unit, max_sample_time
++            );
+             record_error(glean, &self.meta, ErrorType::InvalidOverflow, msg, None);
+-            duration = MAX_SAMPLE_TIME;
+-        }
++            max_sample_time
++        } else {
++            duration
++        };
+ 
+         if !self.should_record(glean) {
+             return;
+@@ -236,6 +253,7 @@ impl TimingDistributionMetric {
+     pub fn accumulate_samples_signed(&mut self, glean: &Glean, samples: Vec<i64>) {
+         let mut num_negative_samples = 0;
+         let mut num_too_long_samples = 0;
++        let max_sample_time = self.time_unit.as_nanos(MAX_SAMPLE_TIME);
+ 
+         glean.storage().record_with(glean, &self.meta, |old_value| {
+             let mut hist = match old_value {
+@@ -247,13 +265,20 @@ impl TimingDistributionMetric {
+                 if sample < 0 {
+                     num_negative_samples += 1;
+                 } else {
+-                    let sample = sample as u64;
+-                    let mut sample = self.time_unit.as_nanos(sample);
+-                    if sample > MAX_SAMPLE_TIME {
++                    let mut sample = sample as u64;
++
++                    // Check the range prior to converting the incoming unit to
++                    // nanoseconds, so we can compare against the constant
++                    // MAX_SAMPLE_TIME.
++                    if sample == 0 {
++                        sample = 1;
++                    } else if sample > MAX_SAMPLE_TIME {
+                         num_too_long_samples += 1;
+                         sample = MAX_SAMPLE_TIME;
+                     }
+ 
++                    sample = self.time_unit.as_nanos(sample);
++
+                     hist.accumulate(sample);
+                 }
+             }
+@@ -273,8 +298,8 @@ impl TimingDistributionMetric {
+ 
+         if num_too_long_samples > 0 {
+             let msg = format!(
+-                "Accumulated {} samples longer than 10 minutes",
+-                num_too_long_samples
++                "{} samples are longer than the maximum of {}",
++                num_too_long_samples, max_sample_time
+             );
+             record_error(
+                 glean,
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/lib_unit_tests.rs</Filename>
+<imports>use std::collections::HashSet;
+use std::iter::FromIterator;
+use super::TimingDistributionMetric;
+use super::TimeUnit;
+use crate::Glean;
+use crate::metrics::CommonMetricData;</imports>
+<Rust>#[test]
+fn test_zero_sample_clamping() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glean, _) = new_glean(Some(dir));
+    let mut dist = TimingDistributionMetric::new(
+        CommonMetricData {
+            name: "zero_test".into(),
+            category: "test".into(),
+            send_in_pings: vec!["baseline".into()],
+            ..Default::default()
+        },
+        TimeUnit::Nanosecond,
+    );
+    dist.accumulate_samples_signed(&glean, vec![0_i64]);
+    let hist = dist.test_get_value(&glean, "baseline").unwrap();
+    let keys: HashSet<u64> = HashSet::from_iter(hist.values().keys().cloned());
+    assert!(!keys.contains(&0), "Zero should be clamped to 1");
+    assert!(keys.contains(&1), "Zero sample must be stored as 1 nanosecond");
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0425]: cannot find function `new_glean` in this scope
+   --> glean-core/src/lib_unit_tests.rs:775:22
+    |
+775 |     let (glean, _) = new_glean(Some(dir));
+    |                      ^^^^^^^^^ not found in this scope
+    |
+note: function `crate::error_recording::test::new_glean` exists but is inaccessible
+   --> glean-core/src/error_recording.rs:158:5
+    |
+158 |     pub fn new_glean() -> (Glean, tempfile::TempDir) {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+help: consider importing this function
+    |
+765 + use crate::tests::new_glean;
+    |
+
+error[E0603]: struct import `CommonMetricData` is private
+   --> glean-core/src/lib_unit_tests.rs:770:21
+    |
+770 | use crate::metrics::CommonMetricData;
+    |                     ^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `CommonMetricData` is defined here...
+   --> glean-core/src/metrics/mod.rs:31:5
+    |
+31  | use crate::CommonMetricData;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct import `CommonMetricData` which is defined here...
+   --> glean-core/src/lib.rs:44:37
+    |
+44  | pub use crate::common_metric_data::{CommonMetricData, Lifetime};
+    |                                     ^^^^^^^^^^^^^^^^ you could import this re-export
+note: ...and refers to the struct `CommonMetricData` which is defined here
+   --> glean-core/src/common_metric_data.rs:56:1
+    |
+56  | pub struct CommonMetricData {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ you could import this directly
+help: import `CommonMetricData` through the re-export
+    |
+770 - use crate::metrics::CommonMetricData;
+770 + use common_metric_data::CommonMetricData;
+    |
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

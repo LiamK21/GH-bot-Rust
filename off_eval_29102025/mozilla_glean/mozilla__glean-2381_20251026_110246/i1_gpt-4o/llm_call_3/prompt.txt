@@ -1,0 +1,260 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Instrument when we reject re-adding an already in-flight ping
+We now reject attempts to re-enqeue pings we are tracking as in-flight (by their doc ID).
+We should instrument this failure case to ensure we're not dropping data.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -110,6 +110,7 @@ pub struct UploadMetrics {
+     pub pending_pings: CounterMetric,
+     pub send_success: TimingDistributionMetric,
+     pub send_failure: TimingDistributionMetric,
++    pub in_flight_pings_dropped: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -198,6 +199,15 @@ impl UploadMetrics {
+                 },
+                 TimeUnit::Millisecond,
+             ),
++
++            in_flight_pings_dropped: CounterMetric::new(CommonMetricData {
++                name: "in_flight_pings_dropped".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -373,7 +373,9 @@ impl PingUploadManager {
+                     document_id,
+                     path
+                 );
+-                // TODO(bug 1816401): Instrument this failure case for monitoring.
++                self.upload_metrics
++                    .in_flight_pings_dropped
++                    .add_sync(glean, 0);
+                 return;
+             }
+         }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use crate::internal_metrics::UploadMetrics;
+use crate::Glean;
+use crate::metrics::CounterMetric;
+use std::sync::Arc;
+use crate::core::InternalConfiguration;
+use std::collections::HashSet;</imports>
+<Rust>#[test]
+fn test_in_flight_pings_dropped_metric() {
+    let glean = Arc::new(Glean::new(InternalConfiguration::default()).unwrap());
+    let upload_metrics = UploadMetrics::new();
+    let mut manager = PingUploadManager {
+        upload_metrics,
+        queue: Vec::new(),
+        directory_manager: None,
+        processed_pending_pings: HashSet::new(),
+        cached_pings: HashSet::new(),
+        recoverable_failure_count: 0,
+        in_flight: HashSet::new(),
+        last_upload_attempt: None,
+        last_upload_success: None,
+        last_upload_failure: None,
+    };
+
+    let document_id = "test_doc_id".to_string();
+    let path = "test_path".to_string();
+
+    manager.in_flight.insert(document_id.clone());
+
+    manager.handle_ping_upload(glean.clone(), document_id, path);
+
+    let expected = Some(1);
+    let actual = manager.upload_metrics.in_flight_pings_dropped.test_get_value(Some("metrics".into()));
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0603]: struct import `InternalConfiguration` is private
+   --> glean-core/src/upload/mod.rs:845:22
+    |
+845 |     use crate::core::InternalConfiguration;
+    |                      ^^^^^^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `InternalConfiguration` is defined here...
+   --> glean-core/src/core/mod.rs:22:53
+    |
+22  |     scheduler, system, CommonMetricData, ErrorKind, InternalConfiguration, Lifetime, Result,
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `InternalConfiguration` which is defined here
+   --> glean-core/src/lib.rs:108:1
+    |
+108 | pub struct InternalConfiguration {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ you could import this directly
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1689:20
+     |
+1689 |             queue: Vec::new(),
+     |                    ^^^^^^^^^^ expected `RwLock<VecDeque<PingRequest>>`, found `Vec<_>`
+     |
+     = note: expected struct `RwLock<VecDeque<request::PingRequest>>`
+                found struct `Vec<_>`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1690:32
+     |
+1690 |             directory_manager: None,
+     |                                ^^^^ expected `PingDirectoryManager`, found `Option<_>`
+     |
+     = note: expected struct `directory::PingDirectoryManager`
+                  found enum `std::option::Option<_>`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1691:38
+     |
+1691 |             processed_pending_pings: HashSet::new(),
+     |                                      ^^^^^^^^^^^^^^ expected `Arc<AtomicBool>`, found `HashSet<_>`
+     |
+     = note: expected struct `std::sync::Arc<AtomicBool>`
+                found struct `HashSet<_>`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1692:27
+     |
+1692 |             cached_pings: HashSet::new(),
+     |                           ^^^^^^^^^^^^^^ expected `Arc<RwLock<PingPayloadsByDirectory>>`, found `HashSet<_>`
+     |
+     = note: expected struct `std::sync::Arc<RwLock<PingPayloadsByDirectory>>`
+                found struct `HashSet<_>`
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1693:40
+     |
+1693 |             recoverable_failure_count: 0,
+     |                                        ^ expected `AtomicU32`, found integer
+     |
+help: call `Into::into` on this expression to convert `{integer}` into `AtomicU32`
+     |
+1693 |             recoverable_failure_count: 0.into(),
+     |                                         +++++++
+
+error[E0308]: mismatched types
+    --> glean-core/src/upload/mod.rs:1694:24
+     |
+1694 |             in_flight: HashSet::new(),
+     |                        ^^^^^^^^^^^^^^ expected `RwLock<HashMap<String, (TimerId, ...)>>`, found `HashSet<_>`
+     |
+     = note: expected struct `RwLock<std::collections::HashMap<std::string::String, (metrics::timing_distribution::TimerId, metrics::timing_distribution::TimerId)>>`
+                found struct `HashSet<_>`
+
+error[E0560]: struct `upload::PingUploadManager` has no field named `last_upload_attempt`
+    --> glean-core/src/upload/mod.rs:1695:13
+     |
+1695 |             last_upload_attempt: None,
+     |             ^^^^^^^^^^^^^^^^^^^ `upload::PingUploadManager` does not have this field
+     |
+     = note: available fields are: `wait_attempt_count`, `rate_limiter`, `language_binding_name`, `policy`
+
+error[E0560]: struct `upload::PingUploadManager` has no field named `last_upload_success`
+    --> glean-core/src/upload/mod.rs:1696:13
+     |
+1696 |             last_upload_success: None,
+     |             ^^^^^^^^^^^^^^^^^^^ `upload::PingUploadManager` does not have this field
+     |
+     = note: available fields are: `wait_attempt_count`, `rate_limiter`, `language_binding_name`, `policy`
+
+error[E0560]: struct `upload::PingUploadManager` has no field named `last_upload_failure`
+    --> glean-core/src/upload/mod.rs:1697:13
+     |
+1697 |             last_upload_failure: None,
+     |             ^^^^^^^^^^^^^^^^^^^ `upload::PingUploadManager` does not have this field
+     |
+     = note: available fields are: `wait_attempt_count`, `rate_limiter`, `language_binding_name`, `policy`
+
+error[E0599]: no method named `insert` found for struct `RwLock` in the current scope
+    --> glean-core/src/upload/mod.rs:1703:27
+     |
+1703 |         manager.in_flight.insert(document_id.clone());
+     |                           ^^^^^^
+     |
+note: the method `insert` exists on the type `std::collections::HashMap<std::string::String, (metrics::timing_distribution::TimerId, metrics::timing_distribution::TimerId)>`
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/collections/hash/map.rs:1203:5
+help: use `.write().unwrap()` to mutably borrow the `std::collections::HashMap<std::string::String, (metrics::timing_distribution::TimerId, metrics::timing_distribution::TimerId)>`, blocking the current thread until it can be acquired
+     |
+1703 |         manager.in_flight.write().unwrap().insert(document_id.clone());
+     |                          +++++++++++++++++
+help: there is a method `set` with a similar name
+     |
+1703 -         manager.in_flight.insert(document_id.clone());
+1703 +         manager.in_flight.set(document_id.clone());
+     |
+
+error[E0599]: no method named `handle_ping_upload` found for struct `upload::PingUploadManager` in the current scope
+    --> glean-core/src/upload/mod.rs:1705:17
+     |
+184  | pub struct PingUploadManager {
+     | ---------------------------- method `handle_ping_upload` not found for this struct
+...
+1705 |         manager.handle_ping_upload(glean.clone(), document_id, path);
+     |                 ^^^^^^^^^^^^^^^^^^ method not found in `upload::PingUploadManager`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,208 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add Timespan's `set_raw` to the Rust trait and the RLB
+We have [concrete uses](https://phabricator.services.mozilla.com/D111348) for setting raw values to `timespan` metrics in FOG. Which means we need to drill `set_raw` up through the layers.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/timespan.rs b/glean-core/rlb/src/private/timespan.rs
+--- a/glean-core/rlb/src/private/timespan.rs
++++ b/glean-core/rlb/src/private/timespan.rs
+@@ -3,6 +3,7 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use std::sync::{Arc, RwLock};
++use std::time::Duration;
+ 
+ use inherent::inherent;
+ 
+@@ -68,6 +69,16 @@ impl glean_core::traits::Timespan for TimespanMetric {
+         });
+     }
+ 
++    fn set_raw(&self, elapsed: Duration) {
++        let metric = Arc::clone(&self.0);
++        crate::launch_with_glean(move |glean| {
++            let inner = metric
++                .write()
++                .expect("Lock poisoned for timespan metric on set_raw.");
++            inner.set_raw(glean, elapsed)
++        });
++    }
++
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<u64> {
+         crate::block_on_dispatcher();
+
+diff --git a/glean-core/src/traits/timespan.rs b/glean-core/src/traits/timespan.rs
+--- a/glean-core/src/traits/timespan.rs
++++ b/glean-core/src/traits/timespan.rs
+@@ -3,6 +3,7 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use crate::ErrorType;
++use std::time::Duration;
+ 
+ /// A description for the [`TimespanMetric`](crate::metrics::TimespanMetric) type.
+ ///
+@@ -28,6 +29,17 @@ pub trait Timespan {
+     /// if no [`start`](Timespan::start) was called.
+     fn cancel(&self);
+ 
++    /// Explicitly sets the timespan value.
++    ///
++    /// This API should only be used if your library or application requires recording
++    /// spans of time in a way that cannot make use of
++    /// [`start`](Timespan::start)/[`stop`](Timespan::stop)/[`cancel`](Timespan::cancel).
++    ///
++    /// # Arguments
++    ///
++    /// * `elapsed` - The elapsed time to record.
++    fn set_raw(&self, elapsed: Duration);
++
+     /// **Exported for test purposes.**
+     ///
+     /// Gets the currently stored value as an integer.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/timespan.rs</Filename>
+<imports>use std::sync::Arc;
+use glean_core::testonly::with_glean_ffi_test_init;
+use glean_core::storage::LocalStorageProvider;
+use glean_core::Glean;</imports>
+<Rust>#[test]
+fn test_set_raw_records_duration_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = LocalStorageProvider::new(&dir.path().to_str().unwrap());
+    let glean = Arc::new(Glean::new(storage, "test.app", true, true).unwrap());
+
+    let metric = TimespanMetric {
+        0: Arc::new(std::sync::RwLock::new(crate::private::TimespanInner {
+            metric: crate::private::Metric::new(
+                CommonMetricData {
+                    category: "test".into(),
+                    name: "metric".into(),
+                    send_in_pings: vec!["default".into()],
+                    ..Default::default()
+                },
+                Duration::from_nanos(0)
+            ),
+        })), 
+    };
+
+    let expected = Duration::from_nanos(123456789);
+    metric.set_raw(expected);
+
+    glean.block_on_dispatcher();
+
+    let actual = metric.test_get_value("default").unwrap();
+    assert_eq!(actual, expected.as_nanos() as u64);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `glean_core::testonly`
+   --> glean-core/rlb/src/private/timespan.rs:132:21
+    |
+132 |     use glean_core::testonly::with_glean_ffi_test_init;
+    |                     ^^^^^^^^ could not find `testonly` in `glean_core`
+
+error[E0432]: unresolved import `glean_core::storage::LocalStorageProvider`
+   --> glean-core/rlb/src/private/timespan.rs:133:9
+    |
+133 |     use glean_core::storage::LocalStorageProvider;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `LocalStorageProvider` in `storage`
+
+error[E0422]: cannot find struct, variant or union type `TimespanInner` in module `crate::private`
+   --> glean-core/rlb/src/private/timespan.rs:183:64
+    |
+183 |             0: Arc::new(std::sync::RwLock::new(crate::private::TimespanInner {
+    |                                                                ^^^^^^^^^^^^^ not found in `crate::private`
+
+error[E0433]: failed to resolve: could not find `Metric` in `private`
+   --> glean-core/rlb/src/private/timespan.rs:184:41
+    |
+184 |                 metric: crate::private::Metric::new(
+    |                                         ^^^^^^ could not find `Metric` in `private`
+    |
+help: consider importing this enum
+    |
+125 +     use glean_core::metrics::Metric;
+    |
+help: if you import `Metric`, refer to it directly
+    |
+184 -                 metric: crate::private::Metric::new(
+184 +                 metric: Metric::new(
+    |
+
+error[E0061]: this function takes 1 argument but 4 arguments were supplied
+   --> glean-core/rlb/src/private/timespan.rs:180:30
+    |
+180 |         let glean = Arc::new(Glean::new(storage, "test.app", true, true).unwrap());
+    |                              ^^^^^^^^^^          ----------  ----  ---- unexpected argument #4 of type `bool`
+    |                                                  |           |
+    |                                                  |           unexpected argument #3 of type `bool`
+    |                                                  unexpected argument #2 of type `&'static str`
+    |
+note: associated function defined here
+   --> /app/testbed/glean-core/src/lib.rs:241:12
+    |
+241 |     pub fn new(cfg: Configuration) -> Result<Self> {
+    |            ^^^
+help: remove the extra arguments
+    |
+180 -         let glean = Arc::new(Glean::new(storage, "test.app", true, true).unwrap());
+180 +         let glean = Arc::new(Glean::new(storage).unwrap());
+    |
+
+error[E0599]: no method named `block_on_dispatcher` found for struct `Arc<Glean>` in the current scope
+   --> glean-core/rlb/src/private/timespan.rs:199:15
+    |
+199 |         glean.block_on_dispatcher();
+    |               ^^^^^^^^^^^^^^^^^^^ method not found in `Arc<Glean>`
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

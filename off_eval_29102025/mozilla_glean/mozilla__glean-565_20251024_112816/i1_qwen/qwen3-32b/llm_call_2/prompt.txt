@@ -1,0 +1,715 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Provide crash resistance to 'ping' lifetime metrics when they are not stored to disk
+This is a follow-up to bug 1596440.
+
+> As a stretch goal, we could provide crash safety by persisting ping-lifetime metrics to disk every N minutes.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/database/mod.rs b/glean-core/src/database/mod.rs
+--- a/glean-core/src/database/mod.rs
++++ b/glean-core/src/database/mod.rs
+@@ -5,6 +5,7 @@
+ use std::collections::btree_map::Entry;
+ use std::collections::BTreeMap;
+ use std::fs;
++use std::str;
+ use std::sync::RwLock;
+ 
+ use rkv::{Rkv, SingleStore, StoreOptions};
+@@ -24,9 +25,7 @@ pub struct Database {
+     app_lifetime_data: RwLock<BTreeMap<String, Metric>>,
+     // If the `delay_ping_lifetime_io` Glean config option is `true`,
+     // we will save metrics with 'ping' lifetime data in a map temporarily
+-    // so as to persist them to disk using rkv in bulk on shutdown,
+-    // or after a given interval, instead of everytime a new metric
+-    // is created / updated.
++    // so as to persist them to disk using rkv in bulk on demand.
+     ping_lifetime_data: Option<RwLock<BTreeMap<String, Metric>>>,
+ }
+ 
+@@ -35,8 +34,11 @@ impl Database {
+     ///
+     /// This opens the underlying rkv store and creates
+     /// the underlying directory structure.
++    ///
++    /// It also loads any Lifetime::Ping data that might be
++    /// persisted, in case `delay_ping_lifetime_io` is set.
+     pub fn new(data_path: &str, delay_ping_lifetime_io: bool) -> Result<Self> {
+-        Ok(Self {
++        let db = Self {
+             rkv: Self::open_rkv(data_path)?,
+             app_lifetime_data: RwLock::new(BTreeMap::new()),
+             ping_lifetime_data: if delay_ping_lifetime_io {
+@@ -44,7 +46,11 @@ impl Database {
+             } else {
+                 None
+             },
+-        })
++        };
++
++        db.load_ping_lifetime_data();
++
++        Ok(db)
+     }
+ 
+     /// Creates the storage directories and inits rkv.
+@@ -78,6 +84,40 @@ impl Database {
+         }
+     }
+ 
++    /// Loads Lifetime::Ping data from rkv to memory,
++    /// if `delay_ping_lifetime_io` is set to true.
++    ///
++    /// Does nothing if it isn't or if there is not data to load.
++    fn load_ping_lifetime_data(&self) {
++        if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
++            let mut data = ping_lifetime_data
++                .write()
++                .expect("Can't read ping lifetime data");
++
++            let store: SingleStore = unwrap_or!(
++                self.rkv
++                    .open_single(Lifetime::Ping.as_str(), StoreOptions::create()),
++                return
++            );
++
++            let reader = unwrap_or!(self.rkv.read(), return);
++            let mut iter = unwrap_or!(store.iter_start(&reader), return);
++
++            while let Some(Ok((metric_name, value))) = iter.next() {
++                let metric_name = match str::from_utf8(metric_name) {
++                    Ok(metric_name) => metric_name.to_string(),
++                    _ => continue,
++                };
++                let metric: Metric = match value.expect("Value missing in iteration") {
++                    rkv::Value::Blob(blob) => unwrap_or!(bincode::deserialize(blob), continue),
++                    _ => continue,
++                };
++
++                data.insert(metric_name, metric);
++            }
++        }
++    }
++
+     /// Iterates with the provided transaction function over the requested data
+     /// from the given storage.
+     ///
+@@ -128,7 +168,7 @@ impl Database {
+             return;
+         }
+ 
+-        // Lifetime::Ping data is not persisted to disk if
++        // Lifetime::Ping data is not immediately persisted to disk if
+         // Glean has `delay_ping_lifetime_io` set to true
+         if lifetime == Lifetime::Ping {
+             if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+@@ -282,7 +322,7 @@ impl Database {
+             return Ok(());
+         }
+ 
+-        // Lifetime::Ping data is not persisted to disk if
++        // Lifetime::Ping data is not immediately persisted to disk if
+         // Glean has `delay_ping_lifetime_io` set to true
+         if lifetime == Lifetime::Ping {
+             if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+@@ -364,7 +404,7 @@ impl Database {
+             return Ok(());
+         }
+ 
+-        // Lifetime::Ping data is not persisted to disk if
++        // Lifetime::Ping data is not immediately persisted to disk if
+         // Glean has `delay_ping_lifetime_io` set to true
+         if lifetime == Lifetime::Ping {
+             if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+@@ -423,14 +463,13 @@ impl Database {
+     ///
+     /// * This function will **not** panic on database errors.
+     pub fn clear_ping_lifetime_storage(&self, storage_name: &str) -> Result<()> {
+-        // Lifetime::Ping might have data saved to `ping_lifetime_data`
++        // Lifetime::Ping data will be saved to `ping_lifetime_data`
+         // in case `delay_ping_lifetime_io` is set to true
+         if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+             ping_lifetime_data
+                 .write()
+                 .expect("Can't access ping lifetime data as writable")
+                 .clear();
+-            return Ok(());
+         }
+ 
+         self.write_with_store(Lifetime::Ping, |mut writer, store| {
+@@ -495,20 +534,26 @@ impl Database {
+             return Ok(());
+         }
+ 
+-        // Lifetime::Ping data is not persisted to disk if
+-        // Glean has `delay_ping_lifetime_io` set to true
++        // Lifetime::Ping data will be saved to `ping_lifetime_data`
++        // in case `delay_ping_lifetime_io` is set to true
+         if lifetime == Lifetime::Ping {
+             if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+                 let mut data = ping_lifetime_data
+                     .write()
+                     .expect("Can't access app lifetime data as writable");
+                 data.remove(&final_key);
+-                return Ok(());
+             }
+         }
+ 
+         self.write_with_store(lifetime, |mut writer, store| {
+-            store.delete(&mut writer, final_key.clone())?;
++            if let Err(e) = store.delete(&mut writer, final_key.clone()) {
++                if self.ping_lifetime_data.is_some() {
++                    // If ping_lifetime_data exists, it might be
++                    // that data is in memory, but not yet in rkv.
++                    return Ok(());
++                }
++                return Err(e.into());
++            }
+             writer.commit()?;
+             Ok(())
+         })
+@@ -522,6 +567,15 @@ impl Database {
+     ///
+     /// * This function will **not** panic on database errors.
+     pub fn clear_all(&self) {
++        // Lifetime::Ping might also have data saved to `ping_lifetime_data`
++        // in case `delay_ping_lifetime_io` is set to true
++        if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
++            ping_lifetime_data
++                .write()
++                .expect("Can't access ping lifetime data as writable")
++                .clear();
++        }
++
+         for lifetime in [Lifetime::User, Lifetime::Ping].iter() {
+             let res = self.write_with_store(*lifetime, |mut writer, store| {
+                 store.clear(&mut writer)?;
+@@ -537,13 +591,35 @@ impl Database {
+             .write()
+             .expect("Can't access app lifetime data as writable")
+             .clear();
++    }
+ 
++    /// Persist ping_lifetime_data to disk.
++    ///
++    /// Does nothing in case there is nothing to persist.
++    ///
++    /// ## Panics
++    ///
++    /// * This function will **not** panic on database errors.
++    pub fn persist_ping_lifetime_data(&self) -> Result<()> {
+         if let Some(ping_lifetime_data) = &self.ping_lifetime_data {
+-            ping_lifetime_data
+-                .write()
+-                .expect("Can't access ping lifetime data as writable")
+-                .clear();
++            let data = ping_lifetime_data
++                .read()
++                .expect("Can't read ping lifetime data");
++
++            self.write_with_store(Lifetime::Ping, |mut writer, store| {
++                for (key, value) in data.iter() {
++                    let encoded =
++                        bincode::serialize(&value).expect("IMPOSSIBLE: Serializing metric failed");
++                    // There is no need for `get_storage_key` here because
++                    // the key is already formatted from when it was saved
++                    // to ping_lifetime_data.
++                    store.put(&mut writer, &key, &rkv::Value::Blob(&encoded))?;
++                }
++                writer.commit()?;
++                Ok(())
++            })?;
+         }
++        Ok(())
+     }
+ }
+ 
+@@ -812,51 +888,188 @@ mod test {
+     }
+ 
+     #[test]
+-    fn test_deferred_ping_lifetime_collection() {
++    fn test_delayed_ping_lifetime_persistence() {
+         // Init the database in a temporary directory.
+         let dir = tempdir().unwrap();
+         let str_dir = dir.path().display().to_string();
+         let db = Database::new(&str_dir, true).unwrap();
++        let test_storage = "test-storage";
+ 
+         assert!(db.ping_lifetime_data.is_some());
+ 
+         // Attempt to record a known value.
+-        let test_value = "test-value";
+-        let test_storage = "test-storage1";
+-        let test_metric_id = "telemetry_test.test_name";
++        let test_value1 = "test-value1";
++        let test_metric_id1 = "telemetry_test.test_name1";
+         db.record_per_lifetime(
+             Lifetime::Ping,
+             test_storage,
+-            test_metric_id,
+-            &Metric::String(test_value.to_string()),
++            test_metric_id1,
++            &Metric::String(test_value1.to_string()),
+         )
+         .unwrap();
+ 
+-        // Verify that the data is correctly recorded.
+-        let mut found_metrics = 0;
+-        let mut snapshotter = |metric_name: &[u8], metric: &Metric| {
+-            found_metrics += 1;
+-            let metric_id = String::from_utf8_lossy(metric_name).into_owned();
+-            assert_eq!(test_metric_id, metric_id);
+-            match metric {
+-                Metric::String(s) => assert_eq!(test_value, s),
+-                _ => panic!("Unexpected data found"),
+-            }
+-        };
++        // Attempt to persist data.
++        db.persist_ping_lifetime_data().unwrap();
+ 
+-        db.iter_store_from(Lifetime::Ping, test_storage, None, &mut snapshotter);
+-        assert_eq!(1, found_metrics, "We only expect 1 Lifetime.Ping metric.");
++        // Attempt to record another known value.
++        let test_value2 = "test-value2";
++        let test_metric_id2 = "telemetry_test.test_name2";
++        db.record_per_lifetime(
++            Lifetime::Ping,
++            test_storage,
++            test_metric_id2,
++            &Metric::String(test_value2.to_string()),
++        )
++        .unwrap();
+ 
+-        // Make sure data was **not** persisted with rkv.
+-        let store: SingleStore = unwrap_or!(
+-            db.rkv
+-                .open_single(Lifetime::Ping.as_str(), StoreOptions::create()),
+-            panic!()
+-        );
+-        let reader = unwrap_or!(db.rkv.read(), panic!());
+-        assert!(store
+-            .get(&reader, &test_metric_id)
+-            .unwrap_or(None)
+-            .is_none());
++        {
++            // At this stage we expect `test_value1` to be persisted and in memory,
++            // since it was recorded before calling `persist_ping_lifetime_data`,
++            // and `test_value2` to be only in memory, since it was recorded after.
++            let store: SingleStore = db
++                .rkv
++                .open_single(Lifetime::Ping.as_str(), StoreOptions::create())
++                .unwrap();
++            let reader = db.rkv.read().unwrap();
++
++            // Verify that test_value1 is in rkv.
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id1))
++                .unwrap_or(None)
++                .is_some());
++            // Verifiy that test_value2 is **not** in rkv.
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id2))
++                .unwrap_or(None)
++                .is_none());
++
++            let data = match &db.ping_lifetime_data {
++                Some(ping_lifetime_data) => ping_lifetime_data,
++                None => panic!("Expected `ping_lifetime_data` to exist here!"),
++            };
++            let data = data.read().unwrap();
++            // Verify that test_value1 is also in memory.
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id1))
++                .is_some());
++            // Verify that test_value2 is in memory.
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id2))
++                .is_some());
++        }
++
++        // Attempt to persist data again.
++        db.persist_ping_lifetime_data().unwrap();
++
++        {
++            // At this stage we expect `test_value1` and `test_value2` to
++            // be persisted, since both were created before a call to
++            // `persist_ping_lifetime_data`.
++            let store: SingleStore = db
++                .rkv
++                .open_single(Lifetime::Ping.as_str(), StoreOptions::create())
++                .unwrap();
++            let reader = db.rkv.read().unwrap();
++
++            // Verify that test_value1 is in rkv.
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id1))
++                .unwrap_or(None)
++                .is_some());
++            // Verifiy that test_value2 is also in rkv.
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id2))
++                .unwrap_or(None)
++                .is_some());
++
++            let data = match &db.ping_lifetime_data {
++                Some(ping_lifetime_data) => ping_lifetime_data,
++                None => panic!("Expected `ping_lifetime_data` to exist here!"),
++            };
++            let data = data.read().unwrap();
++            // Verify that test_value1 is also in memory.
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id1))
++                .is_some());
++            // Verify that test_value2 is also in memory.
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id2))
++                .is_some());
++        }
++    }
++
++    #[test]
++    fn test_load_ping_lifetime_data_from_memory() {
++        // Init the database in a temporary directory.
++        let dir = tempdir().unwrap();
++        let str_dir = dir.path().display().to_string();
++
++        let test_storage = "test-storage";
++        let test_value = "test-value";
++        let test_metric_id = "telemetry_test.test_name";
++
++        {
++            let db = Database::new(&str_dir, true).unwrap();
++
++            // Attempt to record a known value.
++            db.record_per_lifetime(
++                Lifetime::Ping,
++                test_storage,
++                test_metric_id,
++                &Metric::String(test_value.to_string()),
++            )
++            .unwrap();
++
++            // Verify that test_value is in memory.
++            let data = match &db.ping_lifetime_data {
++                Some(ping_lifetime_data) => ping_lifetime_data,
++                None => panic!("Expected `ping_lifetime_data` to exist here!"),
++            };
++            let data = data.read().unwrap();
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id))
++                .is_some());
++
++            // Attempt to persist data.
++            db.persist_ping_lifetime_data().unwrap();
++
++            // Verify that test_value is now in rkv.
++            let store: SingleStore = db
++                .rkv
++                .open_single(Lifetime::Ping.as_str(), StoreOptions::create())
++                .unwrap();
++            let reader = db.rkv.read().unwrap();
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id))
++                .unwrap_or(None)
++                .is_some());
++        }
++
++        // Now create a new instace of the db and check if data was
++        // correctly loaded from rkv to memory.
++        {
++            let db = Database::new(&str_dir, true).unwrap();
++
++            // Verify that test_value is in memory.
++            let data = match &db.ping_lifetime_data {
++                Some(ping_lifetime_data) => ping_lifetime_data,
++                None => panic!("Expected `ping_lifetime_data` to exist here!"),
++            };
++            let data = data.read().unwrap();
++            assert!(data
++                .get(&format!("{}#{}", test_storage, test_metric_id))
++                .is_some());
++
++            // Verify that test_value is also in rkv.
++            let store: SingleStore = db
++                .rkv
++                .open_single(Lifetime::Ping.as_str(), StoreOptions::create())
++                .unwrap();
++            let reader = db.rkv.read().unwrap();
++            assert!(store
++                .get(&reader, format!("{}#{}", test_storage, test_metric_id))
++                .unwrap_or(None)
++                .is_some());
++        }
+     }
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -19,10 +19,7 @@ use chrono::{DateTime, FixedOffset};
+ use lazy_static::lazy_static;
+ use uuid::Uuid;
+ 
+-// This needs to be included first, and the space below prevents rustfmt from
+-// alphabetizing it.
+ mod macros;
+-
+ pub mod ac_migration;
+ mod common_metric_data;
+ mod database;
+@@ -103,7 +100,7 @@ pub struct Configuration {
+ ///
+ /// call_counter.add(&glean, 1);
+ ///
+-/// glean.submit_ping(&ping).unwrap();
++/// glean.send_ping(&ping).unwrap();
+ /// ```
+ ///
+ /// ## Note
+@@ -238,7 +235,7 @@ impl Glean {
+     /// # Return value
+     ///
+     /// `true` if at least one ping was generated, `false` otherwise.
+-    pub fn on_ready_to_submit_pings(&self) -> bool {
++    pub fn on_ready_to_send_pings(&self) -> bool {
+         self.event_data_store.flush_pending_events_on_startup(&self)
+     }
+ 
+@@ -264,9 +261,9 @@ impl Glean {
+     pub fn set_upload_enabled(&mut self, flag: bool) -> bool {
+         log::info!("Upload enabled: {:?}", flag);
+ 
+-        // When upload is disabled, submit a deletion-request ping
++        // When upload is disabled, send a deletion-request ping
+         if !flag {
+-            if let Err(err) = self.internal_pings.deletion_request.submit(self) {
++            if let Err(err) = self.internal_pings.deletion_request.send(self) {
+                 log::error!("Failed to send deletion-request ping on optout: {}", err);
+             }
+         }
+@@ -411,7 +408,7 @@ impl Glean {
+         )
+     }
+ 
+-    /// Collect and submit a ping for eventual uploading.
++    /// Send a ping.
+     ///
+     /// The ping content is assembled as soon as possible, but upload is not
+     /// guaranteed to happen immediately, as that depends on the upload
+@@ -421,12 +418,7 @@ impl Glean {
+     ///
+     /// Returns true if a ping was assembled and queued, false otherwise.
+     /// Returns an error if collecting or writing the ping to disk failed.
+-    pub fn submit_ping(&self, ping: &PingType) -> Result<bool> {
+-        if !self.is_upload_enabled() {
+-            log::error!("Glean must be enabled before sending pings.");
+-            return Ok(false);
+-        }
+-
++    pub fn send_ping(&self, ping: &PingType) -> Result<bool> {
+         let ping_maker = PingMaker::new();
+         let doc_id = Uuid::new_v4().to_string();
+         let url_path = self.make_path(&ping.name, &doc_id);
+@@ -459,26 +451,26 @@ impl Glean {
+         }
+     }
+ 
+-    /// Collect and submit a ping for eventual uploading by name.
++    /// Send a list of pings by name.
+     ///
+-    /// See `submit_ping` for detailed information.
++    /// See `send_ping` for detailed information.
+     ///
+     /// Returns true if at least one ping was assembled and queued, false otherwise.
+-    pub fn submit_pings_by_name(&self, ping_names: &[String]) -> bool {
++    pub fn send_pings_by_name(&self, ping_names: &[String]) -> bool {
+         // TODO: 1553813: glean-ac collects and stores pings in parallel and then joins them all before queueing the worker.
+         // This here is writing them out sequentially.
+ 
+         let mut result = false;
+ 
+         for ping_name in ping_names {
+-            if let Ok(true) = self.submit_ping_by_name(ping_name) {
++            if let Ok(true) = self.send_ping_by_name(ping_name) {
+                 result = true;
+             }
+         }
+         result
+     }
+ 
+-    /// Collect and submit a ping by name for eventual uploading.
++    /// Send a ping by name.
+     ///
+     /// The ping content is assembled as soon as possible, but upload is not
+     /// guaranteed to happen immediately, as that depends on the upload
+@@ -488,13 +480,13 @@ impl Glean {
+     ///
+     /// Returns true if a ping was assembled and queued, false otherwise.
+     /// Returns an error if collecting or writing the ping to disk failed.
+-    pub fn submit_ping_by_name(&self, ping_name: &str) -> Result<bool> {
++    pub fn send_ping_by_name(&self, ping_name: &str) -> Result<bool> {
+         match self.get_ping_by_name(ping_name) {
+             None => {
+-                log::error!("Attempted to submit unknown ping '{}'", ping_name);
++                log::error!("Attempted to send unknown ping '{}'", ping_name);
+                 Ok(false)
+             }
+-            Some(ping) => self.submit_ping(ping),
++            Some(ping) => self.send_ping(ping),
+         }
+     }
+ 
+@@ -551,6 +543,15 @@ impl Glean {
+         metric.set_inactive(&self);
+     }
+ 
++    /// Persist Lifetime::Ping data that might be in memory
++    /// in case `delay_ping_lifetime_io` is set or was set
++    /// at a previous time.
++    ///
++    /// If there is no data to persist, this function does nothing.
++    pub fn persist_ping_lifetime_data(&self) -> Result<()> {
++        self.data_store.persist_ping_lifetime_data()
++    }
++
+     /// **Test-only API (exported for FFI purposes).**
+     ///
+     /// Check if an experiment is currently active.
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/database/mod.rs</Filename>
+<imports>use std::sync::Arc;
+use rkv::{Rkv, StoreOptions};
+use std::borrow::Cow;
+use std::path::PathBuf;
+use std::fs;
+use std::sync::Mutex;
+use tempfile::{tempdir, TempDir};
+use rkv::SingleStore;</imports>
+<Rust>#[test]
+fn test_clear_ping_lifetime_data_after_clear() {
+    // Create a temporary directory and database with delay_ping_lifetime_io enabled.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_path_lossy().into_owned();
+    let db = Database::new(&db_path, true).unwrap();
+
+    let storage_name = "storage_name";
+    let metric_id = "metric_id";
+    let metric_value = Metric::String("value".to_string());
+
+    // Record a metric to ensure it's in memory.
+    db.record_per_lifetime(
+        Lifetime::Ping, 
+        storage_name, 
+        metric_id, 
+        &metric_value
+    ).unwrap();
+
+    // Get the expected key.
+    let key = format!("{}#{}", storage_name, metric_id);
+
+    // Verify the metric exists in ping_lifetime_data.
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(ping_data.contains_key(&key), "Metric should be present before clear");
+
+    // Clear the storage.
+    db.clear_ping_lifetime_storage(storage_name).unwrap();
+
+    // Verify the metric is removed from ping_lifetime_data.
+    let ping_data = db.ping_lifetime_data.as_ref().unwrap().read().unwrap();
+    assert!(!ping_data.contains_key(&key), "Metric should be cleared after clear");
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no method named `submit_ping_by_name` found for reference `&Glean` in the current scope
+   --> glean-core/src/event_database/mod.rs:143:37
+    |
+143 |             if let Err(err) = glean.submit_ping_by_name(&store_name) {
+    |                                     ^^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `get_ping_by_name` with a similar name
+    |
+143 -             if let Err(err) = glean.submit_ping_by_name(&store_name) {
+143 +             if let Err(err) = glean.get_ping_by_name(&store_name) {
+    |
+
+error[E0599]: no method named `submit_ping_by_name` found for reference `&Glean` in the current scope
+   --> glean-core/src/event_database/mod.rs:202:37
+    |
+202 |             if let Err(err) = glean.submit_ping_by_name(store_name) {
+    |                                     ^^^^^^^^^^^^^^^^^^^
+    |
+help: there is a method `get_ping_by_name` with a similar name
+    |
+202 -             if let Err(err) = glean.submit_ping_by_name(store_name) {
+202 +             if let Err(err) = glean.get_ping_by_name(store_name) {
+    |
+
+error[E0599]: no method named `submit_ping` found for reference `&Glean` in the current scope
+  --> glean-core/src/metrics/ping.rs:49:15
+   |
+49 |         glean.submit_ping(self)
+   |               ^^^^^^^^^^^ method not found in `&Glean`
+
+error[E0599]: no method named `send` found for struct `PingType` in the current scope
+   --> glean-core/src/lib.rs:266:68
+    |
+266 |             if let Err(err) = self.internal_pings.deletion_request.send(self) {
+    |                                                                    ^^^^ method not found in `PingType`
+    |
+   ::: glean-core/src/metrics/ping.rs:13:1
+    |
+13  | pub struct PingType {
+    | ------------------- method `send` not found for this struct
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

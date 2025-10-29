@@ -1,0 +1,412 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add PingUploadManager functionality to the Glean object
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -36,10 +36,9 @@ mod internal_pings;
+ pub mod metrics;
+ pub mod ping;
+ pub mod storage;
+-mod util;
+-
+ #[cfg(feature = "upload")]
+ mod upload;
++mod util;
+ 
+ pub use crate::common_metric_data::{CommonMetricData, Lifetime};
+ use crate::database::Database;
+@@ -51,6 +50,8 @@ use crate::internal_pings::InternalPings;
+ use crate::metrics::{Metric, MetricType, PingType};
+ use crate::ping::PingMaker;
+ use crate::storage::StorageManager;
++#[cfg(feature = "upload")]
++use crate::upload::{PingUploadManager, PingUploadTask};
+ use crate::util::{local_now_with_offset, sanitize_application_id};
+ 
+ const GLEAN_SCHEMA_VERSION: u32 = 1;
+@@ -160,6 +161,8 @@ pub struct Glean {
+     start_time: DateTime<FixedOffset>,
+     max_events: usize,
+     is_first_run: bool,
++    #[cfg(feature = "upload")]
++    upload_manager: PingUploadManager,
+ }
+ 
+ impl Glean {
+@@ -183,6 +186,8 @@ impl Glean {
+             event_data_store,
+             core_metrics: CoreMetrics::new(),
+             internal_pings: InternalPings::new(),
++            #[cfg(feature = "upload")]
++            upload_manager: PingUploadManager::new(&cfg.data_path),
+             data_path: PathBuf::from(cfg.data_path),
+             application_id,
+             ping_registry: HashMap::new(),
+@@ -323,6 +328,11 @@ impl Glean {
+ 
+     /// Clear any pending metrics when telemetry is disabled.
+     fn clear_metrics(&mut self) {
++        // Clear the pending pings queue and acquire the lock
++        // so that it can't be accessed until this function is done.
++        #[cfg(feature = "upload")]
++        let _lock = self.upload_manager.clear_ping_queue();
++
+         // There is only one metric that we want to survive after clearing all
+         // metrics: first_run_date. Here, we store its value so we can restore
+         // it after clearing the metrics.
+@@ -402,6 +412,32 @@ impl Glean {
+         self.max_events
+     }
+ 
++    /// Gets the next task for an uploader. Which can be either:
++    ///
++    /// * Wait - which means the requester should ask again later;
++    /// * Upload(PingRequest) - which means there is a ping to upload. This wraps the actual request object;
++    /// * Done - which means there are no more pings queued right now.
++    ///
++    /// # Return value
++    ///
++    /// `PingUploadTask` - an enum representing the possible tasks.
++    #[cfg(feature = "upload")]
++    pub fn get_upload_task(&self) -> PingUploadTask {
++        self.upload_manager.get_upload_task()
++    }
++
++    /// Processes the response from an attempt to upload a ping.
++    ///
++    /// # Arguments
++    ///
++    /// `uuid` - The UUID of the ping in question.
++    /// `status` - The HTTP status of the response.
++    #[cfg(feature = "upload")]
++    pub fn process_ping_upload_response(&self, uuid: &str, status: u16) {
++        self.upload_manager
++            .process_ping_upload_response(uuid, status);
++    }
++
+     /// Take a snapshot for the given store and optionally clear it.
+     ///
+     /// ## Arguments
+@@ -472,6 +508,10 @@ impl Glean {
+                     return Err(e.into());
+                 }
+ 
++                #[cfg(feature = "upload")]
++                self.upload_manager
++                    .enqueue_ping(&doc_id, &url_path, content);
++
+                 log::info!(
+                     "The ping '{}' was submitted and will be sent as soon as possible",
+                     ping.name
+
+diff --git a/glean-core/src/upload/directory.rs b/glean-core/src/upload/directory.rs
+--- a/glean-core/src/upload/directory.rs
++++ b/glean-core/src/upload/directory.rs
+@@ -109,12 +109,12 @@ impl PingDirectoryManager {
+         log::info!("Processing ping at: {}", path.display());
+ 
+         // The way the ping file is structured,
+-        // first line should always have the url
++        // first line should always have the path
+         // and second line should have the body with the ping contents in JSON format
+         let mut lines = BufReader::new(file).lines();
+-        if let (Some(Ok(url)), Some(Ok(body))) = (lines.next(), lines.next()) {
++        if let (Some(Ok(path)), Some(Ok(body))) = (lines.next(), lines.next()) {
+             if let Ok(parsed_body) = serde_json::from_str::<JsonValue>(&body) {
+-                return Some(PingRequest::new(uuid, &url, parsed_body));
++                return Some(PingRequest::new(uuid, &path, parsed_body));
+             } else {
+                 log::warn!(
+                     "Error processing ping file: {}. Can't parse ping contents as JSON.",
+@@ -257,7 +257,7 @@ mod test {
+         assert_eq!(requests.len(), 1);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = requests[0].url.split('/').nth(3).unwrap();
++        let request_ping_type = requests[0].path.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+     }
+ 
+@@ -287,7 +287,7 @@ mod test {
+         assert_eq!(requests.len(), 1);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = requests[0].url.split('/').nth(3).unwrap();
++        let request_ping_type = requests[0].path.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+ 
+         // Verify that file was indeed deleted
+@@ -320,7 +320,7 @@ mod test {
+         assert_eq!(requests.len(), 1);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = requests[0].url.split('/').nth(3).unwrap();
++        let request_ping_type = requests[0].path.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+ 
+         // Verify that file was indeed deleted
+@@ -359,7 +359,7 @@ mod test {
+         assert_eq!(requests.len(), 1);
+ 
+         // Verify request was returned for the "test" ping
+-        let request_ping_type = requests[0].url.split('/').nth(3).unwrap();
++        let request_ping_type = requests[0].path.split('/').nth(3).unwrap();
+         assert_eq!(request_ping_type, "test");
+ 
+         // Verify that file was indeed deleted
+@@ -382,11 +382,8 @@ mod test {
+         // Try and process the pings folder
+         let requests = directory_manager.process_dir();
+ 
+-        // Verify there is just the one request
+         assert_eq!(requests.len(), 1);
+ 
+-        // Verify request was returned for the "test" ping
+-        let request_ping_type = requests[0].url.split('/').nth(3).unwrap();
+-        assert_eq!(request_ping_type, "deletion-request");
++        assert!(requests[0].is_deletion_request());
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -17,7 +17,7 @@
+ use std::collections::VecDeque;
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::{Arc, RwLock};
++use std::sync::{Arc, RwLock, RwLockWriteGuard};
+ use std::thread;
+ 
+ use log;
+@@ -98,22 +98,24 @@ impl PingUploadManager {
+     }
+ 
+     /// Creates a `PingRequest` and adds it to the queue.
+-    pub fn enqueue_ping(&self, uuid: &str, url: &str, body: JsonValue) {
++    pub fn enqueue_ping(&self, uuid: &str, path: &str, body: JsonValue) {
+         let mut queue = self
+             .queue
+             .write()
+             .expect("Can't write to pending pings queue.");
+-        let request = PingRequest::new(uuid, url, body);
++        let request = PingRequest::new(uuid, path, body);
+         queue.push_back(request);
+     }
+ 
+-    /// Clears the pending pings queue.
+-    pub fn clear_ping_queue(&self) {
++    /// Clears the pending pings queue, leaves the deletion-request pings.
++    pub fn clear_ping_queue(&self) -> RwLockWriteGuard<'_, VecDeque<PingRequest>> {
+         let mut queue = self
+             .queue
+             .write()
+             .expect("Can't write to pending pings queue.");
+-        queue.clear();
++
++        queue.retain(|ping| ping.is_deletion_request());
++        queue
+     }
+ 
+     /// Gets the next `PingUploadTask`.
+@@ -217,7 +219,7 @@ mod test {
+     use crate::{tests::new_glean, PENDING_PINGS_DIRECTORY};
+ 
+     const UUID: &str = "40e31919-684f-43b0-a5aa-e15c2d56a674"; // Just a random UUID.
+-    const URL: &str = "http://example.com";
++    const PATH: &str = "/submit/app_id/ping_name/schema_version/doc_id";
+ 
+     #[test]
+     fn test_doesnt_error_when_there_are_no_pending_pings() {
+@@ -247,7 +249,7 @@ mod test {
+         }
+ 
+         // Enqueue a ping
+-        upload_manager.enqueue_ping(UUID, URL, json!({}));
++        upload_manager.enqueue_ping(UUID, PATH, json!({}));
+ 
+         // Try and get the next request.
+         // Verify request was returned
+@@ -271,7 +273,7 @@ mod test {
+         // Enqueue a ping multiple times
+         let n = 10;
+         for _ in 0..n {
+-            upload_manager.enqueue_ping(UUID, URL, json!({}));
++            upload_manager.enqueue_ping(UUID, PATH, json!({}));
+         }
+ 
+         // Verify a request is returned for each submitted ping
+@@ -299,16 +301,49 @@ mod test {
+ 
+         // Enqueue a ping multiple times
+         for _ in 0..10 {
+-            upload_manager.enqueue_ping(UUID, URL, json!({}));
++            upload_manager.enqueue_ping(UUID, PATH, json!({}));
+         }
+ 
+         // Clear the queue
+-        upload_manager.clear_ping_queue();
++        let _ = upload_manager.clear_ping_queue();
+ 
+         // Verify there really isn't any ping in the queue
+         assert_eq!(upload_manager.get_upload_task(), PingUploadTask::Done);
+     }
+ 
++    #[test]
++    fn test_clearing_the_queue_doesnt_clear_deletion_request_pings() {
++        let (mut glean, _) = new_glean(None);
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping multiple times
++        let n = 10;
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        glean
++            .internal_pings
++            .deletion_request
++            .submit(&glean, None)
++            .unwrap();
++
++        // Clear the queue
++        let _ = glean.upload_manager.clear_ping_queue();
++
++        let upload_task = glean.get_upload_task();
++        match upload_task {
++            PingUploadTask::Upload(request) => assert!(request.is_deletion_request()),
++            _ => panic!("Expected upload manager to return the next request!"),
++        }
++
++        // Verify there really isn't any other pings in the queue
++        assert_eq!(glean.get_upload_task(), PingUploadTask::Done);
++    }
++
+     #[test]
+     fn test_fills_up_queue_successfully_from_disk() {
+         let (mut glean, dir) = new_glean(None);
+
+diff --git a/glean-core/src/upload/request.rs b/glean-core/src/upload/request.rs
+--- a/glean-core/src/upload/request.rs
++++ b/glean-core/src/upload/request.rs
+@@ -10,13 +10,13 @@ use chrono::prelude::{DateTime, Utc};
+ use serde_json::Value as JsonValue;
+ 
+ /// Represents a request to upload a ping.
+-#[derive(PartialEq, Debug)]
++#[derive(PartialEq, Debug, Clone)]
+ pub struct PingRequest {
+     /// The Job ID to identify this request,
+     /// this is the same as the ping UUID.
+     pub uuid: String,
+     /// The path for the server to upload the ping to.
+-    pub url: String,
++    pub path: String,
+     /// The body of the request.
+     pub body: JsonValue,
+     /// A map with all the headers to be sent with the request.
+@@ -28,15 +28,24 @@ impl PingRequest {
+     ///
+     /// Automatically creates the default request headers.
+     /// Clients may add more headers such as `userAgent` to this list.
+-    pub fn new(uuid: &str, url: &str, body: JsonValue) -> Self {
++    pub fn new(uuid: &str, path: &str, body: JsonValue) -> Self {
+         Self {
+             uuid: uuid.into(),
+-            url: url.into(),
++            path: path.into(),
+             body,
+             headers: Self::create_request_headers(),
+         }
+     }
+ 
++    pub fn is_deletion_request(&self) -> bool {
++        // The path format should be `/submit/<app_id>/<ping_name>/<schema_version/<doc_id>`
++        self.path
++            .split('/')
++            .nth(3)
++            .map(|url| url == "deletion-request")
++            .unwrap_or(false)
++    }
++
+     /// Creates the default request headers.
+     fn create_request_headers() -> HashMap<String, String> {
+         let mut headers = HashMap::new();
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use std::sync::Arc;
+use std::sync::RwLock;
+use std::collections::VecDeque;
+use serde_json::Value as JsonValue;</imports>
+<Rust>#[test]
+fn test_clearing_queue_leaves_deletion_request_pings() {
+  let upload_manager = PingUploadManager::new("/data/path");
+  let ping_request = super::PingRequest::new("uuid", "/submit/app_id/deletion-request/schema_version/doc_id", JsonValue::Null);
+  let ping_request2 = super::PingRequest::new("uuid2", "/submit/app_id/ping_name/schema_version/doc_id2", JsonValue::Null);
+  upload_manager.enqueue_ping("uuid", "/submit/app_id/deletion-request/schema_version/doc_id", JsonValue::Null);
+  upload_manager.enqueue_ping("uuid2", "/submit/app_id/ping_name/schema_version/doc_id2", JsonValue::Null);
+  let _ = upload_manager.clear_ping_queue();
+  let upload_task = upload_manager.get_upload_task();
+  match upload_task {
+    super::PingUploadTask::Upload(request) => assert!(request.is_deletion_request()),
+    _ => panic!("Expected upload manager to return the next request!"),
+  }
+  assert_eq!(upload_manager.get_upload_task(), super::PingUploadTask::Done);
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

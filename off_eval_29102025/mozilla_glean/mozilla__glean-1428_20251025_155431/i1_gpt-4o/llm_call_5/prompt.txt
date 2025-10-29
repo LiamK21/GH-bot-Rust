@@ -1,0 +1,214 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Report IO errors from writing ping files as a metric
+See linked bug: writing the ping files can occasionally fail.
+We should try to report these errors in a metric.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -10,6 +10,13 @@ pub struct CoreMetrics {
+     pub first_run_date: DatetimeMetric,
+     pub first_run_hour: DatetimeMetric,
+     pub os: StringMetric,
++
++    /// The number of times we encountered an IO error
++    /// when writing a pending ping to disk.
++    ///
++    /// **Note**: Not a _core_ metric, but an error metric,
++    /// placed here for the lack of a more suitable part in the Glean struct.
++    pub io_errors: CounterMetric,
+ }
+ 
+ impl CoreMetrics {
+@@ -56,6 +63,15 @@ impl CoreMetrics {
+                 disabled: false,
+                 dynamic_label: None,
+             }),
++
++            io_errors: CounterMetric::new(CommonMetricData {
++                name: "io".into(),
++                category: "glean.error".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -636,6 +636,7 @@ impl Glean {
+                     &content,
+                 ) {
+                     log::warn!("IO error while writing ping to file: {}", e);
++                    self.core_metrics.io_errors.add(self, 1);
+                     return Err(e.into());
+                 }
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -871,3 +871,38 @@ fn records_database_file_size() {
+     // We should see the database containing some data.
+     assert!(data.sum > 0);
+ }
++
++#[test]
++fn records_io_errors() {
++    use std::fs;
++    let _ = env_logger::builder().is_test(true).try_init();
++
++    let (glean, _data_dir) = new_glean(None);
++    let pending_pings_dir = glean.get_data_path().join(crate::PENDING_PINGS_DIRECTORY);
++    fs::create_dir_all(&pending_pings_dir).unwrap();
++    let attr = fs::metadata(&pending_pings_dir).unwrap();
++    let original_permissions = attr.permissions();
++
++    // Remove write permissions on the pending_pings directory.
++    let mut permissions = original_permissions.clone();
++    permissions.set_readonly(true);
++    fs::set_permissions(&pending_pings_dir, permissions).unwrap();
++
++    // Writing the ping file should fail.
++    let submitted = glean.internal_pings.metrics.submit(&glean, None);
++    assert!(submitted.is_err());
++
++    let metric = &glean.core_metrics.io_errors;
++    assert_eq!(
++        1,
++        metric.test_get_value(&glean, "metrics").unwrap(),
++        "Should have recorded an IO error"
++    );
++
++    // Restore write permissions.
++    fs::set_permissions(&pending_pings_dir, original_permissions).unwrap();
++
++    // Now we can submit a ping
++    let submitted = glean.internal_pings.metrics.submit(&glean, None);
++    assert!(submitted.is_ok());
++}
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/lib_unit_tests.rs</Filename>
+<imports>use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use crate::tests::new_glean;</imports>
+<Rust>#[test]
+fn test_io_error_reporting() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (glean, _data_dir) = new_glean(None);
+    let pending_pings_dir = glean.get_data_path().join(crate::PENDING_PINGS_DIRECTORY);
+    fs::create_dir_all(&pending_pings_dir).unwrap();
+    let attr = fs::metadata(&pending_pings_dir).unwrap();
+    let original_permissions = attr.permissions();
+
+    let mut permissions = original_permissions.clone();
+    permissions.set_mode(0o555);
+    fs::set_permissions(&pending_pings_dir, permissions).unwrap();
+
+    let submitted = glean.internal_pings.metrics.submit(&glean, None);
+    assert!(submitted.is_err());
+
+    let metric = &glean.core_metrics.io_errors;
+    assert_eq!(
+        1,
+        metric.test_get_value(&glean, "metrics").unwrap(),
+        "Should have recorded an IO error"
+    );
+
+    fs::set_permissions(&pending_pings_dir, original_permissions).unwrap();
+
+    let submitted = glean.internal_pings.metrics.submit(&glean, None);
+    assert!(submitted.is_ok());
+}
+</Rust>
+</TEST>
+
+<output>
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+running 1 test
+
+thread 'tests::tests::test_io_error_reporting' panicked at glean-core/src/lib_unit_tests.rs:931:5:
+assertion failed: submitted.is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::tests::test_io_error_reporting ... FAILED
+</output>
+
+Function signatures
+<Signatures>
+fn records_database_file_size() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently fails after the patch.
+Your task is to:
+1. Identify and understand why the unit test failed.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

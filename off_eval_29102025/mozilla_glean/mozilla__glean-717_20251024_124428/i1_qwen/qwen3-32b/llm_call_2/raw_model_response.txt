@@ -1,0 +1,287 @@
+<think>
+Okay, let me try to figure this out. The user says that the existing test in the <TEST> block is passing before the patch, which it shouldn't. So I need to understand why that's happening and adjust the test so it fails before the patch and passes after.
+
+Looking at the provided patch, the main change is the introduction of a new directory for deletion request pings. The PingDirectoryManager now manages two directories: pending_pings and deletion_request. The process_dir method now includes pings from both directories.
+
+The existing test in the <TEST> block is called test_upload_deletion_request_ping. It submits a deletion request ping and checks if the upload task contains a request with "deletion-request" in the body. The problem is that before the patch, the code might have been handling deletion request pings in a different way, maybe even in the pending_pings directory. So the test might have been working even without the patch because the ping was still being picked up by the existing code, which might not be using the new directory correctly.
+
+Wait, in the old code (before the patch), how were deletion request pings handled? Looking at the patch for glean-core/src/ping/mod.rs, before the patch, when a ping type is "deletion-request", the PingMaker would save the ping to a directory named "deletion_request" directly. But without the patch, in the directory_manager, the PingDirectoryManager was probably only looking in pending_pings directory. So in the old code, even if the ping was saved to "deletion_request" directory, the PingDirectoryManager didn't know to look there. So when the test submitted a deletion request ping, the PingMaker would put it in a directory named "deletion_request", but the PingDirectoryManager's process_dir would look in pending_pings. Therefore, in the old code, the test's PingUploadManager would process the pending_pings directory (which had no file), and thus the upload task would be empty or not find the file. Hence, the test would fail. But in the patch, the PingDirectoryManager now has two directories, and process_dir checks both. So after the patch, the test passes.
+
+But according to the user's problem, the current test is passing before the patch. Wait, maybe in the old code, the PingMaker was saving the deletion request pings into a directory that the PingDirectoryManager was already processing. Let me check the original code before the patch.
+
+In the original code, before the patch, in PingMaker's save method, for a deletion request ping, the pings_dir would be data_path.join("deletion_request"), while other pings go to data_path.join("pending_pings"). Then, the PingDirectoryManager's get_dir() returns data_path.join("pending_pings"). So when a deletion request ping is submitted, it's saved to "deletion_request" directory, but the PingDirectoryManager's process_dir() only reads from the pending_pings directory. Therefore, in the old code, the test that submits a deletion request ping would save it to a directory that the PingDirectoryManager does not process. So when the test checks for the upload task, it would not find that ping, making the test fail. But after the patch, the PingDirectoryManager now processes both directories, so the test passes.
+
+Wait, but the user's current test is passing even before the patch. That suggests that maybe in the old code, the PingDirectoryManager was processing the deletion_request directory. But according to the patch, before the patch, the PingDirectoryManager's process_dir() only reads the pending_pings directory. So why would the current test pass before the patch?
+
+Hmm. Let me look at the original code. The test creates a PingUploadManager with dir.path(). The PingDirectoryManager's new() creates a data_path. The old PingDirectoryManager's get_dir() returns data_path.join("pending_pings"). So in the test, after submitting the deletion request ping, it is stored in data_path.join("deletion_request") because PingMaker::save uses that directory. The PingDirectoryManager, in the old code, would only process "pending_pings". So the PingUploadManager's process_dir would not find the deletion request ping. Therefore, the test's assertion that upload_task is some and contains "deletion-request" would fail. But in the user's statement, the current test passes before the patch. That suggests there's a mistake in my understanding. Maybe the deletion request pings were being handled in the pending_pings directory in the old code? Or maybe the PingMaker was saving them into pending_pings, which would explain why the test passes before the patch.
+
+Wait, perhaps the problem is in the test itself. The current test's code in the <TEST> block may have logic that's incorrect. For example, in the test, the line glean.internal_pings.deletion_request.submit(...) would submit a deletion request ping, which in the old code's PingMaker::save would go into the "deletion_request" directory, but in the test, when they create the PingUploadManager, maybe the directory path is not correct. Let's look at the test code.
+
+The test code in the <TEST> block is:
+
+#[test]
+fn test_upload_deletion_request_ping() {
+    let (glean, dir) = new_glean(None);
+    glean.internal_pings.deletion_request.submit(&glean, None).unwrap();
+    let upload_manager = PingUploadManager::new(dir.path().to_str().unwrap());
+    let mut upload_task = upload_manager.get_upload_task().unwrap();
+    assert!(upload_task.is_some());
+    let task = upload_task.as_ref().unwrap();
+    let request = task.read_request_body().unwrap();
+    assert!(request.contains("deletion-request"));
+}
+
+In the old code, the ping is saved into "deletion_request" directory, which the PingDirectoryManager's process_dir does not process (it only processes pending_pings). Therefore, the PingUploadManager's get_upload_task would have an empty queue, and upload_task would be None. Therefore, the test should fail. But according to the user's problem, the test currently passes before the patch. So why?
+
+Ah, maybe the new_glean function used in the test creates a Glean instance that uses a different directory structure. Wait, perhaps the 'dir' in the test is a temporary directory, and when the PingMaker saves the ping to "deletion_request" (inside the dir path), but the PingDirectoryManager in the PingUploadManager uses a different data_path. Wait, looking at the PingUploadManager::new function. In the patch, the PingUploadManager's new function takes a data_path and creates the PingDirectoryManager with that data_path. So if the PingUploadManager is created with dir.path(), then the PingDirectoryManager's pings_dirs would be data_path.join("pending_pings") and data_path.join("deletion_request"). But in the old code, before the patch, the PingDirectoryManager's pings_dirs would not exist. Wait, in the old code, the PingDirectoryManager was called with data_path, and in its new() function, it had data_path as self.data_path. The old process_dir() would call self.get_dir() which is data_path.join("pending_pings"). So when the PingMaker saves the deletion request ping to data_path.join("deletion_request"), but the PingDirectoryManager's process_dir() only reads from data_path.join("pending_pings"). Therefore, in the test, after submitting the deletion request ping, the PingUploadManager would not process it, and the test's upload_task would be None. Hence, the test would fail.
+
+But according to the user's problem, the test currently passes before the patch. So why is that?
+
+Wait, maybe the test's PingUploadManager's PingDirectoryManager is still processing the deletion_request directory even before the patch. No, because before the patch, the PingDirectoryManager's process_dir() only processed pending_pings.
+
+Wait, maybe the test is using a different setup. For example, in the test, the PingUploadManager is created with dir.path(), but when the PingDirectoryManager is created, it's data_path is dir.path(). So, the PingMaker's save would save the deletion request ping to dir.path().join("deletion_request"). The PingDirectoryManager, in the old code, would only read dir.path().join("pending_pings"). Therefore, the test should fail in the old code. But the user says the test passes before the patch. There's a contradiction here.
+
+Wait, perhaps the new_glean function in the test is creating a Glean instance that, when submitting a deletion request ping, somehow ends up in the pending_pings directory. How?
+
+Let me look at the code for glean-core/src/ping/mod.rs in the patch. Before the patch, in the PingMaker::save function, the code would check if the ping_type is "deletion-request" and then use "deletion_request" directory. But in the old code, the code was:
+
+let pings_dir = match ping_type {
+    Some(ping_type) if ping_type == "deletion-request" => {
+        data_path.join("deletion_request")
+    }
+    _ => data_path.join("pending_pings"),
+};
+
+So in the old code, the deletion request pings are saved into "deletion_request" directory. The PingDirectoryManager's process_dir() was using the pending_pings directory. Therefore, the test, which submits a deletion request ping, would have the ping saved into the deletion_request directory. The PingDirectoryManager would process pending_pings, which doesn't contain the ping. So the test's upload_manager would not find it, leading to upload_task being None, making the test fail on the first assert! (upload_task.is_some()). But the user says the test currently passes before the patch. This indicates that there's a mistake in my analysis.
+
+Alternatively, maybe the PingDirectoryManager in the old code was not correctly initialized with the data_path. Let's check the PingDirectoryManager's new function in the old code:
+
+In the old code, PingDirectoryManager::new(data_path) would create a self.data_path, which is path to the pending pings directory. Then, process_dir() would return self.data_path.join("pending_pings").
+
+Wait, in the previous code for PingDirectoryManager::new:
+
+pub fn new<P: Into<PathBuf>>(data_path: P) -> Self {
+    Self {
+        data_path: data_path.into(),
+    }
+}
+
+Then, get_dir() would be self.data_path.join("pending_pings").
+
+So when creating the PingDirectoryManager with dir.path(), get_dir() would be dir.path().join("pending_pings").
+
+But when the PingMaker saves the deletion request ping, it is saved to dir.path().join("deletion_request").
+
+So, in the old code, the test would not process the deletion request ping, leading to upload_task being None. Therefore, the test would fail. Therefore, why does the user say the current test passes before the patch?
+
+This suggests that maybe in the old code, the PingDirectoryManager was processing the "deletion_request" directory by default. But according to the code, that's not the case.
+
+Wait, perhaps the test is using a different PingUploadManager implementation. Let me look at the PingUploadManager's code in the old version. The PingUploadManager::new(data_path: P) creates a PingDirectoryManager with the data_path. The directory_manager.process_dir() would call the process_dir() method, which in the old code would read from the pending_pings directory.
+
+So the test's upload_manager.process_dir() would not process the deletion_request directory, hence the ping would not be added to the queue. So the test would fail. But the user says that the current test passes, which means our analysis is wrong.
+
+This implies that there's another factor at play here. Let me think: perhaps the test is not correctly isolating the directories. For example, maybe the test's new_glean function is using a different directory structure, or maybe the PingMaker in the test is somehow saving the ping into the pending_pings directory instead of deletion_request.
+
+Alternatively, perhaps the test's code is incorrect. Let me look at the test code again.
+
+The test does:
+
+glean.internal_pings.deletion_request.submit(&glean, None).unwrap();
+
+The internal_pings.deletion_request is a pre-defined ping type with ping_type set to "deletion-request". When submitted, it would go through the PingMaker's save method. The data_path for PingMaker would be the dir.path() created by new_glean? Or depends on how the Glean instance is configured in new_glean.
+
+Assuming that the new_glean function sets up the data directory correctly, the PingMaker's data_path is the same as the one passed to PingUploadManager. So when the test runs, it's possible that the PingMaker is saving the deletion request ping into dir.path().join("deletion_request"), which the old PingDirectoryManager does not process. Therefore, the test's upload_manager would have no pings in the queue, and the test would fail. But according to the user, the test currently passes. This suggests that there's a mistake in the test's code, perhaps the PingDirectoryManager is processing the deletion_request directory in the old code.
+
+Hmm. Maybe the PingDirectoryManager in the old code was processing the deletion_request directory. But how?
+
+Looking back at the old code for PingDirectoryManager:
+
+In the old code, the PingDirectoryManager had a data_path, and process_dir() would read from data_path's pending_pings directory.
+
+Wait, perhaps the test's code is passing dir.path().join("deletion_request") to the PingUploadManager. No, because the test calls PingUploadManager::new(dir.path().to_str().unwrap()). The PingUploadManager's new function would pass that data path to the PingDirectoryManager.
+
+But in the old code, the PingDirectoryManager's process_dir would process data_path.join("pending_pings"), but if the PingMaker saved to data_path.join("deletion_request"), then the pings are in a different directory.
+
+So in the test, the PingUploadManager is created with the data_path of dir's path. So the PingDirectoryManager processes data_path/pending_pings, but the deletion request ping is saved in data_path/deletion_request. Therefore, the test should fail. Therefore, perhaps the user made a mistake in their analysis, or maybe the test is not correctly written.
+
+But according to the problem statement, the current test passes even before the patch. Therefore, I need to adjust the test to make it fail before the patch.
+
+So what's wrong with the current test? Maybe the PingMaker is not submitting the ping correctly, leading to it being placed in the pending_pings directory by mistake. Or maybe the PingUploadManager is not using the correct directory.
+
+Alternatively, maybe in the old code, the PingMaker saved the deletion request ping into the pending_pings directory. Let me look at the code again.
+
+In the PingMaker's save method, before the patch:
+
+pub fn save(...) {
+    let pings_dir = match ping_type {
+        Some(ping_type) if ping_type == "deletion-request" => {
+            data_path.join("deletion_request")
+        }
+        _ => data_path.join("pending_pings"),
+    };
+    ...
+}
+
+So it's correct that it's saved to "deletion_request". So in the test, the ping is in "deletion_request", and the PingDirectoryManager is processing "pending_pings". Therefore, the test should fail in the old code. But according to the user, it's passing. So there's a contradiction here.
+
+This suggests that there's a mistake in my reasoning. Perhaps the PingDirectoryManager in the old code was actually processing the "deletion_request" directory for some reason. Alternatively, maybe the new_glean function initializes the data_path in a way that the PingDirectoryManager is using a different data_path.
+
+Alternatively, perhaps the test is using the new code where the PingDirectoryManager includes both directories, but the user is checking the old code. Therefore, maybe the test should be adjusted to ensure that it does not pick up the deletion request pings before the patch.
+
+Wait, the original problem is that the test passes before the patch, but it should fail. So to fix this, we need to adjust the test to correctly assert that the deletion request pings are being handled after the patch, but not before.
+
+Looking at the current test's assertions:
+
+The test asserts that upload_task.is_some(), which is the case when process_dir() returns a non-empty list of pings. In the old code, this should be None, because the ping is in the wrong directory. So why is it passing?
+
+Maybe the test is not correctly creating the PingUploadManager. For example, in the old code, the PingDirectoryManager's new function is called with data_path, and in the PingUploadManager's new function, maybe the data_path is not correctly passed. Let me look at the PingUploadManager's code before the patch.
+
+In the old code, PingUploadManager::new function:
+
+pub fn new<P: Into<PathBuf>>(data_path: P) -> Self {
+    Self {
+        directory_manager: PingDirectoryManager::new(data_path),
+        ... 
+    }
+}
+
+In the old PingDirectoryManager::new function, the data_path is stored. So when the PingDirectoryManager's process_dir() is called, it's using data_path/pending_pings.
+
+If the test submits a deletion request ping, which is saved to data_path/deletion_request, then the process_dir() would not find it, leading to no upload task. Thus, the test should fail. But the user says the current test passes on the old code, which it shouldn't. Therefore, there must be a mistake in the test setup.
+
+Looking at the test code in the <TEST> block:
+
+The upload_manager is created with dir.path().to_str().unwrap(). Then, when the PingDirectoryManager is created with data_path, the PingDirectoryManager would create the pending_pings directory under that path. However, the PingMaker's save code (old code) would save the deletion request ping to data_path/deletion_request. Therefore, the PingDirectoryManager's process_dir would not find the ping, leading to no upload task. Therefore, the test should fail.
+
+But according to the user, the test passes. This suggests that maybe in the test, the dir is a temporary directory that is somehow not being used correctly. Or perhaps the PingMaker is saving to a different directory.
+
+Alternatively, perhaps in the test's new_glean function, the data directory is being set up differently, leading the PingMaker to save the ping into the pending_pings directory. For example, if the ping type is not "deletion-request", the PingMaker saves to pending_pings. Maybe the internal_ping's deletion_request is not set up correctly, and the ping_type is not "deletion-request", but something else. Let me check the code for internal_pings.deletion_request.
+
+Looking at the code for internal_ping's deletion_request. The patch has:
+
+pub(crate) const INTERNAL_STORAGE: &str = "glean_internal_info";
+
+But that's not directly relevant. However, in the code for internal pings, perhaps the ping_type is set in a way that when submitted, it's not "deletion-request", leading the PingMaker to save it to pending_pings. This would explain why the test passes in the old code.
+
+Wait, maybe the ping's ping_type is not "deletion-request" in the test. For example, perhaps the deletion request ping is registered with a different name. If the internal_ping's deletion_request is not set up with a ping_type of "deletion-request", then the PingMaker would save it to pending_pings.
+
+Let me check the code for the internalPing's deletion_request in the patch. In the patch, there's a new test introduced for test_takes_deletion_request_pings_into_account_while_processing in ping/directory.rs. But perhaps the internal_ping's deletion_request is registered in the code as a different ping_type.
+
+Assuming that the deletion request ping is registered as a ping_type other than "deletion-request", then in the PingMaker's code, it would save to pending_pings. Hence, the PingDirectoryManager in the old code would process that directory and find it, making the test pass. However, the patch changes it to use "deletion-request" ping_type, which would trigger the new directory.
+
+This could be the case. For example, maybe the deletion request ping is registered as ping_type "deletion-request", but in the test, when the PingMaker saves it, it's stored in the pending_pings directory. Wait, but according to the code in the patch's PingMaker::save, if the ping_type is "deletion-request", it uses the "deletion_request" directory. Therefore, if the test's deletion request ping is of type "deletion-request", it should be saved to the "deletion_request" directory, which the old code's process_dir wouldn't process, leading to no upload task and test failure.
+
+But the test is passing before the patch, suggesting that the code is finding the ping. This strongly indicates that the PingMaker is saving to the pending_pings directory in the old code.
+
+What's the reason for that? Maybe the ping_type is not "deletion-request", or the code is different. Let's look for where the deletion request ping is defined.
+
+In the patch, the deletion request ping is part of the internal_pings, likely in a file that's not shown here. But in the test, the code uses glean.internal_pings.deletion_request.submit(...). So perhaps the ping_type is registered as something else. For example, if the ping_type is "deletionrequest" (without the hyphen), then the PingMaker would save to pending_pings directory, leading the test to pass in the old code.
+
+Alternatively, maybe the ping_type is "deletion-request", but in the old code, the PingMaker is not using the correct directory. Wait, no, the old code uses a match on the ping_type. So if the ping_type is indeed "deletion-request", then the PingMaker saves it to "deletion_request" directory, but the PingDirectoryManager in the old code reads "pending_pings", leading to no processing.
+
+Therefore, the current test is passing in the old code because the PingMaker is not saving the ping to the correct directory. Wait, but that would mean that the patch is not correctly applied. No, because the user says the current test passes before the patch, which indicates that the test is not correctly designed to fail before the patch.
+
+To resolve this, the test must be modified to ensure that it fails before the patch. How can we do that?
+
+One way is to have the test check the directory where the ping was saved. For example, in the old code, the deletion request ping should be saved to the "deletion_request" directory. If the test asserts that the ping is not processed in the old code but is processed after the patch, then the test should pass after the patch.
+
+So, modifying the test to check the directory. For example, before the patch, the ping is saved to "deletion_request" and the process_dir doesn't read it. After the patch, it's read from that directory.
+
+Therefore, the test should submit a deletion request ping, then check if the PingUploadManager processes it. Before the patch, the PingDirectoryManager doesn't process that directory, so the test should fail. After the patch, it should pass.
+
+But the current test is passing before the patch, so we need to adjust the test to make it fail. Maybe the test is not correctly checking for the absence of the ping in the old code.
+
+Alternative approach: create a test that explicitly verifies that the ping is processed after the directory is added. For example, the test could check that the ping is stored in the deletion_request directory and that the PingDirectoryManager processes it only when the new code is present.
+
+But how to structure the test to fail before the patch.
+
+Perhaps in the current test, the upload_manager is not correctly initialized. For example, the test uses dir.path().to_str().unwrap(), which may not be the correct path. Or maybe the new_ping method is incorrect.
+
+Alternatively, perhaps the PingUploadManager's new function in the old code is being called with a different path. Wait, the test creates the upload_manager with dir.path().to_str().unwrap(). The dir is a temporary directory created by new_glean, which should be the same path used by the PingMaker to save the pings. So in the old code, the deletion request ping is saved to dir.path()/"deletion_request" directory. The PingDirectoryManager in the upload_manager is created with dir.path(). Therefore, the process_dir method would process dir.path()/"pending_pings" directory, which does not have the ping. Hence, the test should fail. So why is it passing?
+
+Maybe the deletion request ping is not being submitted correctly. For example, maybe the internal_ping's deletion_request is not of type "deletion-request". Let's imagine that in the current setup, the ping is of a different type. For example, if the ping_type is something else, then it would be saved to pending_pings, and the PingDirectoryManager in the old code would process it. This would explain why the test passes in the old code.
+
+Therefore, the test is using a ping_type that is not "deletion-request", leading it to be saved to pending_pings. So the test passes in the old code. After the patch, the ping_type is "deletion-request", so it's saved to the new directory, which is processed by the updated PingDirectoryManager. Therefore, the test would pass after the patch. But in the old code, with the ping_type being something else, the test would pass as well. This suggests that the problem is with the ping_type used in the test.
+
+Ah! So the issue is that the ping_type for the internal deletion request ping is not correctly set to "deletion-request" in the test. Therefore, the test is using a different ping_type, causing it to be processed in the old directory (pending_pings), leading to the test passing in the old code. But after the patch, the PingDirectoryManager also processes the new directory, so it should still pass. But the intended behavior is that the ping is stored in the new directory and processed after the patch.
+
+To fix this, the test needs to ensure that before the patch, the ping is not processed (because it's stored in the new directory which the old code doesn't process), leading to test failure, and after the patch, it is processed (new directory is processed), leading to test pass.
+
+Therefore, the test must be written in a way that, before the patch, the ping is stored in a directory that is not processed. Hence, the test should check whether the ping is in the correct directory and whether it's being processed based on the code.
+
+To achieve this, perhaps the test should verify the directory where the ping is stored and whether it's processed. However, in the current test, the only assertion is that the upload task contains "deletion-request" in the request body. But if the ping is processed in the old code for a different reason, the test would pass.
+
+So the crux of the problem is that the test is passing in the old code because the ping is being processed, but it wasn't supposed to. That indicates that the test is not correctly isolating the scenario.
+
+To correct this, we need to create a test that only passes if the PingDirectoryManager is processing both directories. One way is to submit a ping that's stored in the deletion_request directory and verify that it's processed after the patch. Before the patch, it wouldn't be processed, hence the test would fail.
+
+Wait, the current test does that. But it's passing before the patch. That's the problem. So why is it passing? Because the ping is being processed, indicating that maybe the PingDirectoryManager in the old code was already processing it. Or perhaps the PingMaker is saving it to the pending directory.
+
+To fix this, we need to create a test that specifically checks that the ping is stored in the deletion_request directory and that it's processed only after the patch.
+
+The current test is not doing that. Maybe because the ping is of a different type and is saved to the pending directory.
+
+To make the test fail before the patch, we can explicitly create a ping that will be saved to the deletion_request directory. For example, create a custom PingType that uses the "deletion-request" ping_type. Then, submit it and verify that the PingDirectoryManager in the old code does not process it, causing the test to fail, and the new code to process it, causing the test to pass.
+
+So modifying the test to use a custom ping_type, which, when submitted, is stored in deletion_request directory. This way, in the old code, the PingDirectoryManager does not process it, leading to test failure. After the patch, it's processed, leading to test success.
+
+Therefore, the revised test should not rely on the internal deletion request ping, but create a custom one. Let's adjust the test accordingly.
+
+In the test, create a custom PingType with ping_type set to "deletion-request". Submit it and check if it's processed by the PingUploadManager. Before the patch, it should not be processed. After the patch, it should be.
+
+That way, the test will fail in the old code and pass in the new code.
+
+So the new test would look like this:
+
+1. Create a Glean instance and a PingType with "deletion-request" as the type.
+
+2. Submit the ping.
+
+3. Create the PingUploadManager.
+
+4. Check if the upload task contains the ping.
+
+In the old code, this ping would be saved to the deletion_request directory and not processed, leading to test failure. In the new code, it would be processed, leading to test success.
+
+Now, to implement this, the test should import the necessary modules and create the ping_type.
+
+The test code may look like this:
+
+#[test]
+fn test_upload_deletion_request_ping() {
+    let (glean, dir) = new_glean(None);
+    let ping_type = PingType::new("deletion-request-ping", None, true, vec!["https://example.com"]);
+    glean.register_ping_type(&ping_type).unwrap();
+    glean.submit_ping(&ping_type, None).unwrap();
+
+    let upload_manager = PingUploadManager::new(&dir.path());
+    let mut upload_task = upload_manager.get_upload_task().unwrap();
+    assert!(upload_task.is_some());
+    let task = upload_task.as_ref().unwrap();
+    let request = task.read_request_body().unwrap();
+    assert!(request.contains("deletion-request"));
+}
+
+But we need to adjust the imports and ensure that the PingType is correctly created and registered.
+
+In the original code, the PingType struct and related functions are available, so we can use them.
+
+This revised test would use a custom ping_type of "deletion-request" (or "deletion-request" as per the code), which would trigger the PingMaker to save to the deletion_request directory. In the old code, the PingDirectoryManager does not process this directory, hence the upload task would be None, causing the test to fail. After the patch, the directory is processed, so the test passes.
+
+So the current test uses the internal deletion request ping, which may not be set up correctly. The revised test creates a custom ping_type to ensure the directory is as expected.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use crate::PingType;</imports>
+<Rust>
+#[test]
+fn test_upload_custom_deletion_request_ping() {
+    let (glean, dir) = new_glean(None);
+    let ping_type = PingType::new("deletion-request", None, true, vec!["https://example.com"]);
+    glean.register_ping_type(&ping_type).unwrap();
+    glean.submit_ping(&ping_type, None).unwrap();
+    let upload_manager = PingUploadManager::new(dir.path().to_str().unwrap());
+    let mut upload_task = upload_manager.get_upload_task().unwrap();
+    assert!(upload_task.is_some());
+}
+</Rust>

@@ -1,0 +1,174 @@
+<think>
+Okay, let's see. The issue is that non-deletion pings aren't being uploaded, specifically in the test case for when upload is disabled. The patch modified the Glean initialization in the subprocess and the PingUploadManager's handling of scanning directories.
+
+Looking at the patch, the key change is that in `new_for_subprocess`, there's a new parameter `scan_directories` which when true, triggers a scan of pending pings directories. Previously, in the `new` method, it was calling `new_for_subprocess` without this parameter, so it wasn't scanning. After the patch, `new` calls `new_for_subprocess` with `false`, and after setting up, it scans the directories. Also, the `scan_pending_pings_directories` method was added to trigger the scan asynchronously.
+
+The test that's failing is in Android, but we need a Rust test. The test in the patch's `upload/mod.rs` tests might be related. Before the patch, the `new` function for PingUploadManager had a `sync_scan` parameter. The test `async_ping_directories_scanning_works` was removed because it relied on async scanning. The test was checking that a scan done asynchronously completes correctly.
+
+But the issue here is that when upload is disabled, the test expects non-deletion pings not to be uploaded. The patch might affect how the upload manager is initialized, especially in subprocesses. However, the test is in the Android code, but the fix is in the Rust core. So, the Rust test should ensure that when upload is disabled, the scanning of pending pings (which might include non-deletion pings) is handled correctly.
+
+Wait, the problem is that when upload is disabled, the pings are not being deleted or handled properly, leading to the test failure. The fix adds a scan after processing the upload state in the `new` method. So, a test for this could check that when upload is disabled, the pending pings are deleted or not uploaded.
+
+Looking at the code changes, the `new_for_subprocess` method in `Glean::new` is called with `scan_directories: false`. Then, after some setup (like handling upload state), it calls `scan_pending_pings_directories`. So the scan happens after the upload state is processed. For the case where upload is disabled, the code deletes pending pings before scanning, ensuring that no pings are enqueued.
+
+To test this, we need to simulate creating a Glean instance with upload disabled, check if pending pings are properly deleted. Let's think of how to set that up.
+
+We can create a temporary directory, add some ping files, then initialize Glean with upload disabled, and check if those ping files are deleted. The test should use the `PingUploadManager` and Glean's setup to trigger the deletion.
+
+In the `upload::PingUploadManager::new` method, when upload is disabled, the manager should delete all pending pings. But after the patch, the scan is done after handling the upload state. So in the test, setting upload to disabled should cause the pending pings to be deleted when Glean is initialized.
+
+The test would involve:
+
+1. Creating a temporary directory.
+2. Writing some ping files into the pending directory.
+3. Creating a Glean configuration with upload disabled.
+4. Initializing Glean with that config.
+5. Checking that the ping files have been deleted.
+
+The code for this test would need to use the `Glean::new` function, which uses the updated logic. The test would verify that when upload is disabled, pending pings are deleted.
+
+So, in Rust, using the test framework, we can create a temporary directory, write some test files, then create a Glean instance with upload disabled, and check that the files are no longer present.
+
+We might need to use the `tempdir` crate or the `std::tempdir` for creating a temporary directory. Also, we need to create a configuration with `upload_enabled: false`.
+
+In the test, the steps would be:
+
+- Create a temp dir.
+- Create a few ping files in the pending directory.
+- Configure Glean with data_path pointing to that dir and upload disabled.
+- Initialize Glean with `Glean::new(config)`.
+- Check that the ping files have been removed from the pending directory.
+
+So the test might look something like this. But to do this, we need access to the Glean struct and its configuration.
+
+In the code, `Glean::new` uses the config to create the upload manager. So in the test, we can use a configuration with upload disabled, initialize Glean, and then verify that the directory is empty.
+
+But in the test environment, how to set this up? Let's look at the existing test code in the patch. The `mod test` block has a helper function `new_glean` which returns a Glean instance and a Dir. So perhaps we can use similar setup.
+
+The test needs to:
+
+1. Create a data path with pending ping files.
+2. Create a Glean instance with upload disabled.
+3. Check that the pending pings are deleted.
+
+In code, this could be done with a test function that does something like:
+
+let (mut glean, dir) = new_glean(Some(false))?;
+let pending_dir = dir.path().join("pending-pings");
+create a few files in pending_dir.
+glean.new(...)?;
+Then check that the files are gone.
+
+But maybe the `new_glean` helper already creates a Glean instance with upload disabled. Wait, the `new_glean` function in the current test code allows passing an option for upload enabled. So perhaps we can create a ping, then create the Glean instance with upload enabled false, and check that the ping is deleted.
+
+Alternatively, in our test code, we can create a directory, create a pending ping file, then create a Glean config with upload disabled, then call `Glean::new(config)` and then assert that the file is deleted.
+
+In the test for `upload/mod.rs`, there are existing tests that check ping handling. So maybe the test would be added there, or in a new test.
+
+But in the problem, we need to create a Rust test that covers the change made in the patch. The key is that when upload is disabled, the scan of pending pings is done after the upload state is checked, which deletes the pings.
+
+The test for this would ensure that when upload is disabled, after Glean is initialized, the pending pings are deleted. Before the patch, perhaps the scan happened before the deletion, leading to pings being enqueued even though upload was disabled.
+
+So the test would create pending pings, initialize Glean with upload disabled, and then check that those pings are deleted.
+
+The code for the test would involve:
+
+- Creating a pending ping file.
+- Creating a Glean config with upload_enabled: false.
+- Initializing Glean with that config.
+- Verifying that the pending ping is deleted.
+
+In Rust, using the ` tempfile ` crate to create a temporary directory, and then asserting that the files are removed.
+
+So the test would look something like:
+
+use glean_core::Glean;
+use glean_core::Configuration;
+// other necessary imports...
+
+#[test]
+fn test_pending_pings_deleted_when_upload_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let ping_path = dir.path().join("pending-pings").join("test.ping");
+    std::fs::create_dir_all(ping_path.parent().unwrap()).unwrap();
+    std::fs::write(&ping_path, b"{}").unwrap();
+
+    let mut config = Configuration {
+        data_path: dir.path().to_path_buf(),
+        application_id: "test".to_string(),
+        upload_enabled: false,
+        ..Default::default()
+    };
+
+    Glean::new(config).unwrap();
+
+    assert!(!ping_path.exists());
+}
+
+But we need to make sure that the Glean::new() process correctly deletes the pending pings when upload is disabled.
+
+However, the implementation might be asynchronous, so the test may need to ensure that the deletions have completed. The code for `Glean::new` calls `scan_pending_pings_directories()` after handling the upload state, which starts a thread to process the directory. So in the test, after creating the Glean instance, there might be a delay before the files are deleted. However, in the `no_policy()` method for tests, when creating the upload manager, the scan is done synchronously (as per the `no_policy` method now calls `scan_pending_pings_directories().join().unwrap()`).
+
+Wait, in the patch, the `no_policy` method now scans the pending directories synchronously during test setup. So in the test, when we create a Glean instance in a test, the scan is done synchronously, so the test can immediately check for file deletion.
+
+In the `::no_policy()` function, the line `upload_manager.scan_pending_pings_directories().join().unwrap();` ensures that the scan is completed before the test proceeds. So in our test, initializing Glean with a config that calls `no_policy` would ensure the scan is done.
+
+Therefore, the test should pass when using the patched code. Before the patch, the scan would happen before the upload state is processed, leading to the ping being queued, and not deleted.
+
+Thus, the test should fail before the patch and pass after.
+
+Now, the needed imports.
+
+The test needs to use `Configuration`, `Glean`, `tempfile::tempdir`, and handle file operations.
+
+So, the imports would be:
+
+use tempfile::tempdir;
+use std::fs;
+use std::path::PathBuf;
+use super::Configuration;
+use super::Glean;
+
+But since the test is in the same module as the code, using `super::` to import the necessary structs.
+
+So the test would be written in the same `lib.rs` or `upload/mod.rs`? Probably in the same module as Glean and Configuration.
+
+Assuming that the test is added to `glean-core/src/lib.rs` or a separate test file.
+
+But the user asks for a regression test. The correct place is in the `upload` module's tests or a relevant existing test file.
+
+Looking at the patch, the `upload/mod.rs` has a `mod test` block. But the user's task is to generate a Rust test that fits into the project structure. However, in the problem statement, the user is to generate a test in a Rust file. The user should generate a test using the necessary imports and a test function.
+
+Putting it all together, the test function would create a temporary directory, create a ping file in the pending directory, create a Glean instance with upload disabled, and check that the file was deleted.
+
+The code would look something like this.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::fs;
+use std::path::Path;
+use tempfile::tempdir;
+use super::Configuration;
+use super::Glean;
+</imports>
+<Rust>
+#[test]
+fn test_pending_pings_deleted_when_upload_disabled() {
+    let dir = tempdir().unwrap();
+    let ping_file = dir.path().join("pending-pings").join("test.ping");
+    fs::create_dir_all(ping_file.parent().unwrap()).unwrap();
+    fs::write(&ping_file, "{}").unwrap();
+
+    let config = Configuration {
+        data_path: dir.path().to_path_buf(),
+        application_id: "test".to_string(),
+        upload_enabled: false,
+        ..Default::default()
+    };
+
+    Glean::new(config).unwrap();
+
+    assert!(!ping_file.exists());
+}
+</Rust>

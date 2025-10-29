@@ -1,0 +1,327 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the experiments API for the RLB
+Let's follow the semantics of the other language bindings.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -38,6 +38,7 @@
+ //! ```
+ 
+ use once_cell::sync::OnceCell;
++use std::collections::HashMap;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Mutex;
+ 
+@@ -45,6 +46,7 @@ pub use configuration::Configuration;
+ use configuration::DEFAULT_GLEAN_ENDPOINT;
+ pub use core_metrics::ClientInfoMetrics;
+ pub use glean_core::{global_glean, setup_glean, CommonMetricData, Error, Glean, Lifetime, Result};
++use private::RecordedExperimentData;
+ 
+ mod configuration;
+ mod core_metrics;
+@@ -441,6 +443,58 @@ pub(crate) fn submit_ping_by_name_sync(ping: &str, reason: Option<&str>) {
+     }
+ }
+ 
++/// Indicate that an experiment is running.  Glean will then add an
++/// experiment annotation to the environment which is sent with pings. This
++/// infomration is not persisted between runs.
++///
++/// See [`glean_core::Glean::set_experiment_active`].
++pub fn set_experiment_active(
++    experiment_id: String,
++    branch: String,
++    extra: Option<HashMap<String, String>>,
++) {
++    dispatcher::launch(move || {
++        with_glean(|glean| {
++            glean.set_experiment_active(
++                experiment_id.to_owned(),
++                branch.to_owned(),
++                extra.to_owned(),
++            )
++        });
++    })
++}
++
++/// Indicate that an experiment is no longer running.
++///
++/// See [`glean_core::Glean::set_experiment_inactive`].
++pub fn set_experiment_inactive(experiment_id: String) {
++    dispatcher::launch(move || {
++        with_glean(|glean| glean.set_experiment_inactive(experiment_id.to_owned()))
++    })
++}
++
++/// TEST ONLY FUNCTION.
++/// Checks if an experiment is currently active.
++#[allow(dead_code)]
++pub(crate) fn test_is_experiment_active(experiment_id: String) -> bool {
++    dispatcher::block_on_queue();
++    with_glean(|glean| glean.test_is_experiment_active(experiment_id.to_owned()))
++}
++
++/// TEST ONLY FUNCTION.
++/// Returns the `RecordedExperimentData` for the given `experiment_id` or panics if
++/// the id isn't found.
++#[allow(dead_code)]
++pub(crate) fn test_get_experiment_data(experiment_id: String) -> RecordedExperimentData {
++    dispatcher::block_on_queue();
++    with_glean(|glean| {
++        let json_data = glean
++            .test_get_experiment_data_as_json(experiment_id.to_owned())
++            .unwrap_or_else(|| panic!("No experiment found for id: {}", experiment_id));
++        serde_json::from_str::<RecordedExperimentData>(&json_data).unwrap()
++    })
++}
++
+ /// TEST ONLY FUNCTION.
+ /// Resets the Glean state and triggers init again.
+ #[cfg(test)]
+
+diff --git a/glean-core/rlb/src/private/mod.rs b/glean-core/rlb/src/private/mod.rs
+--- a/glean-core/rlb/src/private/mod.rs
++++ b/glean-core/rlb/src/private/mod.rs
+@@ -6,6 +6,8 @@
+ 
+ mod boolean;
+ mod ping;
++mod recorded_experiment_data;
+ 
+ pub use boolean::BooleanMetric;
+ pub use ping::PingType;
++pub use recorded_experiment_data::RecordedExperimentData;
+
+diff --git a/glean-core/rlb/src/private/recorded_experiment_data.rs b/glean-core/rlb/src/private/recorded_experiment_data.rs
+--- a/glean-core/rlb/src/private/recorded_experiment_data.rs
++++ b/glean-core/rlb/src/private/recorded_experiment_data.rs
+@@ -0,0 +1,15 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use crate::HashMap;
++use serde::Deserialize;
++
++/// Deserialized experiment data.
++#[derive(Clone, Deserialize, Debug)]
++pub struct RecordedExperimentData {
++    /// The experiment's branch as set through `set_experiment_active`.
++    pub branch: String,
++    /// Any extra data associated with this experiment through `set_experiment_active`.
++    pub extra: Option<HashMap<String, String>>,
++}
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -118,15 +118,93 @@ fn disabling_upload_disables_metrics_recording() {
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1672982.
+ fn test_experiments_recording() {
+-    todo!()
++    // setup glean for the test
++    let _lock = GLOBAL_LOCK.lock().unwrap();
++    env_logger::try_init().ok();
++    let _t = new_glean(None);
++
++    set_experiment_active("experiment_test".to_string(), "branch_a".to_string(), None);
++    let mut extra = HashMap::new();
++    extra.insert("test_key".to_string(), "value".to_string());
++    set_experiment_active(
++        "experiment_api".to_string(),
++        "branch_b".to_string(),
++        Some(extra),
++    );
++    assert!(test_is_experiment_active("experiment_test".to_string()));
++    assert!(test_is_experiment_active("experiment_api".to_string()));
++    set_experiment_inactive("experiment_test".to_string());
++    assert!(!test_is_experiment_active("experiment_test".to_string()));
++    assert!(test_is_experiment_active("experiment_api".to_string()));
++    let stored_data = test_get_experiment_data("experiment_api".to_string());
++    assert_eq!("branch_b", stored_data.branch);
++    assert_eq!("value", stored_data.extra.unwrap()["test_key"]);
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1672982.
+ fn test_experiments_recording_before_glean_inits() {
+-    todo!()
++    let _lock = GLOBAL_LOCK.lock().unwrap();
++    env_logger::try_init().ok();
++
++    // Destroy the existing glean instance from glean-core so that we
++    // can test the pre-init queueing of the experiment api commands.
++    // This is doing the exact same thing that `reset_glean` is doing
++    // but without calling `initialize`.
++    if was_initialize_called() {
++        // We need to check if the Glean object (from glean-core) is
++        // initialized, otherwise this will crash on the first test
++        // due to bug 1675215 (this check can be removed once that
++        // bug is fixed).
++        if global_glean().is_some() {
++            with_glean_mut(|glean| {
++                glean.test_clear_all_stores();
++                glean.destroy_db();
++            });
++        }
++        // Allow us to go through initialization again.
++        INITIALIZE_CALLED.store(false, Ordering::SeqCst);
++        // Reset the dispatcher.
++        dispatcher::reset_dispatcher();
++    }
++
++    set_experiment_active(
++        "experiment_set_preinit".to_string(),
++        "branch_a".to_string(),
++        None,
++    );
++    set_experiment_active(
++        "experiment_preinit_disabled".to_string(),
++        "branch_a".to_string(),
++        None,
++    );
++    set_experiment_inactive("experiment_preinit_disabled".to_string());
++
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    reset_glean(
++        Configuration {
++            data_path: tmpname,
++            application_id: GLOBAL_APPLICATION_ID.into(),
++            upload_enabled: true,
++            max_events: None,
++            delay_ping_lifetime_io: false,
++            channel: Some("testing".into()),
++            server_endpoint: Some("invalid-test-host".into()),
++            uploader: None,
++        },
++        ClientInfoMetrics::unknown(),
++        false,
++    );
++    crate::dispatcher::block_on_queue();
++
++    assert!(test_is_experiment_active(
++        "experiment_set_preinit".to_string()
++    ));
++    assert!(!test_is_experiment_active(
++        "experiment_preinit_disabled".to_string()
++    ));
+ }
+ 
+ #[test]
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use super::set_experiment_active;
+use super::set_experiment_inactive;
+use super::test_is_experiment_active;
+use super::test_get_experiment_data;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_experiment_lifecycle() {
+    let _lock = GLOBAL_LOCK.lock().unwrap();
+    env_logger::try_init().ok();
+    let _t = new_glean(None);
+
+    set_experiment_active("experiment_test".to_string(), "branch_a".to_string(), None);
+    let mut extra = HashMap::new();
+    extra.insert("test_key".to_string(), "value".to_string());
+    set_experiment_active(
+        "experiment_api".to_string(),
+        "branch_b".to_string(),
+        Some(extra),
+    );
+
+    assert!(test_is_experiment_active("experiment_test".to_string()));
+    assert!(test_is_experiment_active("experiment_api".to_string()));
+
+    set_experiment_inactive("experiment_test".to_string());
+    assert!(!test_is_experiment_active("experiment_test".to_string()));
+    assert!(test_is_experiment_active("experiment_api".to_string()));
+
+    let stored_data = test_get_experiment_data("experiment_api".to_string());
+    assert_eq!("branch_b", stored_data.branch);
+    assert_eq!("value", stored_data.extra.unwrap()["test_key"]);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0425]: cannot find value `GLOBAL_LOCK` in this scope
+   --> glean-core/rlb/src/test.rs:386:17
+    |
+386 |     let _lock = GLOBAL_LOCK.lock().unwrap();
+    |                 ^^^^^^^^^^^ not found in this scope
+    |
+help: consider importing this static
+    |
+378 + use crate::test::GLOBAL_LOCK;
+    |
+
+error[E0425]: cannot find function `new_glean` in this scope
+   --> glean-core/rlb/src/test.rs:388:14
+    |
+388 |     let _t = new_glean(None);
+    |              ^^^^^^^^^ not found in this scope
+    |
+help: consider importing this function
+    |
+378 + use crate::test::new_glean;
+    |
+</output>
+
+Function signatures
+<Signatures>
+fn submit_ping_by_name_sync(ping: &str, reason: Option<&str>) -> ()
+
+fn disabling_upload_disables_metrics_recording() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,185 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Glean should report windows build number along the os version
+Right now Glean will report os version "10.0" for all versions of Windows 10 and upwards (if the surrounding application is build for that).
+
+That's not enough to identify e.g. Windows 11. For that one also needs the build number. Glean should probably report that as part of the os version.
+Glean uses `whatsys`, which already uses `GetVersionEx` to get the information, which includes the build number.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/core_metrics.rs b/glean-core/rlb/src/core_metrics.rs
+--- a/glean-core/rlb/src/core_metrics.rs
++++ b/glean-core/rlb/src/core_metrics.rs
+@@ -33,6 +33,7 @@ impl From<ClientInfoMetrics> for glean_core::ClientInfoMetrics {
+             app_display_version: metrics.app_display_version,
+             channel: metrics.channel,
+             os_version: system::get_os_version(),
++            windows_build_number: system::get_windows_build_number(),
+             architecture: system::ARCH.to_string(),
+             ..Default::default()
+         }
+
+diff --git a/glean-core/rlb/src/system.rs b/glean-core/rlb/src/system.rs
+--- a/glean-core/rlb/src/system.rs
++++ b/glean-core/rlb/src/system.rs
+@@ -73,6 +73,22 @@ pub fn get_os_version() -> String {
+     parse_linux_os_string(whatsys::kernel_version().unwrap_or_else(|| "Unknown".to_owned()))
+ }
+ 
++#[cfg(target_os = "windows")]
++/// Returns the Windows build number, e.g. 22000
++pub fn get_windows_build_number() -> Option<i64> {
++    match whatsys::get_windows_build_number() {
++        // Cast to i64 to work with QuantityMetric type
++        Some(i) => Some(i as i64),
++        _ => None,
++    }
++}
++
++#[cfg(not(target_os = "windows"))]
++/// Returns None, for non-Windows operating systems
++pub fn get_windows_build_number() -> Option<i64> {
++    None
++}
++
+ #[cfg(target_os = "linux")]
+ fn parse_linux_os_string(os_str: String) -> String {
+     os_str.split('.').take(2).collect::<Vec<&str>>().join(".")
+
+diff --git a/glean-core/src/core_metrics.rs b/glean-core/src/core_metrics.rs
+--- a/glean-core/src/core_metrics.rs
++++ b/glean-core/src/core_metrics.rs
+@@ -2,7 +2,9 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use crate::metrics::{Datetime, DatetimeMetric, StringMetric, TimeUnit, TimespanMetric};
++use crate::metrics::{
++    Datetime, DatetimeMetric, QuantityMetric, StringMetric, TimeUnit, TimespanMetric,
++};
+ use crate::{CommonMetricData, Lifetime};
+ 
+ use once_cell::sync::Lazy;
+@@ -26,6 +28,8 @@ pub struct ClientInfoMetrics {
+     pub channel: Option<String>,
+     /// The Android specific SDK version of the software running on this hardware device (e.g. "23").
+     pub android_sdk_version: Option<String>,
++    /// The Windows specific OS build version (e.g. 19043)
++    pub windows_build_number: Option<i64>,
+     /// The manufacturer of the device the application is running on.
+     /// Not set if the device manufacturer can't be determined (e.g. on Desktop).
+     pub device_manufacturer: Option<String>,
+@@ -50,6 +54,7 @@ impl ClientInfoMetrics {
+             os_version: "Unknown".to_string(),
+             channel: Some("Unknown".to_string()),
+             android_sdk_version: None,
++            windows_build_number: None,
+             device_manufacturer: None,
+             device_model: None,
+             locale: None,
+@@ -141,6 +146,17 @@ pub mod internal_metrics {
+         })
+     });
+ 
++    pub static windows_build_number: Lazy<QuantityMetric> = Lazy::new(|| {
++        QuantityMetric::new(CommonMetricData {
++            name: "windows_build_number".into(),
++            category: "".into(),
++            send_in_pings: vec!["glean_client_info".into()],
++            lifetime: Lifetime::Application,
++            disabled: false,
++            ..Default::default()
++        })
++    });
++
+     pub static device_manufacturer: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "device_manufacturer".into(),
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -535,6 +535,9 @@ fn initialize_core_metrics(glean: &Glean, client_info: &ClientInfoMetrics) {
+     if let Some(android_sdk_version) = client_info.android_sdk_version.as_ref() {
+         core_metrics::internal_metrics::android_sdk_version.set_sync(glean, android_sdk_version);
+     }
++    if let Some(windows_build_number) = client_info.windows_build_number.as_ref() {
++        core_metrics::internal_metrics::windows_build_number.set_sync(glean, *windows_build_number);
++    }
+     if let Some(device_manufacturer) = client_info.device_manufacturer.as_ref() {
+         core_metrics::internal_metrics::device_manufacturer.set_sync(glean, device_manufacturer);
+     }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/system.rs</Filename>
+<imports>use super::get_windows_build_number;
+use std::i64;</imports>
+<Rust>#[test]
+fn test_get_windows_build_number() {
+    let expected = None; // Before the patch, the function should return None
+    let actual = get_windows_build_number();
+    assert_eq!(expected, actual);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0063]: missing field `windows_build_number` in initializer of `core_metrics::ClientInfoMetrics`
+   --> /app/testbed/target/debug/build/glean-core-1da2e763aff1c359/out/glean.uniffi.rs:544:12
+    |
+544 |         Ok(r#ClientInfoMetrics {
+    |            ^^^^^^^^^^^^^^^^^^^ missing `windows_build_number`
+</output>
+
+Function signatures
+<Signatures>
+pub fn get_os_version() -> String
+
+pub fn get_os_version() -> String
+
+pub fn get_os_version() -> String
+
+fn initialize_core_metrics(glean: &Glean, client_info: &ClientInfoMetrics) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,141 @@
+<think>
+Okay, let's tackle this step by step. The user provided a patch that adds a `should_record` check in various distribution metrics' functions. The task is to create a regression test for the `TimingDistributionMetric` that correctly verifies the fix.
+
+First, I need to understand why the original test is failing. Looking at the errors:
+
+1. There's an unresolved import for `time_unit`. The original test tried to use `TimeUnit::Nanosecond`, but the correct path is likely `crate::time_unit::TimeUnit`. However, the error message suggests the path should be `metrics::time_unit`. Wait, but the user might have a different structure. Let me check the patch— no changes were made to the time unit's location. So the correct import is `use super::time_unit::TimeUnit;` since `TimingDistributionMetric` is in `timing_distribution.rs` and `time_unit` is a module there.
+
+2. The test uses `new_glean`, which is part of the test utilities. The original code in the patch's test uses `CommonMetricData`, so maybe that's available in the crate.
+
+3. The test is trying to create a `TimingDistributionMetric`, which is in the same file but perhaps needs to be imported from the parent module.
+
+4. The error about `glean` not being mutable: in the test, when the test gets a `glean` instance from `new_glean`, it's initialized as `let (glean, dir)` but needs to be mutable to call `set_upload_enabled`. So adding `mut` to the declaration.
+
+5. The `metric` variable is not mutable, but `accumulate_samples_signed` is called on it. However, the function doesn't need to mutate the metric's data, just call the method. So making `metric` mutable should resolve that.
+
+6. The closure for `iter_store_from` is causing issues because the parameters are being borrowed, which might not align with the function's expected signature. The original function might take a closure that takes `&Metric` as a parameter, so the test's closure should match that. The test uses `&value`, which was causing ownership issues. But since the problem is with the `&` in the closure parameters, removing them might fix it.
+
+Let me start by fixing the imports. The `TimeUnit` is likely in the same crate's `time_unit` module. So `use crate::time_unit::TimeUnit;` but if that's not found, perhaps it's `use crate::common::TimeUnit;` or similar. Wait, looking at the patch, the `TimingDistributionMetric` has a `time_unit` field, but the actual `TimeUnit` enumeration's location isn't clear. However, the original error points to a missing import of `TimeUnit`, and the patch might have moved it. Alternatively, maybe `TimeUnit` is defined in a different module. Let me check the original code structure.
+
+In the original code for `timing_distribution.rs`, the `TimingDistributionMetric` uses `TimeUnit` from the `time_unit` module. So the correct import is `use super::time_unit::TimeUnit;` since `timing_distribution.rs` is in `glean-core/src/metrics/timing_distribution.rs`, and the `time_unit` module is likely under `glean-core/src/time_unit.rs` or similar. But since the test is written in the same module as the code under test, maybe `use crate::time_unit::TimeUnit;` would work if `time_unit` is a module in the crate root.
+
+But the error says that the import is unresolved. Maybe in the actual codebase, `TimeUnit` is part of the `common` module. Alternatively, since the test in the database uses `TimeUnit`, perhaps it's imported elsewhere. The key is to look at the original code's structure. Since the test provided by the user in the patch doesn't have that import, maybe the correct path is `use crate::time_unit::TimeUnit;` if the module is part of the crate.
+
+Another approach: the original test for `Database` uses `CommonMetricData`, which is imported from the crate. So in the test for `TimingDistribution`, we need to import `TimeUnit` correctly.
+
+Next, the test logic. The test should create a metric, record samples when upload is enabled, then disable upload and record more samples. The database should only store the samples collected when upload was enabled. So after the patch, the second accumulation should not add the samples.
+
+The test needs to:
+
+1. Create a new_glean instance with upload enabled.
+2. Create a TimingDistributionMetric.
+3. Record samples, ensuring the database has the initial count and sum.
+4. Disable upload.
+5. Record more samples.
+6. Check that the database hasn't changed.
+
+Now, the original test's closure for `iter_store_from` was taking `&value`, which led to errors because `Metric` is not `Copy`. So changing the closure to take `value` by value might require that the `Metric` is `Copy` or we have to clone it. Alternatively, perhaps the closure in the actual code takes `&Metric`, so the test should match that. Wait, in the `iter_store_from` function, the closure takes `&Metric`, so in the test, when we call it, we need to accept a reference. But in the test code, when using `&value`, we're getting a reference of a reference, perhaps leading to issues.
+
+Wait, the error messages indicate that the closure parameters are causing a problem. Let's look at the `iter_store_from` function. The original code (from the patch) in `glean-core/src/database/mod.rs` has:
+
+pub fn iter_store_from(
+    &self,
+    lifetime: Lifetime,
+    store_name: &str,
+    start_key: Option<&[u8]>,
+    f: &mut dyn FnMut(&[u8], &Metric)
+) {
+    // ...
+}
+
+So the closure takes `&Metric`. In the test closure, the user had:
+
+db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, &value| {
+    ...
+});
+
+This is taking `&value` as the parameter. But `value` is a `&Metric`, so `&value` is `&&Metric`, which is causing the move-out error because the closure is expecting `&Metric`. The correct approach is to remove the `&` in the closure parameter. So the closure should be `&mut |key, value| { ... }`, where `value` is `&Metric`.
+
+In the original test code, the user had:
+
+db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, &value| {
+    ...
+});
+
+This means that `value` is `&Metric`, but we're dereferencing it here with `&value`, leading to the move errors. So the fix is to change `&value` to `value` in the closure parameters. That would fix the implementation of `FnMut` errors because the closure would now take `&Metric` as expected.
+
+Now, to correct the test:
+
+- Fix the import for `TimeUnit`.
+- Make `glean` and `metric` mutable.
+- Remove the `&` in the closure parameters.
+- Ensure that the closure correctly processes the `TimingDistribution` metric.
+
+Additionally, the test should use the `CommonMetricData` properly and verify that the initial samples are recorded, and after disabling upload, no new samples are added.
+
+Putting it all together, the corrected test will:
+
+- Use the correct imports for `TimeUnit`.
+- Use mutable variables.
+- Fix the closure parameters.
+- Ensure the metric is initialized correctly.
+
+The final test should check that after the patch, when upload is disabled, the database entries don't change after accumulating samples. Before the patch, the `accumulate_samples_signed` would proceed regardless of upload, so the test would fail before the fix but pass after.
+</think>
+
+<Filename>glean-core/src/metrics/timing_distribution.rs</Filename>
+<imports>
+use crate::CommonMetricData;
+use crate::Database;
+use crate::Lifetime;
+use crate::Glean;
+use crate::tests::new_glean;
+use crate::time_unit::TimeUnit;
+use std::path::Path;
+</imports>
+<Rust>
+#[test]
+fn test_timing_distribution_doesnt_record_when_upload_disabled() {
+    let (mut glean, dir) = new_glean(None);
+    let db = Database::new(dir.path().to_str().unwrap(), true).unwrap();
+
+    let store_name = "timing_test_store";
+    let metric_id = "test.timing";
+    let metric_data = CommonMetricData::new("test", "timing", store_name);
+    let mut metric = TimingDistributionMetric::new(metric_data, TimeUnit::Nanosecond);
+
+    // Initial metric with upload enabled.
+    glean.set_upload_enabled(true);
+    metric.accumulate_samples_signed(&glean, vec![100, 200]);
+
+    let mut initial_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                initial_data = Some(dist);
+            }
+        }
+    });
+
+    let initial = initial_data.unwrap();
+    assert_eq!(initial.count(), 2);
+    assert_eq!(initial.sum(), 300);
+
+    // Disable upload and add more samples.
+    glean.set_upload_enabled(false);
+    metric.accumulate_samples_signed(&glean, vec![300, 400]);
+
+    let mut final_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                final_data = Some(dist);
+            }
+        }
+    });
+
+    let final_dist = final_data.unwrap();
+    assert_eq!(final_dist.count(), 2);
+    assert_eq!(final_dist.sum(), 300);
+}
+</Rust>

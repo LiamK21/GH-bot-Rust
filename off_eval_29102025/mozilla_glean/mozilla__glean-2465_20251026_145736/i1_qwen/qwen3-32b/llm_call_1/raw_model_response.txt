@@ -1,0 +1,193 @@
+<think>
+Okay, let's see. The issue is that the TimingDistribution trait didn't have the accumulate_samples and accumulate_raw_samples functions, but the patch adds them. So I need to write a regression test to make sure these new methods work correctly.
+
+First, I should check the patch. The functions added are accumulate_samples (taking Vec<i64>) and accumulate_raw_samples_nanos (taking Vec<u64>). The test needs to verify that these methods are present and handle the parameters correctly.
+
+Since the functions are part of a trait, I can't just create a real implementation for testing. But Rust's testing might allow us to use a mock. Wait, but without external libraries, how can I mock the trait? Maybe the existing code has a test implementation. Let me check the original file.
+
+Looking at the original code in timing_distribution.rs, there's a test module. The existing test in the file uses a 'TestTimingDistribution' struct that implements the TimingDistribution trait. Oh right, that's common in Rust for testing traits.
+
+So the test can create a mock struct that implements the trait methods. The key is to verify that when accumulate_samples is called, the samples are processed correctly, and errors are reported for invalid values.
+
+For the test, I need to call accumulate_samples with some samples, including negative and valid values, and check that the errors are reported. But since the trait methods are supposed to discard invalid samples and report errors, the test must somehow capture those errors.
+
+Wait, how does the current test infrastructure handle error collection? In Glean's code, metrics might report errors which are collected in a test environment. The existing test for the TimingDistribution trait probably uses a TestTimer and TestTimingDistribution to simulate the behavior.
+
+So, perhaps the test can call the accumulate_samples method and then check that the errors were reported. But how to collect those errors in the test? The trait might have a method like test_get_value or similar to get the stored errors.
+
+Looking at the existing code, there's a method 'get_error_count' in the test module. Wait, the original patch adds 'accumulate_samples' and 'accumulate_raw_samples_nanos' but the test needs to check if those functions are correctly reporting errors.
+
+Let me outline the test:
+
+1. Create a mock TimingDistribution object (like TestTimingDistribution).
+2. Call accumulate_samples with a mix of valid and invalid (negative, overflow) samples.
+3. Check that the errors are reported correctly. For example, negative samples should trigger InvalidValue, and overflow samples trigger InvalidOverflow.
+4. Also, check that valid samples are recorded correctly, maybe via get_value.
+
+Wait, but the accumulate_samples method is supposed to discard negative samples and report errors. So the test can check that the error count is equal to the number of invalid samples.
+
+Wait, how does the existing test code do it? Maybe there's a way to test for the errors. For example, using glean's test utilities.
+
+In the original code, there's a 'test_only' crate, and the test methods might use functions like glean.testing.* to collect errors. However, without knowing the exact setup, I have to assume that the test can check for the reported errors via some method provided by the trait.
+
+Alternatively, perhaps there's a trait method that returns the error count. The TimingDistribution trait may not have it, but in the tests, there might be a way to access the errors. Let me look again.
+
+In the patch, the existing code has a comment about 'test_get_value' so maybe the test module provides a helper.
+
+Alternatively, the test can check the number of errors reported by the metric using some internal test APIs.
+
+But given the problem statement, the test must be self-contained. So perhaps the test uses the TestTimingDistribution struct that captures all errors for testing.
+
+Therefore, the test would:
+
+- Create a new TestTimingDistribution instance.
+- Call accumulate_samples with some samples.
+- Check that the correct errors are counted.
+
+But how to implement the actual check? For example, in the existing test, there's a test_cancel_timer function. Maybe in the TestTimingDistribution, when accumulate_samples is called, it records the samples and errors.
+
+Wait, the TestTimingDistribution is a dummy implementation. Perhaps it's designed to collect the samples and errors for testing. If that's the case, then in the test, after calling accumulate_samples, we can check the errors collected.
+
+But if the patch doesn't provide such functionality, then the test might not be possible. However, the user said that the test must be self-contained and to-the-point. So perhaps the test can be as simple as ensuring that the functions can be called with the correct parameters and that any invalid samples trigger errors.
+
+For example, create a TestTimingDistribution instance, call accumulate_samples with a negative value, and check that an error is reported. Similarly for a large value that overflows.
+
+But how to check the error count? Maybe the TestTimingDistribution has a method to get the error count. For instance, something like get_error_count(ErrorType::InvalidValue).
+
+Assuming that the TestTimingDistribution has such a method, the test could proceed.
+
+Putting it all together:
+
+The test would:
+
+1. Create a TestTimingDistribution instance.
+2. Call accumulate_samples with a sample that's negative and one that's valid.
+3. Check that ErrorType::InvalidValue is reported once and ErrorType::InvalidOverflow (if applicable) is zero.
+4. Also check that the valid sample is accumulated.
+
+Alternatively, the test could use samples that are valid and overflow, then check the respective error counts.
+
+So, in code:
+
+let metric = TestTimingDistribution::new(...);
+metric.accumulate_samples(vec![i64::from(u64::MAX) + 1, -5, 100]);
+Then check that InvalidValue error count is 1 (from -5), and InvalidOverflow is 1 (from the i64::from(u64::MAX) +1 if it's over MAX_SAMPLE_TIME).
+
+But the actual MAX_SAMPLE_TIME value is required. However, the patch's comments mention that MAX_SAMPLE_TIME is the limit. Let's assume that MAX_SAMPLE_TIME is a known constant.
+
+But without knowing the exact value, the test can check that a very large sample (say, 1_000_000_000_000) would trigger overflow.
+
+Alternatively, the test can use values that are obviously out of range.
+
+The test must ensure that before the patch, calling these functions would cause a compile error, thus the test would fail, but after the patch, it works.
+
+So, the test needs to compile and run. If the TimingDistribution trait doesn't have the method, the test would fail to compile. Thus, the test exists only after the patch is applied.
+
+The test's presence ensures that the methods are there.
+
+Putting it all together, the test code would be:
+
+use crate::TestTimingDistribution;
+use glean::ErrorType;
+
+#[test]
+fn test_accumulate_samples_invalid_values() {
+    let metric = TestTimingDistribution::new();
+    metric.accumulate_samples(vec![100, -1, 1_000_000_000_000]);
+    assert_eq!(metric.test_get_error_count(ErrorType::InvalidValue), 1);
+    assert_eq!(metric.test_get_error_count(ErrorType::InvalidOverflow), 1);
+}
+
+But I need to make sure that the TestTimingDistribution is in the current scope and that the test_get_error_count is available.
+
+Assuming that the existing test code for TimingDistribution includes such a method.
+
+In the imports section, we need to import the necessary types.
+
+The filename is glean-core/src/traits/timing_distribution.rs.
+
+The test should be added in the mod tests block if one exists. But the user said the test should be exactly one #[test] function, not inside a mod tests. Wait, the user said: "If there is no test needed..." and "Write exactly one rust test #[test]fn test_...(){...} block. Do NOT wrap the test inside a 'mod tests' block."
+
+So the test should be written in the same module as the trait and the existing tests. So the imports need to bring in the necessary structs.
+
+But the original code's TestTimingDistribution is in the same module, so the use statements need to be correct.
+
+But perhaps the TestTimingDistribution is defined in the tests module of the same file.
+
+Wait, looking at the original code (from memory), in the timing_distribution.rs, there's a test module where they define TestTimingDistribution.
+
+So in the test code, the use statements would be:
+
+use crate::timing_distribution::TestTimingDistribution;
+
+But the user's instructions say to use super::<function name> for the function under test. So perhaps the TestTimingDistribution is in the same module as the trait, but in the test module.
+
+Alternatively, the use super::TestingOnlyMetric for the function.
+
+Wait, but the user instructions specify that if the test is in the same file as the trait, the use statements should use super::<fn>. However, the TestTimingDistribution is likely defined in the tests module, which is part of the same file. So the test function would have to be in that same tests module.
+
+But the user says that the test must not be wrapped in a 'mod tests' block. However, if the existing file has a mod tests block with the TestTimingDistribution, perhaps the test is written outside of it, but that's not possible in Rust.
+
+This is getting complicated. Let me recheck the user's instructions.
+
+The user says: "Do NOT wrap the test inside a 'mod tests' block. If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique."
+
+But in the patch's original file, there's a test module. So perhaps the test is written inside that module. However, the user's instruction says to not wrap it, but the existing tests may be inside mod tests. So the user expects the test code to be written outside of any mod tests, but that's not feasible. Wait, maybe the user wants the test code to be written as a standalone test function in the same module as the trait.
+
+Alternatively, maybe the test is written in the test module. But given the user's instructions, the test must be a standalone test function not wrapped in a mod tests. But in Rust, that's not standard. So perhaps there's a misunderstanding here.
+
+Alternatively, maybe the user wants the test to be placed in the same test module as the existing tests, but written as a separate test function. However, the user's instruction says to not wrap the test inside a mod tests block, which implies that the test is written at the top level.
+
+Given that the user is not allowing a mod tests block, but existing tests may be in a mod tests, perhaps the correct approach is to write the test in the same module and use appropriate imports.
+
+But this is getting too tangled. Let's focus on the required test.
+
+The test needs to call the new method on a TimingDistribution trait. For that, we need an implementation. So in test code, a struct that implements the trait is needed. In the existing code, there's a TestTimingDistribution struct that does this.
+
+Assuming that the TestTimingDistribution is available in the current module via the existing tests, the test can create an instance and call the new methods.
+
+The test should call accumulate_samples with some samples and check that the correct errors are counted.
+
+So, the test function would look something like:
+
+#[test]
+fn test_accumulate_samples_reports_errors() {
+    let metric = TestTimingDistribution::new();
+    metric.accumulate_samples(vec![-1, 100]);
+    assert_eq!(metric.get_num_errors(ErrorType::InvalidValue), 1);
+}
+
+But the exact method names and how errors are retrieved depend on the existing test code.
+
+Assuming that the TestTimingDistribution has a method like test_get_value or test_get_num_errors, the test can assert that after calling accumulate_samples with invalid samples, the error count increases.
+
+The key is that the test would fail if the accumulate_samples method is not present (before the patch) and pass after.
+
+Now, considering that, the test must be written in the same file, using the TestTimingDistribution.
+
+The code would include the necessary use statements from the current module.
+
+So the imports would be:
+
+use glean::ErrorType;
+use super::TestTimingDistribution; // assuming the TestTimingDistribution is in the same module
+
+But the user's instruction says to not use group imports and to import only what is necessary.
+
+Putting it all together, the final test would be a function that creates the TestTimingDistribution, calls the new methods with samples, and checks error counts.
+</think>
+
+<Filename>glean-core/src/traits/timing_distribution.rs</Filename>
+<imports>
+use super::TestTimingDistribution;
+use glean::ErrorType;
+</imports>
+<Rust>
+#[test]
+fn test_accumulate_samples_reports_invalid_values() {
+    let metric = TestTimingDistribution::new();
+    metric.accumulate_samples(vec![-1, 100, 1_000_000_000_000]);
+    assert_eq!(metric.test_get_error_count(ErrorType::InvalidValue), 1);
+    assert_eq!(metric.test_get_error_count(ErrorType::InvalidOverflow), 1);
+}
+</Rust>

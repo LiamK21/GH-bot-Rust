@@ -1,0 +1,524 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the experiments API for the RLB
+Let's follow the semantics of the other language bindings.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -38,6 +38,7 @@
+ //! ```
+ 
+ use once_cell::sync::OnceCell;
++use std::collections::HashMap;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Mutex;
+ 
+@@ -45,6 +46,7 @@ pub use configuration::Configuration;
+ use configuration::DEFAULT_GLEAN_ENDPOINT;
+ pub use core_metrics::ClientInfoMetrics;
+ pub use glean_core::{global_glean, setup_glean, CommonMetricData, Error, Glean, Lifetime, Result};
++use private::RecordedExperimentData;
+ 
+ mod configuration;
+ mod core_metrics;
+@@ -441,6 +443,58 @@ pub(crate) fn submit_ping_by_name_sync(ping: &str, reason: Option<&str>) {
+     }
+ }
+ 
++/// Indicate that an experiment is running.  Glean will then add an
++/// experiment annotation to the environment which is sent with pings. This
++/// infomration is not persisted between runs.
++///
++/// See [`glean_core::Glean::set_experiment_active`].
++pub fn set_experiment_active(
++    experiment_id: String,
++    branch: String,
++    extra: Option<HashMap<String, String>>,
++) {
++    dispatcher::launch(move || {
++        with_glean(|glean| {
++            glean.set_experiment_active(
++                experiment_id.to_owned(),
++                branch.to_owned(),
++                extra.to_owned(),
++            )
++        });
++    })
++}
++
++/// Indicate that an experiment is no longer running.
++///
++/// See [`glean_core::Glean::set_experiment_inactive`].
++pub fn set_experiment_inactive(experiment_id: String) {
++    dispatcher::launch(move || {
++        with_glean(|glean| glean.set_experiment_inactive(experiment_id.to_owned()))
++    })
++}
++
++/// TEST ONLY FUNCTION.
++/// Checks if an experiment is currently active.
++#[allow(dead_code)]
++pub(crate) fn test_is_experiment_active(experiment_id: String) -> bool {
++    dispatcher::block_on_queue();
++    with_glean(|glean| glean.test_is_experiment_active(experiment_id.to_owned()))
++}
++
++/// TEST ONLY FUNCTION.
++/// Returns the `RecordedExperimentData` for the given `experiment_id` or panics if
++/// the id isn't found.
++#[allow(dead_code)]
++pub(crate) fn test_get_experiment_data(experiment_id: String) -> RecordedExperimentData {
++    dispatcher::block_on_queue();
++    with_glean(|glean| {
++        let json_data = glean
++            .test_get_experiment_data_as_json(experiment_id.to_owned())
++            .unwrap_or_else(|| panic!("No experiment found for id: {}", experiment_id));
++        serde_json::from_str::<RecordedExperimentData>(&json_data).unwrap()
++    })
++}
++
+ /// TEST ONLY FUNCTION.
+ /// Resets the Glean state and triggers init again.
+ #[cfg(test)]
+
+diff --git a/glean-core/rlb/src/private/mod.rs b/glean-core/rlb/src/private/mod.rs
+--- a/glean-core/rlb/src/private/mod.rs
++++ b/glean-core/rlb/src/private/mod.rs
+@@ -6,6 +6,8 @@
+ 
+ mod boolean;
+ mod ping;
++mod recorded_experiment_data;
+ 
+ pub use boolean::BooleanMetric;
+ pub use ping::PingType;
++pub use recorded_experiment_data::RecordedExperimentData;
+
+diff --git a/glean-core/rlb/src/private/recorded_experiment_data.rs b/glean-core/rlb/src/private/recorded_experiment_data.rs
+--- a/glean-core/rlb/src/private/recorded_experiment_data.rs
++++ b/glean-core/rlb/src/private/recorded_experiment_data.rs
+@@ -0,0 +1,15 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use crate::HashMap;
++use serde::Deserialize;
++
++/// Deserialized experiment data.
++#[derive(Clone, Deserialize, Debug)]
++pub struct RecordedExperimentData {
++    /// The experiment's branch as set through `set_experiment_active`.
++    pub branch: String,
++    /// Any extra data associated with this experiment through `set_experiment_active`.
++    pub extra: Option<HashMap<String, String>>,
++}
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -118,15 +118,93 @@ fn disabling_upload_disables_metrics_recording() {
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1672982.
+ fn test_experiments_recording() {
+-    todo!()
++    // setup glean for the test
++    let _lock = GLOBAL_LOCK.lock().unwrap();
++    env_logger::try_init().ok();
++    let _t = new_glean(None);
++
++    set_experiment_active("experiment_test".to_string(), "branch_a".to_string(), None);
++    let mut extra = HashMap::new();
++    extra.insert("test_key".to_string(), "value".to_string());
++    set_experiment_active(
++        "experiment_api".to_string(),
++        "branch_b".to_string(),
++        Some(extra),
++    );
++    assert!(test_is_experiment_active("experiment_test".to_string()));
++    assert!(test_is_experiment_active("experiment_api".to_string()));
++    set_experiment_inactive("experiment_test".to_string());
++    assert!(!test_is_experiment_active("experiment_test".to_string()));
++    assert!(test_is_experiment_active("experiment_api".to_string()));
++    let stored_data = test_get_experiment_data("experiment_api".to_string());
++    assert_eq!("branch_b", stored_data.branch);
++    assert_eq!("value", stored_data.extra.unwrap()["test_key"]);
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1672982.
+ fn test_experiments_recording_before_glean_inits() {
+-    todo!()
++    let _lock = GLOBAL_LOCK.lock().unwrap();
++    env_logger::try_init().ok();
++
++    // Destroy the existing glean instance from glean-core so that we
++    // can test the pre-init queueing of the experiment api commands.
++    // This is doing the exact same thing that `reset_glean` is doing
++    // but without calling `initialize`.
++    if was_initialize_called() {
++        // We need to check if the Glean object (from glean-core) is
++        // initialized, otherwise this will crash on the first test
++        // due to bug 1675215 (this check can be removed once that
++        // bug is fixed).
++        if global_glean().is_some() {
++            with_glean_mut(|glean| {
++                glean.test_clear_all_stores();
++                glean.destroy_db();
++            });
++        }
++        // Allow us to go through initialization again.
++        INITIALIZE_CALLED.store(false, Ordering::SeqCst);
++        // Reset the dispatcher.
++        dispatcher::reset_dispatcher();
++    }
++
++    set_experiment_active(
++        "experiment_set_preinit".to_string(),
++        "branch_a".to_string(),
++        None,
++    );
++    set_experiment_active(
++        "experiment_preinit_disabled".to_string(),
++        "branch_a".to_string(),
++        None,
++    );
++    set_experiment_inactive("experiment_preinit_disabled".to_string());
++
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    reset_glean(
++        Configuration {
++            data_path: tmpname,
++            application_id: GLOBAL_APPLICATION_ID.into(),
++            upload_enabled: true,
++            max_events: None,
++            delay_ping_lifetime_io: false,
++            channel: Some("testing".into()),
++            server_endpoint: Some("invalid-test-host".into()),
++            uploader: None,
++        },
++        ClientInfoMetrics::unknown(),
++        false,
++    );
++    crate::dispatcher::block_on_queue();
++
++    assert!(test_is_experiment_active(
++        "experiment_set_preinit".to_string()
++    ));
++    assert!(!test_is_experiment_active(
++        "experiment_preinit_disabled".to_string()
++    ));
+ }
+ 
+ #[test]
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use super::set_experiment_active;
+use super::test_is_experiment_active;
+use super::test_get_experiment_data;
+use super::set_experiment_inactive;
+use std::collections::HashMap;</imports>
+<Rust>#[test]
+fn test_experiments_api() {
+  let mut extra = HashMap::new();
+  extra.insert("test_key".to_string(), "value".to_string());
+  set_experiment_active("experiment_test".to_string(), "branch_a".to_string(), None);
+  set_experiment_active("experiment_api".to_string(), "branch_b".to_string(), Some(extra.clone()));
+  assert!(test_is_experiment_active("experiment_test".to_string()));
+  assert!(test_is_experiment_active("experiment_api".to_string()));
+  set_experiment_inactive("experiment_test".to_string());
+  assert!(!test_is_experiment_active("experiment_test".to_string()));
+  assert!(test_is_experiment_active("experiment_api".to_string()));
+  let stored_data = test_get_experiment_data("experiment_api".to_string());
+  assert_eq!("branch_b", stored_data.branch);
+  assert_eq!("value", stored_data.extra.unwrap()["test_key"]);
+}
+</Rust>
+</TEST>
+
+<output>
+error[timeout]: Test execution exceeded the time limit of 300 seconds.
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded arrayref v0.3.6
+  Downloaded atty v0.2.14
+  Downloaded autocfg v1.0.1
+  Downloaded bitflags v1.2.1
+  Downloaded byteorder v1.3.4
+  Downloaded bincode v1.3.1
+  Downloaded adler v0.2.3
+  Downloaded bstr v0.2.14
+  Downloaded unicode-bidi v0.3.4
+  Downloaded crossbeam-epoch v0.9.0
+  Downloaded unicode-xid v0.2.1
+  Downloaded uuid v0.8.1
+  Downloaded unicode-width v0.1.8
+  Downloaded walkdir v2.3.1
+  Downloaded url v2.2.0
+  Downloaded unicode-normalization v0.1.13
+  Downloaded serde v1.0.117
+  Downloaded tinyvec v0.3.4
+  Downloaded serde_json v1.0.59
+  Downloaded regex v1.4.2
+  Downloaded serde_cbor v0.11.1
+  Downloaded regex-automata v0.1.9
+  Downloaded tinytemplate v1.1.0
+  Downloaded tempfile v3.1.0
+  Downloaded rkv v0.15.0
+  Downloaded rand_chacha v0.2.2
+  Downloaded quick-error v1.2.3
+  Downloaded proc-macro-hack v0.5.19
+  Downloaded rand v0.7.3
+  Downloaded plotters v0.2.15
+  Downloaded syn v1.0.48
+  Downloaded paste v0.1.18
+  Downloaded ordered-float v1.1.0
+  Downloaded oorandom v11.1.2
+  Downloaded rayon v1.5.0
+  Downloaded once_cell v1.4.1
+  Downloaded rayon-core v1.9.0
+  Downloaded regex-syntax v0.6.21
+  Downloaded rand_core v0.5.1
+  Downloaded proc-macro2 v1.0.24
+  Downloaded num_cpus v1.13.0
+  Downloaded libc v0.2.80
+  Downloaded thiserror-impl v1.0.22
+  Downloaded serde_derive v1.0.117
+  Downloaded semver-parser v0.7.0
+  Downloaded ryu v1.0.5
+  Downloaded remove_dir_all v0.5.3
+  Downloaded pkg-config v0.3.19
+  Downloaded paste-impl v0.1.18
+  Downloaded itertools v0.9.0
+  Downloaded thiserror v1.0.22
+  Downloaded textwrap v0.11.0
+  Downloaded termcolor v1.1.0
+  Downloaded rustc_version v0.2.3
+  Downloaded ppv-lite86 v0.2.10
+  Downloaded percent-encoding v2.1.0
+  Downloaded num-traits v0.2.14
+  Downloaded num-integer v0.1.44
+  Downloaded nom v5.1.2
+  Downloaded miniz_oxide v0.4.3
+  Downloaded memoffset v0.5.6
+  Downloaded lazy_static v1.4.0
+  Downloaded itoa v0.4.6
+  Downloaded half v1.6.0
+  Downloaded failure_derive v0.1.8
+  Downloaded csv v1.1.4
+  Downloaded crossbeam-channel v0.4.4
+  Downloaded version_check v0.9.2
+  Downloaded synstructure v0.12.4
+  Downloaded semver v0.9.0
+  Downloaded scopeguard v1.1.0
+  Downloaded quote v1.0.7
+  Downloaded memchr v2.3.4
+  Downloaded matches v0.1.8
+  Downloaded jsonschema-valid v0.4.0
+  Downloaded itertools v0.8.2
+  Downloaded idna v0.2.0
+  Downloaded flate2 v1.0.19
+  Downloaded crossbeam-utils v0.7.2
+  Downloaded criterion-plot v0.4.3
+  Downloaded chrono v0.4.19
+  Downloaded maybe-uninit v2.0.0
+  Downloaded iso8601 v0.4.0
+  Downloaded id-arena v2.2.1
+  Downloaded getrandom v0.1.15
+  Downloaded form_urlencoded v1.0.0
+  Downloaded env_logger v0.7.1
+  Downloaded either v1.6.1
+  Downloaded csv-core v0.1.10
+  Downloaded crc32fast v1.2.1
+  Downloaded cfg-if v0.1.10
+  Downloaded time v0.1.44
+  Downloaded lmdb-rkv-sys v0.11.0
+  Downloaded ffi-support v0.4.2
+  Downloaded crossbeam-utils v0.8.0
+  Downloaded crossbeam-channel v0.5.0
+  Downloaded criterion v0.3.3
+  Downloaded clap v2.33.3
+  Downloaded cc v1.0.62
+  Downloaded log v0.4.11
+  Downloaded lmdb-rkv v0.14.0
+  Downloaded json-pointer v0.3.4
+  Downloaded iri-string v0.3.0
+  Downloaded humantime v1.3.0
+  Downloaded crossbeam-deque v0.8.0
+  Downloaded const_fn v0.4.3
+  Downloaded cfg-if v1.0.0
+  Downloaded inherent v0.1.4
+  Downloaded failure v0.1.8
+  Downloaded ctor v0.1.16
+  Downloaded cast v0.2.3
+   Compiling autocfg v1.0.1
+   Compiling proc-macro2 v1.0.24
+   Compiling unicode-xid v0.2.1
+   Compiling syn v1.0.48
+   Compiling libc v0.2.80
+   Compiling serde_derive v1.0.117
+   Compiling lazy_static v1.4.0
+   Compiling serde v1.0.117
+   Compiling cfg-if v0.1.10
+   Compiling num-traits v0.2.14
+   Compiling byteorder v1.3.4
+   Compiling quote v1.0.7
+   Compiling cfg-if v1.0.0
+   Compiling getrandom v0.1.15
+   Compiling ryu v1.0.5
+   Compiling itoa v0.4.6
+   Compiling matches v0.1.8
+   Compiling bitflags v1.2.1
+   Compiling serde_json v1.0.59
+   Compiling rand_core v0.5.1
+   Compiling tinyvec v0.3.4
+   Compiling ppv-lite86 v0.2.10
+   Compiling log v0.4.11
+   Compiling proc-macro-hack v0.5.19
+   Compiling cc v1.0.62
+   Compiling pkg-config v0.3.19
+   Compiling rand_chacha v0.2.2
+   Compiling unicode-normalization v0.1.13
+   Compiling unicode-bidi v0.3.4
+   Compiling lmdb-rkv-sys v0.11.0
+   Compiling num-integer v0.1.44
+   Compiling percent-encoding v2.1.0
+   Compiling failure_derive v0.1.8
+   Compiling memchr v2.3.4
+   Compiling form_urlencoded v1.0.0
+   Compiling idna v0.2.0
+   Compiling rand v0.7.3
+   Compiling miniz_oxide v0.4.3
+   Compiling synstructure v0.12.4
+   Compiling crc32fast v1.2.1
+   Compiling paste-impl v0.1.18
+   Compiling url v2.2.0
+   Compiling time v0.1.44
+   Compiling adler v0.2.3
+   Compiling paste v0.1.18
+   Compiling lmdb-rkv v0.14.0
+   Compiling uuid v0.8.1
+   Compiling ordered-float v1.1.0
+   Compiling id-arena v2.2.1
+   Compiling arrayref v0.3.6
+   Compiling flate2 v1.0.19
+   Compiling ffi-support v0.4.2
+   Compiling once_cell v1.4.1
+   Compiling atty v0.2.14
+   Compiling version_check v0.9.2
+   Compiling quick-error v1.2.3
+   Compiling humantime v1.3.0
+   Compiling failure v0.1.8
+   Compiling termcolor v1.1.0
+   Compiling nom v5.1.2
+   Compiling remove_dir_all v0.5.3
+   Compiling tempfile v3.1.0
+   Compiling env_logger v0.7.1
+   Compiling ctor v0.1.16
+   Compiling either v1.6.1
+   Compiling const_fn v0.4.3
+   Compiling crossbeam-utils v0.8.0
+   Compiling unicode-width v0.1.8
+   Compiling textwrap v0.11.0
+   Compiling memoffset v0.5.6
+   Compiling iso8601 v0.4.0
+   Compiling regex-syntax v0.6.21
+   Compiling semver-parser v0.7.0
+   Compiling semver v0.9.0
+   Compiling crossbeam-utils v0.7.2
+   Compiling maybe-uninit v2.0.0
+   Compiling regex v1.4.2
+   Compiling rustc_version v0.2.3
+   Compiling rayon-core v1.9.0
+   Compiling scopeguard v1.1.0
+   Compiling crossbeam-epoch v0.9.0
+   Compiling cast v0.2.3
+   Compiling thiserror-impl v1.0.22
+   Compiling crossbeam-deque v0.8.0
+   Compiling crossbeam-channel v0.4.4
+   Compiling crossbeam-channel v0.5.0
+   Compiling itertools v0.8.2
+   Compiling inherent v0.1.4
+   Compiling thiserror v1.0.22
+   Compiling regex-automata v0.1.9
+   Compiling num_cpus v1.13.0
+   Compiling rayon v1.5.0
+   Compiling chrono v0.4.19
+   Compiling bincode v1.3.1
+   Compiling rkv v0.15.0
+   Compiling json-pointer v0.3.4
+   Compiling iri-string v0.3.0
+   Compiling bstr v0.2.14
+   Compiling glean-core v33.2.0 (/app/testbed/glean-core)
+   Compiling jsonschema-valid v0.4.0
+   Compiling itertools v0.9.0
+warning: fields `baseline`, `metrics`, and `events` are never read
+  --> glean-core/src/internal_pings.rs:15:9
+   |
+14 | pub struct InternalPings {
+   |            ------------- fields in this struct
+15 |     pub baseline: PingType,
+   |         ^^^^^^^^
+16 |     pub metrics: PingType,
+   |         ^^^^^^^
+17 |     pub events: PingType,
+   |         ^^^^^^
+   |
+   = note: `InternalPings` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+</output>
+
+Function signatures
+<Signatures>
+fn submit_ping_by_name_sync(ping: &str, reason: Option<&str>) -> ()
+
+fn disabling_upload_disables_metrics_recording() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

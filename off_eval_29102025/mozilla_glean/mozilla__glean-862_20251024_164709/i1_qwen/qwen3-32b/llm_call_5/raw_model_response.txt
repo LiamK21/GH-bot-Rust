@@ -1,0 +1,65 @@
+<think>
+Okay, let's see. The user provided an issue where two pings submitted in quick succession are not both uploaded. The first one triggers an upload worker, which uploads it, but the second one is missed because the worker doesn't re-scan the directory. The patch added a test to the upload manager, but after applying the patch, the test is still failing even though the new upload mechanism is supposed to fix it.
+
+Looking at the test code provided in the patch, the new test 'new_pings_are_added_while_upload_in_progress' enqueues two pings. The first is uploaded, and then the second is enqueued while the first is being processed. The test then checks if the second ping is picked up after the first's response is processed. This works by simulating each step and checking the queue.
+
+However, in the user's current test (which is different?), the test_concurrent_ping_submission is failing at the point where it expects the second ping after processing the first. The issue might be related to how the second ping is added. The user's test creates a file in the pending directory for the second ping, but maybe the upload manager isn't scanning that directory again immediately after processing the first ping.
+
+Wait, the original problem was that when the second ping is submitted (enqueued), the upload worker doesn't rescan the pending directory. The patch's solution might involve ensuring that when a new ping is submitted, even during an ongoing upload, it gets enqueued correctly. The user's test is trying to simulate a new ping being added while the first is uploading, but perhaps the way the second ping is added isn't triggering the upload manager correctly.
+
+In the user's test, after enqueuing the first ping and getting a request, they manually create a file in the pending directory for the second ping. But maybe the upload manager isn't checking the pending directory again until the first upload completes. Alternatively, the new upload mechanism might handle this by queuing the second ping while the first is being processed.
+
+The test in the patch uses the enqueue_ping method for the second ping, while the user's test is creating a file in the pending directory. The problem in the user's test is that the second ping isn't being detected. So the test is not adding the second ping correctly. The original issue was about pings submitted concurrently, which might be done via the enqueue_ping method. Creating a file in the pending directory is a different approach and might not trigger the same behavior as enqueueing through the upload manager.
+
+So the correct approach is to enqueue the second ping using the same method as the first, but perhaps during the first ping's upload processing, the upload manager should be able to pick up the second ping when it's enqueued. Wait, but in the test from the patch, they enqueue the second ping after getting the first request, and then after processing the response, the second is available. That works because the enqueue_ping method adds it to the queue.
+
+In the user's test, they are creating a file in the pending directory instead of using enqueue_ping. The original problem was that when two pings are submitted (enqueued), the second is missed because the upload worker doesn't rescan. So the user's test is simulating the wrong scenario. By creating a file in the pending directory, they're not using the enqueue_ping method. So the upload manager doesn't process the new ping because it's not being added to the queue properly.
+
+So the fix is to enqueue the second ping using the enqueue_ping method, not by manually creating files. The user's test is incorrectly creating a file, which doesn't trigger the same logic as enqueuing through the upload manager. Therefore, the test should be modified to enqueue the second ping immediately after enqueuing the first, before processing the first one. That way, the upload manager's queue should have both pings, and after the first is processed, the second should be picked up.
+
+In the user's current test, after enqueueing the first ping, they create a file for the second. But in reality, the second ping would be enqueued via enqueue_ping. Therefore, the test should use enqueue_ping for both. So modifying the user's test to enqueue the second ping instead of creating a file in the pending directory should resolve the issue. That way, the upload manager's queue will process both pings correctly.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use tempfile;
+use std::thread;
+use std::time;
+use std::collections::HashMap;</imports>
+<Rust>
+#[test]
+fn test_concurrent_ping_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let upload_manager = PingUploadManager::new(dir.path());
+    while upload_manager.get_upload_task() == PingUploadTask::Wait {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let doc1 = "684fa150-8dff-11ea-8faf-cb1ff3b11119";
+    let path1 = "/submit/app_id/test-ping/1/".to_string();
+    let doc2 = "74f14e9a-8dff-11ea-b45a-6f936923f639";
+    let path2 = "/submit/app_id/test-ping/1/".to_string();
+
+    upload_manager.enqueue_ping(doc1, &path1, HashMap::new());
+    let req1 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("First ping not enqueued"),
+    };
+    assert_eq!(doc1, req1.document_id);
+
+    // Enqueue second ping while first is in progress
+    upload_manager.enqueue_ping(doc2, &path2, HashMap::new());
+
+    // Process first ping
+    upload_manager.process_ping_upload_response(&req1.document_id, 200);
+
+    // Now expect second ping
+    let req2 = match upload_manager.get_upload_task() {
+        PingUploadTask::Upload(req) => req,
+        _ => panic!("Second ping not enqueued after processing first"),
+    };
+    assert_eq!(doc2, req2.document_id);
+
+    upload_manager.process_ping_upload_response(&req2.document_id, 200);
+    assert!(matches!(upload_manager.get_upload_task(), PingUploadTask::Done));
+}
+</Rust>

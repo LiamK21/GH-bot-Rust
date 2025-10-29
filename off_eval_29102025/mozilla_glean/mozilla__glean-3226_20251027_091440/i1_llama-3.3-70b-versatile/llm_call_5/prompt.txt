@@ -1,0 +1,334 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Pings following another ping's schedule don't get submitted if said ping is disabled
+Pings can follow another ping's schedule by annotating them with `metadata.ping_schedule`.
+However, if the ping listed in that schedule is submitted, but disabled at submission time, any pings following its schedule won't even be tried.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -1569,6 +1569,62 @@ fn pings_ride_along_builtin_pings() {
+     assert!(url.contains("ride-along"));
+ }
+ 
++#[test]
++fn pings_get_submitted_on_disabled_ping_schedule() {
++    let _lock = lock_test();
++
++    // Define a fake uploader that reports back the submission headers
++    // using a crossbeam channel.
++    let (s, r) = crossbeam_channel::bounded::<String>(3);
++
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<String>,
++    }
++    impl net::PingUploader for FakeUploader {
++        fn upload(&self, upload_request: net::CapablePingUploadRequest) -> net::UploadResult {
++            let upload_request = upload_request.capable(|_| true).unwrap();
++            self.sender.send(upload_request.url).unwrap();
++            net::UploadResult::http_status(200)
++        }
++    }
++
++    // Create a custom configuration to use a fake uploader.
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().to_path_buf();
++
++    let ping_schedule = HashMap::from([("baseline".to_string(), vec!["ride-along".to_string()])]);
++
++    let cfg = ConfigurationBuilder::new(false, tmpname, GLOBAL_APPLICATION_ID)
++        .with_server_endpoint("invalid-test-host")
++        .with_uploader(FakeUploader { sender: s })
++        .with_ping_schedule(ping_schedule)
++        .build();
++
++    let _t = new_glean(Some(cfg), true);
++
++    let ride_along_ping = PingType::new(
++        "ride-along",
++        true,
++        true,
++        true,
++        true,
++        true,
++        vec![],
++        vec![],
++        false,
++        vec![],
++    );
++    ride_along_ping.set_enabled(true);
++
++    // Simulate becoming active.
++    handle_client_active();
++
++    // We expect a ride-along ping to ride along.
++    let url = r.recv_timeout(Duration::from_millis(100)).unwrap();
++    assert!(url.contains("ride-along"));
++}
++
+ #[test]
+ fn test_attribution_and_distribution_updates_before_glean_inits() {
+     let _lock = lock_test();
+
+diff --git a/glean-core/src/metrics/ping.rs b/glean-core/src/metrics/ping.rs
+--- a/glean-core/src/metrics/ping.rs
++++ b/glean-core/src/metrics/ping.rs
+@@ -282,15 +282,6 @@ impl PingType {
+     /// Whether the ping was succesfully assembled and queued.
+     #[doc(hidden)]
+     pub fn submit_sync(&self, glean: &Glean, reason: Option<&str>) -> bool {
+-        if !self.enabled(glean) {
+-            log::info!(
+-                "The ping '{}' is disabled and will be discarded and not submitted",
+-                self.0.name
+-            );
+-
+-            return false;
+-        }
+-
+         let ping = &self.0;
+ 
+         // Allowing `clippy::manual_filter`.
+@@ -311,10 +302,21 @@ impl PingType {
+             None => None,
+         };
+ 
++        if !self.enabled(glean) {
++            log::info!(
++                "The ping '{}' is disabled and will be discarded and not submitted",
++                self.0.name
++            );
++
++            self.handle_ping_schedule(glean, ping, reason);
++            return false;
++        }
++
+         let ping_maker = PingMaker::new();
+         let doc_id = Uuid::new_v4().to_string();
+         let url_path = glean.make_path(&ping.name, &doc_id);
+-        match ping_maker.collect(glean, self, corrected_reason, &doc_id, &url_path) {
++        let submitted = match ping_maker.collect(glean, self, corrected_reason, &doc_id, &url_path)
++        {
+             None => {
+                 log::info!(
+                     "No content for ping '{}', therefore no ping queued.",
+@@ -322,16 +324,15 @@ impl PingType {
+                 );
+                 false
+             }
+-            Some(ping) => {
+-                if !self.enabled(glean) {
+-                    log::info!(
+-                        "The ping '{}' is disabled and will be discarded and not submitted",
+-                        ping.name
+-                    );
+-
+-                    return false;
+-                }
++            Some(ping) if !self.enabled(glean) => {
++                log::info!(
++                    "The ping '{}' is disabled and will be discarded and not submitted",
++                    ping.name
++                );
+ 
++                false
++            }
++            Some(ping) => {
+                 const BUILTIN_PINGS: [&str; 4] =
+                     ["baseline", "metrics", "events", "deletion-request"];
+ 
+@@ -381,37 +382,42 @@ impl PingType {
+                     ping.name
+                 );
+ 
+-                if ping.schedules_pings.is_empty() {
+-                    let ping_schedule = glean
+-                        .ping_schedule
+-                        .get(ping.name)
+-                        .map(|v| &v[..])
+-                        .unwrap_or(&[]);
+-
+-                    if !ping_schedule.is_empty() {
+-                        log::info!(
+-                            "The ping '{}' is being used to schedule other pings: {:?}",
+-                            ping.name,
+-                            ping_schedule
+-                        );
+-
+-                        for scheduled_ping_name in ping_schedule {
+-                            glean.submit_ping_by_name(scheduled_ping_name, reason);
+-                        }
+-                    }
+-                } else {
+-                    log::info!(
+-                        "The ping '{}' is being used to schedule other pings: {:?}",
+-                        ping.name,
+-                        ping.schedules_pings
+-                    );
+-                    for scheduled_ping_name in &ping.schedules_pings {
+-                        glean.submit_ping_by_name(scheduled_ping_name, reason);
+-                    }
+-                }
+-
+                 true
+             }
++        };
++
++        self.handle_ping_schedule(glean, ping, reason);
++        submitted
++    }
++
++    fn handle_ping_schedule(&self, glean: &Glean, ping: &InnerPing, reason: Option<&str>) {
++        if ping.schedules_pings.is_empty() {
++            let ping_schedule = glean
++                .ping_schedule
++                .get(&ping.name)
++                .map(|v| &v[..])
++                .unwrap_or(&[]);
++
++            if !ping_schedule.is_empty() {
++                log::info!(
++                    "The ping '{}' is being used to schedule other pings: {:?}",
++                    ping.name,
++                    ping_schedule
++                );
++
++                for scheduled_ping_name in ping_schedule {
++                    glean.submit_ping_by_name(scheduled_ping_name, reason);
++                }
++            }
++        } else {
++            log::info!(
++                "The ping '{}' is being used to schedule other pings: {:?}",
++                ping.name,
++                ping.schedules_pings
++            );
++            for scheduled_ping_name in &ping.schedules_pings {
++                glean.submit_ping_by_name(scheduled_ping_name, reason);
++            }
+         }
+     }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/ping.rs</Filename>
+<imports>use super::PingType;
+use super::Glean;
+use std::collections::HashMap;
+use std::error::Error;
+use std::result::Result;
+use crate::InternalConfiguration;
+use crate::ConfigurationBuilder;
+use crate::GLOBAL_APPLICATION_ID;
+use tempfile::tempdir;
+use uuid::Uuid;
+use std::path::PathBuf;
+use std::time::Duration;</imports>
+<Rust>#[test]
+fn test_pings_get_submitted_on_disabled_ping_schedule() {
+  let tmpname = tempdir().unwrap().path().to_path_buf();
+  let cfg = ConfigurationBuilder::new(false, tmpname, GLOBAL_APPLICATION_ID)
+    .with_server_endpoint("invalid-test-host")
+    .build();
+  let mut glean = Glean::new(cfg).unwrap();
+  let ping_type = PingType::new(
+        "test",
+        true,
+        true,
+        true,
+        true,
+        true,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+  ping_type.set_enabled(false);
+  let ping_schedule = HashMap::from([("test".to_string(), vec!["ride-along".to_string()])]);
+  glean.ping_schedule = ping_schedule;
+  let result = ping_type.submit_sync(&glean, None);
+  assert_eq!(result, false);
+  assert!(glean.ping_schedule.get("test").is_some());
+  let ride_along_ping = PingType::new(
+        "ride-along",
+        true,
+        true,
+        true,
+        true,
+        true,
+        vec![],
+        vec![],
+        false,
+        vec![],
+    );
+  ride_along_ping.set_enabled(true);
+  let result_ride_along_before_patch = ride_along_ping.submit_sync(&glean, None);
+  assert_eq!(result_ride_along_before_patch, false);
+  ping_type.set_enabled(true);
+  let result_ride_along_after_patch = ride_along_ping.submit_sync(&glean, None);
+  assert_eq!(result_ride_along_after_patch, true);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::ConfigurationBuilder`
+   --> glean-core/src/metrics/ping.rs:433:5
+    |
+433 | use crate::ConfigurationBuilder;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `ConfigurationBuilder` in the root
+
+error[E0432]: unresolved import `crate::GLOBAL_APPLICATION_ID`
+   --> glean-core/src/metrics/ping.rs:434:5
+    |
+434 | use crate::GLOBAL_APPLICATION_ID;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `GLOBAL_APPLICATION_ID` in the root
+</output>
+
+Function signatures
+<Signatures>
+fn pings_ride_along_builtin_pings() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

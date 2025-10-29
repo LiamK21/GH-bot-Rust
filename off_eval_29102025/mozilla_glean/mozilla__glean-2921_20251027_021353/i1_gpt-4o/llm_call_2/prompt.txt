@@ -1,0 +1,238 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Object metric: document (and possibly improve) behavior of null values
+Since `null` values aren't valid (as far as I know, though maybe they can be set as arrays or objects?), it'd be great if Glean allowed `setString` JSON objects to contain nulls and automatically ignore/remove them where appropriate (e.g. for an object where a key maps to null, the key will be removed). Right now, nulls seem to result in the metric not being set.
+
+Whether the behavior changes or not, it'd be helpful to document it explicitly.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/build/src/lib.rs b/glean-core/build/src/lib.rs
+--- a/glean-core/build/src/lib.rs
++++ b/glean-core/build/src/lib.rs
+@@ -39,7 +39,7 @@ use std::env;
+ 
+ use xshell_venv::{Result, Shell, VirtualEnv};
+ 
+-const GLEAN_PARSER_VERSION: &str = "14.5.0";
++const GLEAN_PARSER_VERSION: &str = "14.5.1";
+ 
+ /// A Glean Rust bindings generator.
+ pub struct Builder {
+
+diff --git a/glean-core/rlb/src/private/object.rs b/glean-core/rlb/src/private/object.rs
+--- a/glean-core/rlb/src/private/object.rs
++++ b/glean-core/rlb/src/private/object.rs
+@@ -189,4 +189,62 @@ mod test {
+         let expected = json!([1, 2, 3]);
+         assert_eq!(expected, data);
+     }
++
++    #[test]
++    fn set_string_api_complex() {
++        let _lock = lock_test();
++        let _t = new_glean(None, true);
++
++        #[derive(
++            Debug, Hash, Eq, PartialEq, traits::__serde::Deserialize, traits::__serde::Serialize,
++        )]
++        #[serde(crate = "traits::__serde")]
++        #[serde(deny_unknown_fields)]
++        struct StackTrace {
++            #[serde(skip_serializing_if = "Option::is_none")]
++            error: Option<String>,
++            #[serde(
++                skip_serializing_if = "Vec::is_empty",
++                default = "Vec::new",
++                deserialize_with = "traits::__serde_helper::vec_null"
++            )]
++            modules: Vec<String>,
++            #[serde(skip_serializing_if = "Option::is_none")]
++            thread_info: Option<StackTraceThreadInfo>,
++        }
++
++        #[derive(
++            Debug, Hash, Eq, PartialEq, traits::__serde::Serialize, traits::__serde::Deserialize,
++        )]
++        #[serde(crate = "traits::__serde")]
++        #[serde(deny_unknown_fields)]
++        struct StackTraceThreadInfo {
++            base_address: Option<String>,
++        }
++
++        let metric: ObjectMetric<StackTrace> = ObjectMetric::new(CommonMetricData {
++            name: "object".into(),
++            category: "test".into(),
++            send_in_pings: vec!["test1".into()],
++            ..Default::default()
++        });
++
++        let arr_str = json!({
++            "error": "error",
++            "modules": null,
++            "thread_info": null,
++        })
++        .to_string();
++        metric.set_string(arr_str);
++
++        let data = metric.test_get_value(None).expect("no object recorded");
++        let expected = json!({
++            "error": "error"
++        });
++        assert_eq!(expected, data);
++        assert_eq!(
++            0,
++            metric.test_get_num_recorded_errors(ErrorType::InvalidValue)
++        );
++    }
+ }
+
+diff --git a/glean-core/src/traits/mod.rs b/glean-core/src/traits/mod.rs
+--- a/glean-core/src/traits/mod.rs
++++ b/glean-core/src/traits/mod.rs
+@@ -54,3 +54,16 @@ pub use self::timing_distribution::TimingDistribution;
+ pub use self::url::Url;
+ pub use self::uuid::Uuid;
+ pub use crate::histogram::HistogramType;
++
++#[doc(hidden)]
++pub mod __serde_helper {
++    /// Deserialize value to a `Vec<T>`.
++    ///
++    /// If the value was `null`  return an empty vector.
++    pub fn vec_null<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
++        d: D,
++    ) -> Result<Vec<T>, D::Error> {
++        let res: Option<Vec<T>> = serde::Deserialize::deserialize(d)?;
++        Ok(res.unwrap_or_default())
++    }
++}
+
+diff --git a/samples/rust/src/main.rs b/samples/rust/src/main.rs
+--- a/samples/rust/src/main.rs
++++ b/samples/rust/src/main.rs
+@@ -12,7 +12,7 @@ use std::time::Duration;
+ use tempfile::Builder;
+ 
+ use flate2::read::GzDecoder;
+-use glean::{net, ClientInfoMetrics, ConfigurationBuilder};
++use glean::{net, ClientInfoMetrics, ConfigurationBuilder, ErrorType};
+ 
+ pub mod glean_metrics {
+     include!(concat!(env!("OUT_DIR"), "/glean_metrics.rs"));
+@@ -100,6 +100,19 @@ fn main() {
+     ]);
+     glean_metrics::party::balloons.set(balloons);
+ 
++    // Testing with empty and null values.
++    let drinks = serde_json::json!([
++        { "name": "lemonade", "ingredients": ["lemon", "water", "sugar"] },
++        { "name": "sparkling-water", "ingredients": [] },
++        { "name": "still-water", "ingredients": null },
++    ]);
++    glean_metrics::party::drinks.set_string(drinks.to_string());
++
++    assert_eq!(
++        0,
++        glean_metrics::party::drinks.test_get_num_recorded_errors(ErrorType::InvalidValue)
++    );
++
+     glean_metrics::prototype.submit(None);
+     // Need to wait a short time for Glean to actually act.
+     thread::sleep(Duration::from_millis(100));
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/private/object.rs</Filename>
+<imports>use crate::ErrorType;</imports>
+<Rust>#[test]
+fn test_set_string_with_null_values() {
+    let _lock = lock_test();
+    let _t = new_glean(None, true);
+
+    #[derive(
+        Debug, Hash, Eq, PartialEq, traits::__serde::Deserialize, traits::__serde::Serialize,
+    )]
+    #[serde(crate = "traits::__serde")]
+    #[serde(deny_unknown_fields)]
+    struct TestObject {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        field1: Option<String>,
+        #[serde(
+            skip_serializing_if = "Vec::is_empty",
+            default = "Vec::new",
+            deserialize_with = "traits::__serde_helper::vec_null"
+        )]
+        field2: Vec<String>,
+    }
+
+    let metric: ObjectMetric<TestObject> = ObjectMetric::new(CommonMetricData {
+        name: "object".into(),
+        category: "test".into(),
+        send_in_pings: vec!["test1".into()],
+        ..Default::default()
+    });
+
+    let input_json = json!({
+        "field1": "value",
+        "field2": null,
+    })
+    .to_string();
+    metric.set_string(input_json);
+
+    let data = metric.test_get_value(None).expect("no object recorded");
+    let expected = json!({
+        "field1": "value"
+    });
+    assert_eq!(expected, data);
+    assert_eq!(
+        0,
+        metric.test_get_num_recorded_errors(ErrorType::InvalidValue)
+    );
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

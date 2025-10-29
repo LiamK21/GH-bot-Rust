@@ -1,0 +1,426 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Provide Glean debugging APIs for RLB consumers
+We need to expose the functions to tag pings and turn on logging from the RLB, e.g. [these](https://searchfox.org/glean/rev/d13410ccc58398d584b61fc286f07f82e40e5d2f/glean-core/ffi/src/lib.rs#470-489).
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -79,6 +79,11 @@ struct RustBindingsState {
+ /// Note: The initialization might still be in progress, as it runs in a separate thread.
+ static INITIALIZE_CALLED: AtomicBool = AtomicBool::new(false);
+ 
++/// Keep track of the debug features before Glean is initialized.
++static PRE_INIT_DEBUG_VIEW_TAG: OnceCell<Mutex<String>> = OnceCell::new();
++static PRE_INIT_LOG_PINGS: AtomicBool = AtomicBool::new(false);
++static PRE_INIT_SOURCE_TAGS: OnceCell<Mutex<Vec<String>>> = OnceCell::new();
++
+ /// A global singleton storing additional state for Glean.
+ ///
+ /// Requires a Mutex, because in tests we can actual reset this.
+@@ -221,6 +226,29 @@ pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) {
+         with_glean_mut(|glean| {
+             let state = global_state().lock().unwrap();
+ 
++            // The debug view tag might have been set before initialize,
++            // get the cached value and set it.
++            if let Some(tag) = PRE_INIT_DEBUG_VIEW_TAG.get() {
++                let lock = tag.try_lock();
++                if let Ok(ref debug_tag) = lock {
++                    glean.set_debug_view_tag(debug_tag);
++                }
++            }
++            // The log pings debug option might have been set before initialize,
++            // get the cached value and set it.
++            let log_pigs = PRE_INIT_LOG_PINGS.load(Ordering::SeqCst);
++            if log_pigs {
++                glean.set_log_pings(log_pigs);
++            }
++            // The source tags might have been set before initialize,
++            // get the cached value and set them.
++            if let Some(tags) = PRE_INIT_SOURCE_TAGS.get() {
++                let lock = tags.try_lock();
++                if let Ok(ref source_tags) = lock {
++                    glean.set_source_tags(source_tags.to_vec());
++                }
++            }
++
+             // Get the current value of the dirty flag so we know whether to
+             // send a dirty startup baseline ping below.  Immediately set it to
+             // `false` so that dirty startup pings won't be sent if Glean
+@@ -400,12 +428,15 @@ pub fn register_ping_type(ping: &private::PingType) {
+ /// Collects and submits a ping for eventual uploading.
+ ///
+ /// See `glean_core::Glean.submit_ping`.
+-pub fn submit_ping(ping: &private::PingType, reason: Option<&str>) {
++pub(crate) fn submit_ping(ping: &private::PingType, reason: Option<&str>) {
+     submit_ping_by_name(&ping.name, reason)
+ }
+ 
+ /// Collects and submits a ping for eventual uploading by name.
+ ///
++/// Note that this needs to be public in order for RLB consumers to
++/// use Glean debugging facilities.
++///
+ /// See `glean_core::Glean.submit_ping_by_name`.
+ pub fn submit_ping_by_name(ping: &str, reason: Option<&str>) {
+     let ping = ping.to_string();
+@@ -428,7 +459,7 @@ pub fn submit_ping_by_name(ping: &str, reason: Option<&str>) {
+ /// queued for sending, unless explicitly specified otherwise in the registry
+ /// file.
+ ///
+-/// ## Arguments
++/// # Arguments
+ ///
+ /// * `ping_name` - the name of the ping to submit.
+ /// * `reason` - the reason the ping is being submitted.
+@@ -541,5 +572,76 @@ pub fn test_reset_glean(cfg: Configuration, client_info: ClientInfoMetrics, clea
+     initialize(cfg, client_info);
+ }
+ 
++/// Sets a debug view tag.
++///
++/// When the debug view tag is set, pings are sent with a `X-Debug-ID` header with the
++/// value of the tag and are sent to the ["Ping Debug Viewer"](https://mozilla.github.io/glean/book/dev/core/internal/debug-pings.html).
++///
++/// # Arguments
++///
++/// * `tag` - A valid HTTP header value. Must match the regex: "[a-zA-Z0-9-]{1,20}".
++///
++/// # Returns
++///
++/// This will return `false` in case `tag` is not a valid tag and `true` otherwise.
++/// If called before Glean is initialized it will always return `true`.
++pub fn set_debug_view_tag(tag: &str) -> bool {
++    if was_initialize_called() {
++        with_glean_mut(|glean| glean.set_debug_view_tag(tag))
++    } else {
++        // Glean has not been initialized yet. Cache the provided tag value.
++        let m = PRE_INIT_DEBUG_VIEW_TAG.get_or_init(Default::default);
++        let mut lock = m.lock().unwrap();
++        *lock = tag.to_string();
++        // When setting the debug view tag before initialization,
++        // we don't validate the tag, thus this function always returns true.
++        true
++    }
++}
++
++/// Sets the log pings debug option.
++///
++/// When the log pings debug option is `true`,
++/// we log the payload of all succesfully assembled pings.
++///
++/// # Arguments
++///
++/// * `value` - The value of the log pings option
++pub fn set_log_pings(value: bool) {
++    if was_initialize_called() {
++        with_glean_mut(|glean| glean.set_log_pings(value));
++    } else {
++        PRE_INIT_LOG_PINGS.store(value, Ordering::SeqCst);
++    }
++}
++
++/// Sets source tags.
++///
++/// Overrides any existing source tags.
++/// Source tags will show in the destination datasets, after ingestion.
++///
++/// # Arguments
++///
++/// * `tags` - A vector of at most 5 valid HTTP header values. Individual
++///   tags must match the regex: "[a-zA-Z0-9-]{1,20}".
++///
++/// # Returns
++///
++/// This will return `false` in case `value` contains invalid tags and `true`
++/// otherwise or if the tag is set before Glean is initialized.
++pub fn set_source_tags(tags: Vec<String>) -> bool {
++    if was_initialize_called() {
++        with_glean_mut(|glean| glean.set_source_tags(tags))
++    } else {
++        // Glean has not been initialized yet. Cache the provided source tags.
++        let m = PRE_INIT_SOURCE_TAGS.get_or_init(Default::default);
++        let mut lock = m.lock().unwrap();
++        *lock = tags;
++        // When setting the source tags before initialization,
++        // we don't validate the tags, thus this function always returns true.
++        true
++    }
++}
++
+ #[cfg(test)]
+ mod test;
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -240,7 +240,7 @@ fn queued_recorded_metrics_correctly_record_during_init() {
+ 
+     // Calling `new_glean` here will cause Glean to be initialized and should cause the queued
+     // tasks recording metrics to execute
+-    let _ = new_glean(None, false);
++    let _t = new_glean(None, false);
+ 
+     // Verify that the callback was executed by testing for the correct value
+     assert!(metric.test_get_value(None).is_some(), "Value must exist");
+@@ -354,6 +354,128 @@ fn test_dirty_flag_is_reset_to_false() {
+     todo!()
+ }
+ 
++#[test]
++fn setting_debug_view_tag_before_initialization_should_not_crash() {
++    let _lock = lock_test();
++
++    destroy_glean(true);
++    assert!(!was_initialize_called());
++
++    // Define a fake uploader that reports back the submission headers
++    // using a crossbeam channel.
++    let (s, r) = crossbeam_channel::bounded::<Vec<(String, String)>>(1);
++
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<Vec<(String, String)>>,
++    };
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            _url: String,
++            _body: Vec<u8>,
++            headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            self.sender.send(headers).unwrap();
++            net::UploadResult::HttpStatus(200)
++        }
++    }
++
++    // Attempt to set a debug view tag before Glean is initialized.
++    set_debug_view_tag("valid-tag");
++
++    // Create a custom configuration to use a fake uploader.
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    let cfg = Configuration {
++        data_path: tmpname,
++        application_id: GLOBAL_APPLICATION_ID.into(),
++        upload_enabled: true,
++        max_events: None,
++        delay_ping_lifetime_io: false,
++        channel: Some("testing".into()),
++        server_endpoint: Some("invalid-test-host".into()),
++        uploader: Some(Box::new(FakeUploader { sender: s })),
++    };
++
++    let _t = new_glean(Some(cfg), true);
++    crate::dispatcher::block_on_queue();
++
++    // Submit a baseline ping.
++    submit_ping_by_name("baseline", Some("background"));
++
++    // Wait for the ping to arrive.
++    let headers = r.recv().unwrap();
++    assert_eq!(
++        "valid-tag",
++        headers.iter().find(|&kv| kv.0 == "X-Debug-ID").unwrap().1
++    );
++}
++
++#[test]
++fn setting_source_tags_before_initialization_should_not_crash() {
++    let _lock = lock_test();
++
++    destroy_glean(true);
++    assert!(!was_initialize_called());
++
++    // Define a fake uploader that reports back the submission headers
++    // using a crossbeam channel.
++    let (s, r) = crossbeam_channel::bounded::<Vec<(String, String)>>(1);
++
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<Vec<(String, String)>>,
++    };
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            _url: String,
++            _body: Vec<u8>,
++            headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            self.sender.send(headers).unwrap();
++            net::UploadResult::HttpStatus(200)
++        }
++    }
++
++    // Attempt to set source tags before Glean is initialized.
++    set_source_tags(vec!["valid-tag1".to_string(), "valid-tag2".to_string()]);
++
++    // Create a custom configuration to use a fake uploader.
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    let cfg = Configuration {
++        data_path: tmpname,
++        application_id: GLOBAL_APPLICATION_ID.into(),
++        upload_enabled: true,
++        max_events: None,
++        delay_ping_lifetime_io: false,
++        channel: Some("testing".into()),
++        server_endpoint: Some("invalid-test-host".into()),
++        uploader: Some(Box::new(FakeUploader { sender: s })),
++    };
++
++    let _t = new_glean(Some(cfg), true);
++    crate::dispatcher::block_on_queue();
++
++    // Submit a baseline ping.
++    submit_ping_by_name("baseline", Some("background"));
++
++    // Wait for the ping to arrive.
++    let headers = r.recv().unwrap();
++    assert_eq!(
++        "valid-tag1,valid-tag2",
++        headers
++            .iter()
++            .find(|&kv| kv.0 == "X-Source-Tags")
++            .unwrap()
++            .1
++    );
++}
++
+ #[test]
+ #[ignore] // TODO: To be done in bug 1673672.
+ fn flipping_upload_enabled_respects_order_of_events() {
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>use super::set_debug_view_tag;
+use super::submit_ping_by_name;
+use super::initialize;
+use super::Configuration;
+use super::ClientInfoMetrics;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::OnceCell;
+use std::sync::Mutex;
+use std::vec::Vec;
+use std::thread;
+use std::time::Duration;
+use std::cell::OnceCell as CellOnceCell;</imports>
+<Rust>#[test]
+fn test_set_debug_view_tag_before_initialization() {
+  let initialize_called = AtomicBool::new(false);
+  let pre_init_debug_view_tag = CellOnceCell::new();
+  let pre_init_log_pings = AtomicBool::new(false);
+  let pre_init_source_tags = CellOnceCell::new();
+  let cfg = Configuration {
+    data_path: "/tmp".to_string(),
+    application_id: "test".to_string(),
+    upload_enabled: true,
+    max_events: None,
+    delay_ping_lifetime_io: false,
+    channel: Some("testing".to_string()),
+    server_endpoint: Some("invalid-test-host".to_string()),
+    uploader: None,
+  };
+  let client_info = ClientInfoMetrics {
+    app_display_version: "1.0".to_string(),
+    app_build: "123".to_string(),
+  };
+  assert_eq!(set_debug_view_tag("test-tag"), true);
+  initialize(cfg, client_info);
+  assert_eq!(set_debug_view_tag("test-tag"), true);
+  thread::sleep(Duration::from_millis(100));
+  submit_ping_by_name("baseline", Some("background"));
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `std::sync::OnceCell`
+   --> glean-core/rlb/src/test.rs:494:5
+    |
+494 | use std::sync::OnceCell;
+    |     ^^^^^^^^^^^^^^^^^^^ no `OnceCell` in `sync`
+    |
+help: consider importing one of these structs instead
+    |
+494 - use std::sync::OnceCell;
+494 + use crate::OnceCell;
+    |
+494 - use std::sync::OnceCell;
+494 + use std::cell::OnceCell;
+    |
+494 - use std::sync::OnceCell;
+494 + use once_cell::sync::OnceCell;
+    |
+494 - use std::sync::OnceCell;
+494 + use once_cell::unsync::OnceCell;
+    |
+
+error[E0282]: type annotations needed for `std::cell::OnceCell<_>`
+   --> glean-core/rlb/src/test.rs:504:7
+    |
+504 |   let pre_init_debug_view_tag = CellOnceCell::new();
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider giving `pre_init_debug_view_tag` an explicit type, where the type for type parameter `T` is specified
+    |
+504 |   let pre_init_debug_view_tag: std::cell::OnceCell<T> = CellOnceCell::new();
+    |                              ++++++++++++++++++++++++
+</output>
+
+Function signatures
+<Signatures>
+pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) -> ()
+
+pub fn submit_ping_by_name(ping: &str, reason: Option<&str>) -> ()
+
+pub fn register_ping_type(ping: &private::PingType) -> ()
+
+fn queued_recorded_metrics_correctly_record_during_init() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,591 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement the 'baseline' ping scheduling in the RLB
+This bug is about implementing the 'baseline' ping scheduling. On non-mobile platform the concept of "activity" may vary. For this reason, we may need to expose a new API:
+
+- `set_inactive` to signal glean-core that the product is now inactive (e.g. going to background on mobile)
+- `set_active` to signal glean-core that the product is now active (e.g. going back to foreground on mobile)
+
+The same APIs can be used in FOG to model different concepts of activity. Prior art is available in [this document](https://docs.google.com/document/d/17D5K--z8GC-vU8t1sKwziTwexQTtDzYB99xDzhUIjiI/edit#heading=h.h63xdax27lqt).
+
+@chutten, @janerik what do you think of this API? Do you want me to write a short proposal?
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/lib.rs b/glean-core/ffi/src/lib.rs
+--- a/glean-core/ffi/src/lib.rs
++++ b/glean-core/ffi/src/lib.rs
+@@ -409,6 +409,16 @@ pub extern "C" fn glean_is_dirty_flag_set() -> u8 {
+     with_glean_value(|glean| glean.is_dirty_flag_set())
+ }
+ 
++#[no_mangle]
++pub extern "C" fn glean_handle_client_active() {
++    with_glean_value_mut(|glean| glean.handle_client_active());
++}
++
++#[no_mangle]
++pub extern "C" fn glean_handle_client_inactive() {
++    with_glean_value_mut(|glean| glean.handle_client_inactive());
++}
++
+ #[no_mangle]
+ pub extern "C" fn glean_test_clear_all_stores() {
+     with_glean_value(|glean| glean.test_clear_all_stores())
+
+diff --git a/glean-core/rlb/src/core_metrics.rs b/glean-core/rlb/src/core_metrics.rs
+--- a/glean-core/rlb/src/core_metrics.rs
++++ b/glean-core/rlb/src/core_metrics.rs
+@@ -2,8 +2,8 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use crate::private::StringMetric;
+-use crate::{CommonMetricData, Lifetime};
++use crate::private::{StringMetric, TimespanMetric};
++use crate::{CommonMetricData, Lifetime, TimeUnit};
+ 
+ use once_cell::sync::Lazy;
+ 
+@@ -26,10 +26,10 @@ impl ClientInfoMetrics {
+     }
+ }
+ 
++#[allow(non_upper_case_globals)]
+ pub mod internal_metrics {
+     use super::*;
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static app_build: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "app_build".into(),
+@@ -41,7 +41,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static app_display_version: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "app_display_version".into(),
+@@ -53,7 +52,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static app_channel: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "app_channel".into(),
+@@ -65,7 +63,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static os_version: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "os_version".into(),
+@@ -77,7 +74,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static architecture: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "architecture".into(),
+@@ -89,7 +85,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static device_manufacturer: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "device_manufacturer".into(),
+@@ -101,7 +96,6 @@ pub mod internal_metrics {
+         })
+     });
+ 
+-    #[allow(non_upper_case_globals)]
+     pub static device_model: Lazy<StringMetric> = Lazy::new(|| {
+         StringMetric::new(CommonMetricData {
+             name: "device_model".into(),
+@@ -112,4 +106,18 @@ pub mod internal_metrics {
+             ..Default::default()
+         })
+     });
++
++    pub static baseline_duration: Lazy<TimespanMetric> = Lazy::new(|| {
++        TimespanMetric::new(
++            CommonMetricData {
++                name: "duration".into(),
++                category: "glean.baseline".into(),
++                send_in_pings: vec!["baseline".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                ..Default::default()
++            },
++            TimeUnit::Second,
++        )
++    });
+ }
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -297,7 +297,17 @@ pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) {
+                 // force-closed. If that's the case, submit a 'baseline' ping with the
+                 // reason "dirty_startup". We only do that from the second run.
+                 if !is_first_run && dirty_flag {
+-                    // TODO: bug 1672956 - submit_ping_by_name_sync("baseline", "dirty_startup");
++                    // The `submit_ping_by_name_sync` function cannot be used, otherwise
++                    // startup will cause a dead-lock, since that function requests a
++                    // write lock on the `glean` object.
++                    // Note that unwrapping below is safe: the function will return an
++                    // `Ok` value for a known ping.
++                    if glean
++                        .submit_ping_by_name("baseline", Some("dirty_startup"))
++                        .unwrap()
++                    {
++                        state.upload_manager.trigger_upload();
++                    }
+                 }
+ 
+                 // From the second time we run, after all startup pings are generated,
+@@ -574,6 +584,57 @@ pub fn set_experiment_inactive(experiment_id: String) {
+     })
+ }
+ 
++/// Performs the collection/cleanup operations required by becoming active.
++///
++/// This functions generates a baseline ping with reason `active`
++/// and then sets the dirty bit.
++/// This should be called whenever the consuming product becomes active (e.g.
++/// getting to foreground).
++pub fn handle_client_active() {
++    dispatcher::launch(move || {
++        with_glean_mut(|glean| {
++            glean.handle_client_active();
++
++            // The above call may generate pings, so we need to trigger
++            // the uploader. It's fine to trigger it if no ping was generated:
++            // it will bail out.
++            let state = global_state().lock().unwrap();
++            state.upload_manager.trigger_upload();
++        })
++    });
++
++    // The previous block of code may send a ping containing the `duration` metric,
++    // in `glean.handle_client_active`. We intentionally start recording a new
++    // `duration` after that happens, so that the measurement gets reported when
++    // calling `handle_client_inactive`.
++    core_metrics::internal_metrics::baseline_duration.start();
++}
++
++/// Performs the collection/cleanup operations required by becoming inactive.
++///
++/// This functions generates a baseline and an events ping with reason
++/// `inactive` and then clears the dirty bit.
++/// This should be called whenever the consuming product becomes inactive (e.g.
++/// getting to background).
++pub fn handle_client_inactive() {
++    // This needs to be called before the `handle_client_inactive` api: it stops
++    // measuring the duration of the previous activity time, before any ping is sent
++    // by the next call.
++    core_metrics::internal_metrics::baseline_duration.stop();
++
++    dispatcher::launch(move || {
++        with_glean_mut(|glean| {
++            glean.handle_client_inactive();
++
++            // The above call may generate pings, so we need to trigger
++            // the uploader. It's fine to trigger it if no ping was generated:
++            // it will bail out.
++            let state = global_state().lock().unwrap();
++            state.upload_manager.trigger_upload();
++        })
++    })
++}
++
+ /// TEST ONLY FUNCTION.
+ /// Checks if an experiment is currently active.
+ #[allow(dead_code)]
+
+diff --git a/glean-core/rlb/src/test.rs b/glean-core/rlb/src/test.rs
+--- a/glean-core/rlb/src/test.rs
++++ b/glean-core/rlb/src/test.rs
+@@ -3,7 +3,7 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use crate::private::PingType;
+-use crate::private::{BooleanMetric, CounterMetric};
++use crate::private::{BooleanMetric, CounterMetric, EventMetric};
+ use std::path::PathBuf;
+ 
+ use super::*;
+@@ -171,15 +171,143 @@ fn test_experiments_recording_before_glean_inits() {
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1673645.
+-fn test_sending_of_foreground_background_pings() {
+-    todo!()
++fn sending_of_foreground_background_pings() {
++    let _lock = lock_test();
++
++    let click: EventMetric<traits::NoExtraKeys> = private::EventMetric::new(CommonMetricData {
++        name: "click".into(),
++        category: "ui".into(),
++        send_in_pings: vec!["events".into()],
++        lifetime: Lifetime::Ping,
++        disabled: false,
++        ..Default::default()
++    });
++
++    // Define a fake uploader that reports back the submission headers
++    // using a crossbeam channel.
++    let (s, r) = crossbeam_channel::bounded::<String>(3);
++
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<String>,
++    }
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            url: String,
++            _body: Vec<u8>,
++            _headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            self.sender.send(url).unwrap();
++            net::UploadResult::HttpStatus(200)
++        }
++    }
++
++    // Create a custom configuration to use a fake uploader.
++    let dir = tempfile::tempdir().unwrap();
++    let tmpname = dir.path().display().to_string();
++
++    let cfg = Configuration {
++        data_path: tmpname,
++        application_id: GLOBAL_APPLICATION_ID.into(),
++        upload_enabled: true,
++        max_events: None,
++        delay_ping_lifetime_io: false,
++        channel: Some("testing".into()),
++        server_endpoint: Some("invalid-test-host".into()),
++        uploader: Some(Box::new(FakeUploader { sender: s })),
++    };
++
++    let _t = new_glean(Some(cfg), true);
++    crate::block_on_dispatcher();
++
++    // Simulate becoming active.
++    handle_client_active();
++
++    // We expect a baseline ping to be generated here (reason: 'active').
++    let url = r.recv().unwrap();
++    assert!(url.contains("baseline"));
++
++    // Recording an event so that an "events" ping will contain data.
++    click.record(None);
++
++    // Simulate becoming inactive
++    handle_client_inactive();
++
++    // Wait for the pings to arrive.
++    let mut expected_pings = vec!["baseline", "events"];
++    for _ in 0..2 {
++        let url = r.recv().unwrap();
++        // If the url contains the expected reason, remove it from the list.
++        expected_pings.retain(|&name| !url.contains(name));
++    }
++    // We received all the expected pings.
++    assert_eq!(0, expected_pings.len());
++
++    // Simulate becoming active again.
++    handle_client_active();
++
++    // We expect a baseline ping to be generated here (reason: 'active').
++    let url = r.recv().unwrap();
++    assert!(url.contains("baseline"));
+ }
+ 
+ #[test]
+-#[ignore] // TODO: To be done in bug 1672958.
+-fn test_sending_of_startup_baseline_ping() {
+-    todo!()
++fn sending_of_startup_baseline_ping() {
++    let _lock = lock_test();
++
++    // Create an instance of Glean, wait for init and then flip the dirty
++    // bit to true.
++    let data_dir = new_glean(None, true);
++
++    crate::block_on_dispatcher();
++
++    with_glean_mut(|glean| glean.set_dirty_flag(true));
++
++    // Restart glean and wait for a baseline ping to be generated.
++    let (s, r) = crossbeam_channel::bounded::<String>(1);
++
++    // Define a fake uploader that reports back the submission URL
++    // using a crossbeam channel.
++    #[derive(Debug)]
++    pub struct FakeUploader {
++        sender: crossbeam_channel::Sender<String>,
++    }
++    impl net::PingUploader for FakeUploader {
++        fn upload(
++            &self,
++            url: String,
++            _body: Vec<u8>,
++            _headers: Vec<(String, String)>,
++        ) -> net::UploadResult {
++            self.sender.send(url).unwrap();
++            net::UploadResult::HttpStatus(200)
++        }
++    }
++
++    // Create a custom configuration to use a fake uploader.
++    let tmpname = data_dir.path().display().to_string();
++
++    // Now reset Glean: it should still send a baseline ping with reason
++    // dirty_startup when starting, because of the dirty bit being set.
++    test_reset_glean(
++        Configuration {
++            data_path: tmpname,
++            application_id: GLOBAL_APPLICATION_ID.into(),
++            upload_enabled: true,
++            max_events: None,
++            delay_ping_lifetime_io: false,
++            channel: Some("testing".into()),
++            server_endpoint: Some("invalid-test-host".into()),
++            uploader: Some(Box::new(FakeUploader { sender: s })),
++        },
++        ClientInfoMetrics::unknown(),
++        false,
++    );
++
++    // Wait for the ping to arrive.
++    let url = r.recv().unwrap();
++    assert_eq!(url.contains("baseline"), true);
+ }
+ 
+ #[test]
+
+diff --git a/glean-core/src/internal_pings.rs b/glean-core/src/internal_pings.rs
+--- a/glean-core/src/internal_pings.rs
++++ b/glean-core/src/internal_pings.rs
+@@ -21,7 +21,16 @@ pub struct InternalPings {
+ impl InternalPings {
+     pub fn new() -> InternalPings {
+         InternalPings {
+-            baseline: PingType::new("baseline", true, false, vec![]),
++            baseline: PingType::new(
++                "baseline",
++                true,
++                false,
++                vec![
++                    "active".to_string(),
++                    "dirty_startup".to_string(),
++                    "inactive".to_string(),
++                ],
++            ),
+             metrics: PingType::new(
+                 "metrics",
+                 true,
+@@ -34,7 +43,16 @@ impl InternalPings {
+                     "upgrade".to_string(),
+                 ],
+             ),
+-            events: PingType::new("events", true, false, vec![]),
++            events: PingType::new(
++                "events",
++                true,
++                false,
++                vec![
++                    "startup".to_string(),
++                    "inactive".to_string(),
++                    "max_capacity".to_string(),
++                ],
++            ),
+             deletion_request: PingType::new("deletion-request", true, true, vec![]),
+         }
+     }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -882,6 +882,34 @@ impl Glean {
+         }
+     }
+ 
++    /// Performs the collection/cleanup operations required by becoming active.
++    ///
++    /// This functions generates a baseline ping with reason `active`
++    /// and then sets the dirty bit.
++    pub fn handle_client_active(&mut self) {
++        if let Err(err) = self.internal_pings.baseline.submit(self, Some("active")) {
++            log::warn!("Failed to submit baseline ping on active: {}", err);
++        }
++
++        self.set_dirty_flag(true);
++    }
++
++    /// Performs the collection/cleanup operations required by becoming inactive.
++    ///
++    /// This functions generates a baseline and an events ping with reason
++    /// `inactive` and then clears the dirty bit.
++    pub fn handle_client_inactive(&mut self) {
++        if let Err(err) = self.internal_pings.baseline.submit(self, Some("inactive")) {
++            log::warn!("Failed to submit baseline ping on inactive: {}", err);
++        }
++
++        if let Err(err) = self.internal_pings.events.submit(self, Some("inactive")) {
++            log::warn!("Failed to submit events ping on inactive: {}", err);
++        }
++
++        self.set_dirty_flag(false);
++    }
++
+     /// **Test-only API (exported for FFI purposes).**
+     ///
+     /// Checks if an experiment is currently active.
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -907,3 +907,23 @@ fn records_io_errors() {
+     let submitted = glean.internal_pings.metrics.submit(&glean, None);
+     assert!(submitted.is_ok());
+ }
++
++#[test]
++fn test_activity_api() {
++    let _ = env_logger::builder().is_test(true).try_init();
++
++    let dir = tempfile::tempdir().unwrap();
++    let (mut glean, _) = new_glean(Some(dir));
++
++    // Signal that the client was active.
++    glean.handle_client_active();
++
++    // Check that we set everything we needed for the 'active' status.
++    assert!(glean.is_dirty_flag_set());
++
++    // Signal back that client is ianctive.
++    glean.handle_client_inactive();
++
++    // Check that we set everything we needed for the 'inactuve' status.
++    assert!(!glean.is_dirty_flag_set());
++}
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/lib_unit_tests.rs</Filename>
+<imports>use super::handle_client_active;
+use super::handle_client_inactive;
+use super::Glean;
+use tempfile::tempdir;</imports>
+<Rust>#[test]
+fn test_activity_api_behavior() {
+    let dir = tempdir().unwrap();
+    let (mut glean, _) = Glean::new(Some(dir));
+
+    handle_client_active(&mut glean);
+    assert!(glean.is_dirty_flag_set());
+
+    handle_client_inactive(&mut glean);
+    assert!(!glean.is_dirty_flag_set());
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `super::handle_client_active`
+   --> glean-core/src/lib_unit_tests.rs:933:5
+    |
+933 | use super::handle_client_active;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `handle_client_active` in `tests`
+
+error[E0432]: unresolved import `super::handle_client_inactive`
+   --> glean-core/src/lib_unit_tests.rs:934:5
+    |
+934 | use super::handle_client_inactive;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `handle_client_inactive` in `tests`
+
+error[E0308]: mismatched types
+   --> glean-core/src/lib_unit_tests.rs:941:37
+    |
+941 |     let (mut glean, _) = Glean::new(Some(dir));
+    |                          ---------- ^^^^^^^^^ expected `Configuration`, found `Option<TempDir>`
+    |                          |
+    |                          arguments to this function are incorrect
+    |
+    = note: expected struct `Configuration`
+                 found enum `std::option::Option<TempDir>`
+note: associated function defined here
+   --> glean-core/src/lib.rs:241:12
+    |
+241 |     pub fn new(cfg: Configuration) -> Result<Self> {
+    |            ^^^ ------------------
+
+error[E0308]: mismatched types
+   --> glean-core/src/lib_unit_tests.rs:941:9
+    |
+941 |     let (mut glean, _) = Glean::new(Some(dir));
+    |         ^^^^^^^^^^^^^^   --------------------- this expression has type `std::result::Result<Glean, error::Error>`
+    |         |
+    |         expected `Result<Glean, Error>`, found `(_, _)`
+    |
+    = note: expected enum `std::result::Result<Glean, error::Error>`
+              found tuple `(_, _)`
+</output>
+
+Function signatures
+<Signatures>
+fn glean_is_dirty_flag_set() -> u8
+
+pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) -> ()
+
+pub fn set_experiment_inactive(experiment_id: String) -> ()
+
+fn records_io_errors() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,187 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Bump the limit for the URL metric type to 8k and support truncation
+[Original GH Issue](https://github.com/mozilla/glean.js/issues/1508)
+
+Glean imposes limits on certain metric types, e.g.
+- max length of 100 for strings: https://mozilla.github.io/glean/book/reference/metrics/string.html#limits
+- max length of 2048 for URLs: https://mozilla.github.io/glean/book/reference/metrics/url.html#limits
+- and so on
+
+Glean.js enforces these limits on the client side, so it would be great if **these constants could be exported** so that they can be checked before setting metrics. This would allow the client to e.g. skip a metric, or truncate it, without producing an `invalid_overflow` error.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/metrics/url.rs b/glean-core/src/metrics/url.rs
+--- a/glean-core/src/metrics/url.rs
++++ b/glean-core/src/metrics/url.rs
+@@ -8,11 +8,12 @@ use crate::error_recording::{record_error, test_get_num_recorded_errors, ErrorTy
+ use crate::metrics::Metric;
+ use crate::metrics::MetricType;
+ use crate::storage::StorageManager;
++use crate::util::truncate_string_at_boundary_with_error;
+ use crate::CommonMetricData;
+ use crate::Glean;
+ 
+ // The maximum number of characters a URL Metric may have, before encoding.
+-const MAX_URL_LENGTH: usize = 2048;
++const MAX_URL_LENGTH: usize = 8192;
+ 
+ /// A URL metric.
+ ///
+@@ -80,16 +81,7 @@ impl UrlMetric {
+             return;
+         }
+ 
+-        let s = value.into();
+-        if s.len() > MAX_URL_LENGTH {
+-            let msg = format!(
+-                "Value length {} exceeds maximum of {}",
+-                s.len(),
+-                MAX_URL_LENGTH
+-            );
+-            record_error(glean, &self.meta, ErrorType::InvalidOverflow, msg, None);
+-            return;
+-        }
++        let s = truncate_string_at_boundary_with_error(glean, &self.meta, value, MAX_URL_LENGTH);
+ 
+         if s.starts_with("data:") {
+             record_error(
+@@ -204,12 +196,24 @@ mod test {
+             dynamic_label: None,
+         });
+ 
+-        let long_path = "testing".repeat(2000);
+-        let test_url = format!("glean://{}", long_path);
++        // Whenever the URL is longer than our MAX_URL_LENGTH, we truncate the URL to the
++        // MAX_URL_LENGTH.
++        //
++        // This 8-character string was chosen so we could have an even number that is
++        // a divisor of our MAX_URL_LENGTH.
++        let long_path_base = "abcdefgh";
++
++        // Using 2000 creates a string > 16000 characters, well over MAX_URL_LENGTH.
++        let test_url = format!("glean://{}", long_path_base.repeat(2000));
+         metric.set_sync(&glean, test_url);
+ 
+-        assert!(metric.get_value(&glean, "store1").is_none());
++        // "glean://" is 8 characters
++        // "abcdefgh" (long_path_base) is 8 characters
++        // `long_path_base` is repeated 1023 times (8184)
++        // 8 + 8184 = 8192 (MAX_URL_LENGTH)
++        let expected = format!("glean://{}", long_path_base.repeat(1023));
+ 
++        assert_eq!(metric.get_value(&glean, "store1").unwrap(), expected);
+         assert_eq!(
+             1,
+             test_get_num_recorded_errors(&glean, metric.meta(), ErrorType::InvalidOverflow)
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/metrics/url.rs</Filename>
+<imports>use crate::CommonMetricData;
+use crate::Glean;
+use crate::UrlMetric;</imports>
+<Rust>#[test]
+fn test_url_truncation_to_max_length() {
+    let metric = UrlMetric::new(CommonMetricData {
+        category: "test_category".to_string(),
+        name: "test_url".to_string(),
+        send_in_pings: vec!["store1".to_string()],
+        ..Default::default()
+    });
+    let mut glean = Glean::new(None, None).unwrap();
+    let long_url = "a".repeat(8192 + 1); // Exceeds the new max length by 1
+    metric.set_sync(&glean, &long_url);
+    let stored = metric.get_value(&glean, "store1").unwrap();
+    assert_eq!(stored.len(), 8192);
+    assert_eq!(
+        test_get_num_recorded_errors(&glean, metric.meta(), ErrorType::InvalidOverflow),
+        1
+    );
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0061]: this function takes 1 argument but 2 arguments were supplied
+   --> glean-core/src/metrics/url.rs:324:25
+    |
+324 |         let mut glean = Glean::new(None, None).unwrap();
+    |                         ^^^^^^^^^^       ---- unexpected argument #2 of type `std::option::Option<_>`
+    |
+note: expected `InternalConfiguration`, found `Option<_>`
+   --> glean-core/src/metrics/url.rs:324:36
+    |
+324 |         let mut glean = Glean::new(None, None).unwrap();
+    |                                    ^^^^
+    = note: expected struct `InternalConfiguration`
+                 found enum `std::option::Option<_>`
+note: associated function defined here
+   --> glean-core/src/core/mod.rs:220:12
+    |
+220 |     pub fn new(cfg: InternalConfiguration) -> Result<Self> {
+    |            ^^^ --------------------------
+help: remove the extra argument
+    |
+324 -         let mut glean = Glean::new(None, None).unwrap();
+324 +         let mut glean = Glean::new(/* InternalConfiguration */).unwrap();
+    |
+
+error[E0308]: mismatched types
+   --> glean-core/src/metrics/url.rs:331:13
+    |
+331 |             1
+    |             ^ expected `Result<i32, String>`, found integer
+    |
+    = note: expected enum `std::result::Result<i32, std::string::String>`
+               found type `{integer}`
+help: try wrapping the expression in `Ok`
+    |
+331 |             Ok(1)
+    |             +++ +
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

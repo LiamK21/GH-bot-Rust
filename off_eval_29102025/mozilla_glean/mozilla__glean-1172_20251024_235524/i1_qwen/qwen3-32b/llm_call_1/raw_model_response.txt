@@ -1,0 +1,257 @@
+<think>
+Okay, so I need to create a regression test for the issue where the `accumulate_samples_signed` functions in the distribution metrics aren't checking if they should record before doing so. The patch adds a `should_record` check in those functions. 
+
+First, I should identify which files have the modified functions. The issue mentions custom_distribution.rs, memory_distribution.rs, and timing_distribution.rs. Each of these files has the `accumulate_samples_signed` function now including the `should_record` check.
+
+The goal is to write a test that verifies that when upload is disabled, these functions do not record any samples. 
+
+Looking at the existing tests in the patch, there's a new test in the Database and EventDatabase modules. But for the distribution metrics, perhaps a unit test is missing. Since the user is asking for a unit test, I should focus on one of the distribution types. Let's pick the TimingDistributionMetric as an example since it's commonly used.
+
+The function to test is `accumulate_samples_signed` in TimingDistributionMetric. The test needs to:
+
+1. Create a TimingDistributionMetric instance.
+2. Set up Glean with upload disabled.
+3. Call accumulate_samples_signed with some samples.
+4. Check that no data is recorded in the database.
+
+But how to verify that nothing was recorded? Maybe by checking the stored metric data. However, the test might need access to the database. Alternatively, since the `should_record` function is used, and it's part of the metric's CommonMetricData, perhaps the test can check if the metric's internal state remains unchanged when upload is disabled.
+
+Wait, the existing test in the Database's `doesnt_record_when_upload_is_disabled` checks that the `record` functions don't persist data when upload is disabled. Maybe a similar approach can be used here. For the distribution metric, after calling accumulate_samples_signed with upload disabled, we can check if the metric's stored data is empty or hasn't changed.
+
+But how to inspect the internal state of the metric? The metric might be stored in the database, which is managed by Glean. So perhaps the test needs to initialize Glean, create the metric, call the accumulate function with upload disabled, and then check the database to ensure no data was written.
+
+However, setting up Glean for each test might be complex. Maybe the test can use the temporary directory as in other tests, create a Glean instance, and then check the stored data.
+
+Wait, the test for the Database in the patch uses a test helper function `new_glean`. I can use that. Let's outline the steps for the test:
+
+- Use `new_glean` to create a Glean instance with a temporary directory.
+- Create a TimingDistributionMetric instance with CommonMetricData.
+- Enable upload, accumulate some samples, disable upload and accumulate again.
+- Then check the database to ensure that only the samples from the enabled state are present.
+
+But how to check the database? The Database's `iter_store_from` function can be used to iterate over stored metrics. The test can check after disabling upload that the stored data hasn't included the new samples.
+
+Wait, in the `accumulate_samples_signed` function, the actual recording is done via the Glean instance. The `should_record` check is in the metric's method, which would prevent the samples from being sent, but the metric might be stored in the database with the accumulated data. Wait, no: the `accumulate_samples_signed` function is part of the metric, and the patch adds the `should_record` check before processing the samples. So if upload is disabled, the samples won't be added to the metric's internal state, and thus when the metric is recorded to the database, it should not include those samples.
+
+Wait, no. The metric's internal state (like the histogram) is part of the metric struct. When recording data, the metric's internal state is updated. However, Glean might not send the data to the server unless upload is enabled. So the internal state might be updated even when upload is disabled, but not persisted to the database. Or perhaps the recording to the database is conditional on upload being enabled.
+
+Wait, the original issue was that the `accumulate_samples_signed` functions didn't check `should_record` before adding the samples. So even if upload is disabled, the samples were added to the metric's internal data. But with the fix, the samples are only added if upload is enabled. So the internal state of the metric won't be updated when upload is disabled, so when the metric is persisted, the samples added during the disabled state won't be there.
+
+But how to test that the internal state is not updated? Maybe by checking the stored metric data in the database. If the samples are only added when upload is enabled, then after disabling upload and calling accumulate_samples_signed again, the stored data should not include those samples.
+
+So here's the plan for the test:
+
+1. Create a TimingDistributionMetric with a known test identifier.
+2. Enable upload, call accumulate_samples_signed with some samples. This should update the metric's internal state.
+3. Disable upload, call accumulate_samples_signed with more samples. Since upload is disabled, these new samples should not be added to the metric's internal state.
+4. Read back the metric from the database and verify that only the initial samples are present.
+
+But how to access the database and read the metric's stored data? Using the `record` functions, perhaps the test can check the metric's internal state directly. However, the metric's internal state (like the histogram) is private. So maybe the test can compare the metric's data before and after.
+
+Alternatively, since the `accumulate_samples_signed` function is part of the TimingDistributionMetric, maybe we can test that when upload is disabled, the histogram isn't modified. But how? The test would need access to the internal state.
+
+This might be tricky. Another approach is to use the `TestingOnlyGetMetricNumRecordedLocks` or similar testing APIs if available. However, assuming those are not exposed, perhaps the test can check the database to see if the metric's stored data includes the samples only when upload is enabled.
+
+Looking at the existing test in `database/mod.rs#test_doesnt_record_when_upload_is_disabled`, they create a metric, record it, check the database, disable upload, record again, and verify that the database has not changed. So perhaps for distributions, we can do something similar.
+
+Here's a possible test outline:
+
+- Use `new_glean` to create a Glean instance with a temporary directory.
+- Create a TimingDistributionMetric with a known identifier and storage name.
+- Call accumulate_samples_signed with some samples when upload is enabled. Then check that the metric's data in the database includes those samples.
+- Disable upload.
+- Call accumulate_samples_signed again with new samples. Then check that the database has not changed beyond the initial samples.
+
+But how to check the stored data? For distributions, the stored data is a `Metric::TimingDistribution`. So the test can iterate over the database entries for the metric and verify the data.
+
+Let's structure the test accordingly.
+
+First, we need to import necessary modules. The test will need to use `new_glean`, `CommonMetricData`, `Glean`, `Database`, etc.
+
+So the imports would be:
+
+use super::TimingDistributionMetric;
+use super::CommonMetricData;
+use crate::tests::new_glean;
+use glean::Glean;
+use std::collections::Metric; // Assuming this is the correct path; but actual paths might differ.
+
+Wait, but the actual code might have different module structures. For example, the `TimingDistributionMetric` is in `glean-core/src/metrics/timing_distribution.rs`. So when writing the test, the function under test is in that module, and the test is probably in a `test` module within the same file.
+
+But the user's instruction is to write a test function for one of the modified functions. So for `TimingDistributionMetric::accumulate_samples_signed`, the test should live in the same file as the metric or in a test module.
+
+Assuming the existing patch includes tests in the same module, the test in the TimingDistributionMetric's test section would be in the same file.
+
+But in the provided patch, the TimingDistributionMetric's test isn't shown. The user wants a new test in the same file as the modified function.
+
+But the user's instruction is to return the filename where the test is added. The TimingDistributionMetric code is in `glean-core/src/metrics/timing_distribution.rs`. So the test should be added there, in the `#[cfg(test)] mod test { ... }` block.
+
+Wait, the existing test for `accumulate_samples_signed` is not present in the provided code. The patch added the `should_record` check but doesn't show any existing tests for it. However, the user's patch shows that the Database's `record` functions now have tests for upload disabled. The custom distribution's patch added a test for `accumulate_samples_signed` in the `custom_distribution.rs`.
+
+Looking back, the `custom_distribution.rs` in the patch has a test for `accumulate_samples_signed`. Let me check:
+
+In the patch for `custom_distribution.rs`, there's no test addition. Hmm. So maybe the user expects a test in one of these files.
+
+But according to the user's problem statement, the issue is that the custom, memory, and timing distributions don't check should_record in their accumulate_samples_signed function. The patch adds the check in those three files. So the tests for these functions are needed.
+
+But the user says that if a test is needed, write one. So in this case, for example, the TimingDistributionMetric's `accumulate_samples_signed` needs a test that when upload is disabled, the function doesn't record samples.
+
+So the test should be added to the TimingDistributionMetric's test module.
+
+The steps for the test are:
+
+- Create a TimingDistributionMetric with known settings.
+- Initialize Glean with upload enabled.
+- Call accumulate_samples_signed with some samples.
+- Check that the metric's database entry exists and includes the samples.
+- Disable upload.
+- Call accumulate_samples_signed again with more samples.
+- Check that the metric's database entry still only has the initial samples.
+
+The test can use the Database's `record_with_store` or other methods to read the stored metric data.
+
+So the code would look something like this:
+
+Use `new_glean` to set up a Glean instance. Then create a TimingDistributionMetric. Accumulate samples, check that the metric is in the database. Then disable upload and repeat.
+
+But how to get the stored value? The test would have to read from the database.
+
+In the `TimingDistributionMetric` test, the test can use the Glean instance and the database to check the stored metric.
+
+Putting this into code:
+
+use glean::CommonMetricData;
+use glean::TimingDistributionMetric;
+use glean::tests::new_glean;
+use glean::Glean;
+
+#[test]
+fn test_timing_distribution_does_not_record_when_upload_disabled() {
+    let (glean, dir) = new_glean(None);
+    let test_db_path = dir.path().display().to_string();
+    let db = Database::new(&test_db_path, true).expect("Failed to create database");
+
+    let test_data = CommonMetricData {
+        category: "test".to_string(),
+        name: "timing".to_string(),
+        send_in_pings: vec!["store".to_string()],
+        ..Default::default()
+    };
+    let metric = TimingDistributionMetric::new(test_data);
+
+    // Enable upload and record some samples.
+    metric.accumulate_samples_signed(&glean, vec![100, 200]);
+
+    // Check database for samples.
+    db.iter_store_from(Lifetime::Ping, "store", None, &mut |metric_id, metric| {
+        assert_eq!(String::from_utf8_lossy(metric_id), test_data.identifier(&glean));
+        if let Metric::TimingDistribution(d) = metric {
+            // Check that the histogram includes the samples.
+            // For example, the sum and count should include 300 and 2.
+            assert_eq!(d.sum, 300);
+            assert_eq!(d.count, 2);
+        }
+    });
+
+    // Disable upload and record more samples.
+    glean.set_upload_enabled(false);
+    metric.accumulate_samples_signed(&glean, vec![300, 400]);
+
+    // Check that the stored data hasn't changed.
+    db.iter_store_from(Lifetime::Ping, "store", None, &mut |metric_id, metric| {
+        assert_eq!(String::from_utf8_lossy(metric_id), test_data.identifier(&glean));
+        if let Metric::TimingDistribution(d) = metric {
+            // The count and sum should still be 2 and 300.
+            assert_eq!(d.sum, 300);
+            assert_eq!(d.count, 2);
+        }
+    });
+}
+
+However, there are missing imports and dependencies. For instance, Lifetime and Metric are in specific modules. Also, creating the database instance might require more setup.
+
+Looking at the existing test in the database module, the `Database::new` requires a path and a boolean for read-only. The test would need to create a Glean instance and a metric. Then, after recording, check the database.
+
+But in the actual code, the TimingDistributionMetric's accumulate_samples_signed function may not immediately write to the database. The metric's data might be stored in the metric's internal state, and Glean's `submit_ping` or similar function would be responsible for persisting it. However, in this case, the test needs to ensure that the internal histogram is not modified when upload is disabled.
+
+This is getting complicated. Another approach could be to create two instances of the metric, compare their internal states, but since the internal state is private, that's not feasible.
+
+Alternatively, the test could check that the `accumulate_samples_signed` function, when upload is disabled, leaves the metric's histogram unchanged. For example, initially create a metric instance, accumulate some samples, check the count. Then, with upload disabled, accumulate more samples. Check that the count hasn't increased.
+
+But the internal state (like the histogram) is private. The patch's code for TimingDistributionMetric uses a `Histogram` instance. If there's a method to get the current count or sum, that could be used.
+
+Alternatively, if there's a `TestingOnlyGetHistogram` method, but this isn't part of the public API.
+
+Given the complexity, perhaps the best approach is to check the stored metric in the database. For example, after calling accumulate_samples_signed when upload is enabled, the database should have the samples, and when upload is disabled, it shouldn't. But how?
+
+Perhaps in the test, after creating the metric and calling accumulate_samples_signed, the metric is stored in the database. So the test can read from the database to verify the metric's data.
+
+But to do that, perhaps the test can use the Database's methods, which, as shown in the provided patch's test, loop through the database entries.
+
+In summary, the test should:
+
+1. Create Glean instance with upload enabled.
+2. Create a TimingDistributionMetric.
+3. Accumulate samples, which should be stored in the database.
+4. Disable upload, accumulate samples again; these should not be stored.
+5. Verify the database does not include the new samples.
+
+Now, the code with correct imports and structure:
+</think>
+
+<Filename>glean-core/src/metrics/timing_distribution.rs</Filename>
+<imports>
+use super::TimingDistributionMetric;
+use super::CommonMetricData;
+use crate::tests::new_glean;
+use crate::Glean;
+use crate::Database;
+use crate::Lifetime;
+use std::path::Path;
+</imports>
+<Rust>
+#[test]
+fn test_timing_distribution_doesnt_record_when_upload_disabled() {
+    let (glean, dir) = new_glean(None);
+    let db = Database::new(dir.path().to_str().unwrap(), true).unwrap();
+
+    let store_name = "timing_test_store";
+    let metric_id = "test.category.timing";
+    let metric_data = CommonMetricData::new("test", "timing", store_name);
+    let metric = TimingDistributionMetric::new(metric_data);
+
+    // Initial metric with upload enabled.
+    glean.set_upload_enabled(true);
+    metric.accumulate_samples_signed(&glean, vec![100, 200]);
+
+    let mut initial_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                initial_data = Some(dist);
+            }
+        }
+    });
+
+    let initial = initial_data.unwrap();
+    assert_eq!(initial.count, 2);
+    assert_eq!(initial.sum, 300);
+
+    // Disable upload and add more samples.
+    glean.set_upload_enabled(false);
+    metric.accumulate_samples_signed(&glean, vec![300, 400]);
+
+    let mut final_data = None;
+    db.iter_store_from(Lifetime::Ping, store_name, None, &mut |key, value| {
+        if key == metric_id.as_bytes() {
+            if let Metric::TimingDistribution(dist) = value {
+                final_data = Some(dist);
+            }
+        }
+    });
+
+    let final_dist = final_data.unwrap();
+    assert_eq!(final_dist.count, 2);
+    assert_eq!(final_dist.sum, 300);
+}
+</Rust>

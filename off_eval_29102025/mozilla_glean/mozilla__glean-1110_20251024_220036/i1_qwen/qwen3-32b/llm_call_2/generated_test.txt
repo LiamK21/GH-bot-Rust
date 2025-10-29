@@ -1,0 +1,60 @@
+#[test]
+fn test_pending_pings_directory_size_is_recorded() {
+    let tmp_dir = tempdir().expect("Could not create temporary directory");
+    let data_path = tmp_dir.path().to_path_buf();
+
+    // Initialize Glean for this test
+    let mut glean = Glean::new("test", data_path.clone(), false, true)
+        .expect("Could not initialize Glean instance");
+
+    let upload_metrics = UploadMetrics::new();
+    let manager = PingDirectoryManager::new(data_path.clone());
+
+    // Register a test ping type
+    let ping_type = PingType::new("test", true, true, Vec::new());
+    glean.register_ping_type(&ping_type);
+
+    // Submit the ping twice
+    for _ in 0..2 {
+        glean.submit_ping(&ping_type, None).expect("Failed to submit ping");
+    }
+
+    // Get the ping file paths and adjust sizes
+    let pings = manager.process_dirs().pending_pings;
+    assert_eq!(pings.len(), 2);
+
+    for (i, (_, (doc_id, path_str, _, _))) in pings.iter().enumerate() {
+        let path = Path::new(path_str);
+        let mut file = fs::File::create(path).expect("Failed to create file");
+        let size_bytes = if i == 0 { 1024 } else { 2048 };
+        let bytes = vec![b'a'; size_bytes];
+        file.write_all(&bytes).expect("Failed to write to file");
+    }
+
+    // Create and use the upload manager to calculate the pending pings directory size
+    let upload_manager = PingUploadManager::new(data_path, "Rust", true);
+    // Set a very high quota to prevent deletion, ensuring we only test size recording
+    upload_manager.enqueue_cached_pings(&glean, 100_000_000); // large quota
+
+    // Retrieve the metric value as JSON
+    let metric_value = upload_manager
+        .upload_metrics
+        .pending_pings_directory_size
+        .test_get_value(&glean, "metrics")
+        .expect("Failed to get metric value");
+
+    // Expected value in KiB (3 KiB = 3072 bytes)
+    let expected_bytes = 3 * 1024;
+    // If metric uses KiB unit, then 3072 bytes = 3 KiB
+    let expected_kib = 3;
+
+    // Parse the metric's JSON and verify the sum
+    let metric_value_str = metric_value.to_string();
+    let json_start_pos = metric_value_str.find("{").expect("Metric JSON not found");
+    let json_str = &metric_value_str[json_start_pos..];
+    let json: serde_json::Value = serde_json::from_str(json_str).expect("Failed to parse JSON");
+    let recorded_sum = json["sum"].as_u64().expect("Sum not found");
+
+    // Check if the sum is in KiB as expected (value should be 3)
+    assert_eq!(recorded_sum, expected_kib as u64);
+}

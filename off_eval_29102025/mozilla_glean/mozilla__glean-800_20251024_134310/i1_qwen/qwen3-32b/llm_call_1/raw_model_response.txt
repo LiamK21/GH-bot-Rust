@@ -1,0 +1,413 @@
+<think>
+Okay, let's see. The user wants a regression test for the Glean patch. The issue was about thread-unsafe behavior in the global Glean object. The patch addressed that by handling cases where Glean isn't initialized. So, the test should check if the test fails before the patch and passes after.
+
+First, I need to find which functions to test. The functions in question are setup_glean and global_glean. The patch modified with_glean and with_glean_mut in preview/src/lib.rs, and also added error handling. The FFI functions in ffi/src/lib.rs were updated to handle the case when Glean isn't initialized.
+
+The ErrorKind::NotInitialized is new, so the test should trigger that scenario. The key is to test that when global Glean isn't set, the function returns an error instead of panicking.
+
+The with_glean and with_glean_mut functions use global_glean().expect(), so if Glean isn't set, they'll panic. But after the patch, the FFI functions handle it by returning an error. However, the preview with_glean functions still use expect, so maybe the main test should check that.
+
+Wait, looking at the patch in preview/src/lib.rs, the with_glean and with_glean_mut now use global_glean().expect("message"). So if global_glean is None, they panic. But the issue was about replacing the panic with proper error handling. Hmm, maybe the test needs to check that when Glean isn't initialized, the FFI functions return an error instead of panicking.
+
+In the FFI code, the functions now check if global_glean is Some, and if not, return Error::not_initialized(). So the test should simulate a call to these FFI functions when Glean is not initialized, ensuring that the error is returned instead of a panic.
+
+So, the test for the FFI functions' error handling. Let's take the read_metric function as an example. Before the patch, the FFI functions would panic if Glean wasn't set. After the patch, they return an error. So a test that calls a function that triggers a call to global_glean() without it being initialized should pass after the patch.
+
+To write a unit test for this, in the FFI src, create a test where Glean is not set, then call a function that would access it. But how to do that without actually initializing Glean?
+
+Wait, the setup_glean is used to set Glean. So in the test, if we don't call setup_glean, then Glean remains unset. Then call one of the FFI functions.
+
+But in the FFI code, the functions are part of the ffi module. Let's look at the code in glean-core/ffi/src/lib.rs. The example is the with_glean ffi functions, but maybe there's a read_metric function that's part of the FFI.
+
+Alternatively, create a dummy callback function that would trigger the check. For example, in the FFI library, perhaps create a test that calls a function that would call with_glean.
+
+Wait, the FFI code in the patch has changes to the with_glean ffi functions. Let's look at the first diff:
+
+In ffi/src/lib.rs, the with_glean ffi function now checks if global_glean is None, returns an error. So, a test that calls this function without having setup Glean should get an error instead of a panic.
+
+But how to test this in Rust? The test would need to call the function that would trigger this path.
+
+Assuming there's a FFI-compatible function in the ffi/src/lib.rs that can be tested. However, writing a test in Rust that simulates the FFI environment might be tricky. But for a unit test, perhaps we can call the rust function directly, bypassing the actual FFI.
+
+Wait, the FFI functions in rusty-ffi are written in Rust. So in the test, we can directly call the FFI function, assuming that we don't want to involve actual FFI calls. For example, the first function in the diff is:
+
+pub extern "C" fn glean_with_glean<F, R, T>(callback: F) -> T where F: Fn(&Glean) -> R ...
+
+But perhaps in the test, we can call the function as a test target.
+
+But perhaps the actual test should be written in the ffi/src/lib.rs's test module, checking that the function returns the correct error when Glean is not initialized.
+
+Alternatively, since the user is looking for a regression test for the global_glean handling, maybe the test should be in the FFI code's test section.
+
+Let's look for existing tests. The user didn't provide existing tests in the patch, but the patch adds error handling. So in the FFI src, the test would be something like:
+
+Testing that when Glean is not initialized, the with_glean ffi function returns an error.
+
+In the test, we can call the function without initializing Glean, and check that the result is an error of kind NotInitialized.
+
+But how to check that. The FFI functions return R: IntoFfi, but for testing, maybe there's a way to get an result. Wait, in the code for the FFI function:
+
+The function uses call_with_result, which returns a Result. The handlemap_ext::log_if_error is called, but the function is supposed to handle the error in some way. However, the test would need to verify that the result is an error.
+
+But in the FFI code, perhaps the test can be written to capture the result.
+
+Alternatively, perhaps the test should be written in the error.rs code. But the key is to test that the new error case is handled.
+
+Alternatively, perhaps the best approach is to write a test in the preview module, where the with_glean function now uses expect, but the patch was to add error handling there as well.
+
+Wait, in preview/src/lib.rs, the with_glean and with_glean_mut functions use global_glean().expect("..."), which would panic if Glean is not setup. But the patch added error handling in the FFI functions. However, the with_glean in preview still uses expect. So that's conflicting with the original issue.
+
+Wait, the original issue says that the problem is about setup_glean and global_glean. The patch adds error handling in the FFI functions to handle when Glean isn't initialized. But the with_glean and with_glean_mut in preview still panic. However, the issue states that it's acceptable in the current usage because the wrappers control the order of calls. So maybe the test should be about ensuring that the FFI functions don't panic, which they now handle.
+
+So the regression test is to ensure that when Glean is not initialized, the FFI functions return an error instead of panicking.
+
+Therefore, a test in the FFI module that calls the with_glean function and checks that the result is an error when Glean is not initialized.
+
+But how to do that. Let's take the example of the first FFI function in the patch:
+
+pub extern "C" fn glean_with_glean<F, R, T>(callback: F) -> T
+where
+    F: Fn(&Glean) -> R,
+    T: FromResult<R>,
+{
+    // code here
+}
+
+But in the test, to call this function and check the result. However, the function is marked as extern "C", which might complicate testing in Rust. But maybe for the purpose of the test, the function can be wrapped in a safe function that allows testing.
+
+Alternatively, in the test, we can create a mock function. For example, create a test case where we call a function that triggers the with_glean ffi code, but without initializing Glean.
+
+Wait, perhaps the test can be written to call the function that would hit the error condition and assert that the error is correctly captured.
+
+But given that the FFI code uses abort_on_panic::call_with_result, and returns a Result, perhaps the test can check that the returned Result is an error.
+
+But the code is part of the FFI library, which might have specific return types. For example, the first function in the diff returns T: FromResult<R>, which for testing might require implementing FromResult for a specific type. However, that's complicated.
+
+Alternatively, perhaps the best approach is to test the new error kind by triggering a scenario where Glean is not initialized and check if the error is correctly generated.
+
+In the error.rs module, the Error::not_initialized function is added. So a test in error.rs's test module could create an error of that kind and check its display.
+
+But the user's issue is about the code not panicking. The main regression test should check that when Glean isn't initialized, no panic occurs.
+
+So, focusing on the setup_glean function's behavior. The original issue says that the setup_glean function can be called multiple times. But in the patch, setup_glean now uses OnceCell, which is thread-safe. However, the test should check that setup_glean can be called once, and that concurrent calls behave correctly.
+
+Wait, the patch modifies setup_glean to use OnceCell, which is thread-safe. So a regression test could be written to check that setting Glean multiple times or in parallel works as expected.
+
+Another possible regression test: before the patch, setup_glean used a check-then-set pattern which isn't atomic. After the patch, using OnceCell's set is atomic. Therefore, a test that creates two threads to call setup_glean concurrently and checks that the final state is correct.
+
+That's a good test. Before the patch, the code would panic because the check would fail after the first set, but another thread might have already set it. After the patch, OnceCell ensures that only the first set succeeds, and others return an Err, and the test should log an error but not panic.
+
+So the test would be in the lib.rs's test module, which is glean-core/src/lib.rs.
+
+The test would:
+
+1. Create a Glean instance.
+2. Create two threads that call setup_glean() with different instances.
+3. Check that the final Glean is the first one, and that the second thread's setup fails, and that there was a log error message indicating the concurrent init attempt.
+
+But how to capture the log messages. The setup_glean function logs an error message when the set fails in the OnceCell. So the test can use a logger to capture that log.
+
+In Rust, using the env_logger or log crate. In the test setup, we can capture logs.
+
+So, the test would be:
+
+- Initialize a Glean instance.
+- Call setup_glean with it. Check that it's successful.
+- Call setup_glean again. The second call should replace the Glean in the first case (before the patch) and after the patch, it should log an error.
+
+Wait, the setup_glean function in the patch allows overriding the Glean for test mode. So after the patch, if the Glean is already set, the code replaces it. But in the case where the Glean is already set (not in test mode), the code used to panic if setup_glean was called again, but after the patch, the OnceCell's set is atomic, and the second set returns an error, leading to the log message.
+
+So to test the thread-safety, the test should create two threads that call setup_glean concurrently with different Glean instances. The OnceCell's set should be thread-safe, and the second set should fail.
+
+In the test, after the two threads run, the Glean's value should be either of the two, depending on which thread set first. But in the test, perhaps both threads are setup with the same Glean, but the key is to check that no panic occurs.
+
+But to make the test deterministic, perhaps the first thread calls setup_glean successfully, and the second thread tries to call setup_glean concurrently. The test can check that the Glean's value is set correctly.
+
+However, in the test, the main thread can check if the Glean is set correctly. Also, the test can verify that the log message is emitted when the set fails.
+
+So, the test for the setup_glean function would be in the lib.rs tests. Let's structure it as follows.
+
+The test would need to:
+
+- Use OnceCell and Mutex as in the setup_glean function.
+- Test concurrent setup.
+
+But the setup_glean function is part of the code. So the test can be written as:
+
+#[test]
+fn test_concurrent_setup_glean() {
+    let g1 = Glean::new(std::path::PathBuf::from("/tmp"), "test", "1");
+    let g2 = Glean::new(std::path::PathBuf::from("/tmp"), "test2", "2");
+    let threads = (0..2).map(|_| {
+        std::thread::spawn(move || {
+            setup_glean(g1.clone()) // Or perhaps clone? But Glean may not be Clone.
+            // Wait, Glean is not Clone. Hmm. So perhaps the test can't be written like this.
+
+Wait, this is a problem. The Glean struct might not be Clone. So creating two threads that modify Glean would require cloning it, which may not be possible. Therefore, maybe the test can't be written that way.
+
+Alternative approach: use a single Glean instance and have two threads call setup_glean, but since setup_glean uses OnceCell, the first call sets it, and the second call replaces it (in the original setup) or logs an error (after the patch).
+
+Wait, in the patch, the setup_glean function first checks if Glean is not set, then sets it. If already set, in the original code it would replace it by locking and assigning. After the patch, the setup_glean uses OnceCell's set, which can only be set once. So if the Glean is already set, the second call to set() returns an error, and in that case, the code logs an error message.
+
+Wait, in the new setup_glean:
+
+if GLEAN.get().is_none() {
+    if GLEAN.set(...).is_err() {
+        log error...
+    }
+} else {
+    // override...
+}
+
+But the OnceCell's set is not thread-safe for multiple threads to call set() multiple times. However, OnceCell is thread-safe, and its set() returns Ok if set, else Err. So when two threads call set() at the same time, the first one will succeed, and the second will return Err. However, in the setup_glean code, the first block (if GLEAN.get().is_none()) will check if it's None, and then try to set it. The 'set' operation is atomic. So in the case of a race between two threads, the first thread to set will succeed. The second thread will have is_none() true, but during the set, another thread may have set it. So the if GLEAN.get().is_none() is a race condition.
+
+Ah! So the original setup_glean code uses a double-checked pattern which is not thread-safe. The patch changes to use OnceCell which is thread-safe.
+
+So in the patched code, the setup_glean uses OnceCell::set which is atomic and thread-safe.
+
+So the regression test should test that when setup_glean is called concurrently from multiple threads, the Glean is set only once, and the second call does not overwrite it. But wait, after the patch, if the existing code has GLEAN.set(...) which returns a Result, which fails if already set. Then, the code logs an error.
+
+In the patch, the else clause (when GLEAN.get().is_some()) allows overriding it for test mode. But wait, the else clause is for when it's already set. The code says:
+
+if GLEAN.get().is_none() {
+    if GLEAN.set(...).is_err() {
+        log error
+    }
+} else {
+    // we allow overriding for test mode
+    let mut lock = GLEAN.get().unwrap().lock().unwrap();
+    *lock = glean;
+}
+
+Wait, after the patch, setup_glean will set the Glean if it's not set, or overwrite it if it is. So regardless of thread-safety, the code allows overwriting. But for test mode, the Glean is destroyed and recreated, which the code allows. So the OnceCell is used to ensure that the first set is atomic. But the setup_glean function allows overwriting.
+
+Therefore, the test that was supposed to be written is to check that the first set is atomic and that concurrent setup_glean calls don't panic.
+
+So the test would spawn two threads, both calling setup_glean with different instances. Before the patch, the code would panic when the second thread sets it because the first thread may have already set it. After the patch, OnceCell's set is atomic, so the second thread's call to set would fail, but the code logs an error but doesn't panic.
+
+Therefore, the test can be written to spawn two threads that call setup_glean with different Glean instances. The test would not panic after the patch.
+
+But to create two different Glean instances, perhaps use dummy ones. Here's how the test could look:
+
+But how to create two different instances of Glean? Let's assume that Glean can be created with different parameters. For example:
+
+let g1 = Glean::new(...);
+let g2 = Glean::new(...);
+
+But in the test, the code may not need real instances. Maybe we can use simple instances.
+
+Assuming that Glean has a constructor that can be called, but without knowing the actual structure, it's hard to say. However, for the sake of writing the test, we'll assume that it's possible.
+
+The test would proceed as:
+
+1. Create two different Glean instances.
+2. Spawn two threads, each calling setup_glean with their respective instance.
+3. The test should not panic after the patch.
+4. The expected result is that the first thread's set is successful, and the second's set either fails (if the first thread wins), but no panic occurs.
+
+But to make this test work, we need to capture that no panic occurs.
+
+So the test would be:
+
+#[test]
+fn test_concurrent_setup_glean_no_panic() {
+    use std::thread;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let g1 = Arc::new(Glean::new(...));
+    let g2 = Arc::new(Glean::new(...));
+    let success = Arc::new(AtomicBool::new(false));
+    let success2 = Arc::clone(&success);
+    let success3 = Arc::clone(&success);
+
+    let handles = (0..2).map(|_| {
+        let g = if _ == 0 { g1 } else { g2 };
+        let success = Arc::clone(&success);
+        thread::spawn(move || {
+            setup_glean(g);
+            success.store(true, Ordering::SeqCst);
+        })
+    });
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    assert_eq!(success.load(Ordering::SeqCst), true);
+}
+
+But this test is not complete. It's just a sketch. The key is to ensure that no panic occurs when running setup_glean in parallel.
+
+Alternatively, the test can be written to run two threads calling setup_glean and checking that no panic occurs.
+
+But without knowing the exact behavior of Glean's creation, the test may not be possible. But the user's patch is in the code, and the setup_glean function is modified, so the test is needed for regression testing the thread-safety.
+
+Therefore, the test name could be test_concurrent_setup_glean_no_panic, and it would check that setup_glean can be called concurrently without panicking.
+
+The test would be placed in the test module of lib.rs.
+
+Now, writing the actual test. Since Glean might require some parameters, but in the test, perhaps we can use dummy data.
+
+But given the code's setup_glean function returns a Result, we need to construct a Glean instance. For the purpose of the test, maybe we can use a mock.
+
+But assuming that Glean::new can be created with some dummy path.
+
+The test steps:
+
+- Create two threads that call setup_glean with different Glean instances.
+- The test thread should wait for all to complete.
+- Ensure that no panics occur.
+
+But to make it work, the test could use a dummy Glean instance.
+
+The test code:
+
+#[test]
+fn test_concurrent_setup_glean() {
+    use std::thread;
+    use std::sync::Arc;
+
+    let g1 = Arc::new(glean_core::Glean::new("/tmp/glean1", "app_id").unwrap());
+    let g2 = Arc::new(glean_core::Glean::new("/tmp/glean2", "app_id").unwrap());
+
+    let g1_clone = g1.clone();
+    let handle1 = thread::spawn(move || {
+        // This one should succeed
+        glean_core::setup_glean(g1_clone).unwrap();
+    });
+
+    let g2_clone = g2.clone();
+    let handle2 = thread::spawn(move || {
+        // This one may fail if setup_glean is called concurrently.
+        // After patch, it logs error but no panic.
+        glean_core::setup_glean(g2_clone).unwrap();
+    });
+
+    // Join threads and check for panics
+    handle1.join().unwrap();
+    handle2.join().unwrap();
+}
+
+This test would panic after the patch if there's an error. Wait, no. Because the setup_glean function returns Result<()>, but in the test, we are calling unwrap() on it. If the second thread tries to set it while the first is already setting, then in the patched code, the first set succeeds, and the second's set will return an Err, but the code inside setup_glean logs an error and returns Ok(()) in the else clause (since the code allows overwriting for test mode).
+
+Wait, the setup_glean function after the patch allows overwriting when GLEAN.set returns an error. Wait no. Let's look at the code again:
+
+After the patch, the setup_glean function first checks if GLEAN.get().is_none(). If it is, then it tries to set it using OnceCell::set. If that returns an error (because another thread set it), it logs an error. Else, it proceeds. Then, if GLEAN.get().is_some(), it overwrites it by locking the mutex.
+
+Wait, the code in setup_glean after the patch is:
+
+pub fn setup_glean(glean: Glean) -> Result<()> {
+    if GLEAN.get().is_none() {
+        if GLEAN.set(Mutex::new(glean)).is_err() {
+            log::error!("... concurrent init");
+        }
+    } else {
+        let mut lock = GLEAN.get().unwrap().lock().unwrap();
+        *lock = glean;
+    }
+    Ok(())
+}
+
+Wait, but the function returns Result<()> but all return statements are Ok(()). That can't be right. Because in the code, if the set fails, it logs an error and returns Ok(())? That's a problem. Because the Err case is not returned as an error. Wait, looking at the original code's setup_glean function:
+
+pub fn setup_glean(glean: Glean) -> Result<()> {
+    if GLEAN.get().is_none() {
+        if GLEAN.set(Mutex::new(glean)).is_err() {
+            log::error!("Global Glean object is initialized already. This probably happened concurrently.");
+        }
+    } else {
+        let mut lock = GLEAN.get().unwrap().lock().unwrap();
+        *lock = glean;
+    }
+    Ok(())
+}
+
+Ah, the setup_glean always returns Ok, regardless of whether the set was successful. Because OnceCell::set returns Result, but the code ignores it in the if block. The only error is the log message, but the function returns Result<()>, but in code it's always Ok. This seems incorrect. Maybe the Result is supposed to indicate if the setup was successful.
+
+But regardless, the test should check that no panic occurs when setup_glean is called concurrently.
+
+In this case, the test would spawn two threads to call setup_glean, and join them, expecting no panic. The code before the patch would panic if the setup_glean() call is done concurrently, because the double-checked pattern isn't thread-safe.
+
+So the test would fail before the patch and pass after.
+
+But how to write the test. For example:
+
+#[test]
+fn test_concurrent_setup_glean() {
+    use std::thread;
+    // Assume Glean can be constructed with dummy parameters
+    let g1 = Glean::new(...);
+    let g2 = Glean::new(...);
+    let t1 = thread::spawn(move || {
+        setup_glean(g1);
+    });
+    let t2 = thread::spawn(move || {
+        setup_glean(g2);
+    });
+    t1.join().unwrap();
+    t2.join().unwrap();
+}
+
+But again, the issue is whether the setup_glean function returns Ok or not, but the test doesn't check the result. However, if the original code panics, then the threads would panic, and the unwrap() would cause the test to fail. After the patch, the code would not panic, and the test would pass.
+
+So the test would be:
+
+In the lib.rs test module, a test that spawns two threads and calls setup_glean and joins, expecting no panic.
+
+Thus, the correct filename is glean-core/src/lib.rs.
+
+Imports would include the necessary modules for Glean and setup_glean.
+
+The test code would be:
+
+#[test]
+fn test_concurrent_setup_glean_no_panic() {
+    use std::thread;
+    let g1 = Glean::new(std::path::PathBuf::from("/tmp/glean1"), "app_id");
+    let g2 = Glean::new(std::path::PathBuf::from("/tmp/glean2"), "app_id");
+
+    thread::spawn(move || {
+        setup_glean(g1).unwrap();
+    })
+    .join()
+    .unwrap();
+
+    thread::spawn(move || {
+        setup_glean(g2).unwrap();
+    })
+    .join()
+    .unwrap();
+}
+
+Wait, but in the current setup_glean code, the function returns Result<()>, so the unwrap() would panic if the setup is an error. However, in the code after the patch, setup_glean allows overriding, so calling it twice would succeed on the second call (since it replaces the existing Glean object). So the threads would not panic.
+
+But before the patch, setup_glean's code was not thread-safe, and in the case of concurrent set, the GLEAN.get().is_none() could be true in both threads, and then the first to set would lock it, and the second would also proceed to overwrite it without mutex, possibly leading to panics.
+
+But after the patch, the set is handled using OnceCell's atomic set, which is thread-safe, so no panic.
+
+Therefore, this test would fail before the patch and pass after.
+</think>
+
+<Filename>glean-core/src/lib.rs</Filename>
+<imports>
+use std::thread;
+use std::path::PathBuf;
+use super::{Glean, setup_glean};
+</imports>
+<Rust>
+#[test]
+fn test_concurrent_setup_glean_no_panic() {
+    let g1 = Glean::new(PathBuf::from("/tmp/glean1"), "app1");
+    let g2 = Glean::new(PathBuf::from("/tmp/glean2"), "app2");
+
+    let t1 = thread::spawn(move || {
+        setup_glean(g1).unwrap();
+    });
+
+    let t2 = thread::spawn(move || {
+        setup_glean(g2).unwrap();
+    });
+
+    t1.join().unwrap();
+    t2.join().unwrap();
+}
+</Rust>

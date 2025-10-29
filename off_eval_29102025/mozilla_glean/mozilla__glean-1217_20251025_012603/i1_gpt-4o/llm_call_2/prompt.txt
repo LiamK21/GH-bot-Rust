@@ -1,0 +1,535 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Hundreds of "Processing ping  at [..}" log messages on start up
+When launching Fenix Nightly (200914) I get a ton of those "Processing ping at" log messages. The following snippet is only a tiny subset of log messages. Is this normal? This happens on every app start.
+
+```
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/381af193-f305-4c3c-83df-10cce57aa008
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/1989c625-c3de-48ab-a38a-5ab47b80b14c
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/15f3f276-a9c8-4acb-86fe-428c608d1cac
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/872633aa-2be4-4fb2-8df0-713e796dbffc
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/03ed122e-2a15-4af9-9399-ca47d4fe9abb
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/c88a0954-07ae-40e0-ba51-7a238ccfc151
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/1c5b46cf-5c90-4436-82fb-e37eedc1b03f
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/8bb66eb2-1952-457a-a241-6d11a0f61393
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/c8a0bd29-41c5-40d7-86e0-02f963b419e3
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/81de3cac-5bb5-4af8-847b-89d61036ed53
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/b84b6c54-2a93-4ab0-9e0f-b5719686ec8d
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/9ace92c9-a14c-41e2-a6a5-924ef7d4d04d
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/5a306116-772b-4a53-88f4-1404b3900a2f
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/aa14b29e-b6b1-48c1-811f-0f18f6b9e0b7
+I  glean_core::upload::directory: Processing ping at: /data/user/0/org.mozilla.fenix/glean_data/pending_pings/55ea7f30-5a1a-458d-ba3c-07628a4c2e90
+````
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -53,6 +53,7 @@ pub struct UploadMetrics {
+     pub discarded_exceeding_pings_size: MemoryDistributionMetric,
+     pub pending_pings_directory_size: MemoryDistributionMetric,
+     pub deleted_pings_after_quota_hit: CounterMetric,
++    pub pending_pings: CounterMetric,
+ }
+ 
+ impl UploadMetrics {
+@@ -108,6 +109,15 @@ impl UploadMetrics {
+                 disabled: false,
+                 dynamic_label: None,
+             }),
++
++            pending_pings: CounterMetric::new(CommonMetricData {
++                name: "pending_pings".into(),
++                category: "glean.upload".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -10,6 +10,7 @@
+ //!   and either delete the corresponding ping from disk or re-enqueue it for sending.
+ 
+ use std::collections::VecDeque;
++use std::convert::TryInto;
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Arc, RwLock, RwLockWriteGuard};
+@@ -220,6 +221,7 @@ impl PingUploadManager {
+         upload_manager
+             .policy
+             .set_max_pending_pings_directory_size(None);
++        upload_manager.policy.set_max_pending_pings_count(None);
+ 
+         // When building for tests, always scan the pending pings directories and do it sync.
+         upload_manager
+@@ -341,7 +343,22 @@ impl PingUploadManager {
+ 
+         if cached_pings.len() > 0 {
+             let mut pending_pings_directory_size: u64 = 0;
++            let mut pending_pings_count = 0;
+             let mut deleting = false;
++
++            let total = cached_pings.pending_pings.len() as u64;
++            self.upload_metrics
++                .pending_pings
++                .add(glean, total.try_into().unwrap_or(0));
++
++            if total > self.policy.max_pending_pings_count() {
++                log::warn!(
++                    "More than {} pending pings in the directory, will delete {} old pings.",
++                    self.policy.max_pending_pings_count(),
++                    total - self.policy.max_pending_pings_count()
++                );
++            }
++
+             // The pending pings vector is sorted by date in ascending order (oldest -> newest).
+             // We need to calculate the size of the pending pings directory
+             // and delete the **oldest** pings in case quota is reached.
+@@ -349,8 +366,11 @@ impl PingUploadManager {
+             // so that we iterate in descending order (newest -> oldest).
+             cached_pings.pending_pings.reverse();
+             cached_pings.pending_pings.retain(|(file_size, (document_id, _, _, _))| {
++                pending_pings_count += 1;
+                 pending_pings_directory_size += file_size;
+-                if pending_pings_directory_size > self.policy.max_pending_pings_directory_size() {
++
++                // We don't want to spam the log for every ping over the quota.
++                if !deleting && pending_pings_directory_size > self.policy.max_pending_pings_directory_size() {
+                     log::warn!(
+                         "Pending pings directory has reached the size quota of {} bytes, outstanding pings will be deleted.",
+                         self.policy.max_pending_pings_directory_size()
+@@ -358,6 +378,13 @@ impl PingUploadManager {
+                     deleting = true;
+                 }
+ 
++                // Once we reach the number of allowed pings we start deleting,
++                // no matter what size.
++                // We already log this before the loop.
++                if pending_pings_count > self.policy.max_pending_pings_count() {
++                    deleting = true;
++                }
++
+                 if deleting && self.directory_manager.delete_file(&document_id) {
+                     self.upload_metrics
+                         .deleted_pings_after_quota_hit
+@@ -1201,7 +1228,235 @@ mod test {
+                 .deleted_pings_after_quota_hit
+                 .test_get_value(&glean, "metrics")
+                 .unwrap()
+-        )
++        );
++        assert_eq!(
++            n as i32,
++            upload_manager
++                .upload_metrics
++                .pending_pings
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++    }
++
++    #[test]
++    fn number_quota_is_enforced_when_enqueueing_cached_pings() {
++        let (mut glean, dir) = new_glean(None);
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        // How many pings we allow at maximum
++        let count_quota = 3;
++        // The number of pings we fill the pending pings directory with.
++        let n = 10;
++
++        // Submit the ping multiple times
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        let directory_manager = PingDirectoryManager::new(dir.path());
++        let pending_pings = directory_manager.process_dirs().pending_pings;
++        // The pending pings array is sorted by date in ascending order,
++        // the newest element is the last one.
++        let expected_pings = pending_pings
++            .iter()
++            .rev()
++            .take(count_quota)
++            .map(|(_, ping)| ping.0.clone())
++            .collect::<Vec<_>>();
++
++        // Create a new upload manager pointing to the same data_path as the glean instance.
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
++
++        upload_manager
++            .policy
++            .set_max_pending_pings_count(Some(count_quota as u64));
++
++        // Get a task once
++        // One ping should have been enqueued.
++        // Make sure it is the newest ping.
++        for ping_id in expected_pings.iter().rev() {
++            match upload_manager.get_upload_task(&glean, false) {
++                PingUploadTask::Upload(request) => assert_eq!(&request.document_id, ping_id),
++                _ => panic!("Expected upload manager to return the next request!"),
++            }
++        }
++
++        // Verify that no other requests were returned,
++        // they should all have been deleted because pending pings quota was hit.
++        assert_eq!(
++            upload_manager.get_upload_task(&glean, false),
++            PingUploadTask::Done
++        );
++
++        // Verify that the correct number of deleted pings was recorded
++        assert_eq!(
++            (n - count_quota) as i32,
++            upload_manager
++                .upload_metrics
++                .deleted_pings_after_quota_hit
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++        assert_eq!(
++            n as i32,
++            upload_manager
++                .upload_metrics
++                .pending_pings
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++    }
++
++    #[test]
++    fn size_and_count_quota_work_together_size_first() {
++        let (mut glean, dir) = new_glean(None);
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        let expected_number_of_pings = 3;
++        // The number of pings we fill the pending pings directory with.
++        let n = 10;
++
++        // Submit the ping multiple times
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        let directory_manager = PingDirectoryManager::new(dir.path());
++        let pending_pings = directory_manager.process_dirs().pending_pings;
++        // The pending pings array is sorted by date in ascending order,
++        // the newest element is the last one.
++        let expected_pings = pending_pings
++            .iter()
++            .rev()
++            .take(expected_number_of_pings)
++            .map(|(_, ping)| ping.0.clone())
++            .collect::<Vec<_>>();
++
++        // Create a new upload manager pointing to the same data_path as the glean instance.
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
++
++        // From manual testing we figured out an empty ping file is 324bytes,
++        // so this allows 3 pings.
++        upload_manager
++            .policy
++            .set_max_pending_pings_directory_size(Some(1000));
++        upload_manager.policy.set_max_pending_pings_count(Some(5));
++
++        // Get a task once
++        // One ping should have been enqueued.
++        // Make sure it is the newest ping.
++        for ping_id in expected_pings.iter().rev() {
++            match upload_manager.get_upload_task(&glean, false) {
++                PingUploadTask::Upload(request) => assert_eq!(&request.document_id, ping_id),
++                _ => panic!("Expected upload manager to return the next request!"),
++            }
++        }
++
++        // Verify that no other requests were returned,
++        // they should all have been deleted because pending pings quota was hit.
++        assert_eq!(
++            upload_manager.get_upload_task(&glean, false),
++            PingUploadTask::Done
++        );
++
++        // Verify that the correct number of deleted pings was recorded
++        assert_eq!(
++            (n - expected_number_of_pings) as i32,
++            upload_manager
++                .upload_metrics
++                .deleted_pings_after_quota_hit
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++        assert_eq!(
++            n as i32,
++            upload_manager
++                .upload_metrics
++                .pending_pings
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++    }
++
++    #[test]
++    fn size_and_count_quota_work_together_count_first() {
++        let (mut glean, dir) = new_glean(None);
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
++        glean.register_ping_type(&ping_type);
++
++        let expected_number_of_pings = 2;
++        // The number of pings we fill the pending pings directory with.
++        let n = 10;
++
++        // Submit the ping multiple times
++        for _ in 0..n {
++            glean.submit_ping(&ping_type, None).unwrap();
++        }
++
++        let directory_manager = PingDirectoryManager::new(dir.path());
++        let pending_pings = directory_manager.process_dirs().pending_pings;
++        // The pending pings array is sorted by date in ascending order,
++        // the newest element is the last one.
++        let expected_pings = pending_pings
++            .iter()
++            .rev()
++            .take(expected_number_of_pings)
++            .map(|(_, ping)| ping.0.clone())
++            .collect::<Vec<_>>();
++
++        // Create a new upload manager pointing to the same data_path as the glean instance.
++        let mut upload_manager = PingUploadManager::no_policy(dir.path());
++
++        // From manual testing we figured out an empty ping file is 324bytes,
++        // so this allows 3 pings.
++        upload_manager
++            .policy
++            .set_max_pending_pings_directory_size(Some(1000));
++        upload_manager.policy.set_max_pending_pings_count(Some(2));
++
++        // Get a task once
++        // One ping should have been enqueued.
++        // Make sure it is the newest ping.
++        for ping_id in expected_pings.iter().rev() {
++            match upload_manager.get_upload_task(&glean, false) {
++                PingUploadTask::Upload(request) => assert_eq!(&request.document_id, ping_id),
++                _ => panic!("Expected upload manager to return the next request!"),
++            }
++        }
++
++        // Verify that no other requests were returned,
++        // they should all have been deleted because pending pings quota was hit.
++        assert_eq!(
++            upload_manager.get_upload_task(&glean, false),
++            PingUploadTask::Done
++        );
++
++        // Verify that the correct number of deleted pings was recorded
++        assert_eq!(
++            (n - expected_number_of_pings) as i32,
++            upload_manager
++                .upload_metrics
++                .deleted_pings_after_quota_hit
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
++        assert_eq!(
++            n as i32,
++            upload_manager
++                .upload_metrics
++                .pending_pings
++                .test_get_value(&glean, "metrics")
++                .unwrap()
++        );
+     }
+ 
+     #[test]
+
+diff --git a/glean-core/src/upload/policy.rs b/glean-core/src/upload/policy.rs
+--- a/glean-core/src/upload/policy.rs
++++ b/glean-core/src/upload/policy.rs
+@@ -9,6 +9,14 @@ const MAX_WAIT_ATTEMPTS: u32 = 3;
+ const MAX_PING_BODY_SIZE: usize = 1024 * 1024; // 1 MB
+ const MAX_PENDING_PINGS_DIRECTORY_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+ 
++// The average number of baseline pings per client (on Fenix) is at 15 pings a day.
++// The P99 value is ~110.
++// With a maximum of (a nice round) 250 we can store about 2 days worth of pings.
++// A baseline ping file averages about 600 bytes, so that's a total of just 144 kB we store.
++// With the default rate limit of 15 pings per 60s it would take roughly 16 minutes to send out all pending
++// pings.
++const MAX_PENDING_PINGS_COUNT: u64 = 250;
++
+ /// A struct holding the values for all the policies related to ping storage, uploading and requests.
+ #[derive(Debug)]
+ pub struct Policy {
+@@ -25,6 +33,8 @@ pub struct Policy {
+     max_ping_body_size: Option<usize>,
+     /// The maximum size in byte the pending pings directory may have on disk.
+     max_pending_pings_directory_size: Option<u64>,
++    /// The maximum number of pending pings on disk.
++    max_pending_pings_count: Option<u64>,
+ }
+ 
+ impl Default for Policy {
+@@ -34,6 +44,7 @@ impl Default for Policy {
+             max_wait_attempts: Some(MAX_WAIT_ATTEMPTS),
+             max_ping_body_size: Some(MAX_PING_BODY_SIZE),
+             max_pending_pings_directory_size: Some(MAX_PENDING_PINGS_DIRECTORY_SIZE),
++            max_pending_pings_count: Some(MAX_PENDING_PINGS_COUNT),
+         }
+     }
+ }
+@@ -82,8 +93,20 @@ impl Policy {
+         }
+     }
+ 
++    pub fn max_pending_pings_count(&self) -> u64 {
++        match &self.max_pending_pings_count {
++            Some(v) => *v,
++            None => u64::MAX,
++        }
++    }
++
+     #[cfg(test)]
+     pub fn set_max_pending_pings_directory_size(&mut self, v: Option<u64>) {
+         self.max_pending_pings_directory_size = v;
+     }
++
++    #[cfg(test)]
++    pub fn set_max_pending_pings_count(&mut self, v: Option<u64>) {
++        self.max_pending_pings_count = v;
++    }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>use crate::PingDirectoryManager;</imports>
+<Rust>#[test]
+fn test_pending_pings_quota_enforced() {
+    let (mut glean, dir) = new_glean(None);
+
+    let ping_type = PingType::new("test", true, true, vec![]);
+    glean.register_ping_type(&ping_type);
+
+    let count_quota = 5;
+    let n = 20;
+
+    for _ in 0..n {
+        glean.submit_ping(&ping_type, None).unwrap();
+    }
+
+    let directory_manager = PingDirectoryManager::new(dir.path());
+    let pending_pings = directory_manager.process_dirs().pending_pings;
+    let expected_pings = pending_pings
+        .iter()
+        .rev()
+        .take(count_quota)
+        .map(|(_, ping)| ping.0.clone())
+        .collect::<Vec<_>>();
+
+    let mut upload_manager = PingUploadManager::no_policy(dir.path());
+    upload_manager.policy.set_max_pending_pings_count(Some(count_quota as u64));
+
+    for ping_id in expected_pings.iter().rev() {
+        match upload_manager.get_upload_task(&glean, false) {
+            PingUploadTask::Upload(request) => assert_eq!(&request.document_id, ping_id),
+            _ => panic!("Expected upload manager to return the next request!"),
+        }
+    }
+
+    assert_eq!(
+        upload_manager.get_upload_task(&glean, false),
+        PingUploadTask::Done
+    );
+
+    assert_eq!(
+        (n - count_quota) as i32,
+        upload_manager
+            .upload_metrics
+            .deleted_pings_after_quota_hit
+            .test_get_value(&glean, "metrics")
+            .unwrap()
+    );
+    assert_eq!(
+        n as i32,
+        upload_manager
+            .upload_metrics
+            .pending_pings
+            .test_get_value(&glean, "metrics")
+            .unwrap()
+    );
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::PingDirectoryManager`
+   --> glean-core/src/upload/mod.rs:724:9
+    |
+724 |     use crate::PingDirectoryManager;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `PingDirectoryManager` in the root
+    |
+help: consider importing this struct through its public re-export instead
+    |
+724 |     use crate::upload::PingDirectoryManager;
+    |                ++++++++
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
