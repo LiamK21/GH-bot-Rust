@@ -1,0 +1,603 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Move the cli-specific dependencies to the cli subcrate
+Serde serializers and terminal management should not be part of the library crate.
+</issue>
+
+Patch:
+<patch>
+diff --git a/rust-code-analysis-cli/src/formats.rs b/rust-code-analysis-cli/src/formats.rs
+--- a/rust-code-analysis-cli/src/formats.rs
++++ b/rust-code-analysis-cli/src/formats.rs
+@@ -0,0 +1,122 @@
++use regex::Regex;
++use std::fs::File;
++use std::io::Write;
++use std::io::{Error, ErrorKind};
++use std::path::PathBuf;
++use std::str::FromStr;
++
++use rust_code_analysis::FuncSpace;
++
++#[derive(Debug, Clone)]
++pub enum Format {
++    Cbor,
++    Json,
++    Toml,
++    Yaml,
++}
++
++impl Format {
++    pub fn all() -> &'static [&'static str] {
++        &["cbor", "json", "toml", "yaml"]
++    }
++
++    pub fn dump_formats(
++        &self,
++        space: &FuncSpace,
++        path: &PathBuf,
++        output_path: &Option<PathBuf>,
++        pretty: bool,
++    ) -> std::io::Result<()> {
++        if output_path.is_none() {
++            let stdout = std::io::stdout();
++            let mut stdout = stdout.lock();
++
++            match self {
++                Format::Cbor => Err(Error::new(
++                    ErrorKind::Other,
++                    "Cbor format cannot be printed to stdout",
++                )),
++                Format::Json => {
++                    let json_data = if pretty {
++                        serde_json::to_string_pretty(&space).unwrap()
++                    } else {
++                        serde_json::to_string(&space).unwrap()
++                    };
++                    write!(stdout, "{}", json_data)
++                }
++                Format::Toml => {
++                    let toml_data = if pretty {
++                        toml::to_string_pretty(&space).unwrap()
++                    } else {
++                        toml::to_string(&space).unwrap()
++                    };
++                    write!(stdout, "{}", toml_data)
++                }
++                Format::Yaml => write!(stdout, "{}", serde_yaml::to_string(&space).unwrap()),
++            }
++        } else {
++            let format_ext = match self {
++                Format::Cbor => ".cbor",
++                Format::Json => ".json",
++                Format::Toml => ".toml",
++                Format::Yaml => ".yml",
++            };
++
++            let output_path = output_path.as_ref().unwrap();
++
++            let mut file = path.as_path().file_name().unwrap().to_os_string();
++            file.push(format_ext);
++
++            let mut format_path = output_path.clone();
++            format_path.push(file);
++
++            if format_path.as_path().exists() {
++                let mut new_filename = path.to_str().unwrap().to_string();
++                let re = Regex::new(r"[\\:/]").unwrap();
++                new_filename = re.replace_all(&new_filename, "_").to_string();
++                new_filename.push_str(format_ext);
++                format_path.pop();
++                format_path.push(new_filename);
++            }
++
++            let mut format_file = File::create(format_path)?;
++            match self {
++                Format::Cbor => serde_cbor::to_writer(format_file, &space)
++                    .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
++                Format::Json => {
++                    if pretty {
++                        serde_json::to_writer_pretty(format_file, &space)
++                            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
++                    } else {
++                        serde_json::to_writer(format_file, &space)
++                            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
++                    }
++                }
++                Format::Toml => {
++                    let toml_data = if pretty {
++                        toml::to_string_pretty(&space).unwrap()
++                    } else {
++                        toml::to_string(&space).unwrap()
++                    };
++                    format_file.write_all(toml_data.as_bytes())
++                }
++                Format::Yaml => serde_yaml::to_writer(format_file, &space)
++                    .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
++            }
++        }
++    }
++}
++
++impl FromStr for Format {
++    type Err = String;
++
++    fn from_str(format: &str) -> Result<Self, Self::Err> {
++        match format {
++            "cbor" => Ok(Format::Cbor),
++            "json" => Ok(Format::Json),
++            "toml" => Ok(Format::Toml),
++            "yaml" => Ok(Format::Yaml),
++            format => Err(format!("{:?} is not a supported format", format)),
++        }
++    }
++}
+
+diff --git a/rust-code-analysis-cli/src/main.rs b/rust-code-analysis-cli/src/main.rs
+--- a/rust-code-analysis-cli/src/main.rs
++++ b/rust-code-analysis-cli/src/main.rs
+@@ -4,9 +4,13 @@ extern crate crossbeam;
+ extern crate num_cpus;
+ #[macro_use]
+ extern crate serde;
++extern crate serde_cbor;
+ #[cfg_attr(test, macro_use)]
+ extern crate serde_json;
++extern crate serde_yaml;
++extern crate toml;
+ 
++mod formats;
+ mod web;
+ 
+ use clap::{App, Arg};
+@@ -21,6 +25,7 @@ use std::sync::{Arc, Mutex};
+ use std::{process, thread};
+ use walkdir::{DirEntry, WalkDir};
+ 
++use formats::Format;
+ use rust_code_analysis::*;
+ use web::server;
+ 
+@@ -34,7 +39,7 @@ struct Config {
+     function: bool,
+     metrics: bool,
+     output_format: Option<Format>,
+-    output: String,
++    output: Option<PathBuf>,
+     pretty: bool,
+     line_start: Option<usize>,
+     line_end: Option<usize>,
+@@ -91,17 +96,13 @@ fn act_on_file(language: Option<LANG>, path: PathBuf, cfg: &Config) -> std::io::
+         };
+         action::<Dump>(&language, source, &path, pr, cfg)
+     } else if cfg.metrics {
+-        let cfg = MetricsCfg {
+-            path,
+-            output_format: cfg.output_format.clone(),
+-            pretty: cfg.pretty,
+-            output_path: if cfg.output.is_empty() {
+-                None
+-            } else {
+-                Some(PathBuf::from(cfg.output.clone()))
+-            },
+-        };
+-        action::<Metrics>(&language, source, &cfg.path.clone(), pr, cfg)
++        if let Some(output_format) = &cfg.output_format {
++            let space = get_function_spaces(&language, source, &path, pr).unwrap();
++            output_format.dump_formats(&space, &path, &cfg.output, cfg.pretty)
++        } else {
++            let cfg = MetricsCfg { path };
++            action::<Metrics>(&language, source, &cfg.path.clone(), pr, cfg)
++        }
+     } else if cfg.comments {
+         let cfg = CommentRmCfg {
+             in_place: cfg.in_place,
+@@ -474,9 +475,9 @@ fn main() {
+         .value_of("output_format")
+         .map(parse_or_exit::<Format>);
+     let pretty = matches.is_present("pretty");
+-    let output = matches.value_of("output").unwrap().to_string();
+-    let output_is_dir = PathBuf::from(output.clone()).is_dir();
+-    if metrics && !output.is_empty() && !output_is_dir {
++    let output = matches.value_of("output").map(|s| PathBuf::from(s));
++    let output_is_dir = output.as_ref().map(|p| p.is_dir()).unwrap_or(false);
++    if metrics && output.is_some() && !output_is_dir {
+         eprintln!("Error: The output parameter must be a directory");
+         process::exit(1);
+     }
+@@ -576,11 +577,10 @@ fn main() {
+         fix_includes(&mut data.files, &all_files);
+ 
+         let data = serde_json::to_string(&data).unwrap();
+-        if output.is_empty() {
+-            println!("{}", data);
++        if let Some(output_path) = output {
++            write_file(&output_path, data.as_bytes()).unwrap();
+         } else {
+-            let output = PathBuf::from(output);
+-            write_file(&output, data.as_bytes()).unwrap();
++            println!("{}", data);
+         }
+     }
+ }
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -48,10 +48,6 @@
+ extern crate lazy_static;
+ #[macro_use]
+ extern crate serde;
+-extern crate serde_cbor;
+-extern crate serde_json;
+-extern crate serde_yaml;
+-extern crate toml;
+ 
+ #[macro_use]
+ mod asttools;
+
+diff --git a/src/macros.rs b/src/macros.rs
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -106,9 +106,6 @@ macro_rules! mk_action {
+         /// // Configuration options used by the function which computes the metrics
+         /// let cfg = MetricsCfg {
+         ///     path,
+-        ///     output_format: None,
+-        ///     pretty: false,
+-        ///     output_path: None,
+         /// };
+         ///
+         /// action::<Metrics>(&language, source_as_vec, &cfg.path.clone(), None, cfg);
+@@ -127,6 +124,38 @@ macro_rules! mk_action {
+                 )*
+             }
+         }
++
++        /// Returns all function spaces data of a code.
++        ///
++        /// # Examples
++        ///
++        /// ```
++        /// use std::path::PathBuf;
++        ///
++        /// use rust_code_analysis::{get_function_spaces, LANG};
++        ///
++        /// # fn main() {
++        /// let source_code = "int a = 42;";
++        /// let language = LANG::Cpp;
++        ///
++        /// // The path to a dummy file used to contain the source code
++        /// let path = PathBuf::from("foo.c");
++        /// let source_as_vec = source_code.as_bytes().to_vec();
++        ///
++        /// get_function_spaces(&language, source_as_vec, &path, None).unwrap();
++        /// # }
++        /// ```
++        #[inline(always)]
++        pub fn get_function_spaces(lang: &LANG, source: Vec<u8>, path: &PathBuf, pr: Option<Arc<PreprocResults>>) -> Option<FuncSpace> {
++            match lang {
++                $(
++                    LANG::$camel => {
++                        let parser = $parser::new(source, &path, pr);
++                        metrics(&parser, &path)
++                    },
++                )*
++            }
++        }
+     };
+ }
+
+diff --git a/src/output/dump_formats.rs b/src/output/dump_formats.rs
+--- a/src/output/dump_formats.rs
++++ b/src/output/dump_formats.rs
+@@ -1,140 +0,0 @@
+-use regex::Regex;
+-use std::fs::File;
+-use std::io::Write;
+-use std::io::{Error, ErrorKind};
+-use std::path::PathBuf;
+-use std::str::FromStr;
+-
+-use crate::spaces::FuncSpace;
+-
+-#[derive(Debug, Clone)]
+-/// The list of implemented output formats.
+-pub enum Format {
+-    /// The `CBOR` format
+-    Cbor,
+-    /// The `JSON` format
+-    Json,
+-    /// The `TOML` format
+-    Toml,
+-    /// The `YAML` format
+-    Yaml,
+-}
+-
+-impl Format {
+-    /// Returns the list of implemented output formats as a slice of `&str`.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use rust_code_analysis::Format;
+-    ///
+-    /// # fn main() {
+-    /// for format in Format::all().iter(){
+-    ///     println!("{}", format);
+-    /// }
+-    /// # }
+-    /// ```
+-    pub fn all() -> &'static [&'static str] {
+-        &["cbor", "json", "toml", "yaml"]
+-    }
+-}
+-
+-impl FromStr for Format {
+-    type Err = String;
+-
+-    fn from_str(format: &str) -> Result<Self, Self::Err> {
+-        match format {
+-            "cbor" => Ok(Format::Cbor),
+-            "json" => Ok(Format::Json),
+-            "toml" => Ok(Format::Toml),
+-            "yaml" => Ok(Format::Yaml),
+-            format => Err(format!("{:?} is not a supported format", format)),
+-        }
+-    }
+-}
+-
+-pub(crate) fn dump_formats(
+-    space: &FuncSpace,
+-    path: &PathBuf,
+-    output_path: &Option<PathBuf>,
+-    output_format: Format,
+-    pretty: bool,
+-) -> std::io::Result<()> {
+-    if output_path.is_none() {
+-        let stdout = std::io::stdout();
+-        let mut stdout = stdout.lock();
+-
+-        match output_format {
+-            Format::Cbor => Err(Error::new(
+-                ErrorKind::Other,
+-                "Cbor format cannot be printed to stdout",
+-            )),
+-            Format::Json => {
+-                let json_data = if pretty {
+-                    serde_json::to_string_pretty(&space).unwrap()
+-                } else {
+-                    serde_json::to_string(&space).unwrap()
+-                };
+-                write!(stdout, "{}", json_data)
+-            }
+-            Format::Toml => {
+-                let toml_data = if pretty {
+-                    toml::to_string_pretty(&space).unwrap()
+-                } else {
+-                    toml::to_string(&space).unwrap()
+-                };
+-                write!(stdout, "{}", toml_data)
+-            }
+-            Format::Yaml => write!(stdout, "{}", serde_yaml::to_string(&space).unwrap()),
+-        }
+-    } else {
+-        let format_ext = match output_format {
+-            Format::Cbor => ".cbor",
+-            Format::Json => ".json",
+-            Format::Toml => ".toml",
+-            Format::Yaml => ".yml",
+-        };
+-
+-        let output_path = output_path.as_ref().unwrap();
+-
+-        let mut file = path.as_path().file_name().unwrap().to_os_string();
+-        file.push(format_ext);
+-
+-        let mut format_path = output_path.clone();
+-        format_path.push(file);
+-
+-        if format_path.as_path().exists() {
+-            let mut new_filename = path.to_str().unwrap().to_string();
+-            let re = Regex::new(r"[\\:/]").unwrap();
+-            new_filename = re.replace_all(&new_filename, "_").to_string();
+-            new_filename.push_str(format_ext);
+-            format_path.pop();
+-            format_path.push(new_filename);
+-        }
+-
+-        let mut format_file = File::create(format_path)?;
+-        match output_format {
+-            Format::Cbor => serde_cbor::to_writer(format_file, &space)
+-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
+-            Format::Json => {
+-                if pretty {
+-                    serde_json::to_writer_pretty(format_file, &space)
+-                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+-                } else {
+-                    serde_json::to_writer(format_file, &space)
+-                        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+-                }
+-            }
+-            Format::Toml => {
+-                let toml_data = if pretty {
+-                    toml::to_string_pretty(&space).unwrap()
+-                } else {
+-                    toml::to_string(&space).unwrap()
+-                };
+-                format_file.write_all(toml_data.as_bytes())
+-            }
+-            Format::Yaml => serde_yaml::to_writer(format_file, &space)
+-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string())),
+-        }
+-    }
+-}
+
+diff --git a/src/output/mod.rs b/src/output/mod.rs
+--- a/src/output/mod.rs
++++ b/src/output/mod.rs
+@@ -1,8 +1,5 @@
+ pub(crate) mod dump;
+ pub use dump::*;
+ 
+-pub(crate) mod dump_formats;
+-pub use dump_formats::*;
+-
+ pub(crate) mod dump_metrics;
+ pub use dump_metrics::*;
+
+diff --git a/src/spaces.rs b/src/spaces.rs
+--- a/src/spaces.rs
++++ b/src/spaces.rs
+@@ -14,7 +14,6 @@ use crate::loc::{self, Loc};
+ use crate::mi::{self, Mi};
+ use crate::nom::{self, Nom};
+ 
+-use crate::dump_formats::*;
+ use crate::dump_metrics::*;
+ use crate::traits::*;
+ 
+@@ -202,7 +201,8 @@ struct State<'a> {
+     halstead_maps: HalsteadMaps<'a>,
+ }
+ 
+-/// Returns function space data of the code in a file.
++/// Returns all function spaces data of a code. This function needs a parser to
++/// be created a priori in order to work.
+ ///
+ /// # Examples
+ ///
+@@ -221,7 +221,7 @@ struct State<'a> {
+ /// // The parser of the code, in this case a CPP parser
+ /// let parser = CppParser::new(source_as_vec, &path, None);
+ ///
+-/// // Gets the function space data of the code contained in foo.c
++/// // Gets all function spaces data of the code contained in foo.c
+ /// metrics(&parser, &path).unwrap();
+ /// # }
+ /// ```
+@@ -296,15 +296,6 @@ pub fn metrics<'a, T: ParserTrait>(parser: &'a T, path: &'a PathBuf) -> Option<F
+ pub struct MetricsCfg {
+     /// Path to the file containing the code
+     pub path: PathBuf,
+-    /// The output format
+-    pub output_format: Option<Format>,
+-    /// If `true`, the `CBOR` and `JSON` output formats are
+-    /// pretty-printed
+-    pub pretty: bool,
+-    /// Path to the output file containing the metrics
+-    ///
+-    /// If `None`, the metrics are dumped on shell
+-    pub output_path: Option<PathBuf>,
+ }
+ 
+ pub struct Metrics {
+@@ -317,17 +308,7 @@ impl Callback for Metrics {
+ 
+     fn call<T: ParserTrait>(cfg: Self::Cfg, parser: &T) -> Self::Res {
+         if let Some(space) = metrics(parser, &cfg.path) {
+-            if let Some(output_format) = cfg.output_format {
+-                dump_formats(
+-                    &space,
+-                    &cfg.path,
+-                    &cfg.output_path,
+-                    output_format,
+-                    cfg.pretty,
+-                )
+-            } else {
+-                dump_root(&space)
+-            }
++            dump_root(&space)
+         } else {
+             Ok(())
+         }
+
+
+</patch>
+
+<TEST>
+<Filename>rust-code-analysis-cli/src/main.rs</Filename>
+<imports>use super::act_on_file;
+use std::path::PathBuf;
+use std::fs;
+use rust_code_analysis::LANG;
+use rust_code_analysis::metrics;
+use rust_code_analysis::CppParser;</imports>
+<Rust>#[test]
+fn test_act_on_file_with_output_format() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output_path = temp_dir.path().join("output.json");
+    let cfg = Config {
+        function: false,
+        metrics: true,
+        output_format: Some(Format::Json),
+        output: Some(temp_dir.path().to_path_buf()),
+        pretty: false,
+        line_start: None,
+        line_end: None,
+        in_place: false,
+        comments: false,
+        web: false,
+    };
+    let path = PathBuf::from("test.c");
+    let source_code = b"int main() { return 0; }";
+    let language = Some(LANG::Cpp);
+
+    let result = act_on_file(language, path.clone(), &cfg);
+    assert!(result.is_ok());
+
+    let output_content = fs::read_to_string(output_path).unwrap();
+    assert!(output_content.contains("\"name\":\"main\""));
+
+    let parser = CppParser::new(source_code.to_vec(), &path, None);
+    let space = metrics(&parser, &path).unwrap();
+    let expected_output = serde_json::to_string(&space).unwrap();
+    assert_eq!(output_content, expected_output);
+}
+</Rust>
+</TEST>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+fn act_on_file(language: Option<LANG>, path: PathBuf, cfg: &Config) -> std::io::Result<()>
+
+pub fn metrics<'a, T: ParserTrait>(parser: &'a T, path: &'a PathBuf) -> Option<FuncSpace>
+</Signatures>
+
+You are a software tester at rust-code-analysis and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently passes before the patch.
+Your task is to:
+1. Identify and understand the reason behind the unit test passing before the patch.
+2. Update the unit test in the <TEST> block to resolve these issues. 3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

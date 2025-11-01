@@ -1,0 +1,277 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Wrong LLOC computation for the Rust language
+Initially we assumed that **ALL** Rust expressions were statements. For example:
+
+Accessing a field --> `struct.field`
+Parenthesized expressions --> `(42 + 0)`
+Tuple expressions ---> `(0, 42)`
+Array expressions ---> `[0; 42]`
+Functions and macros when they are not used as statements ---> `if foo() {}` or `if foo!() {}`
+
+This approach leaded to have an high and wrong `LLOC`  for the `Rust` language. It would be helpful to remove these statements and consider only the effective ones.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/metrics/loc.rs b/src/metrics/loc.rs
+--- a/src/metrics/loc.rs
++++ b/src/metrics/loc.rs
+@@ -310,26 +310,37 @@ impl Loc for RustCode {
+             | AssignmentExpression
+             | CompoundAssignmentExpr
+             | ReturnExpression
+-            | CallExpression
+-            | ArrayExpression
+-            | ParenthesizedExpression
+-            | TupleExpression
+-            | UnitExpression
+             | IfExpression
+             | IfLetExpression
+             | WhileExpression
+             | WhileLetExpression
+             | LoopExpression
+             | ForExpression
+-            | ClosureExpression
+             | BreakExpression
+             | ContinueExpression
+-            | IndexExpression
+-            | AwaitExpression
+-            | FieldExpression
+-            | MacroInvocation => {
++            | AwaitExpression => {
+                 stats.logical_lines += 1;
+             }
++            CallExpression | MacroInvocation | ClosureExpression => {
++                if count_specific_ancestors!(
++                    node,
++                    CallExpression
++                        | MacroInvocation
++                        | ClosureExpression
++                        | LetDeclaration
++                        | WhileExpression
++                        | WhileLetExpression
++                        | ForExpression
++                        | IfExpression
++                        | IfLetExpression
++                        | ReturnExpression
++                        | AwaitExpression,
++                    Block
++                ) == 0
++                {
++                    stats.logical_lines += 1;
++                }
++            }
+             _ => {
+                 stats.lines.insert(start);
+             }
+@@ -562,6 +573,135 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn rust_no_field_expression_lloc() {
++        check_metrics!(
++            "struct Foo {
++                field: usize,
++             }
++             let foo = Foo { 42 };
++             foo.field",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 1, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_no_parenthesized_expression_lloc() {
++        check_metrics!(
++            "let a = (42 + 0);",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 1, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_no_array_expression_lloc() {
++        check_metrics!(
++            "let a = [0; 42];",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 1, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_no_tuple_expression_lloc() {
++        check_metrics!(
++            "let a = (0, 42);",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 1, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_no_unit_expression_lloc() {
++        check_metrics!("let a = ();", "foo.rs", RustParser, loc, [(lloc, 1, usize)]);
++    }
++
++    #[test]
++    fn rust_call_function_lloc() {
++        check_metrics!(
++            "let a = foo(); // +1
++             foo(); // +1
++             k!(foo()); // +1",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 3, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_macro_invocation_lloc() {
++        check_metrics!(
++            "let a = foo!(); // +1
++             foo!(); // +1
++             k(foo!()); // +1",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 3, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_function_in_loop_lloc() {
++        check_metrics!(
++            "for (a, b) in c.iter().enumerate() {} // +1
++             while (a, b) in c.iter().enumerate() {} // +1
++             while let Some(a) = c.strip_prefix(\"hi\") {} // +1",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 3, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_function_in_if_lloc() {
++        check_metrics!(
++            "if foo() {} // +1
++             if let Some(a) = foo() {} // +1",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 2, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_function_in_return_lloc() {
++        check_metrics!(
++            "return foo();
++             await foo();",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 2, usize)]
++        );
++    }
++
++    #[test]
++    fn rust_closure_expression_lloc() {
++        check_metrics!(
++            "let a = |i: i32| -> i32 { i + 1 }; // +1
++             a(42); // +1
++             k(b.iter().map(|n| n.parse.ok().unwrap_or(42))); // +1",
++            "foo.rs",
++            RustParser,
++            loc,
++            [(lloc, 3, usize)]
++        );
++    }
++
+     #[test]
+     fn python_general_loc() {
+         check_metrics!(
+
+
+</patch>
+
+<TEST>
+<Filename>src/metrics/loc.rs</Filename>
+<imports></imports>
+<Rust>#[test]
+fn test_rust_lloc_computation() {
+  let code = "struct Foo { field: usize, } let foo = Foo { 42 }; foo.field";
+  let expected_lloc = 1;
+  let actual_lloc = RustCode::calculate_lloc(code);
+  assert_eq!(expected_lloc, actual_lloc);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `calculate_lloc` found for struct `langs::RustCode` in the current scope
+   --> src/metrics/loc.rs:733:35
+    |
+733 |       let actual_lloc = RustCode::calculate_lloc(code);
+    |                                   ^^^^^^^^^^^^^^ function or associated item not found in `langs::RustCode`
+    | 
+   ::: src/macros.rs:246:13
+    |
+246 |             pub struct $code { _guard: (), }
+    |             ---------------- function or associated item `calculate_lloc` not found for this
+
+error: aborting due to previous error
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at rust-code-analysis and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

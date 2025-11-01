@@ -1,0 +1,251 @@
+<think>
+Okay, let's tackle this. The issue is about splitting metrics into average and sum. The patch added new fields like functions_average and closures_average in the nom metrics. The user wants a regression test to ensure these averages are correctly calculated.
+
+Looking at the patch, the Stats struct in nom.rs now has a space_count, and methods like functions_average, closures_average, and average. The tests in the patch check these new fields with specific expected values based on the number of spaces.
+
+So, the test should verify that when multiple spaces are merged, the averages are calculated correctly. For example, if there are two spaces with 1 function each, merging them should make the average 0.5 each.
+
+The existing tests in the patch use a Stats struct and merge multiple Stats instances. So, the test should create two Stats, merge them, and check if the averages are computed correctly.
+
+The test needs to use the Stats struct and its merge method. It will create two Stats instances with known values, merge them, and then assert that the average fields are correct.
+
+We can create two Stats instances: one with 1 function and 0 closures, and another with the same. When merged, the space_count becomes 2. The functions_average should be (1+1)/2 = 1.0? Wait, wait. Wait, the first example in the patch's tests shows functions_average as 0.5 when space_count is 4. Wait, maybe I need to look at the test examples.
+
+Wait, in the first test in the patch, they have four spaces, and functions_sum is 3 (since 0.75 average times 4 spaces is 3). But how does that work? Wait, the test data in the patch's code has multiple Stats being merged. For example, in one test, they create four different Stats instances and merge them. The merged sum of functions is 3, and space_count is 4, leading to 0.75 average.
+
+So, for our test case, if we merge two Stats each with 1 function and 0 closures, the merged sum would be 2 functions (1+1) and space_count 2. Then functions_sum() is 2, space_count is 2, so average is 1.0. Wait, but in the patch's tests, when there are two spaces with 1 function each, the average is 1.0 (like in the second example where space_count is 2, and the average is 1.0). But wait, in another test, when space_count is 2 and functions_sum is 1, the average is 0.5. So, functions_average is functions_sum divided by space_count.
+
+So, the test should create two Stats instances, each with 1 function and 0 closures. When merged, the merged Stats will have functions_sum 2, space_count 2. Then functions_average will be 2/2 = 1.0. Wait, but that would be 1.0. But according to the patch's tests, when there's two spaces each with 1 function, the functions_average is 1.0. For example, one of the test cases in the patch has:
+
+In the first patch example, the "nom" in server.rs has "functions_average": 0.5. How does that work? Let me check the code.
+
+In server.rs, the first modified test case has a "nom" with functions_average 0.5. The space_count here would be 2, because 1 function total divided by 2 spaces gives 0.5. So, merging two spaces where one has 1 function and the other has 0?
+
+Wait, perhaps the test should create two Stats. The first Stats represents a space with 1 function, the second with 0 functions. When merged, the sum is 1, space_count 2. So average is 0.5.
+
+So, to create a test that fails before the patch and passes after. Before the patch, the average fields didn't exist. So the test must check that after the patch, the functions_average is correctly calculated.
+
+Let me outline the test steps:
+
+1. Create two Stats instances. Let's say the first has 1 function, 0 closures. The second has 0 functions, 0 closures.
+2. Merge them into a third Stats.
+3. Check that the merged Stats' functions_average is (1 + 0)/2 = 0.5.
+4. Also check that functions_sum is 1 (correct sum), space_count is 2.
+
+This test would fail before the patch since functions_average wasn't present. After the patch, it should pass.
+
+Now, how to code this? The Stats struct has a merge method. Each Stats instance is initialized with functions_sum and space_count.
+
+Wait, the Stats struct's merge function adds the functions_sum and closures_sum, and increments the space_count. So, when you merge two Stats instances, their functions are summed and space_count is summed.
+
+Wait, in the Stats::merge method:
+
+self.functions_sum += other.functions_sum;
+self.space_count += other.space_count;
+
+So, if you start with two Stats instances:
+
+s1: functions_sum 1, space_count 1.
+
+s2: functions_sum 0, space_count 1.
+
+After merging s1 and s2, the merged Stats will have functions_sum 1, space_count 2. Therefore, functions_average is 1 / 2 = 0.5.
+
+Yes, that's correct.
+
+So the test can be:
+
+- Create two Stats instances. One with 1 function (s1), another with 0 functions (s2).
+- Merge s2 into s1.
+- Check that functions_average is 0.5.
+
+But how to create a Stats instance with specific functions_sum and space_count?
+
+The Stats struct has methods for functions_sum(), which is self.functions_sum as f64. But the internal fields are functions_sum: usize.
+
+Wait, the Stats struct is a Default and has a merge method. But to set specific values, perhaps we need to directly modify the internal fields. However, the struct is not public in the code. Wait, looking at the code in the patch, the Stats struct in src/metrics/nom.rs has fields like functions_sum and space_count. But are they public?
+
+In the code, the struct is defined as:
+
+pub struct Stats {
+    functions_max: usize,
+    closures_min: usize,
+    closures_max: usize,
+    space_count: usize,
+}
+
+So the fields are public? Wait, no. In Rust, fields are private by default. The struct is pub, but the fields are not. So to modify them directly, perhaps they need to be public. But in the code in the patch, the tests like in mod tests have code like:
+
+let mut s1 = Stats::default();
+s1.functions_sum = 1;
+s1.space_count = 1;
+
+But in the code of the patch, the tests have code like:
+
+fn test_foo() {
+    let mut s1 = Stats::default();
+    s1.functions_sum = 1;
+    s1.space_count = 1;
+    ...
+}
+
+But since the tests are in the same module, maybe the Stats struct is defined in a mod tests and the fields are accessible. However, when writing a test outside of that module, perhaps the fields are not public. Wait, the user is adding a new test to the same module, as per the patch. The existing tests are in a mod tests block in server.rs and nom.rs.
+
+But in the user's task, they need to write a test in Rust. The user is to write a test that's self-contained. But if the Stats struct's fields are private, then modifying them directly in the test would not be possible. However, the code in the patch shows that in tests, they do modify the fields directly. That implies that the Stats struct's fields are public. Wait, perhaps the struct is defined with pub fields.
+
+Looking at the code in src/metrics/nom.rs:
+
+pub struct Stats {
+    functions_sum: usize,
+    ...
+    space_count: usize,
+}
+
+The fields are pub? No, the struct is pub, but the fields are not. But in the tests in the patch, they are modifying the fields. So perhaps the code in the patch is part of the same module as the test, allowing access to private fields. Because in the patch, the test is inside mod tests, and they can access the struct's fields if they are in the same module.
+
+So, for the test we are writing, if the test is in the same module as Stats, we can access its private fields. Therefore, in the test, we can create instances of Stats and modify their fields directly.
+
+Therefore, the test can be written as follows:
+
+- Create two Stats instances.
+- For the first, set functions_sum to 1, space_count to 1.
+- For the second, set functions_sum to 0, space_count to 1.
+- Merge the second into the first.
+- Check that the merged functions_average is 0.5.
+
+So the code would be:
+
+use super::Stats;
+
+#[test]
+fn test_nom_functions_average() {
+    let mut s1 = Stats::default();
+    s1.functions_sum = 1;
+    s1.space_count = 1;
+
+    let mut s2 = Stats::default();
+    s2.functions_sum = 0;
+    s2.space_count = 1;
+
+    s1.merge(&s2);
+
+    assert_eq!(s1.functions_average(), 0.5);
+}
+
+This test would fail before the patch (when functions_average doesn't exist) and pass after the patch.
+
+But wait, functions_average is a method added in the patch. So before the patch, that method isn't present. Therefore, this test would fail before the patch and pass after.
+
+Yes, that's correct. But the user's task is to write a test that fails before the patch and passes after. Therefore, this test should be correct.
+
+Now, check the imports. The test needs to use the Stats struct. If the test is in the same module as Stats, then use super::Stats is correct.
+
+Assuming the test is written in the same module as the Stats struct (e.g., in the mod tests block of nom.rs), the use statement is super::Stats. But the user's test is to be added in a file. The user's task is to generate a test that can be added to the existing code. The existing code's tests (in nom.rs) have tests inside mod tests, but the user's test should be a single test function. However, the user's instruction says to write exactly one test function without wrapping it in a mod tests block. But if the existing code has a mod tests block, perhaps the new test should be added inside it. However, the user's instruction allows that.
+
+But the user's instruction says to write the test as a standalone test function, not inside a mod. Wait, the user's instruction says: "Write exactly one rust test #[test]fn test_...(){...} block. Do NOT wrap the test inside a 'mod tests' block." So the test must stand alone. But in the code, the existing tests are inside mod tests. So the user's test should be added to the same module as Stats. However, Rust requires that to access the struct's fields, the test must be in the same module. But how to do that without a mod tests block? That's tricky.
+
+Wait, the user's instruction says: "If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique." So the existing tests are inside mod tests. Therefore, perhaps the new test should be added inside that mod tests block. But the user's instruction says to avoid wrapping the test in a mod tests block. Hmm, this is conflicting. But the user's instruction says to write a test function that is not wrapped in a mod tests block. Therefore, perhaps the test is to be written in a separate test file or in a different module. However, in Rust, to access private methods and fields, the test must be in the same module.
+
+This complicates things. But given the user's instruction, perhaps the test is to be written as a standalone function, assuming that it's in the same module as the Stats struct. So using super::Stats would be correct if the test is in the same module.
+
+But in practice, if the test is not inside a mod tests block, the code may not compile. However, for the sake of the exercise, we proceed.
+
+So the imports are use super::Stats;. But where is this test placed? According to the user's instruction, the test must be self-contained and in the same file as the code under test, or in a test module.
+
+Given the user's example in the patch, where the existing tests are in a mod tests inside the same file as the code, the new test should be added there. But the user's instruction says to write the test outside of the mod tests. So perhaps the correct approach is to create a new test module. But given the user's constraints, perhaps the best approach is to proceed as per the instructions, even if in practice it might not work.
+
+Alternatively, perhaps the test is part of the integration tests for the crate, in which case the code would have access to the necessary modules. However, without knowing the exact structure, we proceed with what the user provided.
+
+The user's test requires that the test is written as a standalone #[test] function. Therefore, the imports must include whatever is needed. But for the Stats struct to be available, the test must import it correctly.
+
+The correct filename is src/metrics/nom.rs, as per the patch. The test would be added there, likely inside the existing mod tests. But according to the user's instruction, the test must be written as a single test function without wrapping in mod tests. So perhaps the test is written in a different test file. However, the user's example shows that the test in server.rs's mod tests block uses the Stats struct from the same file. So in the case of the nom.rs test, if we write a test in the same mod tests block, it can access the Stats struct's fields.
+
+But the user's instruction says to not wrap the test in a mod tests block. So perhaps the test is in a separate test file, but that would require different handling. However, given the constraints, proceed with the code that uses super::Stats and assumes it's in the correct module.
+
+Thus, the test code would be:
+
+use super::Stats;
+
+#[test]
+fn test_nom_functions_average() {
+    let mut s1 = Stats::default();
+    s1.functions_sum = 1;
+    s1.space_count = 1;
+
+    let mut s2 = Stats::default();
+    s2.functions_sum = 0;
+    s2.space_count = 1;
+
+    s1.merge(&s2);
+
+    assert_eq!(s1.functions_average(), 0.5);
+}
+
+This test checks that after merging two Stats instances (with space counts 1 each), the functions_average is calculated correctly as (1 + 0)/2 = 0.5.
+
+This test will fail before the patch since the functions_average method doesn't exist. After applying the patch, the method exists and the test should pass.
+
+Now, check if the merge method is public. The Stats struct's merge method is part of the impl block. Looking at the code:
+
+impl Stats {
+    // other methods
+    pub fn merge(&mut self, other: &Self) {
+        // code
+    }
+}
+
+If the merge method is public, then the test can call it. If not, the test would need to call it via some public API. But according to the patch's code, in the tests, they call merge directly, suggesting it's public. For example, in the mod tests in the patch, they do:
+
+let mut s1 = ...;
+s1.merge(&s2);
+
+Thus, the merge method is public.
+
+Therefore, the code above is correct.
+
+Now, the filename is src/metrics/nom.rs, as per the patch. The imports are use super::Stats; since the test is in the same module as the Stats struct (assuming the test is inside the same mod tests block).
+
+So the final answer is:
+
+<Filename>src/metrics/nom.rs</Filename>
+<imports>
+use super::Stats;
+</imports>
+<Rust>
+#[test]
+fn test_nom_functions_average() {
+    let mut s1 = Stats::default();
+    s1.functions_sum = 1;
+    s1.space_count = 1;
+
+    let mut s2 = Stats::default();
+    s2.functions_sum = 0;
+    s2.space_count = 1;
+
+    s1.merge(&s2);
+
+    assert_eq!(s1.functions_average(), 0.5);
+}
+</Rust>
+</think>
+
+<Filename>src/metrics/nom.rs</Filename>
+<imports>
+use super::Stats;
+</imports>
+<Rust>
+#[test]
+fn test_nom_functions_average() {
+    let mut s1 = Stats::default();
+    s1.functions_sum = 1;
+    s1.space_count = 1;
+
+    let mut s2 = Stats::default();
+    s2.functions_sum = 0;
+    s2.space_count = 1;
+
+    s1.merge(&s2);
+
+    assert_eq!(s1.functions_average(), 0.5);
+}
+</Rust>

@@ -1,0 +1,92 @@
+#src/web/server.rs
+extern crate actix_web;
+
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use std::path::PathBuf;
+
+use super::ast::{AstCallback, AstCfg, AstPayload};
+use super::comment::{WebCommentCallback, WebCommentCfg, WebCommentPayload};
+use crate::languages::action;
+use crate::tools::get_language_for_file;
+
+fn ast_parser(item: web::Json<AstPayload>, _req: HttpRequest) -> HttpResponse {
+    let language = get_language_for_file(&PathBuf::from(&item.file_name));
+    let payload = item.into_inner();
+    let cfg = AstCfg {
+        id: payload.id,
+        comment: payload.comment,
+        span: payload.span,
+    };
+    // TODO: the 4th arg should be preproc data
+    HttpResponse::Ok().json(action::<AstCallback>(
+        &language.unwrap(),
+        payload.code.into_bytes(),
+        &PathBuf::from(""),
+        None,
+        cfg,
+    ))
+}
+
+fn comment_removal(item: web::Json<WebCommentPayload>, _req: HttpRequest) -> HttpResponse {
+    let language = get_language_for_file(&PathBuf::from(&item.file_name));
+    let payload = item.into_inner();
+    let cfg = WebCommentCfg { id: payload.id };
+    HttpResponse::Ok().json(action::<WebCommentCallback>(
+        &language.unwrap(),
+        payload.code.into_bytes(),
+        &PathBuf::from(""),
+        None,
+        cfg,
+    ))
+}
+
+pub fn run(host: &str, port: u32, n_threads: usize) -> std::io::Result<()> {
+    println!("Run server");
+    HttpServer::new(|| {
+        App::new()
+            .service(
+                web::resource("/ast")
+                    .data(web::JsonConfig::default().limit(std::u32::MAX as usize))
+                    .route(web::post().to(ast_parser)),
+            )
+            .service(
+                web::resource("/comment")
+                    .data(web::JsonConfig::default().limit(std::u32::MAX as usize))
+                    .route(web::post().to(comment_removal)),
+            )
+    })
+    .workers(n_threads)
+    .bind(format!("{}:{}", host, port))?
+    .run()
+}
+
+// curl --header "Content-Type: application/json" --request POST --data '{"id": "1234", "file_name": "prova.cpp", "code": "int x = 1;", "comment": true, "span": true}' http://127.0.0.1:8080/ast
+
+#[cfg(test)]
+mod tests {
+use super::ast_parser;
+use actix_web::{test, web, App};
+use serde_json::json;
+use crate::tools::get_language_for_file;
+use std::path::PathBuf;
+
+#[test]
+fn test_ast_parser_language_detection() {
+    let mut app = test::init_service(App::new().route("/ast", web::post().to(ast_parser)));
+    let payload = json!({
+        "id": "1234",
+        "file_name": "example.cpp",
+        "code": "int x = 1;",
+        "comment": true,
+        "span": true
+    });
+    let req = test::TestRequest::post()
+        .uri("/ast")
+        .set_json(&payload)
+        .to_request();
+    let resp = test::call_service(&mut app, req);
+    assert!(resp.status().is_success());
+    let language = get_language_for_file(&PathBuf::from("example.cpp"));
+    assert_eq!(language, "cpp");
+}
+}

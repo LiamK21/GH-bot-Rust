@@ -1,0 +1,260 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Sloc shouldn't count spurious blank lines after the code
+It would be possible to create a file which has a series of blank lines after the last line of code.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/macros.rs b/src/macros.rs
+--- a/src/macros.rs
++++ b/src/macros.rs
+@@ -106,6 +106,9 @@ macro_rules! mk_action {
+         /// // Configuration options used by the function which computes the metrics
+         /// let cfg = MetricsCfg {
+         ///     path,
++        ///     output_format: None,
++        ///     pretty: false,
++        ///     output_path: None,
+         /// };
+         ///
+         /// action::<Metrics>(&language, source_as_vec, &cfg.path.clone(), None, cfg);
+@@ -124,38 +127,6 @@ macro_rules! mk_action {
+                 )*
+             }
+         }
+-
+-        /// Returns all function spaces data of a code.
+-        ///
+-        /// # Examples
+-        ///
+-        /// ```
+-        /// use std::path::PathBuf;
+-        ///
+-        /// use rust_code_analysis::{get_function_spaces, LANG};
+-        ///
+-        /// # fn main() {
+-        /// let source_code = "int a = 42;";
+-        /// let language = LANG::Cpp;
+-        ///
+-        /// // The path to a dummy file used to contain the source code
+-        /// let path = PathBuf::from("foo.c");
+-        /// let source_as_vec = source_code.as_bytes().to_vec();
+-        ///
+-        /// get_function_spaces(&language, source_as_vec, &path, None).unwrap();
+-        /// # }
+-        /// ```
+-        #[inline(always)]
+-        pub fn get_function_spaces(lang: &LANG, source: Vec<u8>, path: &PathBuf, pr: Option<Arc<PreprocResults>>) -> Option<FuncSpace> {
+-            match lang {
+-                $(
+-                    LANG::$camel => {
+-                        let parser = $parser::new(source, &path, pr);
+-                        metrics(&parser, &path)
+-                    },
+-                )*
+-            }
+-        }
+     };
+ }
+ 
+@@ -291,7 +262,9 @@ macro_rules! check_metrics {
+      $( [ $( ( $func_float: ident, $true_float_value: expr )$(,)* )* ] )?) => {
+         {
+             let path = PathBuf::from($file);
+-            let parser = $parser::new($source.to_string().into_bytes(), &path, None);
++            let mut trimmed_bytes = $source.trim_end().trim_matches('\n').as_bytes().to_vec();
++            trimmed_bytes.push(b'\n');
++            let parser = $parser::new(trimmed_bytes, &path, None);
+             let func_space = metrics(&parser, &path).unwrap();
+ 
+             $( assert_eq!(func_space.metrics.$metric.$func_int() $(as $type_int)?, $true_int_value); )*
+
+diff --git a/src/metrics/loc.rs b/src/metrics/loc.rs
+--- a/src/metrics/loc.rs
++++ b/src/metrics/loc.rs
+@@ -375,10 +375,30 @@ mod tests {
+ 
+     use super::*;
+ 
++    #[test]
++    fn test_sloc() {
++        check_metrics!(
++            "
++
++            a = 42
++
++            ",
++            "foo.py",
++            PythonParser,
++            loc,
++            [(sloc, 1, usize)]
++        );
++    }
++
+     #[test]
+     fn test_blank_python() {
+         check_metrics!(
+-            "\na = 42\n\n",
++            "
++            a = 42
++
++            b = 43
++
++            ",
+             "foo.py",
+             PythonParser,
+             loc,
+@@ -389,7 +409,13 @@ mod tests {
+     #[test]
+     fn test_blank_rust() {
+         check_metrics!(
+-            "\nlet a = 42;\n\n",
++            "
++
++            let a = 42;
++
++            let b = 43;
++
++            ",
+             "foo.rs",
+             RustParser,
+             loc,
+@@ -397,7 +423,7 @@ mod tests {
+         );
+ 
+         check_metrics!(
+-            "fn func() { /* comment */ }\n",
++            "fn func() { /* comment */ }",
+             "foo.rs",
+             RustParser,
+             loc,
+@@ -408,7 +434,13 @@ mod tests {
+     #[test]
+     fn test_blank_c() {
+         check_metrics!(
+-            "\nint a = 42;\n\n",
++            "
++
++            int a = 42;
++
++            int b = 43;
++
++            ",
+             "foo.c",
+             CppParser,
+             loc,
+
+diff --git a/src/tools.rs b/src/tools.rs
+--- a/src/tools.rs
++++ b/src/tools.rs
+@@ -26,6 +26,8 @@ pub fn read_file(path: &PathBuf) -> std::io::Result<Vec<u8>> {
+     let mut data = Vec::new();
+     file.read_to_end(&mut data)?;
+ 
++    remove_blank_lines(&mut data);
++
+     Ok(data)
+ }
+ 
+@@ -80,13 +82,7 @@ pub fn read_file_with_eol(path: &PathBuf) -> std::io::Result<Option<Vec<u8>>> {
+ 
+     file.read_to_end(&mut data)?;
+ 
+-    if let Some(c) = data.last() {
+-        if *c != b'\n' {
+-            data.push(b'\n');
+-        }
+-    } else {
+-        data.push(b'\n');
+-    }
++    remove_blank_lines(&mut data);
+ 
+     Ok(Some(data))
+ }
+@@ -243,6 +239,15 @@ pub fn guess_language<P: AsRef<Path>>(buf: &[u8], path: P) -> (Option<LANG>, Str
+     }
+ }
+ 
++pub(crate) fn remove_blank_lines(data: &mut Vec<u8>) {
++    let count_trailing = data.iter().rev().take_while(|&c| *c == b'\n').count();
++    if count_trailing > 0 {
++        data.truncate(data.len() - count_trailing + 1);
++    } else {
++        data.push(b'\n');
++    }
++}
++
+ pub(crate) fn normalize_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
+     // Copied from Cargo sources: https://github.com/rust-lang/cargo/blob/master/src/cargo/util/paths.rs#L65
+     let mut components = path.as_ref().components().peekable();
+
+
+</patch>
+
+<TEST>
+<Filename>src/tools.rs</Filename>
+<imports>use std::path::PathBuf;
+use std::io;</imports>
+<Rust>#[test]
+fn test_remove_trailing_blank_lines() {
+  let mut data_with_trailing_blank_lines = "fn main() {\n\n\n\n".as_bytes().to_vec();
+  let expected_data_with_trailing_blank_lines = "fn main() {\n\n\n".as_bytes().to_vec();
+  remove_blank_lines(&mut data_with_trailing_blank_lines);
+  assert_eq!(data_with_trailing_blank_lines, expected_data_with_trailing_blank_lines);
+
+  let mut data_without_trailing_blank_lines = "fn main() {\n\n}".as_bytes().to_vec();
+  let expected_data_without_trailing_blank_lines = "fn main() {\n\n}".as_bytes().to_vec();
+  remove_blank_lines(&mut data_without_trailing_blank_lines);
+  assert_eq!(data_without_trailing_blank_lines, expected_data_without_trailing_blank_lines);
+}
+</Rust>
+</TEST>
+
+<output>
+running 1 test
+thread 'tools::tests::test_remove_trailing_blank_lines' panicked at 'assertion failed: `(left == right)`
+</output>
+
+Function signatures
+<Signatures>
+pub fn read_file(path: &PathBuf) -> std::io::Result<Vec<u8>>
+
+pub fn read_file_with_eol(path: &PathBuf) -> std::io::Result<Option<Vec<u8>>>
+</Signatures>
+
+You are a software tester at rust-code-analysis and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently fails after the patch.
+Your task is to:
+1. Identify and understand why the unit test failed.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
