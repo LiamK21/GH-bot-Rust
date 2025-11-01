@@ -1,0 +1,162 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Cobertura report doesn't contain proper class line coverage
+The cobertura report format introduced with #599 seems to [only report orphan lines on class level](https://github.com/mozilla/grcov/blob/master/src/cobertura.rs#L314).
+
+While the cobertura format itself is not properly specified, it seems that pretty much all other test frameworks and reporters always add the full coverage data on class level and not just orphan lines. This can also be seen when looking at example reports created by cobertura itself, e.g. the [cobertura example report for the official Jenkins cobertura plugin](https://github.com/jenkinsci/cobertura-plugin/blob/master/src/test/resources/hudson/plugins/cobertura/coverage-with-data.xml). The lack of this data causes incompatibilities with reporting tools like [GitLab's cobertura artefact](https://docs.gitlab.com/ee/user/project/merge_requests/test_coverage_visualization.html): **[Example coverage not shown since empty like coverage on class level was reported](https://gitlab.com/fh1ch/hello-inline-coverage-rust/-/merge_requests/1/diffs)** 
+
+When the logic is changed to always add the complete class level line coverage ([via following diff](https://github.com/fh1ch/grcov/commit/0a64a1b16d34af6eb80a240a16feed2a0fda1713)), the report on GitLab works just fine: **[Example coverage shown](https://gitlab.com/fh1ch/hello-inline-coverage-rust/-/merge_requests/2/diffs)**
+
+This fact also becomes apparent when bypassing the cobertura reporter by creating an lcov report first and using the [`lcov_cobertura` python module](https://github.com/eriwen/lcov-to-cobertura-xml) to create the final cobertura report:
+
+```sh
+grcov . --source-dir . --binary-path target/debug/ --branch --output-type lcov --output-path coverage.lcov
+pip3 install lcov_cobertura
+python3 -m lcov_cobertura coverage.lcov
+```
+
+This report contains the full class level line coverage and is hence also properly parsed by tools like GitLab.
+
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/cobertura.rs b/src/cobertura.rs
+--- a/src/cobertura.rs
++++ b/src/cobertura.rs
+@@ -241,8 +241,6 @@ fn get_coverage(
+         .map(|(_, rel_path, result)| {
+             let all_lines: Vec<u32> = result.lines.iter().map(|(k, _)| k).cloned().collect();
+ 
+-            let mut orphan_lines: BTreeSet<u32> = all_lines.iter().cloned().collect();
+-
+             let end: u32 = result.lines.keys().last().unwrap_or(&0) + 1;
+ 
+             let mut start_indexes: Vec<u32> = Vec::new();
+@@ -295,7 +293,6 @@ fn get_coverage(
+                         .filter(|&&x| x >= function.start && x < func_end)
+                     {
+                         lines_in_function.push(*line);
+-                        orphan_lines.remove(line);
+                     }
+ 
+                     let lines: Vec<Line> = lines_in_function
+@@ -311,7 +308,7 @@ fn get_coverage(
+                 })
+                 .collect();
+ 
+-            let lines: Vec<Line> = orphan_lines.into_iter().map(line_from_number).collect();
++            let lines: Vec<Line> = all_lines.into_iter().map(line_from_number).collect();
+             let class = Class {
+                 name: rel_path
+                     .file_stem()
+
+
+</patch>
+
+<TEST>
+<Filename>src/cobertura.rs</Filename>
+<imports></imports>
+<Rust>#[test]
+fn test_cobertura_report_contains_full_class_line_coverage() {
+  let results: BTreeMap<PathBuf, BTreeMap<u32, u32>> = BTreeMap::new();
+  let sources: Vec<String> = vec![];
+  let demangle: bool = false;
+  let demangle_options: DemangleOptions = DemangleOptions::default();
+  let expected_lines: Vec<u32> = vec![1, 2, 3];
+  let coverage = get_coverage(results.into_iter(), sources, demangle, demangle_options);
+  let actual_lines: Vec<u32> = coverage.classes.iter().next().unwrap().lines.iter().map(|line| line.number).collect();
+  assert_eq!(expected_lines, actual_lines);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `default` found for struct `symbolic_demangle::DemangleOptions` in the current scope
+   --> src/cobertura.rs:865:64
+    |
+865 |       let demangle_options: DemangleOptions = DemangleOptions::default();
+    |                                                                ^^^^^^^ function or associated item not found in `symbolic_demangle::DemangleOptions`
+    |
+note: if you're trying to build a new `symbolic_demangle::DemangleOptions` consider using one of the following associated functions:
+      symbolic_demangle::DemangleOptions::complete
+      symbolic_demangle::DemangleOptions::name_only
+   --> /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/symbolic-demangle-8.5.0/src/lib.rs:96:5
+    |
+96  |     pub const fn complete() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+104 |     pub const fn name_only() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> src/cobertura.rs:867:35
+    |
+867 |       let coverage = get_coverage(results.into_iter(), sources, demangle, demangle_options);
+    |                      ------------ ^^^^^^^^^^^^^^^^^^^ expected `Box<dyn Iterator<Item = ...>>`, found `IntoIter<PathBuf, BTreeMap<u32, u32>>`
+    |                      |
+    |                      arguments to this function are incorrect
+    |
+    = note: expected struct `Box<(dyn Iterator<Item = (std::path::PathBuf, std::path::PathBuf, defs::CovResult)> + 'static)>`
+               found struct `std::collections::btree_map::IntoIter<std::path::PathBuf, std::collections::BTreeMap<u32, u32>>`
+note: function defined here
+   --> src/cobertura.rs:234:4
+    |
+234 | fn get_coverage(
+    |    ^^^^^^^^^^^^
+235 |     results: CovResultIter,
+    |     ----------------------
+
+error[E0609]: no field `classes` on type `Coverage`
+   --> src/cobertura.rs:868:45
+    |
+868 |       let actual_lines: Vec<u32> = coverage.classes.iter().next().unwrap().lines.iter().map(|line| line.number).collect();
+    |                                             ^^^^^^^ unknown field
+    |
+    = note: available fields are: `sources`, `packages`
+</output>
+
+Function signatures
+<Signatures>
+fn get_coverage(
+results: CovResultIter,
+sources: Vec<String>,
+demangle: bool,
+demangle_options: DemangleOptions) -> Coverage
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

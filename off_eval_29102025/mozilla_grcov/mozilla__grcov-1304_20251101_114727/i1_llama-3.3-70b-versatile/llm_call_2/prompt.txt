@@ -1,0 +1,376 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Option to use local bulma instead of jsdelivr CDN
+Hi, thanks for developing grcov!
+
+On https://doc.wikimedia.org we have a pretty restrictive CSP that only allows local/self-hosted resources for both privacy and security reasons (e.g. [a broken report](https://doc.wikimedia.org/cover/mwbot-rs/mwbot/coverage/)). Would it be possible to bundle any necessary resources with grcov so they don't need to be loaded from a remote site? This would also be nice for offline usage.
+
+See for example how a [PHPUnit report](https://doc.wikimedia.org/cover-extensions/Linter/) bundles bootstrap.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/html.rs b/src/html.rs
+--- a/src/html.rs
++++ b/src/html.rs
+@@ -1,4 +1,5 @@
+ use chrono::{DateTime, Utc};
++use log::warn;
+ use serde::{Deserialize, Serialize};
+ use serde_json::value::{from_value, to_value, Value};
+ use std::borrow::Cow;
+@@ -8,7 +9,7 @@ use std::fs::{self, File};
+ use std::io::{BufReader, Read, Write};
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+-use tera::try_get_value;
++use tera::{try_get_value, Context, Tera};
+ 
+ use crate::defs::*;
+ 
+@@ -24,6 +25,12 @@ impl HtmlStats {
+     }
+ }
+ 
++#[derive(Debug, clap::ValueEnum, Clone, Copy)]
++pub enum HtmlResources {
++    Bundled,
++    Cdn,
++}
++
+ #[derive(Clone, Debug)]
+ pub struct Config {
+     hi_limit: f64,
+@@ -35,10 +42,17 @@ pub struct Config {
+     date: Option<DateTime<Utc>>,
+     branch_enabled: bool,
+     precision: usize,
++    html_resources: HtmlResources,
+ }
+ 
+ impl Config {
+-    fn new(cfg: &ConfigFile, branch_enabled: bool, precision: usize, no_date: bool) -> Config {
++    fn new(
++        cfg: &ConfigFile,
++        branch_enabled: bool,
++        precision: usize,
++        no_date: bool,
++        html_resources: HtmlResources,
++    ) -> Config {
+         Config {
+             hi_limit: cfg.hi_limit.unwrap_or(90.),
+             med_limit: cfg.med_limit.unwrap_or(75.),
+@@ -49,6 +63,7 @@ impl Config {
+             date: if no_date { None } else { Some(Utc::now()) },
+             branch_enabled,
+             precision,
++            html_resources,
+         }
+     }
+ }
+@@ -76,7 +91,8 @@ impl ConfigFile {
+     }
+ }
+ 
+-static BULMA_VERSION: &str = "0.9.1";
++static BULMA_CDN_VERSION: &str = "0.9.1";
++static BULMA_BUNDLED: &[u8] = include_bytes!("bulma/bulma-0.9.1.min.css");
+ 
+ fn load_template(path: &str) -> String {
+     fs::read_to_string(path).unwrap()
+@@ -127,9 +143,16 @@ pub fn get_config(
+     branch_enabled: bool,
+     precision: usize,
+     no_date: bool,
++    html_resources: HtmlResources,
+ ) -> (Tera, Config) {
+     let user_conf = ConfigFile::load(output_config_file);
+-    let conf = Config::new(&user_conf, branch_enabled, precision, no_date);
++    let conf = Config::new(
++        &user_conf,
++        branch_enabled,
++        precision,
++        no_date,
++        html_resources,
++    );
+ 
+     let mut tera = Tera::default();
+ 
+@@ -273,13 +296,23 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &Path, stats:
+     };
+ }
+ 
+-use tera::{Context, Tera};
+-
+-fn make_context(conf: &Config) -> Context {
++fn make_context(conf: &Config, path_to_root: &str) -> Context {
+     let mut ctx = Context::new();
+ 
+-    let ver = std::env::var("BULMA_VERSION").map_or(BULMA_VERSION.into(), |v| v);
+-    ctx.insert("bulma_version", &ver);
++    let overridden_bulma = std::env::var("BULMA_VERSION").ok();
++    let bulma_url = match conf.html_resources {
++        HtmlResources::Bundled => {
++            if overridden_bulma.is_some() {
++                warn!("BULMA_VERSION env var is incompatible with --html-resources=bundled");
++            }
++            format!("{}/bulma.min.css", path_to_root.trim_end_matches('/'))
++        }
++        HtmlResources::Cdn => {
++            let version = overridden_bulma.as_deref().unwrap_or(BULMA_CDN_VERSION);
++            format!("https://cdn.jsdelivr.net/npm/bulma@{version}/css/bulma.min.css")
++        }
++    };
++    ctx.insert("bulma_url", &bulma_url);
+ 
+     ctx.insert("date", &conf.date);
+     ctx.insert("precision", &conf.precision);
+@@ -299,7 +332,7 @@ pub fn gen_index(tera: &Tera, global: &HtmlGlobalStats, conf: &Config, output: &
+         Ok(f) => f,
+     };
+ 
+-    let mut ctx = make_context(conf);
++    let mut ctx = make_context(conf, ".");
+     let empty: &[&str] = &[];
+     ctx.insert("current", "top_level");
+     ctx.insert("parents", empty);
+@@ -339,7 +372,7 @@ pub fn gen_dir_index(
+         Ok(f) => f,
+     };
+ 
+-    let mut ctx = make_context(conf);
++    let mut ctx = make_context(conf, &"../".repeat(layers));
+     ctx.insert("current", dir_name);
+     let parent_link = match &dir_stats.abs_prefix {
+         Some(p) => p.join(PathBuf::from("index.html")),
+@@ -397,7 +430,7 @@ fn gen_html(
+     let mut index_url = base_url;
+     index_url.push_str("index.html");
+ 
+-    let mut ctx = make_context(conf);
++    let mut ctx = make_context(conf, &get_base(rel_path));
+     ctx.insert("current", filename);
+ 
+     let (top_level_link, parent_link) = match abs_link_prefix {
+@@ -549,7 +582,7 @@ pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, s
+         Ok(f) => f,
+     };
+ 
+-    let mut ctx = make_context(conf);
++    let mut ctx = make_context(conf, ".");
+     ctx.insert(
+         "current",
+         &(get_percentage_of_covered_lines(stats.covered_lines, stats.total_lines) as usize),
+@@ -620,6 +653,17 @@ pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path, precis
+     }
+ }
+ 
++pub fn gen_bundled_resources(conf: &Config, output: &Path) {
++    if !matches!(conf.html_resources, HtmlResources::Bundled) {
++        return;
++    }
++
++    let bulma = output.join("bulma.min.css");
++    if let Err(err) = std::fs::write(&bulma, BULMA_BUNDLED) {
++        eprintln!("cannot write {}: {err:?}", bulma.display());
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::get_percentage_of_covered_lines;
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -17,6 +17,7 @@ use std::str::FromStr;
+ use std::sync::{Arc, Mutex};
+ use std::{process, thread};
+ 
++use grcov::html::HtmlResources;
+ use grcov::*;
+ 
+ #[derive(Clone, PartialEq)]
+@@ -303,6 +304,9 @@ struct Opt {
+     /// Do not include the current date in the HTML report.
+     #[arg(long)]
+     no_date: bool,
++    /// Where to retrieve the CSS files used to style the HTML reports.
++    #[arg(long, value_name = "SOURCE", default_value = "bundled")]
++    html_resources: HtmlResources,
+ }
+ 
+ fn main() {
+@@ -570,6 +574,7 @@ fn main() {
+                 opt.precision,
+                 &opt.abs_link_prefix.clone(),
+                 opt.no_date,
++                opt.html_resources,
+             ),
+             OutputType::Cobertura => output_cobertura(
+                 source_root.as_deref(),
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -21,7 +21,7 @@ use tabled::{Table, Tabled};
+ use uuid::Uuid;
+ 
+ use crate::defs::*;
+-use crate::html;
++use crate::html::{self, HtmlResources};
+ 
+ macro_rules! demangle {
+     ($name: expr, $demangle: expr, $options: expr) => {{
+@@ -528,6 +528,7 @@ pub fn output_html(
+     precision: usize,
+     abs_link_prefix: &Option<String>,
+     no_date: bool,
++    html_resources: HtmlResources,
+ ) {
+     let output = if let Some(output_dir) = output_dir {
+         PathBuf::from(output_dir)
+@@ -553,7 +554,13 @@ pub fn output_html(
+     };
+     let stats = Arc::new(Mutex::new(global_stats));
+     let mut threads = Vec::with_capacity(num_threads);
+-    let (tera, config) = html::get_config(output_config_file, branch_enabled, precision, no_date);
++    let (tera, config) = html::get_config(
++        output_config_file,
++        branch_enabled,
++        precision,
++        no_date,
++        html_resources,
++    );
+     let abs_link_prefix_owned = abs_link_prefix.clone();
+     for i in 0..num_threads {
+         let receiver = receiver.clone();
+@@ -608,6 +615,7 @@ pub fn output_html(
+     }
+ 
+     html::gen_coverage_json(&global.stats, &config, &output, precision);
++    html::gen_bundled_resources(&config, &output);
+ }
+ 
+ pub fn output_markdown(results: &[ResultTuple], output_file: Option<&Path>, precision: usize) {
+
+
+</patch>
+
+<TEST>
+<Filename>src/html.rs</Filename>
+<imports>use super::Config;
+use super::HtmlResources;
+use std::path::Path;
+use std::fs;</imports>
+<Rust>#[test]
+fn test_bundled_resources() {
+  let config = Config { 
+    hi_limit: 90.0, 
+    med_limit: 75.0, 
+    date: None, 
+    branch_enabled: false, 
+    precision: 2, 
+    html_resources: HtmlResources::Bundled 
+  };
+  let output = Path::new("test_output");
+  fs::create_dir_all(output).unwrap();
+  super::gen_bundled_resources(&config, output);
+  let bulma = output.join("bulma.min.css");
+  assert!(bulma.exists());
+}
+</Rust>
+</TEST>
+
+<output>
+error: couldn't read `src/bulma/bulma-0.9.1.min.css`: No such file or directory (os error 2)
+  --> src/html.rs:95:31
+   |
+95 | static BULMA_BUNDLED: &[u8] = include_bytes!("bulma/bulma-0.9.1.min.css");
+   |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+</output>
+
+Function signatures
+<Signatures>
+pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path, precision: usize) -> ()
+
+fn gen_html(
+tera: &Tera,
+path: &Path,
+result: &CovResult,
+conf: &Config,
+output: &Path,
+rel_path: &Path,
+global: Arc<Mutex<HtmlGlobalStats>>,
+abs_link_prefix: &Option<String>) -> ()
+
+pub fn gen_index(tera: &Tera, global: &HtmlGlobalStats, conf: &Config, output: &Path) -> ()
+
+pub fn gen_dir_index(
+tera: &Tera,
+dir_name: &str,
+dir_stats: &HtmlDirStats,
+conf: &Config,
+output: &Path) -> ()
+
+fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &Path, stats: &HtmlStats) -> ()
+
+pub fn get_config(
+output_config_file: Option<&Path>,
+branch_enabled: bool,
+precision: usize,
+no_date: bool,
+html_resources: HtmlResources) -> (Tera, Config)
+
+pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, style: BadgeStyle) -> ()
+
+fn main() -> ()
+
+pub fn output_html(
+results: &[ResultTuple],
+output_dir: Option<&Path>,
+num_threads: usize,
+branch_enabled: bool,
+output_config_file: Option<&Path>,
+precision: usize,
+abs_link_prefix: &Option<String>,
+no_date: bool,
+html_resources: HtmlResources) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently contains linting issues, which are inside the <output> block.
+Your task is to:
+1. Identify and understand the linting issue introduced by the unit test.
+2. Update the unit test in the <TEST> block to resolve these issues.
+3. The test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,230 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+No longer able to handle partially malformed LCOV data
+[minimized.zip](https://github.com/user-attachments/files/17452262/minimized.zip)
+
+grcov v0.5.0 works, v0.8.20 doesn't
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/parser.rs b/src/parser.rs
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -191,9 +191,19 @@ pub fn parse_lcov(
+                 }
+ 
+                 let key = iter
+-                    .take_while(|&&c| c != b':')
+-                    .fold(*c as u32, |r, &x| r * (1 << 8) + u32::from(x));
+-                match key {
++                    .take_while(|&&c| c.is_ascii_uppercase())
++                    .try_fold(*c as u32, |r, &x| {
++                        r.checked_mul(1 << 8)?.checked_add(u32::from(x))
++                    });
++
++                if key.is_none() {
++                    return Err(ParserError::InvalidRecord(format!(
++                        "Invalid key at line {}",
++                        line
++                    )));
++                }
++
++                match key.unwrap() {
+                     SF => {
+                         // SF:string
+                         cur_file = Some(
+@@ -204,9 +214,19 @@ pub fn parse_lcov(
+                     }
+                     DA => {
+                         // DA:uint,int
++                        if let Some(c) = iter.peek() {
++                            if !c.is_ascii_digit() {
++                                return Err(ParserError::InvalidRecord(format!(
++                                    "DA at line {}",
++                                    line
++                                )));
++                            }
++                        }
++
+                         let line_no = iter
+-                            .take_while(|&&c| c != b',')
++                            .take_while(|&&c| c.is_ascii_digit())
+                             .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
++
+                         if iter.peek().is_none() {
+                             return Err(ParserError::InvalidRecord(format!("DA at line {}", line)));
+                         }
+@@ -215,7 +235,7 @@ pub fn parse_lcov(
+                                 iter.take_while(|&&c| c != b'\n').last();
+                                 0
+                             } else {
+-                                iter.take_while(|&&c| c != b'\n' && c != b'\r')
++                                iter.take_while(|&&c| c.is_ascii_digit())
+                                     .fold(u64::from(*c - b'0'), |r, &x| {
+                                         r * 10 + u64::from(x - b'0')
+                                     })
+@@ -227,8 +247,16 @@ pub fn parse_lcov(
+                     }
+                     FN => {
+                         // FN:int,string
++                        if let Some(c) = iter.peek() {
++                            if !c.is_ascii_digit() {
++                                return Err(ParserError::InvalidRecord(format!(
++                                    "FN at line {}",
++                                    line
++                                )));
++                            }
++                        }
+                         let start = iter
+-                            .take_while(|&&c| c != b',')
++                            .take_while(|&&c| c.is_ascii_digit())
+                             .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
+                         if iter.peek().is_none() {
+                             return Err(ParserError::InvalidRecord(format!("FN at line {}", line)));
+@@ -255,8 +283,16 @@ pub fn parse_lcov(
+                     }
+                     FNDA => {
+                         // FNDA:int,string
++                        if let Some(c) = iter.peek() {
++                            if !c.is_ascii_digit() {
++                                return Err(ParserError::InvalidRecord(format!(
++                                    "FNDA at line {}",
++                                    line
++                                )));
++                            }
++                        }
+                         let executed = iter
+-                            .take_while(|&&c| c != b',')
++                            .take_while(|&&c| c.is_ascii_digit())
+                             .fold(0, |r, &x| r * 10 + u64::from(x - b'0'));
+                         if iter.peek().is_none() {
+                             return Err(ParserError::InvalidRecord(format!(
+@@ -280,8 +316,16 @@ pub fn parse_lcov(
+                     BRDA => {
+                         // BRDA:int,int,int,int or -
+                         if branch_enabled {
++                            if let Some(c) = iter.peek() {
++                                if !c.is_ascii_digit() {
++                                    return Err(ParserError::InvalidRecord(format!(
++                                        "BRDA at line {}",
++                                        line
++                                    )));
++                                }
++                            }
+                             let line_no = iter
+-                                .take_while(|&&c| c != b',')
++                                .take_while(|&&c| c.is_ascii_digit())
+                                 .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
+                             if iter.peek().is_none() {
+                                 return Err(ParserError::InvalidRecord(format!(
+@@ -290,7 +334,7 @@ pub fn parse_lcov(
+                                 )));
+                             }
+                             let _block_number = iter
+-                                .take_while(|&&c| c != b',')
++                                .take_while(|&&c| c.is_ascii_digit())
+                                 .fold(0, |r, &x| r * 10 + u64::from(x - b'0'));
+                             if iter.peek().is_none() {
+                                 return Err(ParserError::InvalidRecord(format!(
+@@ -299,7 +343,7 @@ pub fn parse_lcov(
+                                 )));
+                             }
+                             let branch_number = iter
+-                                .take_while(|&&c| c != b',')
++                                .take_while(|&&c| c.is_ascii_digit())
+                                 .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
+                             if iter.peek().is_none() {
+                                 return Err(ParserError::InvalidRecord(format!(
+@@ -1208,6 +1252,22 @@ mod tests {
+         assert!(result.is_err());
+     }
+ 
++    #[allow(non_snake_case)]
++    #[test]
++    fn test_lcov_parser_empty_DA_record() {
++        let buf = "DA:152,4
++DA:153,4
++DA:154,8
++DA:156,12
++DA
++TN:http_3a_2f_2fweb_2dplatform_2etest_3a8000_2freferrer_2dpolicy_2fgen_2fsrcdoc_2dinherit_2emeta_2funset_2fiframe_2dtag_2ehttp_2ehtml_2c_20about_3ablank"
++        .as_bytes().to_vec();
++        let result = parse_lcov(buf, true);
++        assert!(result.is_err());
++        let error = result.unwrap_err();
++        assert_eq!(error.to_string(), "Invalid record: 'DA at line 5'");
++    }
++
+     #[test]
+     fn test_parser() {
+         let results = parse_gcov(Path::new("./test/prova.gcov")).unwrap();
+
+
+</patch>
+
+<TEST>
+<Filename>src/parser.rs</Filename>
+<imports>use std::vec::Vec;</imports>
+<Rust>#[test]
+fn test_lcov_parser_invalid_key() {
+    let buf = "XX:152,4\nDA:153,4\nDA:154,8\nDA:156,12\n".as_bytes().to_vec();
+    let result = parse_lcov(buf, true);
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_eq!(error.to_string(), "Invalid record: 'Invalid key at line 1'");
+}
+</Rust>
+</TEST>
+
+<output>
+running 1 test
+
+thread 'parser::tests::test_lcov_parser_invalid_key' panicked at src/parser.rs:2108:9:
+assertion failed: result.is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test parser::tests::test_lcov_parser_invalid_key ... FAILED
+</output>
+
+Function signatures
+<Signatures>
+pub fn parse_lcov(
+buffer: Vec<u8>,
+branch_enabled: bool) -> Result<Vec<(String, CovResult)>, ParserError>
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.The test should fail on the code before the patch, and pass after, hence the test verifies that the patch resolves the issue.
+However, the test currently fails after the patch.
+Your task is to:
+1. Identify and understand why the unit test failed.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

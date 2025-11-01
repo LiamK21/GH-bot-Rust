@@ -1,0 +1,102 @@
+<think>
+Okay, let's figure out why the existing test is failing. The user provided a <TEST> block that's trying to test the LCOV parser's ability to ignore invalid FNDA records. The problem is that when they run the test, it's failing because the file ./test/invalid_FNDA_record.info doesn't exist. So the first thing I notice is that the test is attempting to open a file that's not present in the test directory.
+
+Looking at the patch, there's a new test added in the existing code called test_lcov_parser_ignoring_invalid_DA_record, which uses a file named invalid_DA_record.info. The user's new test is trying to do something similar for FNDA records, but the test file doesn't exist. 
+
+So, the test as written assumes that there's a specific test file named invalid_FNDA_record.info in the ./test/ directory. However, without that file, the test can't run. To fix the test, we need to create a valid test case that doesn't rely on a missing file. Instead of relying on a physical file, perhaps we can create an in-memory buffer that simulates the content of what invalid_FNDA_record.info would look like.
+
+The issue is that the current test uses File::open on a non-existent file. To fix this, the test should generate a buffer with the LCOV data that includes an invalid FNDA line. For example, an FNDA line that lacks the necessary components for the parser to process correctly, but which should be ignored due to the ignore_parsing_error flag.
+
+So the approach is to create a Vec<u8> containing the LCOV content with an invalid FNDA line. The content should be structured to trigger parsing errors but should be skipped when ignore_parsing_error is true. 
+
+Let's see what the valid LCOV FNDA line looks like. Normally, an FNDA line is something like "FNDA:execution_count,function_name". For an invalid case, maybe the line doesn't start with a number, or is missing parts.
+
+For example, an invalid FNDA line could be "FNDA:,,functionB" — missing the execution count. The existing test for DA lines in the patch uses a similar approach by creating an invalid DA line, and the test creates the content in code instead of relying on a file.
+
+So, instead of reading from a file, the test should generate a buffer with the following content:
+
+- Start with "FNDA:0,functionA\n" (valid)
+- Then add an invalid line like "FNDA:,"functionB\n"
+- Then another valid line.
+
+This way, when the parser is set to ignore parsing errors, the invalid FNDA line is skipped, and the parser continues processing the rest, resulting in the expected functions.
+
+By modifying the test to generate this buffer instead of relying on a file, we can avoid the file not found error and test the intended behavior.
+
+In terms of code changes, the test should create a buffer with the necessary invalid content. Using the parse_lcov function directly with this buffer, and then checking that the result does not include the invalid entry but retains the valid ones.
+
+So the test would look something like this:
+
+1. Create a Vec<u8> with the test data.
+2. Call parse_lcov with that buffer, branch_enabled as true, and ignore_parsing_error as true.
+3. Assert that the results include only the valid functions.
+
+This approach eliminates the need for a physical test file and directly tests the parsing logic. Also, the existing tests in the patch have similar in-memory tests, so following the same pattern is necessary.
+
+Now, let's structure the test code. The imports need to include the necessary items, like the parse_lcov function and any result types. Since the test is in the parser module, using super::parse_lcov.
+
+The imports should include:
+- std::io::Read (but since we don't read from files, maybe it's not needed here)
+- Other necessary types, but since we are generating a buffer manually, perhaps not needed.
+
+So the test will generate the LCOV data as a byte vector, pass it to parse_lcov, and check the results.
+
+For example:
+
+let test_data = "FNDA:0,functionA\nFNDA:,,functionB\nFNDA:1,functionC\n".as_bytes().to_vec();
+
+Then parse this buffer and check that functionB is not present, but functionA and functionC are included if the parsing ignores errors.
+
+Wait, but the test needs to expect that the invalid line is ignored. Depending on how the parser handles it, maybe the invalid line would cause an error before the patch but be skipped after the patch. When ignore_parsing_error is true, the invalid line is skipped, and the parsing continues. The test should verify that the parser doesn't error out and processes the valid lines.
+
+In the test, the expected functions should include functionA and functionC but exclude functionB. But in the user's original test, they expected functionB to be present with executed false. Hmm. Wait, maybe the invalid line is leading to a missing FN record, which would be handled by the manage_parsing_error macro.
+
+In the parse_lcov function, for FNDA lines, if the FN record is missing, it would emit an error unless ignoring. So if the test includes a FNDA line for a function that has no FN line, but the error is ignored, then the test should not include that function in the results.
+
+But in this case, the user's test wants to ensure that when invalid FNDA records are present, the parser continues and doesn't error. So the generated data should have a valid FN line for functionA and functionC, and an invalid one for functionB.
+
+So the test data should include:
+
+- An FN line for functionA and functionC.
+- An FNDA line for functionA (valid)
+- An invalid FNDA line (e.g., missing execution count)
+- An FNDA line for functionC (valid)
+
+Then, when ignore_parsing_error is true, the invalid FNDA line is skipped, and the parser continues. However, for functionB's FNDA line, if the FN line is missing, it would trigger an error, but with ignore_parsing_error true, it's skipped.
+
+But maybe the test is supposed to have an invalid FNDA line that doesn't have the proper format. So the test needs to have an FNDA line that causes a parsing error but is ignored.
+
+By creating a buffer with such content, the test can verify that the parser continues without error.
+
+Thus, modifying the test to generate the buffer directly instead of relying on a file will fix the issue.
+</think>
+
+<Filename>src/parser.rs</Filename>
+<imports>use super::parse_lcov;</imports>
+<Rust>
+#[test]
+fn test_lcov_parser_ignoring_invalid_FNDA_record() {
+    let test_data = " \
+        FN:1,functionA\n \
+        FNDA:0,functionA\n \
+        FNDA:,functionB\n \
+        FN:2,functionC\n \
+        FNDA:1,functionC\n \
+    ".as_bytes().to_vec();
+    let results = parse_lcov(test_data, true, true).unwrap();
+    
+    assert_eq!(results.len(), 1);
+    let (source_name, result) = &results[0];
+    assert!(source_name.ends_with("/parser.rs"));
+    
+    assert_eq!(
+        result.functions,
+        vec![
+            ("functionA".to_string(), Default::default()),
+            ("functionC".to_string(), Default::default()),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+</Rust>

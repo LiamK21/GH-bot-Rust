@@ -1,0 +1,454 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+no links to subdirectories in generated html
+The generated HTML output in `index.html` contains only links to the source files of the current directory.  Modules are not listed and require manual modification of the url.
+
+E.g. package content looks like
+
+![Image](https://github.com/user-attachments/assets/c7c90636-2acd-4bc3-9c51-d4e0de75a320)
+
+Opening `index.html` shows only the `.rs` files but not `devices/`, `http/` or other modules:
+
+![Image](https://github.com/user-attachments/assets/b59dfb72-ea1e-471d-a1df-2658ae5a8742)
+
+
+grcov (0.9.1) is invoked as
+
+```sh
+    - grcov
+      "${X_CI_PROFILE_DIRECTORY}"
+      --binary-path "${CARGO_TARGET_DIR}/debug"
+      --llvm
+      --branch
+      -s "."
+      -o "${CARGO_TARGET_DIR}/coverage/"
+      --keep-only '*'
+      --ignore "${CARGO_HOME}/**"
+      --ignore "${CARGO_TARGET_DIR}/**"
+      --ignore-not-existing
+      --output-types html,cobertura
+      --commit-sha "${CI_COMMIT_SHA}"
+      ${CI_COMMIT_BRANCH:+--vcs-branch "${CI_COMMIT_BRANCH}"}
+```
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -92,7 +92,7 @@ pub struct HtmlItem {
+     pub result: CovResult,
+ }
+ 
+-#[derive(Clone, Debug, Default, serde::Serialize)]
++#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+ pub struct HtmlStats {
+     pub total_lines: usize,
+     pub covered_lines: usize,
+@@ -102,26 +102,80 @@ pub struct HtmlStats {
+     pub covered_branches: usize,
+ }
+ 
+-#[derive(Clone, Debug, serde::Serialize)]
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+ pub struct HtmlFileStats {
+     pub stats: HtmlStats,
+     pub abs_prefix: Option<PathBuf>,
+ }
+ 
+-#[derive(Clone, Debug, serde::Serialize)]
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+ pub struct HtmlDirStats {
+     pub files: BTreeMap<String, HtmlFileStats>,
+     pub stats: HtmlStats,
+     pub abs_prefix: Option<PathBuf>,
+ }
+ 
+-#[derive(Debug, Default, serde::Serialize)]
++#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+ pub struct HtmlGlobalStats {
+     pub dirs: BTreeMap<String, HtmlDirStats>,
+     pub stats: HtmlStats,
+     pub abs_prefix: Option<PathBuf>,
+ }
+ 
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
++#[serde(untagged)]
++pub enum HtmlItemStats {
++    Directory(HtmlDirStats),
++    File(HtmlFileStats),
++}
++
++impl HtmlGlobalStats {
++    pub fn list(&self, dir: String) -> BTreeMap<String, HtmlItemStats> {
++        let mut result = BTreeMap::new();
++
++        // Add files from the specified directory
++        if let Some(dir_stats) = self.dirs.get(&dir) {
++            for (file_name, file_stats) in &dir_stats.files {
++                result.insert(file_name.clone(), HtmlItemStats::File(file_stats.clone()));
++            }
++        }
++
++        // Add subdirectories as entries
++        if dir.is_empty() {
++            // For root directory, add top-level directories
++            for (dir_path, dir_stats) in &self.dirs {
++                if !dir_path.is_empty() && !dir_path.contains('/') {
++                    result.insert(
++                        dir_path.clone(),
++                        HtmlItemStats::Directory(dir_stats.clone()),
++                    );
++                }
++            }
++        } else {
++            // For specific directory, add immediate subdirectories
++            let prefix = if dir.ends_with('/') {
++                dir
++            } else {
++                format!("{}/", dir)
++            };
++
++            for (dir_path, dir_stats) in &self.dirs {
++                if dir_path.starts_with(&prefix) {
++                    let suffix = &dir_path[prefix.len()..];
++                    if !suffix.is_empty() && !suffix.contains('/') {
++                        result.insert(
++                            suffix.to_string(),
++                            HtmlItemStats::Directory(dir_stats.clone()),
++                        );
++                    }
++                }
++            }
++        }
++
++        result
++    }
++}
++
+ pub type HtmlJobReceiver = Receiver<Option<HtmlItem>>;
+ pub type HtmlJobSender = Sender<Option<HtmlItem>>;
+ 
+@@ -155,3 +209,82 @@ pub struct JacocoReport {
+     pub lines: BTreeMap<u32, u64>,
+     pub branches: BTreeMap<u32, Vec<bool>>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_html_global_stats_list() {
++        let global_json = r#"
++        {
++            "dirs": {
++                "": {
++                    "files": {
++                        "build.rs": {
++                            "stats": {"total_lines": 30, "covered_lines": 25, "total_funs": 3, "covered_funs": 2, "total_branches": 6, "covered_branches": 5},
++                            "abs_prefix": null
++                        }
++                    },
++                    "stats": {"total_lines": 30, "covered_lines": 25, "total_funs": 3, "covered_funs": 2, "total_branches": 6, "covered_branches": 5},
++                    "abs_prefix": null
++                },
++                "src": {
++                    "files": {
++                        "lib.rs": {
++                            "stats": {"total_lines": 50, "covered_lines": 40, "total_funs": 5, "covered_funs": 4, "total_branches": 10, "covered_branches": 8},
++                            "abs_prefix": null
++                        }
++                    },
++                    "stats": {"total_lines": 100, "covered_lines": 80, "total_funs": 10, "covered_funs": 8, "total_branches": 20, "covered_branches": 16},
++                    "abs_prefix": null
++                },
++                "src/utils": {
++                    "files": {
++                        "mod.rs": {
++                            "stats": {"total_lines": 50, "covered_lines": 40, "total_funs": 5, "covered_funs": 4, "total_branches": 10, "covered_branches": 8},
++                            "abs_prefix": null
++                        }
++                    },
++                    "stats": {"total_lines": 50, "covered_lines": 40, "total_funs": 5, "covered_funs": 4, "total_branches": 10, "covered_branches": 8},
++                    "abs_prefix": null
++                }
++            },
++            "stats": {"total_lines": 130, "covered_lines": 105, "total_funs": 13, "covered_funs": 10, "total_branches": 26, "covered_branches": 21},
++            "abs_prefix": null
++        }
++        "#;
++
++        let global: HtmlGlobalStats = serde_json::from_str(global_json).unwrap();
++
++        let root_items = global.list("".to_string());
++        assert_eq!(root_items.len(), 2);
++        assert!(root_items.contains_key("build.rs"));
++        assert!(root_items.contains_key("src"));
++
++        // Check that build.rs is a file and src is a directory
++        match root_items.get("build.rs").unwrap() {
++            HtmlItemStats::File(_) => {}
++            HtmlItemStats::Directory(_) => panic!("build.rs should be a file"),
++        }
++        match root_items.get("src").unwrap() {
++            HtmlItemStats::Directory(_) => {}
++            HtmlItemStats::File(_) => panic!("src should be a directory"),
++        }
++
++        let src_items = global.list("src".to_string());
++        assert_eq!(src_items.len(), 2);
++        assert!(src_items.contains_key("lib.rs"));
++        assert!(src_items.contains_key("utils"));
++
++        // Check that utils is a directory
++        match src_items.get("utils").unwrap() {
++            HtmlItemStats::Directory(_) => {}
++            HtmlItemStats::File(_) => panic!("utils should be a directory"),
++        }
++
++        let utils_items = global.list("src/utils".to_string());
++        assert_eq!(utils_items.len(), 1);
++        assert!(utils_items.contains_key("mod.rs"));
++    }
++}
+
+diff --git a/src/html.rs b/src/html.rs
+--- a/src/html.rs
++++ b/src/html.rs
+@@ -334,11 +334,11 @@ pub fn gen_index(tera: &Tera, global: &HtmlGlobalStats, conf: &Config, output: &
+ 
+     let mut ctx = make_context(conf, ".");
+     let empty: &[&str] = &[];
++    let items = global.list("".to_string());
+     ctx.insert("current", "top_level");
+     ctx.insert("parents", empty);
+     ctx.insert("stats", &global.stats);
+-    ctx.insert("items", &global.dirs);
+-    ctx.insert("kind", "Directory");
++    ctx.insert("items", &items);
+ 
+     let out = tera.render("index.html", &ctx).unwrap();
+ 
+@@ -347,14 +347,22 @@ pub fn gen_index(tera: &Tera, global: &HtmlGlobalStats, conf: &Config, output: &
+         return;
+     }
+ 
+-    for (dir_name, dir_stats) in global.dirs.iter() {
+-        gen_dir_index(tera, dir_name, dir_stats, conf, output);
++    for (dir_name, item_type) in items.iter() {
++        match item_type {
++            HtmlItemStats::Directory(dir_stats) => {
++                gen_dir_index(tera, dir_name, global, dir_stats, conf, output);
++            }
++            HtmlItemStats::File(_) => {
++                // Files don't generate directory indexes, skip
++            }
++        }
+     }
+ }
+ 
+ pub fn gen_dir_index(
+     tera: &Tera,
+     dir_name: &str,
++    global: &HtmlGlobalStats,
+     dir_stats: &HtmlDirStats,
+     conf: &Config,
+     output: &Path,
+@@ -364,7 +372,7 @@ pub fn gen_dir_index(
+     let prefix = "../".repeat(layers) + "index.html";
+     let output_file = output.join(index);
+     create_parent(&output_file);
+-    let mut output = match File::create(&output_file) {
++    let mut output_file = match File::create(&output_file) {
+         Err(_) => {
+             eprintln!("Cannot create file {output_file:?}");
+             return;
+@@ -380,14 +388,31 @@ pub fn gen_dir_index(
+     };
+     ctx.insert("parents", &[(parent_link, "top_level")]);
+     ctx.insert("stats", &dir_stats.stats);
+-    ctx.insert("items", &dir_stats.files);
+-    ctx.insert("kind", "File");
++    let items = global.list(dir_name.to_string());
++    ctx.insert("items", &items);
+ 
+     let out = tera.render("index.html", &ctx).unwrap();
+ 
+-    if output.write_all(out.as_bytes()).is_err() {
++    if output_file.write_all(out.as_bytes()).is_err() {
+         eprintln!("Cannot write the file {output_file:?}");
+     }
++
++    let parent = if dir_name.is_empty() {
++        dir_name.to_string()
++    } else {
++        dir_name.to_string() + "/"
++    };
++    for (dir_name, item_type) in items.iter() {
++        match item_type {
++            HtmlItemStats::Directory(dir_stats) => {
++                let full_dir_name = parent.clone() + dir_name;
++                gen_dir_index(tera, &full_dir_name, global, dir_stats, conf, output);
++            }
++            HtmlItemStats::File(_) => {
++                // Files don't generate directory indexes, skip
++            }
++        }
++    }
+ }
+ 
+ fn gen_html(
+
+
+</patch>
+
+<TEST>
+<Filename>src/html.rs</Filename>
+<imports>use super::gen_index;
+use super::HtmlGlobalStats;
+use super::HtmlDirStats;
+use super::HtmlFileStats;
+use super::HtmlItemStats;
+use super::Config;
+use std::path::Path;
+use tera::Tera;
+use std::collections::BTreeMap;
+use std::fs;
+use super::HtmlResources;
+use std::default::Default;</imports>
+<Rust>#[test]
+fn test_gen_index_with_subdirectories() {
+  let tera = Tera::default();
+  let mut global = HtmlGlobalStats {
+    dirs: BTreeMap::new(),
+    stats: super::HtmlStats {
+      total_lines: 0,
+      covered_lines: 0,
+      total_funs: 0,
+      covered_funs: 0,
+      total_branches: 0,
+      covered_branches: 0,
+    },
+    abs_prefix: None,
+  };
+  let mut dir_stats = HtmlDirStats {
+    files: BTreeMap::new(),
+    stats: super::HtmlStats {
+      total_lines: 0,
+      covered_lines: 0,
+      total_funs: 0,
+      covered_funs: 0,
+      total_branches: 0,
+      covered_branches: 0,
+    },
+    abs_prefix: None,
+  };
+  let file_stats = HtmlFileStats {
+    stats: super::HtmlStats {
+      total_lines: 10,
+      covered_lines: 5,
+      total_funs: 2,
+      covered_funs: 1,
+      total_branches: 3,
+      covered_branches: 2,
+    },
+    abs_prefix: None,
+  };
+  dir_stats.files.insert("file.rs".to_string(), file_stats);
+  global.dirs.insert("src".to_string(), dir_stats);
+  let conf = Config {
+    hi_limit: 100.0,
+    med_limit: 50.0,
+    fn_hi_limit: 100.0,
+    fn_med_limit: 50.0,
+    branch_hi_limit: 100.0,
+    branch_med_limit: 50.0,
+    branch_enabled: true,
+    date: "2022-01-01".to_string(),
+    precision: 2,
+    html_resources: HtmlResources::default(),
+  };
+  let output = Path::new("output");
+  fs::create_dir_all(output).unwrap();
+  super::gen_index(&tera, &global, &conf, output);
+  assert!(output.join("index.html").exists());
+  assert!(output.join("src").exists());
+  assert!(output.join("src/index.html").exists());
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> src/html.rs:766:15
+    |
+766 |         date: "2022-01-01".to_string(),
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<DateTime<Utc>>`, found `String`
+    |
+    = note: expected enum `std::option::Option<chrono::DateTime<Utc>>`
+             found struct `std::string::String`
+
+error[E0599]: no variant or associated item named `default` found for enum `HtmlResources` in the current scope
+   --> src/html.rs:768:40
+    |
+29  | pub enum HtmlResources {
+    | ---------------------- variant or associated item `default` not found for this enum
+...
+768 |         html_resources: HtmlResources::default(),
+    |                                        ^^^^^^^ variant or associated item not found in `HtmlResources`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `default`, perhaps you need to implement it:
+            candidate #1: `std::default::Default`
+</output>
+
+Function signatures
+<Signatures>
+pub fn gen_dir_index(
+tera: &Tera,
+dir_name: &str,
+global: &HtmlGlobalStats,
+dir_stats: &HtmlDirStats,
+conf: &Config,
+output: &Path) -> ()
+
+pub fn gen_index(tera: &Tera, global: &HtmlGlobalStats, conf: &Config, output: &Path) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,174 @@
+<think>
+Okay, I need to figure out why the existing unit test for the Kotlin Jacoco report parsing is failing even after the patch. Let me start by understanding what the test is supposed to do.
+
+The original test test_parser_jacoco_kotlin is reading an XML file, and expecting to parse it into a specific CovResult. The problem is that after applying the patch, when the test runs, it's panicking with an error about an attribute not found. The error message is "InvalidRecord("Attribute line not found")". Hmm, maybe the test's expected data is not matching the actual parsed structure.
+
+Looking at the test case, the XML data simulates two classes in the same file, BreakpointValue.kt. The patch was supposed to aggregate all classes under the same source file instead of using the class name. The test expects that the key in the map is the filename, not the class name. 
+
+Wait, the test's XML data has two classes: one with name "com/example/BreakpointValue" and another with "com/example/BreakpointDirection", both with sourcefilename "BreakpointValue.kt". The original code was mapping by the class's top-level name, but the patch changes it to use the sourcefilename if available. So in the test's expected result, the key should be the filename, which it is. But why is the test failing?
+
+Looking at the test's error, the line where the test is failing is when parsing the XML. The error comes from parse_jacoco_report_package. The test is using a Cursor to create a reader, but maybe the XML structure is not being parsed correctly. 
+
+Wait, the original test data in the test_parser_jacoco_kotlin has specific lines for each class. In the Kotlin case, the classes can have different names but same sourcefile. The test uses a simplified XML, but perhaps the parser is not handling the lines properly. The error message says "Attribute line not found" which suggests that a required attribute is missing. Let me check the patch code.
+
+In the patch, the parse_jacoco_report_package function was modified to use the file as a key. The line where the error is happening might be where the code expects a sourcefile or some other attribute that's not present. 
+
+Wait, the test's XML has <class> elements with sourcefilename attributes, which the parser should use. In the provided XML, the <line nr="5" hit="0"/> elements exist, but perhaps the code is missing some other attributes that are expected.
+
+Looking at the code in the patch, when parsing a <class>, it processes all methods and counters. The code uses the file (sourcefilename) as the key. However, in the test's XML data, each <class> element is inside a <package> element. The package in the test example is "/", which is the root. 
+
+Wait, the test's XML structure might not be complete. The original report structure for Jacoco includes a <sessioninfo> and other elements, but the test simulates a minimal case. Maybe the test is missing some necessary elements for parsing, leading to the error.
+
+Another possibility is that the test's expected data includes extra lines (like 9, 27, etc.), but the actual parsed data only includes the lines specified in the XML. For example, the test's expected lines include (9,0), but the XML only has lines 5,14,26. So when comparing, the test fails because it's expecting lines that aren't there.
+
+Ah, right! The test creates a lines BTreeMap with many entries, such as (5,0), (9,0), (14,0), etc. But the XML data only includes lines 5,14,26. So when the parser actually parses the XML, it will have lines only for those numbers. The test's expected_lines variable includes lines that aren't present in the test XML. That's a problem because the test is comparing against lines that should not be there.
+
+Wait, the original test in the patch has a test_parser_jacoco_kotlin where the expected lines include entries like (5, 0), (9, 0), (14, 0), etc., but the XML data provided in the test only includes lines 5,14, and 26. The other lines like 9 are not present. Therefore, the test is failing because when the parser runs, it's not generating those lines, leading to the expected lines including entries that aren't there, causing the assert_eq! to fail.
+
+So, the test's expected data is not matching the actual data. The test's expected lines have more entries than what the XML data provides. Therefore, to fix the test, the expected data must only include the lines that are specified in the XML.
+
+But the problem is that the unit test in the patch is expecting lines that don't exist. The XML has three <line> elements, but the test has a list of (5,0), (14,0), (26,0), but in the test expected code, it has other lines as well. Wait, no. Let me check.
+
+The test code in the patch is:
+
+let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
+for i in &[
+    (5, 0),
+    (9, 0),
+    (14, 0),
+    (27, 0),
+    (30, 0),
+    (32, 0),
+    (41, 0),
+    (49, 0),
+    (57, 0),
+    (65, 0),
+    (73, 0),
+    (81, 0),
+    (89, 0),
+    (97, 0),
+    (104, 0),
+    (105, 0),
+    (106, 0),
+    (107, 0),
+    (108, 0),
+    (109, 0),
+    (110, 0),
+    (111, 0),
+    (112, 0),
+    (118, 0),
+    (119, 0),
+    (120, 0),
+] {
+    lines.insert(i.0, i.1);
+}
+
+But the XML in the test has <line nr="5" hit="0"/>, <line nr="14" hit="0"/>, <line nr="26" hit="0"/>. So the expected lines in the test's code include entries like (9, 0) and (27, 0) which are not present in the XML data. That's the problem. The parser, when processing the XML, will only collect the lines that exist in the XML (5, 14, 26), but the expected data has more lines, so the test will fail when comparing.
+
+So the test setup is incorrect because the expected data includes lines that are not in the XML. Therefore, to fix the test, the expected lines should only include those that are present in the XML. 
+
+The test's XML data has three lines. The expected_lines should be:
+
+(5, 0), (14, 0), (26, 0)
+
+But the test's code includes many more lines. Therefore, the test must be modified to only include these three lines.
+
+In the current test in the <TEST> block, the XML data has three lines. The expected lines are a bunch of other numbers. So the test is expecting lines that aren't present, leading to a failure. Hence, the test must be adjusted to reflect the actual lines in the XML.
+
+Therefore, the solution is to modify the test to have the expected lines only for the numbers present in the XML data. For example, in the test, replace the lines with:
+
+let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
+lines.insert(5, 0);
+lines.insert(14, 0);
+lines.insert(26, 0);
+
+That way, the test will pass, as the parser will collect exactly those three lines. Additionally, the functions and branches data may also need to be corrected if they include methods or branches that aren't in the test XML data.
+
+Looking at the functions in the test code:
+
+The functions vector has entries like ("BreakpointValue#<init>", 5, false), etc. The XML data's <class> entries have <method> elements. The test's functions include methods that are not in the XML data. For example, the XML has methods:
+
+<method name="BreakpointValue#<init>" start="5"/>
+<method name="BreakpointValue#setValue" start="26"/>
+<method name="BreakpointValue#getBreakpointValueMap" start="14"/>
+
+So the functions should only include those three methods. The original test's functions include many more methods that aren't in the XML data, leading to mismatches.
+
+Therefore, the functions and branches in the test's expected data must be trimmed to only include those that are present in the XML data.
+
+The branches in the test have an entry for 26. In the XML, there is a <line nr="26"> but no <branch> elements. The code in the patch inserts branches into the CovResult if present. However, the current test's XML doesn't have any branches. So the branches in the expected data are incorrect. The branches should be empty or not include that entry.
+
+So, the test's expected branches should be empty or not include any entries if the XML doesn't have branch data. Therefore, the branches BTreeMap in the test's expected data should be empty. 
+
+Putting this together, the test needs to be rewritten to have the correct lines, functions, and branches based on the provided XML data. Let me adjust the test accordingly.
+</think>
+
+<Filename>src/parser.rs</Filename>
+<imports>
+use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
+use std::io::BufReader;
+use std::io::Cursor;
+</imports>
+<Rust>
+#[test]
+fn test_parser_jacoco_kotlin_duplicate() {
+    let xml_data = r#"
+<report>
+  <package name="/">
+    <class name="com/example/BreakpointValue" sourcefilename="BreakpointValue.kt">
+      <methods>
+        <method name="BreakpointValue#<init>" start="5"/>
+        <method name="BreakpointValue#setValue" start="26"/>
+        <method name="BreakpointValue#getBreakpointValueMap" start="14"/>
+      </methods>
+      <lines>
+        <line nr="5" hit="0"/>
+        <line nr="14" hit="0"/>
+        <line nr="26" hit="0"/>
+      </lines>
+    </class>
+    <class name="com/example/BreakpointDirection" sourcefilename="BreakpointValue.kt">
+      <methods>
+        <method name="BreakpointDirection#getEntries" start="120"/>
+      </methods>
+      <lines>
+        <line nr="118" hit="0"/>
+        <line nr="120" hit="0"/>
+      </lines>
+    </class>
+  </package>
+</report>
+"#;
+
+    let mut reader = Cursor::new(xml_data.as_bytes());
+    let file = BufReader::new(&mut reader);
+
+    let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
+    lines.insert(5, 0);
+    lines.insert(14, 0);
+    lines.insert(26, 0);
+    lines.insert(118, 0);
+    lines.insert(120, 0);
+
+    let mut functions: FxHashMap<String, Function> = FxHashMap::default();
+    functions.insert("BreakpointValue#<init>".to_string(), Function { start: 5, executed: false });
+    functions.insert("BreakpointValue#setValue".to_string(), Function { start: 26, executed: false });
+    functions.insert("BreakpointValue#getBreakpointValueMap".to_string(), Function { start: 14, executed: false });
+    functions.insert("BreakpointDirection#getEntries".to_string(), Function { start: 120, executed: false });
+
+    let branches: BTreeMap<u32, Vec<bool>> = BTreeMap::new();
+
+    let expected = vec![(
+        String::from("BreakpointValue.kt"),
+        CovResult {
+            lines,
+            branches,
+            functions,
+        },
+    )];
+
+    let results = super::parse_jacoco_xml_report(file).unwrap();
+    assert_eq!(results, expected);
+}
+</Rust>

@@ -1,0 +1,235 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Try to generate partial path mapping only when required
+See the first suggestion from https://github.com/mozilla/grcov/pull/1311#issuecomment-2782894377.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -251,21 +251,29 @@ pub fn rewrite_paths(
+     //
+     // This is a pre-requisite of the `map_partial_path` function, which is needed for Java.
+     let mut file_to_paths: FxHashMap<String, Vec<PathBuf>> = FxHashMap::default();
++    let mut map_partial_path_needed = false;
+     if let Some(ref source_dir) = source_dir {
+         // Calling walkdir over a large directory tree can take a significant time, so we want to
+         // execute this only when `map_partial_path` is actually needed.
+         //
+         // The function's purpose is to figure out whether a covered path is inside a subdirectory.
++
++        // This only happens for Java, so if there are no Java files, we don't need to do it.
++        let has_java = result_map
++            .keys()
++            .any(|path| check_extension(Path::new(&path), PARTIAL_PATH_EXTENSION));
++
+         // If all covered paths are direct childs of the source directory, then that function will
+         // do nothing, and we don't have to do its pre-requisite data gathering.
+-        let mut map_partial_path_needed = false;
+-        for path in result_map.keys() {
+-            let mut path = Path::new(path);
+-            if let Some(prefix) = &prefix_dir {
+-                path = path.strip_prefix(prefix).unwrap_or(path);
+-            }
+-            if !source_dir.join(path).exists() {
+-                map_partial_path_needed = true;
++        if has_java {
++            for path in result_map.keys() {
++                let mut path = Path::new(path);
++                if let Some(prefix) = &prefix_dir {
++                    path = path.strip_prefix(prefix).unwrap_or(path);
++                }
++                if !source_dir.join(path).exists() {
++                    map_partial_path_needed = true;
++                }
+             }
+         }
+ 
+@@ -331,11 +339,12 @@ pub fn rewrite_paths(
+             let rel_path = remove_prefix(prefix_dir, rel_path);
+ 
+             // Try mapping a partial path to a full path.
+-            let rel_path = if check_extension(&rel_path, PARTIAL_PATH_EXTENSION) {
+-                map_partial_path(&file_to_paths, rel_path)
+-            } else {
+-                rel_path
+-            };
++            let rel_path =
++                if map_partial_path_needed && check_extension(&rel_path, PARTIAL_PATH_EXTENSION) {
++                    map_partial_path(&file_to_paths, rel_path)
++                } else {
++                    rel_path
++                };
+ 
+             // Get absolute path to the source file.
+             let (abs_path, rel_path) = get_abs_path(source_dir, rel_path)?;
+
+
+</patch>
+
+<TEST>
+<Filename>src/path_rewriting.rs</Filename>
+<imports>use std::collections::HashMap;
+use std::path::PathBuf;
+use crate::FileFilter;
+use crate::CovResultMap;
+use crate::Value;</imports>
+<Rust>#[test]
+fn test_rewrite_paths_with_partial_path_mapping() {
+  let mut result_map: CovResultMap = HashMap::new();
+  let path_mapping = None;
+  let source_dir = Some(Path::new("/source"));
+  let prefix_dir = None;
+  let ignore_not_existing = false;
+  let to_ignore_dirs: &[&str] = &[];
+  let to_keep_dirs: &[&str] = &[];
+  let filter_option = None;
+  let file_filter = FileFilter {};
+  result_map.insert("Test.java".to_string(), ());
+  let result_before_patch = rewrite_paths(result_map.clone(), path_mapping, source_dir, prefix_dir, ignore_not_existing, to_ignore_dirs, to_keep_dirs, filter_option, file_filter);
+  result_map.insert("Test2.java".to_string(), ());
+  let result_after_patch = rewrite_paths(result_map, path_mapping, source_dir, prefix_dir, ignore_not_existing, to_ignore_dirs, to_keep_dirs, filter_option, file_filter);
+  assert_ne!(result_before_patch.len(), result_after_patch.len());
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::Value`
+   --> src/path_rewriting.rs:412:9
+    |
+412 |     use crate::Value;
+    |         ^^^^^^^^^^^^ no `Value` in the root
+    |
+help: consider importing one of these items instead
+    |
+412 |     use crate::path_rewriting::Value;
+    |                ++++++++++++++++
+412 -     use crate::Value;
+412 +     use clap::builder::Resettable::Value;
+    |
+412 -     use crate::Value;
+412 +     use serde_json::Value;
+    |
+412 -     use crate::Value;
+412 +     use tabled::grid::dimension::ConstSize::Value;
+    |
+      and 1 other candidate
+
+error[E0308]: mismatched types
+    --> src/path_rewriting.rs:1771:42
+     |
+1771 |       let mut result_map: CovResultMap = HashMap::new();
+     |                           ------------   ^^^^^^^^^^^^^^ expected `HashMap<String, CovResult, ...>`, found `HashMap<_, _>`
+     |                           |
+     |                           expected due to this
+     |
+     = note: expected struct `HashMap<std::string::String, defs::CovResult, FxBuildHasher>`
+                found struct `HashMap<_, _, RandomState>`
+
+error: cannot construct `file_filter::FileFilter` with struct literal syntax due to private fields
+    --> src/path_rewriting.rs:1779:25
+     |
+1779 |       let file_filter = FileFilter {};
+     |                         ^^^^^^^^^^
+     |
+     = note: private fields `excl_line`, `excl_start`, `excl_stop`, `excl_br_line`, `excl_br_start` and `excl_br_stop` that were not provided
+help: you might have meant to use the `new` associated function
+     |
+1779 -       let file_filter = FileFilter {};
+1779 +       let file_filter = FileFilter::new(_, _, _, _, _, _);
+     |
+help: consider using the `Default` trait
+     |
+1779 -       let file_filter = FileFilter {};
+1779 +       let file_filter = <FileFilter as std::default::Default>::default();
+     |
+
+error[E0308]: mismatched types
+    --> src/path_rewriting.rs:1780:50
+     |
+1780 |       result_map.insert("Test.java".to_string(), ());
+     |                  ------                          ^^ expected `CovResult`, found `()`
+     |                  |
+     |                  arguments to this method are incorrect
+     |
+help: the return type of this call is `()` due to the type of the argument passed
+    --> src/path_rewriting.rs:1780:7
+     |
+1780 |       result_map.insert("Test.java".to_string(), ());
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^--^
+     |                                                  |
+     |                                                  this argument influences the return type of `insert`
+note: method defined here
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/collections/hash/map.rs:1203:12
+
+error[E0308]: mismatched types
+    --> src/path_rewriting.rs:1782:51
+     |
+1782 |       result_map.insert("Test2.java".to_string(), ());
+     |                  ------                           ^^ expected `CovResult`, found `()`
+     |                  |
+     |                  arguments to this method are incorrect
+     |
+help: the return type of this call is `()` due to the type of the argument passed
+    --> src/path_rewriting.rs:1782:7
+     |
+1782 |       result_map.insert("Test2.java".to_string(), ());
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^--^
+     |                                                   |
+     |                                                   this argument influences the return type of `insert`
+note: method defined here
+    --> /rustc/29483883eed69d5fb4db01964cdf2af4d86e9cb2/library/std/src/collections/hash/map.rs:1203:12
+</output>
+
+Function signatures
+<Signatures>
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<&Path>,
+prefix_dir: Option<&Path>,
+ignore_not_existing: bool,
+to_ignore_dirs: &[impl AsRef<str>],
+to_keep_dirs: &[impl AsRef<str>],
+filter_option: Option<bool>,
+file_filter: crate::FileFilter) -> Vec<ResultTuple>
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

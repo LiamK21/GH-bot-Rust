@@ -1,0 +1,215 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+ 0.8.5 always reports 0% in coverage.json 
+It seems the coverage.json file generated for shields.io is broken in 0.8.5, as it now always reports 0% coverage. The HTML file created is still correct and shows the right coverage stats. Reverting to 0.8.4 fixes it, and the project then shows the correct percentage again.
+
+With 0.8.5:
+```json
+{"schemaVersion":1,"label":"coverage","message":"0%","color":"red"}
+```
+
+And 0.8.4:
+```json
+{"schemaVersion":1,"label":"coverage","message":"24%","color":"red"}
+```
+
+Args:
+```
+grcov . --binary-path ./target/debug/ -s . -t html --branch --ignore "*cargo*" -o ./coverage.xml --excl-br-start "mod tests \{" --excl-start "mod test \{"  --prefix-dir /src/ .
+```
+
+Project is in Rust, with version `rustc 1.60.0-nightly (84322efad 2022-01-23)`, with latest llvm-tools-preview. It happens with both profraw files and gcda/gcno files. 
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/html.rs b/src/html.rs
+--- a/src/html.rs
++++ b/src/html.rs
+@@ -5,7 +5,6 @@ use std::collections::HashMap;
+ use std::collections::{btree_map, BTreeMap};
+ use std::fs::{self, File};
+ use std::io::{BufRead, BufReader, Write};
+-use std::ops::{Div, Mul};
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use tera::try_get_value;
+@@ -153,18 +152,13 @@ fn get_stats(result: &CovResult) -> HtmlStats {
+ }
+ 
+ #[inline(always)]
+-fn get_percentage<
+-    T: Div + Mul + PartialOrd + std::ops::Mul<Output = T> + std::ops::Div<Output = T> + From<u8>,
+->(
+-    x: T,
+-    y: T,
+-) -> T {
+-    if y != T::from(0) {
+-        x / y * T::from(100)
++fn get_percentage_of_covered_lines(covered_lines: usize, total_lines: usize) -> f64 {
++    if total_lines != 0 {
++        covered_lines as f64 / total_lines as f64 * 100.0
+     } else {
+         // If the file is empty (no lines) then the coverage
+         // must be 100% (0% means "bad" which is not the case).
+-        T::from(100)
++        100.0
+     }
+ }
+ 
+@@ -174,7 +168,7 @@ fn percent(args: &HashMap<String, Value>) -> tera::Result<Value> {
+             from_value::<usize>(n.clone()),
+             from_value::<usize>(d.clone()),
+         ) {
+-            Ok(to_value(get_percentage(num as f64, den as f64)).unwrap())
++            Ok(to_value(get_percentage_of_covered_lines(num, den)).unwrap())
+         } else {
+             Err(tera::Error::msg("Invalid arguments"))
+         }
+@@ -466,7 +460,7 @@ pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, s
+     let mut ctx = make_context();
+     ctx.insert(
+         "current",
+-        &get_percentage(stats.covered_lines, stats.total_lines),
++        &(get_percentage_of_covered_lines(stats.covered_lines, stats.total_lines) as usize),
+     );
+     ctx.insert("hi_limit", &conf.hi_limit);
+     ctx.insert("med_limit", &conf.med_limit);
+@@ -511,7 +505,7 @@ pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) {
+         Ok(f) => f,
+     };
+ 
+-    let coverage = get_percentage(stats.covered_lines, stats.total_lines);
++    let coverage = get_percentage_of_covered_lines(stats.covered_lines, stats.total_lines) as usize;
+ 
+     let res = serde_json::to_writer(
+         &mut output_stream,
+@@ -533,3 +527,17 @@ pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) {
+         eprintln!("cannot write the file {:?}", output_file);
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::get_percentage_of_covered_lines;
++
++    #[test]
++    fn test_get_percentage_of_covered_lines() {
++        assert_eq!(get_percentage_of_covered_lines(5, 5), 100.0);
++        assert_eq!(get_percentage_of_covered_lines(1, 2), 50.0);
++        assert_eq!(get_percentage_of_covered_lines(200, 500), 40.0);
++        assert_eq!(get_percentage_of_covered_lines(0, 0), 100.0);
++        assert_eq!(get_percentage_of_covered_lines(5, 0), 100.0);
++    }
++}
+
+
+</patch>
+
+<TEST>
+<Filename>src/html.rs</Filename>
+<imports>use super::gen_coverage_json;
+use super::HtmlStats;
+use super::Config;
+use std::path::Path;
+use std::fs;</imports>
+<Rust>#[test]
+fn test_gen_coverage_json_reports_correct_coverage() {
+    let stats = HtmlStats {
+        covered_lines: 24,
+        total_lines: 100,
+        ..Default::default()
+    };
+    let conf = Config {
+        hi_limit: 80,
+        med_limit: 50,
+        ..Default::default()
+    };
+    let output_path = Path::new("test_coverage.json");
+    gen_coverage_json(&stats, &conf, &output_path);
+
+    let expected = r#"{"schemaVersion":1,"label":"coverage","message":"24%","color":"red"}"#;
+    let actual = fs::read_to_string(output_path).unwrap();
+    assert_eq!(expected, actual);
+
+    fs::remove_file(output_path).unwrap();
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> src/html.rs:558:23
+    |
+558 |             hi_limit: 80,
+    |                       ^^ expected `f64`, found integer
+    |
+help: use a float literal
+    |
+558 |             hi_limit: 80.0,
+    |                         ++
+
+error[E0277]: the trait bound `Config: Default` is not satisfied
+   --> src/html.rs:560:15
+    |
+560 |             ..Default::default()
+    |               ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Config`
+
+error[E0308]: mismatched types
+   --> src/html.rs:559:24
+    |
+559 |             med_limit: 50,
+    |                        ^^ expected `f64`, found integer
+    |
+help: use a float literal
+    |
+559 |             med_limit: 50.0,
+    |                          ++
+</output>
+
+Function signatures
+<Signatures>
+pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) -> ()
+
+fn get_stats(result: &CovResult) -> HtmlStats
+
+fn percent(args: &HashMap<String, Value>) -> tera::Result<Value>
+
+pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, style: BadgeStyle) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
