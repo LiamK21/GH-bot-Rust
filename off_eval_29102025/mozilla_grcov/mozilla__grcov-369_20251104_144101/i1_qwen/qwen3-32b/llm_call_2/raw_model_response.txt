@@ -1,0 +1,522 @@
+<think>
+Okay, let me try to figure out why the test is failing after the patch. The original test was checking the handling of duplicate "top-level" functions, which was a workaround for a bug. The patch removed that workaround. The new test provided after the patch is supposed to verify that the patch fixed the issue, but it's currently failing.
+
+The existing test creates a data string with two FN entries for "top-level" at different line numbers and two FNDA entries. After parsing, it expects that the result has one function named "top-level" which is marked as executed.
+
+Looking at the test failure message, the error is that result.functions.len() is 0 instead of 1. That suggests that in the current code (post-patch), the parser is not processing the FN entries correctly. Before the patch, the workaround would rename duplicates (like to "top-level1"), but after the patch, the code should handle duplicates by logging an error once and not storing duplicates.
+
+Wait, the patch removed the code that handled the renaming. Now, when duplicate FN entries are encountered, the code would insert the first one and then, on the second, since it's a duplicate, maybe the second is ignored? But in the test's data, the first "FN:1,top-level" is a valid entry. But the second "FN:42,top-level" would cause a duplicate. According to the new code, when parsing "FN", if the name is already present in cur_functions, it logs an error once, but doesn't rename. However, the first insertion would be okay. The second FN would not be inserted, because cur_functions already has the key. Wait, the code inserts into cur_functions, but if there's a duplicate FN, then the second insertion would overwrite? Or not?
+
+Wait, looking at the patch: in the "FN" parsing section, the code now inserts using f_name.to_owned(), but in the original code, after the workaround, multiple "top-level" entries were being renamed and added as separate entries. Now, without the workaround, when a duplicate FN is encountered, the code checks if the name is already present. The test's data has two FN entries with the same name. Let's see:
+
+In the new code, for each FN line, they split the value. The f_name is taken as-is. Then, the code checks if cur_functions contains the key, but it doesn't do anything except log an error once. Wait, in the code:
+
+Original patch:
+
+In the FN parsing part:
+
+if !duplicated_error_logged && cur_functions.contains_key(&f_name) {
+    error!("FN '{}' duplicated...", cur_file);
+    duplicated_error_logged = true;
+}
+
+But then cur_functions.insert(f_name..., ...) will overwrite the existing entry? Or maybe the first insertion is allowed, and the second one would overwrite. Wait, in BTreeMap, insert returns the previous value if present. So, in this case, the first FN would insert the function with name "top-level" and start=1. The second FN would insert again, overwriting the previous entry with start=42. Then, when processing the FNDA entries, both are "top-level" and would update the same key. 
+
+In the test, the FNDA entries are "1,top-level" and "0,top-level". If the code processes them, after insertion, the last insertion would be the one that remains. However, the test's expected result is that the function "top-level" has start=1 and executed=true (since FNDA=1 is processed). 
+
+Wait, the test's data is:
+
+"SF:test_file.js\nFN:42,top-level\nFN:1,top-level\nFNDA:1,top-level\nFNDA:0,top-level\nEND\n"
+
+So, first FN:42, then FN:1. So in the code, when inserting into cur_functions, the second FN (start=1) would overwrite the first (start=42). Then the FNDA entries would set executed to true (from 1) and then false (from 0), but since it's the same key, the final state would be executed: false.
+
+But in the test's assertion, it's checking that func.start is 1 and func.executed is true. However, in the current code (post-patch), after the two FN entries, the last insertion is the one with start=1. Then, the FNDA entries would process the first one (sets executed to true) and then the second (sets to false). So the final executed would be false. 
+
+But the test is expecting executed to be true. That's a problem. Also, the test expects the function to exist, but perhaps the code is not inserting it correctly.
+
+Alternatively, maybe the code is not handling the FNDA entries correctly. Let's check the FNDA part:
+
+In the code after the patch, for FNDA, it tries to get the function from cur_functions and if present, sets executed. However, in the test's case, after the two FNs, the second FN overwrites the first. So the function "top-level" in cur_functions would have start=1 (from the second FN line). The FNDA lines are "1" and "0", so the first FNDA sets executed to true, the second to false. So the final executed is false. But the test's assertion is:
+
+assert!(func.executed); 
+
+But the test's current setup would have executed as false. That's why the test is failing. The test expects that both FNDA entries are processed, leading to executed being true OR false based on the sum. Wait, no—FNDA is cumulative? No, the code for FNDA lines sets executed |= executed. So if the first is 1 (true), executed becomes true. Then the second is 0 (false), so executed |= false leaves it as true. Wait, no: executed is a boolean. The code does f.executed |= executed. If the first FNDA is 1 (true), then executed is true. The next FNDA is 0 (false), then executed |= false doesn't change it. So the final executed would be true. Oh, right! Because |= is a logical OR. So the first FNDA sets executed to true, then the second (0) would set executed |= false, so executed remains true. 
+
+But wait, what's the actual code in the patch for FNDA?
+
+In the post-patch code, the FNDA processing is:
+
+if let Some(f) = cur_functions.get_mut(f_name) {
+    f.executed |= executed;
+} else {
+    error and return err
+}
+
+So in the test, there are two FNDA entries for the same "top-level". The first one sets executed to true (since 1 != 0). The second is 0, which is executed = false. But since executed is a boolean, executed |= false is equivalent to executed = executed || false. So the executed remains true. So after both FNDA entries, the function's executed is true. 
+
+So, if the FNDA entries are processed, then the function's executed would be true. However, the problem is whether the function is actually inserted into cur_functions. 
+
+In the current code, after the patch, when two FN lines are parsed, both have the same name. The first insertion into cur_functions is (start=42), then overwritten with (start=1). Then, the two FNDA entries are processed, which set executed to true (from 1) and then executed remains true. 
+
+But in the test, the final result is that there's one function, "top-level", with start=1 and executed=true. But in the test, the actual result.functions.len() is 0. Wait, how?
+
+Wait, the test's data is:
+
+"SF:test_file.js\nFN:42,top-level\nFN:1,top-level\nFNDA:1,top-level\nFNDA:0,top-level\nEND\n"
+
+So, after processing the two FN lines, the cur_functions has one entry for "top-level" with start=1. Then, the FNDA lines are processed, which find that entry, set executed to true. Then, when the test checks, it expects that the result has one function, which it does. But the test's failure says that the len is 0. That's confusing. 
+
+Wait the test's assertion is:
+
+assert_eq!(result.functions.len(), 1);
+
+But the test is failing because left is 0. Why would that be? Maybe the code is not adding the functions correctly. Or perhaps the test is using a wrong file. Let's look deeper.
+
+The parse_lcov function returns a Vec<(String, CovResult)>. The test creates data with SF:test_file.js, then processes it. So after parsing, the results.len() should be 1. But in the test output, it's 0? Or the test is failing in a different line.
+
+The output says:
+
+left: `0`,
+ right: `1`', src/parser.rs:1638:9
+
+Wait, that's the line in the test where it checks result.functions.len() is 1. So in reality, the function entry is not present. How?
+
+Ah! Because in the current code, after the patch, when there are duplicate FN entries, the second FN line is inserted, overwriting the previous entry. So after the two FN lines, the function "top-level" has start=1. Then, during processing of FNDA lines, the code tries to get that function and updates executed. So the function exists. But in the test, the result.functions.len() is 0? That's impossible. Unless maybe the SF entry is not properly handled, leading to no functions being recorded. Wait, maybe there's an error in parsing that causes the functions not to be recorded. Let me check the code flow.
+
+The parse_lcov function processes lines. When an SF line is read, it sets cur_file. Then, subsequent FN lines add to cur_functions. At the end, the functions are added to the result only if they are non-zero in some way. Wait, no, the code adds all functions to cur_functions. Unless there's a check for empty. But the test's data has an SF line, so cur_file is set. Then the FN lines add functions to cur_functions. At the end, when building the result for that file, it's added to results if it has any functions or branches. 
+
+Looking at the code, in the parse_lcov function, after processing all lines, the code checks if the current result (cur_file and other data) should be added to the results. The code does something like:
+
+if cur_file is Some, and (cur_lines, cur_branches, cur_functions are not empty), then push to results.
+
+So in the test case, after processing the data, cur_functions has one function. So the result should be added. But in the test, it's not. Why?
+
+Wait, the test's data ends with END, which is one of the lines that triggers adding to results. So after processing the END line, the code adds the current cur_functions, etc., to the result. So why would the functions be empty? Maybe because during parsing, an error occurs, causing the parse_lcov to return an error. 
+
+Wait, the code could be triggering an error somewhere. Let me check the code for FN processing. The code checks if the name is already present. But when processing the first FN line, it's added. Then the second FN line, the same name is added, but in the new code, the code doesn't do anything except log an error once. However, inserting into cur_functions would overwrite the previous entry. So after processing two FN lines, cur_functions has one entry. Then the FNDA lines process that entry. 
+
+But in the test, after parsing, the result's functions is zero length. That suggests that the code is not adding the function to cur_functions. How?
+
+Wait, perhaps in the new code, during theFN line processing, the function is inserted only once. Let me look again:
+
+Original code (post-patch) for FN lines:
+
+let f_name = try_next!(...);
+if !duplicated_error_logged && cur_functions.contains_key(f_name) {
+    error... 
+    duplicated_error_logged = true;
+}
+cur_functions.insert(
+    f_name.to_owned(),
+    Function { ... }
+);
+
+Wait, no—this is incorrect. The code checks if the function name already exists (but the check is for cur_functions.contains_key(f_name)), but then it proceeds to insert regardless. So for the first FN line, the function is inserted. For the second FN line, even though the check logs an error, it still inserts a new function with the same name, overwriting the previous. Therefore, in the test, after two FN lines, the function is stored as the second insertion (start=1). Then, when processing FNDA lines, the same function is updated.
+
+So, in the test case, after parsing, the cur_functions should have one entry. Then, when building the result, it's added. Therefore, the test's assertion should pass. But the test says that result.functions.len() is 0. That can't be. So why?
+
+Alternatively, maybe the code is not building the CovResult correctly. Let me check the code for when the SF is processed. The code sets cur_file, and when an SF is processed, all subsequent data is part of that file. Then, at the end (when END is encountered), the code adds the current state to the results.
+
+In the test's data, there's an SF line: SF:test_file.js. So cur_file is Some. Then the code processes the FN lines, inserting into cur_functions. Then the END line is processed, and the code checks if cur_functions or other data exists. If so, add to results. 
+
+So the result should have one entry, with the function. Therefore, the test's failure must be due to another reason. Maybe the error is elsewhere. Oh! Wait, the test uses parse_lcov(reader, false). The branch_enabled argument is false. But does that affect anything? The code for FN and FNDA lines is separate from branch handling. So, branch_enabled probably doesn't impact this case. 
+
+Another possibility: the test is using parse_lcov with a BufReader over a Cursor, but in the actual code, the parsing depends on the correct processing of lines. Let me check the test data:
+
+The test data is:
+
+"SF:test_file.js\nFN:42,top-level\nFN:1,top-level\nFNDA:1,top-level\nFNDA:0,top-level\nEND\n"
+
+But the code may require the lines to be properly read. For example, the code uses BufReader and splits on lines. Perhaps the test data is missing the trailing newline or some other formatting. Or the lines are not properly separated. Let me check how the code splits the input. 
+
+The code uses BufReader to read lines. The test uses a Cursor (in-memory) which is wrapped in a BufReader. So, each line is processed correctly. 
+
+Hmm. Another possibility: the code for parsing FN lines checks if the name is "top-level" in the old code. The new code doesn't have that. Wait, no— the old code had a specific workaround for "top-level", but the new code removed that. Now, any duplicate FN line with the same name would be logged once. 
+
+But in the test case, the name is "top-level", and the code is now handling duplicates for any name. So, the test's scenario is that two FN lines have the same name, causing a duplicate. 
+
+Wait, why is the test expecting a single function in the result? Because the current code should insert the first function, then overwrite it with the second, and then the FNDA lines update that function. So the final result should have one function. 
+
+But the test says that the result's functions.len() is zero. That suggests that the code is not adding the function. Why? Maybe the error is due to the code's handling of the SF line. Let me look for any other conditions. 
+
+Wait, the code may not be adding the current result to the results vector if the functions are empty. Wait, in the code, after processing the file, the code checks:
+
+if let Some(file) = cur_file {
+    let result = CovResult {
+        lines: cur_lines,
+        branches: cur_branches,
+        functions: cur_functions,
+    };
+    if !result.is_empty() {
+        results.push((file, result));
+    }
+}
+
+But result.is_empty() is probably a function that returns true if all (lines, branches, functions) are empty. In the test case, cur_functions has one function, so the result is not empty and is added. Therefore, the test's results.len() should be 1. 
+
+But in the test's output, it says that the result's functions.len() is 0. That implies that somehow, the function is not inserted into cur_functions. 
+
+Wait, could the code be failing during the insertion? For example, if try_next! fails. The test data's lines are:
+
+FN:42,top-level
+FN:1,top-level
+FNDA:1,top-level
+FNDA:0,top-level
+
+But the code for FN uses splitn(2, ',') to split the value. So for the FN line, value is "42,top-level". splitn(2, ',') splits into ["42", "top-level"], which is two parts. Then start is parsed as 42. 
+
+In the code, for FN lines:
+
+let mut f_splits = value.splitn(2, ',');
+let start = try_parse_next!(f_splits, l);
+
+But for the first FN line, the split gives ["42", "top-level"], so start is 42. The second FN line splits into ["1", "top-level"], start is 1. 
+
+The function is inserted into cur_functions. So after processing both FN lines, cur_functions should have the second one. Then FNDA is processed. So why would the functions.len() be zero?
+
+Wait, could there be an error in the parse_lcov processing? For example, if there's an error elsewhere in the parsing, leading to an early return. Let me check the code for the FNDA processing. The original code had an error in the test case where the cur_fndas were used, but that was removed. 
+
+Another possibility: the test is using parse_lcov with false for branch_enabled, but that doesn't affect the processing of FN and FNDA lines. 
+
+Wait, maybe the test is using a BufReader over a Cursor, but the code expects a file with certain line endings. For example, the Cursor may not read the final line correctly if there's no newline. But the test data includes an END line followed by a \n. 
+
+Alternatively, the test's data is missing the final END line. Let me check the test data again:
+
+"data = \"SF:test_file.js\\nFN:42,top-level\\nFN:1,top-level\\nFNDA:1,top-level\\nFNDA:0,top-level\\nEND\\n\";"
+
+The data ends with END\n. So when processed, the code should read the END line. 
+
+Wait, maybe the code is not processing the END line correctly. Let me check the code for processing lines. 
+
+In the code, after parsing each line, it loops through lines and processes according to their type. When an END line is encountered, it adds the current result to the results. Then, after processing all lines, cur_file is reset. 
+
+So in the test case, after parsing the END line, the current result is added. 
+
+So the test should have one result, with one function. 
+
+But the test is failing with the result's functions.len() being 0. That can't be. Therefore, the problem must be elsewhere. 
+
+Another possibility: the code has a bug in the new code that prevents the function from being inserted into cur_functions. Let me look at the code for inserting into cur_functions after the patch. 
+
+In the new code for FN lines:
+
+cur_functions.insert(
+    f_name.to_owned(),
+    Function {
+        start,
+        executed: false,
+        name: f_name.to_owned(),
+    },
+);
+
+But perhaps the code is not inserting into cur_functions when the name is already present. Wait, no, in the new code, the insertion is done regardless of whether the name exists. The check for existing is only to log an error, but the insertion proceeds. So for the first FN line, it's inserted. For the second, it's overwritten. 
+
+But then, if the test passes after the patch, the function should be present. However, in the test's current output, it's 0. So there's a contradiction here. 
+
+Wait, perhaps the problem is that the code in the patch has a typo or other mistake. For example, in the code for the FN line:
+
+In the original code, after the patch, the code for FN is:
+
+let f_name = try_next!(...);
+if !duplicated_error_logged && cur_functions.contains_key(f_name) {
+    error(...)
+    duplicated_error_logged = true;
+}
+
+cur_functions.insert(...)
+
+So, the code inserts regardless. 
+
+Wait, maybe the code has a mistake where the condition is checking cur_functions.contains_key(f_name), but f_name is a reference, not owned. For example, in the code:
+
+The code uses:
+
+cur_functions.contains_key(f_name)
+
+But f_name is the result of try_next!(f_splits, l), which is a &str. cur_functions is a FxHashMap<String, Function>, so contains_key takes a &str. So this should work. 
+
+So, in the first FN line, f_name is "top-level", and cur_functions is empty. So it's added. The second FN line, the same name is checked, and since it's present, the error is logged once. Then the code proceeds to insert again, replacing the existing entry. 
+
+So after two FN lines, cur_functions has one entry. 
+
+Then, when processing the FNDA lines, the code finds that function and updates executed. 
+
+But in the test, the result's functions.len() is 0. 
+
+This is very puzzling. 
+
+Wait, perhaps the code is not inserting the function into cur_functions if the name is empty? Or if there's some other error. Let me check the code again. 
+
+In the code, for FN lines:
+
+let f_name = try_next!(f_splits, l);
+The try_next! macro probably returns the next part or else returns an error. 
+
+Assuming that the split is correct and try_next! returns the correct string. 
+
+Another possibility: the code uses FxHashMap, which requires that the key type (String) is properly handled. That shouldn't be an issue. 
+
+Another angle: the test's assertion is checking result.functions.len() == 1. But maybe the code is not adding the function to the result. 
+
+Wait, perhaps in the new code, the check for duplicated functions is causing an error. For example, if the code returns an error when a duplicate is detected. 
+
+But in the code, after the patch, for FN processing, it logs an error once but does not return an error. It proceeds to insert. 
+
+Wait, the original code (before the patch) had an error message but continued. The new code also logs an error but continues. So, the test should process the data properly. 
+
+Alternatively, maybe the code for the patch introduced a typo. For example, in the new code for FN lines:
+
+cur_functions.insert(
+    f_name.to_owned(),
+    Function {
+        start,
+        executed: false,
+        name: f_name.to_owned(),
+    },
+);
+
+But perhaps the Function struct's name field is not being filled correctly. 
+
+Wait, in the code for FN lines, the function's name is set to f_name.to_owned(). If the f_name is "top-level", then the name is stored as that. When querying result.functions.get("top-level"), it should retrieve it. 
+
+But in the test, the assertion is that the name exists and has start=1 and executed=true. 
+
+So why is the test failing? 
+
+Maybe the test is using the wrong variable. Let's look at the code's CovResult struct. 
+
+Assuming that CovResult has a functions field which is a BTreeMap or FxHashMap, the test is checking len. 
+
+But perhaps the code in the patch removed some code that is necessary for the test. 
+
+Alternatively, perhaps the test is expecting the code to have two functions (like before the patch) but after the patch, only one is present. Wait, no. Before the patch, the code would rename duplicates (top-level, top-level1), so the test would have multiple functions. After the patch, duplicates are overwritten. So the test is trying to verify that only one function is present and that the last FN's start is used. 
+
+But the test's current output is that the function's len is zero. That suggests that the insertion is not happening. 
+
+Wait, maybe the code is not handling the SF line correctly. Let me look for code that processes SF lines. 
+
+When the code processes an SF line, it stores the current file name in cur_file. All subsequent FN and DA lines are processed under this file. The END line triggers adding to the results. 
+
+In the test's data, the SF line is processed, cur_file is Some("test_file.js"), then the FN lines are processed. 
+
+So, the result should be added. 
+
+Hmm. This is getting frustrating. Maybe the test is not correctly forming the input data. For example, maybe the code requires the lines to be in a certain order. 
+
+Alternatively, maybe the test uses an incorrect CovResult. For example, perhaps the code doesn't add functions to the result if executed is false. 
+
+But the test is checking if the function is executed, which is set to true. 
+
+Alternatively, perhaps the test's data contains an error in the lines that causes the whole parse_lcov to return an error. But in the test, parse_lcov is called and unwrap() is used, so any error would cause a panic. But the test output is not showing an error. 
+
+Wait, the test's output shows that the test failed at the line where result.functions.len() is checked. So the code parsed the data and returned Some result. 
+
+Hmm. Maybe there's a mistake in how the test is built. For example, in the test code, after parsing, the code is:
+
+let results = parse_lcov(reader, false).unwrap();
+assert_eq!(results.len(), 1);
+let (_source_name, result) = &results[0];
+assert_eq!(result.functions.len(), 1);
+
+But if results.len() is 1, then the first assertion passes. The second is checking that the result has one function, which is zero. 
+
+So in the actual test case, the code is processing the data and adding an entry to results, but that entry's functions is empty. 
+
+But why would that happen? 
+
+Wait, what if the code is inserting the function into cur_functions, but in the CovResult, the functions are not being carried over correctly? For example, in the parse_lcov function, when building the result, perhaps the functions are not being added. 
+
+Looking at the code, when building the result, the code adds cur_functions. So if cur_functions has one entry, then the result should have it. 
+
+Another possibility: the code uses a different way to collect the functions. For example, maybe the code uses a different key when inserting into the result. 
+
+Wait, in the code, when the file is closed (END line), the code creates a CovResult with cur_lines, cur_branches, and cur_functions. So if cur_functions is being filled correctly, then the result should have it. 
+
+So why is it empty?
+
+Ah! Maybe in the new code, when a duplicate FN is encountered, the code is not inserting into cur_functions at all. Because of a typo. For example, the code says:
+
+cur_functions.insert(f_name.to_owned(), ...)
+
+But due to a typo, perhaps the function is not inserted. 
+
+Alternatively, maybe the code is not inserting into cur_functions because the name is empty? But the name is "top-level". 
+
+Alternatively, maybe the code is using a different hash map. For example, in the patch, the original code uses FxHashMap for cur_functions. So after insertion, it's stored there. 
+
+But perhaps when the test is using a different hash map implementation, like BTreeMap, but no, the function is FxHashMap. 
+
+I'm stuck. Maybe the test needs to be adjusted to reflect what the code actually does now. 
+
+The original test for the workaround (test_lcov_parser_duplicate_fn_fnda) is removed, but the new test is supposed to verify that the patch works. 
+
+The new test is designed to check that the code now handles duplicates by logging a single error and keeping only one function. 
+
+So, in the test case, after parsing two FN lines with same name, the function is present once. 
+
+But the current test is failing because the functions.len() is 0. That suggests that the function is not inserted. 
+
+Wait, could it be that the code is using a different cur_file handling? For example, the code may require that the SF line is followed by other lines. 
+
+Let me check the code for SF processing. 
+
+In parse_lcov:
+
+When an SF line is processed, cur_file is set. Any subsequent FN lines are processed. When END is processed, the cur_file is reset. 
+
+But in the test data, the SF line is followed by FN lines, and then END. So cur_file is set, and then the functions are added. 
+
+Hmm. Maybe the test is missing the DA or other lines. But the test data includes END, which triggers adding the result. 
+
+Another possibility: maybe the code for parsing FN lines has a bug. For example, perhaps the code is using a different f_name. 
+
+In the new code, for FN lines:
+
+let f_name = try_next!(f_splits, l).to_string();
+
+Wait, but in the code, try_next! returns a reference, then to_owned() is called. 
+
+In the code, f_splits is split on the first comma. For example, "FN:42,top-level" is split into ["42", "top-level"]. So, try_next!(f_splits) returns "42", and try_next! again returns "top-level". 
+
+But in the code for parsing FN lines:
+
+let f_splits = value.splitn(2, ',');
+let start = parse the first split.
+let f_name = try_next!(...).
+
+So the code for FN lines is correct. 
+
+Hmm. Maybe the test is not properly building the data. For example, the data may have "top-level" with a typo. 
+
+The test's data uses "top-level", which is correct. 
+
+Another idea: in the current code after the patch, when processing FN lines, the code inserts the function into cur_functions, but the name is not correctly stored. For example, maybe a typo in the function struct. 
+
+Looking at the code, the Function struct has a name field. Are the cur_functions using the name field as the key? Or is it a separate hash? No, the cur_functions is keyed by the f_name. So the key is the f_name, not the function's name. 
+
+Wait, the code for cur_functions is a map where the key is the f_name (from the FN line), and the value is the function. The function's name field is also set to f_name.to_owned(). So both are the same. 
+
+In the test's assertion, the function's name is not checked, but the start and executed are. 
+
+So, the problem is why is the function not present in the result. 
+
+Maybe the code has a bug that the f_splits.splitn(2, ',') is splitting on the wrong character. For example, if the code is using a different delimiter. 
+
+No, the code uses splitn(2, ','), which should split into two parts. 
+
+I'm really stuck. Maybe the issue is that the test is expecting the function to exist but it doesn't, so the test should be modified to expect that the function is being overwritten and only one is present, but the test is checking for the wrong start value or execution status. 
+
+Alternatively, perhaps the new code doesn't allow duplicate FN lines, and the test is designed to check that. 
+
+Wait, the current code allows duplicates to be inserted, but logs a warning. So the function is inserted. 
+
+But why is the test failing? 
+
+Perhaps the test's expected result is wrong. For example, the new code is inserting one function with start=1 and executed=true, but the test expects start=1 and executed. 
+
+In the current data, after inserting the two FN lines, the function's start is 1. The two FNDA lines are processed in order. The first FNDA:1 sets executed to true. The second FNDA:0 sets executed to executed |= false (which doesn't change it). 
+
+So executed is true. 
+
+In the test, the assertion is:
+
+assert_eq!(func.start, 1);
+assert!(func.executed);
+
+So the test expects that the start is 1 and executed is true. 
+
+But the test is failing because the result.functions.len() is 0. 
+
+Ah! Wait, maybe the problem is that the code is not handling the END line correctly. For example, the END line may not be parsed, leading to the function not being added to the results. 
+
+In the code, when END is encountered, the code adds the current cur_file and data to the results. 
+
+But if the END line is not processed, the data for the current file is not added. 
+
+In the test data, the END line is present and ends with \n. 
+
+But maybe the code is not processing the END line correctly. 
+
+Another possibility: the test's data is missing the final newline after END. For example, if the data is:
+
+"SF:test_file.js\nFN:...\nFN:...\nFNDA:...\nFNDA:...\nEND"
+
+Without the trailing newline,BufReader may not read the line correctly. 
+
+In the current test data, the string ends with "\nEND\n". Wait, the string is:
+
+"data = \"SF:test_file.js\\nFN:42,top-level\\nFN:1,top-level\\nFNDA:1,top-level\\nFNDA:0,top-level\\nEND\\n\";"
+
+So the END line is followed by a '\n', which BufReader should process correctly. 
+
+Hmm. I'm stuck. 
+
+Maybe the test is not correct as written. Perhaps the new code is not able to handle FN lines with the same name after the patch. But according to the patch, the code should handle duplicate FN names by logging an error and inserting the function, but the last inserted one overwrites the previous. 
+
+Given that the test is failing post-patch, perhaps the test should be adjusted to expect that only the last FN line's start is stored. 
+
+But according to the test's data, the first FN line has start=42, the second has start=1. So the function's start should be 1. 
+
+But the test is failing because the function is not present. 
+
+Maybe the code has a bug where it only inserts the function if the name is not a duplicate. But that's not the case. 
+
+Alternatively, perhaps the code is not inserting the function if the name was already present. 
+
+Wait, in the code after the patch, the code checks for duplicated names, but inserts anyway. 
+
+The code does:
+
+cur_functions.insert(f_name.to_owned(), ...)
+
+So the insertion happens regardless of whether the name is already present. 
+
+Thus, the function should be present. 
+
+Given all this, the test's failure must be due to a problem in the test's setup. 
+
+Perhaps the test's data is not formatted correctly. For example, maybe the code expects that after an FN line, there must be a LF and the test's string is using \\n, but the actual code requires a CRLF or something else. 
+
+But Rust'sBufReader should handle lines correctly, regardless of line endings. 
+
+Another idea: the new code may have a bug in how it inserts the function into cur_functions. For example, the code uses f_name to insert, but the function's name is stored in the function itself. But that shouldn't matter. 
+
+Another possibility: the test is using the wrong parse_lcov parameters. The test calls parse_lcov with branch_enabled: false. Maybe the code uses branch_enabled to determine whether to process FN lines. 
+
+Looking at the function signature, it's possible that branch_enabled is not related to FN parsing, but to branch lines. So the test's use of false should not affect FN parsing. 
+
+Hmm. Given that I'm stuck, maybe I should adjust the test to expect a different outcome. 
+
+The test's current data has two FN lines with the same name. Before the patch, the code would rename them, leading to two functions. After the patch, the code would overwrite one with the other, keeping one function. 
+
+The test is currently expecting that the function exists. So the test is trying to verify that the code handles duplicates by keeping only one function. 
+
+However, in the current test, after the patch, the function is being inserted, but the test is failing, implying that the function is not present. 
+
+Alternatively, maybe the patch has a bug where the function is not inserted when there's a duplicate. 
+
+In the current code for the FN line processing:
+
+If a duplicate is detected (cur_functions already has the name), the code logs an error but proceeds to insert the function. 
+
+So, in the test case, the second insertion should overwrite the first. 
+
+So, the function should be present. 
+
+Given that, maybe the test is correct, and the patch has a bug. But the user says that the test should pass after the patch. 
+
+Alternatively, maybe the test's data is malformed. 
+
+Wait, the test's data is using FN lines with commas, but maybe the code expects a different delimiter. 
+
+No, the code uses splitn(2, ',') as per the test's data. 
+
+At this point, perhaps the solution is to modify the test to make it expect the correct behavior after the patch. 
+
+The test is designed to verify that the patch fixed the issue. The original test was checking for three functions (top-level, top-level1, top-level2) when the workaround was enabled. The new test should check that after the patch, duplicates are not created. 
+
+The new test should create a scenario where there are two FN lines with the same name, and verify that only the last one is present, and that the FNDA entries are processed correctly. 
+
+But the current test is failing, perhaps due to an issue in the test setup. 
+
+Maybe the test should expect that the function is present once, but

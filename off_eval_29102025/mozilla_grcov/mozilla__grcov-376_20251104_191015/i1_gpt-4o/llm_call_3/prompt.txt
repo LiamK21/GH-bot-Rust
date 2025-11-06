@@ -1,0 +1,274 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Coveralls's API requires "service_job_id" field
+According Coveralls' API Document,  `service_job_id` is used to reference a repository.
+
+```
+We can reference a repository in one of two ways:
+
+service_job_id String and service_name String
+
+Coveralls currently supports the following continuous integration services: Travis CI (open source), Travis Pro (private repos), CircleCI, Semaphore, JenkinsCI, or Codeship.
+
+Setting service_name to "travis-ci" and service_job_id to the Travis Job ID will automatically look up the appropriate build and repository, and assign the job correctly on Coveralls.
+```
+
+But grcov generates `service-job-number` now. Although Coveralls can accept grcov's output, there are some problems. For example the link from Coveralls to Travis doesn't work. 
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -121,11 +121,7 @@ fn main() {
+                                .help("Sets the hash of the commit used to generate the code coverage data")
+                                .long("commit-sha")
+                                .value_name("COMMIT HASH")
+-                               .takes_value(true)
+-                               .required_ifs(&[
+-                                   ("output_type", "coveralls"),
+-                                   ("output_type", "coveralls+")
+-                               ]))
++                               .takes_value(true))
+ 
+                           .arg(Arg::with_name("service_name")
+                                .help("Sets the service name")
+@@ -140,10 +136,18 @@ fn main() {
+                                .takes_value(true))
+ 
+                           .arg(Arg::with_name("service_job_number")
+-                               .help("Sets the service job number")
++                               .help("Sets the service job number (deprecated in favour of --service-job-id)")
+                                .long("service-job-number")
+                                .value_name("SERVICE JOB NUMBER")
+-                               .takes_value(true))
++                               .takes_value(true)
++                               .conflicts_with("service_job_id"))
++
++                          .arg(Arg::with_name("service_job_id")
++                               .help("Sets the service job id")
++                               .long("service-job-id")
++                               .value_name("SERVICE JOB ID")
++                               .takes_value(true)
++                               .conflicts_with("service_job_number"))
+ 
+                           .arg(Arg::with_name("service_pull_request")
+                                .help("Sets the service pull request number")
+@@ -209,7 +213,10 @@ fn main() {
+     let service_name = matches.value_of("service_name").unwrap_or("");
+     let is_parallel = matches.is_present("parallel");
+     let service_number = matches.value_of("service_number").unwrap_or("");
+-    let service_job_number = matches.value_of("service_job_number").unwrap_or("");
++    let service_job_id = matches
++        .value_of("service_job_id")
++        .or_else(|| matches.value_of("service_job_number"))
++        .unwrap_or("");
+     let service_pull_request = matches.value_of("service_pull_request").unwrap_or("");
+     let vcs_branch = matches.value_of("vcs_branch").unwrap_or("");
+     let log = matches.value_of("log").unwrap_or("");
+@@ -376,7 +383,7 @@ fn main() {
+             repo_token,
+             service_name,
+             service_number,
+-            service_job_number,
++            service_job_id,
+             service_pull_request,
+             commit_sha,
+             false,
+@@ -390,7 +397,7 @@ fn main() {
+             repo_token,
+             service_name,
+             service_number,
+-            service_job_number,
++            service_job_id,
+             service_pull_request,
+             commit_sha,
+             true,
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -369,7 +369,7 @@ pub fn output_coveralls(
+     repo_token: &str,
+     service_name: &str,
+     service_number: &str,
+-    service_job_number: &str,
++    service_job_id: &str,
+     service_pull_request: &str,
+     commit_sha: &str,
+     with_function_info: bool,
+@@ -440,7 +440,7 @@ pub fn output_coveralls(
+             "source_files": source_files,
+             "service_name": service_name,
+             "service_number": service_number,
+-            "service_job_number": service_job_number,
++            "service_job_id": service_job_id,
+             "service_pull_request": service_pull_request,
+             "parallel": parallel,
+         }),
+@@ -587,4 +587,43 @@ mod tests {
+ 
+         assert_eq!(results, expected);
+     }
++
++    #[test]
++    fn test_coveralls_service_job_id() {
++        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
++        let file_name = "test_coveralls_service_job_id.json";
++        let file_path = tmp_dir.path().join(&file_name);
++
++        let results = vec![(
++            PathBuf::from("foo/bar/a.cpp"),
++            PathBuf::from("foo/bar/a.cpp"),
++            CovResult {
++                lines: [(1, 10), (2, 11)].iter().cloned().collect(),
++                branches: BTreeMap::new(),
++                functions: FxHashMap::default(),
++            },
++        )];
++
++        let results = Box::new(results.into_iter());
++        let expected_service_job_id: &str = "100500";
++        let with_function_info: bool = true;
++        let parallel: bool = true;
++        output_coveralls(
++            results,
++            "unused",
++            "unused",
++            "unused",
++            expected_service_job_id,
++            "unused",
++            "unused",
++            with_function_info,
++            Some(file_path.to_str().unwrap()),
++            "unused",
++            parallel,
++        );
++
++        let results: Value = serde_json::from_str(&read_file(&file_path)).unwrap();
++
++        assert_eq!(results["service_job_id"], expected_service_job_id);
++    }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>src/output.rs</Filename>
+<imports>use std::path::PathBuf;
+use serde_json::Value;
+use crate::CovResult;
+use fxhash::FxHashMap;
+use std::fs::File;
+use std::io::Read;</imports>
+<Rust>#[test]
+fn test_coveralls_service_job_id_integration() {
+    let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+    let file_name = "test_coveralls_service_job_id_integration.json";
+    let file_path = tmp_dir.path().join(&file_name);
+
+    let results = vec![(
+        PathBuf::from("foo/bar/a.cpp"),
+        PathBuf::from("foo/bar/a.cpp"),
+        CovResult {
+            lines: [(1, 10), (2, 11)].iter().cloned().collect(),
+            branches: BTreeMap::new(),
+            functions: FxHashMap::default(),
+        },
+    )];
+
+    let results = Box::new(results.into_iter());
+    let expected_service_job_id: &str = "100500";
+    let with_function_info: bool = true;
+    let parallel: bool = true;
+    output_coveralls(
+        results,
+        "unused",
+        "unused",
+        "unused",
+        expected_service_job_id,
+        "unused",
+        "unused",
+        with_function_info,
+        Some(file_path.to_str().unwrap()),
+        "unused",
+        parallel,
+    );
+
+    let mut file = File::open(&file_path).expect("Failed to open file");
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).expect("Failed to read file");
+    let results: Value = serde_json::from_str(&contents).unwrap();
+
+    assert_eq!(results["service_job_id"], expected_service_job_id);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `fxhash`
+   --> src/output.rs:531:9
+    |
+531 |     use fxhash::FxHashMap;
+    |         ^^^^^^ use of undeclared crate or module `fxhash`
+
+error: aborting due to previous error
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+pub fn output_coveralls(
+results: CovResultIter,
+repo_token: &str,
+service_name: &str,
+service_number: &str,
+service_job_id: &str,
+service_pull_request: &str,
+commit_sha: &str,
+with_function_info: bool,
+output_file: Option<&str>,
+vcs_branch: &str,
+parallel: bool) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

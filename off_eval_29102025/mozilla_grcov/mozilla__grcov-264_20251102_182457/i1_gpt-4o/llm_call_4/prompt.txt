@@ -1,0 +1,346 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Wrong coverage when multiple same file names
+To reproduce:
+ - git clone https://github.com/adrian17/grcov_test
+ - CARGO_INCREMENTAL=0 RUSTFLAGS="-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Zno-landing-pads" cargo test
+ - grcov target -s src/ -t lcov --llvm --branch --ignore-not-existing --ignore-dir "/*"  > lcov.info
+ - lcov.info contains:
+   DA:333,1
+   DA:334,1
+   DA:337,0
+   DA:339,0
+   DA:341,1
+ for src/lib.rs which is obviously wrong.
+
+It appears that we've two lib.rs files in gcnos:
+ - src/lib.rs
+ - /rustc/0ea22717a1e01fa535534b85a5347a7e49fc79de/src/libtest/lib.rs (on my system)
+
+and because of path_rewriting stuff, these two files are finally the same !! 
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -124,6 +124,18 @@ fn get_abs_path(
+     (abs_path, rel_path)
+ }
+ 
++fn check_extension(path: &PathBuf, e: &str) -> bool {
++    if let Some(ext) = &path.extension() {
++        if let Some(ext) = ext.to_str() {
++            ext == e
++        } else {
++            false
++        }
++    } else {
++        false
++    }
++}
++
+ fn map_partial_path(file_to_paths: &HashMap<String, Vec<PathBuf>>, path: PathBuf) -> PathBuf {
+     let options = file_to_paths.get(path.file_name().unwrap().to_str().unwrap());
+ 
+@@ -235,7 +247,11 @@ pub fn rewrite_paths(
+         let rel_path = remove_prefix(&prefix_dir, rel_path);
+ 
+         // Try mapping a partial path to a full path.
+-        let rel_path = map_partial_path(&file_to_paths, rel_path);
++        let rel_path = if check_extension(&rel_path, "java") {
++            map_partial_path(&file_to_paths, rel_path)
++        } else {
++            rel_path
++        };
+ 
+         // Get absolute path to the source file.
+         let (abs_path, rel_path) = get_abs_path(&source_dir, rel_path, &mut cache);
+@@ -618,12 +634,12 @@ mod tests {
+     #[test]
+     fn test_rewrite_paths_rewrite_path_using_absolute_source_directory() {
+         let mut result_map: CovResultMap = HashMap::new();
+-        result_map.insert("class/main.cpp".to_string(), empty_result!());
+-        result_map.insert("tests/class/main.cpp".to_string(), empty_result!());
++        result_map.insert("java/main.java".to_string(), empty_result!());
++        result_map.insert("test/java/main.java".to_string(), empty_result!());
+         let results = rewrite_paths(
+             result_map,
+             None,
+-            Some(canonicalize_path("tests").unwrap()),
++            Some(canonicalize_path("test").unwrap()),
+             None,
+             true,
+             Vec::new(),
+@@ -633,8 +649,8 @@ mod tests {
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+             assert!(abs_path.is_absolute());
+-            assert!(abs_path.ends_with("tests/class/main.cpp"));
+-            assert_eq!(rel_path, PathBuf::from("class/main.cpp"));
++            assert!(abs_path.ends_with("test/java/main.java"));
++            assert_eq!(rel_path, PathBuf::from("java/main.java"));
+             assert_eq!(result, empty_result!());
+         }
+         assert_eq!(count, 2);
+@@ -644,12 +660,12 @@ mod tests {
+     #[test]
+     fn test_rewrite_paths_rewrite_path_using_absolute_source_directory() {
+         let mut result_map: CovResultMap = HashMap::new();
+-        result_map.insert("class\\main.cpp".to_string(), empty_result!());
+-        result_map.insert("tests\\class\\main.cpp".to_string(), empty_result!());
++        result_map.insert("java\\main.java".to_string(), empty_result!());
++        result_map.insert("test\\java\\main.java".to_string(), empty_result!());
+         let results = rewrite_paths(
+             result_map,
+             None,
+-            Some(canonicalize_path("tests").unwrap()),
++            Some(canonicalize_path("test").unwrap()),
+             None,
+             true,
+             Vec::new(),
+@@ -659,18 +675,68 @@ mod tests {
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+             assert!(abs_path.is_absolute());
+-            assert!(abs_path.ends_with("tests\\class\\main.cpp"));
+-            assert_eq!(rel_path, PathBuf::from("class\\main.cpp"));
++            assert!(abs_path.ends_with("test\\java\\main.java"));
++            assert_eq!(rel_path, PathBuf::from("java\\main.java"));
+             assert_eq!(result, empty_result!());
+         }
+         assert_eq!(count, 2);
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn test_rewrite_paths_rewrite_path_for_java_and_rust() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("java/main.java".to_string(), empty_result!());
++        result_map.insert("main.rs".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            Some(canonicalize_path(".").unwrap()),
++            None,
++            true,
++            Vec::new(),
++            None,
++        );
++        let mut results: Vec<(PathBuf, PathBuf, CovResult)> = results.collect();
++        assert!(results.len() == 1);
++
++        let (abs_path, rel_path, result) = results.remove(0);
++        assert!(abs_path.is_absolute());
++        assert!(abs_path.ends_with("test/java/main.java"));
++        assert_eq!(rel_path, PathBuf::from("test/java/main.java"));
++        assert_eq!(result, empty_result!());
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn test_rewrite_paths_rewrite_path_for_java_and_rust() {
++        let mut result_map: CovResultMap = HashMap::new();
++        result_map.insert("java\\main.java".to_string(), empty_result!());
++        result_map.insert("main.rs".to_string(), empty_result!());
++        let results = rewrite_paths(
++            result_map,
++            None,
++            Some(canonicalize_path(".").unwrap()),
++            None,
++            true,
++            Vec::new(),
++            None,
++        );
++        let mut results: Vec<(PathBuf, PathBuf, CovResult)> = results.collect();
++        assert!(results.len() == 1);
++
++        let (abs_path, rel_path, result) = results.remove(0);
++        assert!(abs_path.is_absolute());
++        assert!(abs_path.ends_with("test\\java\\main.java"));
++        assert_eq!(rel_path, PathBuf::from("test\\java\\main.java"));
++        assert_eq!(result, empty_result!());
++    }
++
+     #[cfg(unix)]
+     #[test]
+     fn test_rewrite_paths_rewrite_path_using_absolute_source_directory_and_partial_path() {
+         let mut result_map: CovResultMap = HashMap::new();
+-        result_map.insert("class/main.cpp".to_string(), empty_result!());
++        result_map.insert("java/main.java".to_string(), empty_result!());
+         let results = rewrite_paths(
+             result_map,
+             None,
+@@ -684,8 +750,8 @@ mod tests {
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+             assert!(abs_path.is_absolute());
+-            assert!(abs_path.ends_with("tests/class/main.cpp"));
+-            assert_eq!(rel_path, PathBuf::from("tests/class/main.cpp"));
++            assert!(abs_path.ends_with("test/java/main.java"));
++            assert_eq!(rel_path, PathBuf::from("test/java/main.java"));
+             assert_eq!(result, empty_result!());
+         }
+         assert_eq!(count, 1);
+@@ -695,7 +761,7 @@ mod tests {
+     #[test]
+     fn test_rewrite_paths_rewrite_path_using_absolute_source_directory_and_partial_path() {
+         let mut result_map: CovResultMap = HashMap::new();
+-        result_map.insert("class\\main.cpp".to_string(), empty_result!());
++        result_map.insert("java\\main.java".to_string(), empty_result!());
+         let results = rewrite_paths(
+             result_map,
+             None,
+@@ -709,8 +775,8 @@ mod tests {
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+             assert!(abs_path.is_absolute());
+-            assert!(abs_path.ends_with("tests\\class\\main.cpp"));
+-            assert_eq!(rel_path, PathBuf::from("tests\\class\\main.cpp"));
++            assert!(abs_path.ends_with("test\\java\\main.java"));
++            assert_eq!(rel_path, PathBuf::from("test\\java\\main.java"));
+             assert_eq!(result, empty_result!());
+         }
+         assert_eq!(count, 1);
+
+
+</patch>
+
+<TEST>
+<Filename>src/path_rewriting.rs</Filename>
+<imports>use std::path::PathBuf;
+use crate::CovResultMap;
+use crate::CovResult;
+use crate::canonicalize_path;</imports>
+<Rust>#[test]
+fn test_rewrite_paths_handles_multiple_lib_rs_files() {
+    let mut result_map: CovResultMap = HashMap::new();
+    result_map.insert("src/lib.rs".to_string(), CovResult::default());
+    result_map.insert("/rustc/0ea22717a1e01fa535534b85a5347a7e49fc79de/src/libtest/lib.rs".to_string(), CovResult::default());
+
+    let results = rewrite_paths(
+        result_map,
+        None,
+        Some(canonicalize_path("src").unwrap()),
+        None,
+        true,
+        Vec::new(),
+        None,
+    );
+
+    let mut results: Vec<(PathBuf, PathBuf, CovResult)> = results.collect();
+    assert_eq!(results.len(), 1);
+
+    let (abs_path, rel_path, result) = results.remove(0);
+    assert!(abs_path.is_absolute());
+    assert!(abs_path.ends_with("src/lib.rs"));
+    assert_eq!(rel_path, PathBuf::from("src/lib.rs"));
+    assert_eq!(result, CovResult::default());
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0599]: no function or associated item named `default` found for struct `defs::CovResult` in the current scope
+    --> src/path_rewriting.rs:1182:64
+     |
+1182 |         result_map.insert("src/lib.rs".to_string(), CovResult::default());
+     |                                                                ^^^^^^^ function or associated item not found in `defs::CovResult`
+     | 
+    ::: src/defs.rs:13:1
+     |
+13   | pub struct CovResult {
+     | -------------------- function or associated item `default` not found for this
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `default`, perhaps you need to implement it:
+             candidate #1: `Default`
+
+error[E0599]: no function or associated item named `default` found for struct `defs::CovResult` in the current scope
+    --> src/path_rewriting.rs:1183:120
+     |
+1183 |         result_map.insert("/rustc/0ea22717a1e01fa535534b85a5347a7e49fc79de/src/libtest/lib.rs".to_string(), CovResult::default());
+     |                                                                                                                        ^^^^^^^ function or associated item not found in `defs::CovResult`
+     | 
+    ::: src/defs.rs:13:1
+     |
+13   | pub struct CovResult {
+     | -------------------- function or associated item `default` not found for this
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `default`, perhaps you need to implement it:
+             candidate #1: `Default`
+
+error[E0599]: no function or associated item named `default` found for struct `defs::CovResult` in the current scope
+    --> src/path_rewriting.rs:1202:39
+     |
+1202 |         assert_eq!(result, CovResult::default());
+     |                                       ^^^^^^^ function or associated item not found in `defs::CovResult`
+     | 
+    ::: src/defs.rs:13:1
+     |
+13   | pub struct CovResult {
+     | -------------------- function or associated item `default` not found for this
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following trait defines an item `default`, perhaps you need to implement it:
+             candidate #1: `Default`
+
+error: aborting due to 3 previous errors; 18 warnings emitted
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+fn get_abs_path(
+source_dir: &Option<PathBuf>,
+rel_path: PathBuf,
+cache: &mut Option<PathBuf>) -> (PathBuf, PathBuf)
+
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<PathBuf>,
+prefix_dir: Option<PathBuf>,
+ignore_not_existing: bool,
+mut to_ignore_dirs: Vec<String>,
+filter_option: Option<bool>) -> CovResultIter
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

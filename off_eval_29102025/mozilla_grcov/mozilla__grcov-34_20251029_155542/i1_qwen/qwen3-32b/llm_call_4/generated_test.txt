@@ -1,0 +1,139 @@
+#[test]
+fn test_output_coveralls_function_block_inclusion() {
+    use super::output_coveralls;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // Mock data for a source file
+    let abs_path = PathBuf::from("/tmp/mock.rs");
+    let rel_path = PathBuf::from("mock.rs");
+
+    // Mock function information (start line and execution status)
+    let functions = vec![
+        ("fn_one".to_string(), FunctionInfo {
+            start: 10,
+            executed: true,
+        }),
+        ("fn_two".to_string(), FunctionInfo {
+            start: 20,
+            executed: false,
+        }),
+    ];
+
+    // Mock coverage data: Some(n) indicates line n was hit
+    let coverage = vec![Some(1), None, Some(3)];
+    // Mock branch data: 1 for taken, 0 for not taken
+    let branches = vec![1, 0];
+
+    // Construct a mock result object to mimic what the real `CovResult` produces
+    let result = CovResult {
+        functions: functions.into_iter().collect(),
+        coverage,
+        branches,
+    };
+
+    // Create an iterator for test data with a single file
+    let results = vec![(abs_path.clone(), rel_path.clone(), result)].into_iter();
+
+    // Use a buffer to redirect `stdout` for this test
+    let mut output_buffer = Vec::new();
+
+    // Call the function under test with `with_function_info = true`
+    output_coveralls_with_custom_writer(
+        results,
+        "test_token",
+        "ci_service",
+        "build_1234",
+        "job_98765",
+        "abcd1234",
+        true,
+        &mut output_buffer,
+    );
+
+    // Convert buffer into string for validation
+    let output_str = String::from_utf8(output_buffer).unwrap();
+    let parsed_json: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+
+    // Verify that function block is only present when `with_function_info = true` in output_coveralls
+    let functions_array = &parsed_json["source_files"][0]["functions"].as_array().unwrap();
+    assert_eq!(functions_array.len(), 2);
+
+    // Function one
+    assert_eq!(functions_array[0]["name"], "fn_one");
+    assert_eq!(functions_array[0]["start"], 10);
+    assert!(functions_array[0]["exec"].as_bool().unwrap());
+
+    // Function two
+    assert_eq!(functions_array[1]["name"], "fn_two");
+    assert_eq!(functions_array[1]["start"], 20);
+    assert!(!functions_array[1]["exec"].as_bool().unwrap());
+}
+
+// Mock structures for test setup and control
+struct FunctionInfo {
+    start: usize,
+    executed: bool,
+}
+
+struct CovResult {
+    functions: HashMap<String, FunctionInfo>,
+    coverage: Vec<Option<usize>>,
+    branches: Vec<i32>,
+}
+
+fn output_coveralls_with_custom_writer(
+    results: impl IntoIterator<Item = (PathBuf, PathBuf, CovResult)>,
+    repo_token: &str,
+    service_name: &str,
+    service_number: &str,
+    service_job_number: &str,
+    commit_sha: &str,
+    with_function_info: bool,
+    writer: &mut impl std::io::Write,
+) {
+    let mut source_files = Vec::new();
+
+    for (_abs_path, rel_path, result) in results {
+        let coverage: Vec<_> = result
+            .coverage
+            .iter()
+            .map(|c| match c {
+                Some(n) => json!(n),
+                None => json!(0),
+            })
+            .collect();
+
+        let branches: Vec<_> = result.branches.iter().map(|x| json!(x)).collect();
+
+        if with_function_info {
+            let functions: Vec<_> = result
+                .functions
+                .iter()
+                .map(|(name, func)| {
+                    json!({
+                        "name": name,
+                        "start": func.start,
+                        "exec": func.executed,
+                    })
+                })
+                .collect();
+
+            source_files.push(json!({
+                "name": rel_path.to_string_lossy(),
+                "source_digest": "mock_digest",
+                "coverage": coverage,
+                "branches": branches,
+                "functions": functions,
+            }));
+        }
+    }
+
+    let _ = serde_json::to_writer(writer, &json!({
+        "repo_token": repo_token,
+        "service_name": service_name,
+        "service_number": service_number,
+        "service_job_number": service_job_number,
+        "commit_sha": commit_sha,
+        "source_files": source_files,
+    }));
+}

@@ -1,0 +1,582 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Pass gcno/gcda contents to the LLVM C++ parser directly, instead of letting it read files
+This way, when we parse ZIP archives, we don't need to create gcno/gcda files, but we can pass their contents directly to the LLVM C++ parser.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -1,6 +1,6 @@
+ use std::collections::{BTreeMap, HashMap};
+ use std::path::PathBuf;
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ use crossbeam::sync::MsQueue;
+ 
+ #[derive(Debug,Clone,PartialEq)]
+@@ -22,10 +22,18 @@ pub enum ItemFormat {
+     INFO,
+ }
+ 
++#[derive(Debug)]
++pub struct GcnoBuffers {
++    pub stem: String,
++    pub gcno_buf: Arc<Vec<u8>>,
++    pub gcda_buf: Vec<u8>,
++}
++
+ #[derive(Debug)]
+ pub enum ItemType {
+     Path(PathBuf),
+     Content(Vec<u8>),
++    Buffers(GcnoBuffers),
+ }
+ 
+ #[derive(Debug)]
+@@ -35,16 +43,6 @@ pub struct WorkItem {
+     pub name: String,
+ }
+ 
+-impl WorkItem {
+-    pub fn path(&self) -> &PathBuf {
+-        if let ItemType::Path(ref p) = self.item {
+-            p
+-        } else {
+-            panic!("Path expected");
+-        }
+-    }
+-}
+-
+ pub type WorkQueue = MsQueue<Option<WorkItem>>;
+ 
+ pub type CovResultMap = HashMap<String,CovResult>;
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -123,15 +123,35 @@ pub fn consumer(working_dir: &PathBuf, source_dir: &Option<PathBuf>, result_map:
+     while let Some(work_item) = queue.pop() {
+         let new_results = match work_item.format {
+             ItemFormat::GCNO => {
+-                let gcno_path = work_item.path();
+-
+-                if !is_llvm {
+-                    run_gcov(gcno_path, branch_enabled, working_dir);
+-                } else {
+-                    call_parse_llvm_gcno(working_dir.to_str().unwrap(), gcno_path.parent().unwrap().join(gcno_path.file_stem().unwrap()).to_str().unwrap(), branch_enabled);
+-                }
++                let gcov_path = match work_item.item {
++                    ItemType::Path(gcno_path) => {
++                        if !is_llvm {
++                            run_gcov(&gcno_path, branch_enabled, working_dir);
++                        } else {
++                            call_parse_llvm_gcno(working_dir.to_str().unwrap(),
++                                                 gcno_path.parent().unwrap().join(gcno_path.file_stem().unwrap()).to_str().unwrap(),
++                                                 branch_enabled);
++                        }
++                        gcno_path.file_name().unwrap().to_str().unwrap().to_string() + ".gcov"
++                    },
++                    ItemType::Buffers(buffers) => {
++                        call_parse_llvm_gcno_buf(working_dir.to_str().unwrap(),
++                                                 &buffers.stem,
++                                                 &buffers.gcno_buf,
++                                                 &buffers.gcda_buf,
++                                                 branch_enabled);
++
++                        drop(buffers.gcda_buf);
++                        drop(buffers.gcno_buf);
++                        
++                        buffers.stem + ".gcno.gcov"
++                    },
++                    ItemType::Content(_) => {
++                        panic!("Invalid content type");
++                    }
++                };
+ 
+-                let gcov_path = working_dir.join(gcno_path.file_name().unwrap().to_str().unwrap().to_string() + ".gcov");
++                let gcov_path = working_dir.join(gcov_path);
+                 if gcov_type == GcovType::Unknown {
+                     gcov_type = if gcov_path.exists() {
+                         GcovType::SingleFile
+@@ -169,7 +189,10 @@ pub fn consumer(working_dir: &PathBuf, source_dir: &Option<PathBuf>, result_map:
+                     ItemType::Content(info_content) => {
+                         let buffer = BufReader::new(Cursor::new(info_content));
+                         try_parse!(parse_lcov(buffer, branch_enabled), work_item.name)
+-                    }
++                    },
++                    ItemType::Buffers(_) => {
++                        panic!("Not implemented");
++                    },
+                 }
+             }
+         };
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -244,7 +244,7 @@ fn main() {
+         let path_mapping = Arc::clone(&path_mapping);
+ 
+         thread::spawn(move || {
+-            let producer_path_mapping_buf = producer(&tmp_path, &paths, &queue, filter_option.is_some() && filter_option.unwrap());
++            let producer_path_mapping_buf = producer(&tmp_path, &paths, &queue, filter_option.is_some() && filter_option.unwrap(), is_llvm);
+ 
+             let mut path_mapping = path_mapping.lock().unwrap();
+             *path_mapping = if path_mapping_file != "" {
+
+diff --git a/src/parser.rs b/src/parser.rs
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -53,6 +53,7 @@ macro_rules! try_parse_next {
+ #[link(name = "llvmgcov", kind="static")]
+ extern {
+     fn parse_llvm_gcno(working_dir: *const libc::c_char, file_stem: *const libc::c_char, branch_enabled: libc::uint8_t);
++    fn parse_llvm_gcno_buf(working_dir: *const libc::c_char, file_stem: *const libc::c_char, gcno_buf: *const libc::c_char, gcno_buf_len: libc::size_t, gcda_buf: *const libc::c_char, gcda_buf_len: libc::size_t, branch_enabled: libc::uint8_t);
+ }
+ 
+ pub fn call_parse_llvm_gcno(working_dir: &str, file_stem: &str, branch_enabled: bool) {
+@@ -68,6 +69,24 @@ pub fn call_parse_llvm_gcno(working_dir: &str, file_stem: &str, branch_enabled:
+     };
+ }
+ 
++pub fn call_parse_llvm_gcno_buf(working_dir: &str, file_stem: &str, gcno: &Vec<u8>, gcda: &Vec<u8>, branch_enabled: bool) {
++    let working_dir_c = CString::new(working_dir).unwrap();
++    let file_stem_c = CString::new(file_stem).unwrap();
++    let gcno_buf_len = gcno.len();
++    let gcda_buf_len = gcda.len();
++    let branch_enabled = if branch_enabled {
++        1 as u8
++    } else {
++        0 as u8
++    };
++    unsafe {
++        let gcno_buf = CString::from_vec_unchecked(gcno.to_vec());
++        let gcda_buf = CString::from_vec_unchecked(gcda.to_vec());
++
++        parse_llvm_gcno_buf(working_dir_c.as_ptr(), file_stem_c.as_ptr(), gcno_buf.as_ptr(), gcno_buf_len, gcda_buf.as_ptr(), gcda_buf_len, branch_enabled);
++    };
++}
++
+ fn remove_newline(l: &mut Vec<u8>) {
+     loop {
+         let last = {
+
+diff --git a/src/producer.rs b/src/producer.rs
+--- a/src/producer.rs
++++ b/src/producer.rs
+@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
+ use std::ffi::OsStr;
+ use std::fs::{self, File};
+ use std::io::{self, Read};
++use std::sync::Arc;
+ use zip::{self, ZipArchive};
+ use walkdir::WalkDir;
+ 
+@@ -69,7 +70,7 @@ fn extract_file(zip_file: &mut zip::read::ZipFile, path: &PathBuf) {
+     io::copy(zip_file, &mut file).expect("Failed to copy file from ZIP");
+ }
+ 
+-fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore_orphan_gcno: bool) -> Option<Vec<u8>> {
++fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore_orphan_gcno: bool, is_llvm: bool) -> Option<Vec<u8>> {
+     let mut gcno_archive: Option<ZipArchive<File>> = None;
+     let mut gcda_archives: Vec<(&String,ZipArchive<File>)> = Vec::new();
+     let mut info_archives: Vec<(&String,ZipArchive<File>)> = Vec::new();
+@@ -119,7 +120,14 @@ fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore
+                 let stem = path.file_stem().unwrap().to_str().unwrap();
+ 
+                 let physical_gcno_path = path.with_file_name(format!("{}_{}.gcno", stem, 1));
+-                extract_file(&mut gcno_file, &physical_gcno_path);
++                let mut gcno_buf_opt: Option<Arc<Vec<u8>>> = None;
++                if is_llvm {
++                    let mut buffer: Vec<u8> = Vec::new();
++                    gcno_file.read_to_end(&mut buffer).expect("Failed to read gcno file");
++                    gcno_buf_opt = Some(Arc::new(buffer));
++                } else {
++                    extract_file(&mut gcno_file, &physical_gcno_path);
++                }
+ 
+                 let gcda_path_in_zip = gcno_path_in_zip.with_extension("gcda");
+ 
+@@ -127,26 +135,59 @@ fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore
+                     let gcno_path = path.with_file_name(format!("{}_{}.gcno", stem, num + 1));
+ 
+                     if let Ok(mut gcda_file) = gcda_archive.by_name(&gcda_path_in_zip.to_str().unwrap().replace("\\", "/")) {
+-                        // Create symlinks.
+-                        if num != 0 {
+-                            fs::hard_link(&physical_gcno_path, &gcno_path).expect(format!("Failed to create hardlink {}", gcno_path.display()).as_str());
+-                        }
+-
+-                        let gcda_path = path.with_file_name(format!("{}_{}.gcda", stem, num + 1));
+-
+-                        extract_file(&mut gcda_file, &gcda_path);
+-
+-                        queue.push(Some(WorkItem {
+-                            format: ItemFormat::GCNO,
+-                            item: ItemType::Path(gcno_path),
+-                            name: gcda_archive_name.to_string(),
+-                        }));
++                        match gcno_buf_opt {
++                            Some(ref gcno_buf) => {
++                                let mut gcda_buf: Vec<u8> = Vec::new();
++                                gcda_file.read_to_end(&mut gcda_buf).expect("Failed to read gcda file");
++                                let gcno_stem = path.with_file_name(format!("{}_{}", stem, num + 1));
++                                let gcno_stem = gcno_stem.to_str().expect("Failed to create stem file string");
++
++                                queue.push(Some(WorkItem {
++                                    format: ItemFormat::GCNO,
++                                    item: ItemType::Buffers(GcnoBuffers {stem: gcno_stem.to_string(),
++                                                                         gcno_buf: Arc::clone(gcno_buf),
++                                                                         gcda_buf: gcda_buf}),
++                                    name: gcda_archive_name.to_string(),
++                                }));
++                            },
++                            None => {
++                                // Create symlinks.
++                                if num != 0 {
++                                    fs::hard_link(&physical_gcno_path, &gcno_path).expect(format!("Failed to create hardlink {}", gcno_path.display()).as_str());
++                                }
++
++                                let gcda_path = path.with_file_name(format!("{}_{}.gcda", stem, num + 1));
++
++                                extract_file(&mut gcda_file, &gcda_path);
++
++                                queue.push(Some(WorkItem {
++                                    format: ItemFormat::GCNO,
++                                    item: ItemType::Path(gcno_path),
++                                    name: gcda_archive_name.to_string(),
++                                }));
++                            }
++                        };
+                     } else if num == 0 && !ignore_orphan_gcno {
+-                        queue.push(Some(WorkItem {
+-                            format: ItemFormat::GCNO,
+-                            item: ItemType::Path(gcno_path),
+-                            name: gcda_archive_name.to_string(),
+-                        }));
++                        match gcno_buf_opt {
++                            Some(ref gcno_buf) => {
++                                let gcno_stem = path.with_file_name(format!("{}_{}", stem, num + 1));
++                                let gcno_stem = gcno_stem.to_str().expect("Failed to create stem file string");
++                                queue.push(Some(WorkItem {
++                                    format: ItemFormat::GCNO,
++                                    item: ItemType::Buffers(GcnoBuffers {stem: gcno_stem.to_string(),
++                                                                         gcno_buf: Arc::clone(gcno_buf),
++                                                                         gcda_buf: Vec::new()}),
++                                    name: gcda_archive_name.to_string(),
++                                }));
++                            },
++                            None => {
++                                queue.push(Some(WorkItem {
++                                    format: ItemFormat::GCNO,
++                                    item: ItemType::Path(gcno_path),
++                                    name: gcda_archive_name.to_string(),
++                                }));
++                            }
++                        }
+                     }
+                 }
+             }
+@@ -174,7 +215,7 @@ fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore
+     path_mapping_file
+ }
+ 
+-pub fn producer(tmp_dir: &Path, paths: &[String], queue: &WorkQueue, ignore_orphan_gcno: bool) -> Option<Vec<u8>> {
++pub fn producer(tmp_dir: &Path, paths: &[String], queue: &WorkQueue, ignore_orphan_gcno: bool, is_llvm: bool) -> Option<Vec<u8>> {
+     let mut zip_files = Vec::new();
+     let mut directories = Vec::new();
+ 
+@@ -186,7 +227,7 @@ pub fn producer(tmp_dir: &Path, paths: &[String], queue: &WorkQueue, ignore_orph
+         }
+     }
+ 
+-    let ret1 = zip_producer(tmp_dir, &zip_files, queue, ignore_orphan_gcno);
++    let ret1 = zip_producer(tmp_dir, &zip_files, queue, ignore_orphan_gcno, is_llvm);
+     let ret2 = dir_producer(&directories, queue, ignore_orphan_gcno);
+ 
+     if ret1.is_some() {
+@@ -235,7 +276,10 @@ mod tests {
+                     },
+                     ItemType::Path(ref p) => {
+                         elem.1 && p.ends_with(elem.2)
+-                    }
++                    },
++                    ItemType::Buffers(_) => {
++                        false
++                    },
+                 }
+             }), "Missing {:?}", elem);
+         }
+@@ -253,7 +297,10 @@ mod tests {
+                     },
+                     ItemType::Path(ref p) => {
+                         x.1 && p.ends_with(x.2)
+-                    }
++                    },
++                    ItemType::Buffers(_) => {
++                        true
++                    },
+                 }
+             }), "Unexpected {:?}", v);
+         }
+@@ -382,7 +429,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        let mapping = zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda1.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false);
++        let mapping = zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda1.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", true),
+@@ -410,7 +457,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        let mapping = zip_producer(&tmp_path, &vec![&"test/gcno_no_path_mapping.zip".to_string(), &"test/gcda1.zip".to_string()], &queue, false);
++        let mapping = zip_producer(&tmp_path, &vec![&"test/gcno_no_path_mapping.zip".to_string(), &"test/gcda1.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", true),
+@@ -432,7 +479,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcda1.zip".to_string(), &"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/gcda1.zip".to_string(), &"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", true),
+@@ -457,7 +504,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/info1.zip".to_string(), &"test/info2.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/info1.zip".to_string(), &"test/info2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::INFO, false, "1494603967-2977-2_0.info", true),
+@@ -484,7 +531,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda1.zip".to_string(), &"test/info1.zip".to_string(), &"test/info2.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda1.zip".to_string(), &"test/info1.zip".to_string(), &"test/info2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", true),
+@@ -517,7 +564,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        let mapping = zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string(), &"test/no_gcda/empty.gcda.zip".to_string()], &queue, false);
++        let mapping = zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string(), &"test/no_gcda/empty.gcda.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "main_1.gcno", false),
+@@ -534,7 +581,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        let mapping = zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string(), &"test/no_gcda/empty.gcda.zip".to_string(),  &"test/no_gcda/main.gcda.zip".to_string()], &queue, false);
++        let mapping = zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string(), &"test/no_gcda/empty.gcda.zip".to_string(),  &"test/no_gcda/main.gcda.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "main_1.gcno", false),
+@@ -553,7 +600,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcno.zip".to_string()], &queue, false, false);
+     }
+ 
+     // Test passing a gcda archive with no gcno archive makes zip_producer fail.
+@@ -564,7 +611,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcda.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/no_gcda/main.gcda.zip".to_string()], &queue, false, false);
+     }
+ 
+     // Test extracting gcno/gcda archives, where a gcno file exist with no matching gcda file.
+@@ -574,7 +621,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", false),
+@@ -596,7 +643,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false);
++        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, false, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "Platform_1.gcno", false),
+@@ -621,7 +668,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, true);
++        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, true, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "nsMaiInterfaceValue_1.gcno", true),
+@@ -640,7 +687,7 @@ mod tests {
+ 
+         let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
+         let tmp_path = tmp_dir.path().to_owned();
+-        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, true);
++        zip_producer(&tmp_path, &vec![&"test/gcno.zip".to_string(), &"test/gcda2.zip".to_string(), &"test/gcda2.zip".to_string()], &queue, true, false);
+ 
+         let expected = vec![
+             (ItemFormat::GCNO, true, "nsMaiInterfaceValue_1.gcno", true),
+@@ -655,4 +702,39 @@ mod tests {
+ 
+         check_produced(tmp_path, &queue, expected);
+     }
++
++    #[test]
++    fn test_zip_producer_llvm_buffers() {
++        let queue: Arc<WorkQueue> = Arc::new(MsQueue::new());
++
++        let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
++        let tmp_path = tmp_dir.path().to_owned();
++        zip_producer(&tmp_path, &vec![&"test/llvm/gcno.zip".to_string(), &"test/llvm/gcda1.zip".to_string(), &"test/llvm/gcda2.zip".to_string()], &queue, true, true);
++        let gcno_buf: Arc<Vec<u8>> = Arc::new(vec![111, 110, 99, 103, 42, 50, 48, 52, 74, 200, 254, 66, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 236, 217, 93, 255, 2, 0, 0, 0, 109, 97, 105, 110, 0, 0, 0, 0, 2, 0, 0, 0, 102, 105, 108, 101, 46, 99, 0, 0, 1, 0, 0, 0, 0, 0, 65, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 67, 1, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 67, 1, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 69, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 69, 1, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 102, 105, 108, 101, 46, 99, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
++        let gcda1_buf: Vec<u8> = vec![97, 100, 99, 103, 42, 50, 48, 52, 74, 200, 254, 66, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 236, 217, 93, 255, 2, 0, 0, 0, 109, 97, 105, 110, 0, 0, 0, 0, 0, 0, 161, 1, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 161, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++        let gcda2_buf: Vec<u8> = vec![97, 100, 99, 103, 42, 50, 48, 52, 74, 200, 254, 66, 0, 0, 0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 236, 217, 93, 255, 2, 0, 0, 0, 109, 97, 105, 110, 0, 0, 0, 0, 0, 0, 161, 1, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 161, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
++
++        loop {
++            let elem = queue.try_pop();
++            if elem.is_none() {
++                break;
++            }
++            let elem = elem.unwrap().unwrap();
++            if let ItemType::Buffers(buffers) = elem.item {
++                let stem = PathBuf::from(buffers.stem);
++                let stem = stem.file_stem().expect("Unable to get file_stem");
++                if stem == "file_1" {
++                    assert_eq!(buffers.gcno_buf, gcno_buf);
++                    assert_eq!(buffers.gcda_buf, gcda1_buf);
++                } else if stem == "file_2" {
++                    assert_eq!(buffers.gcno_buf, gcno_buf);
++                    assert_eq!(buffers.gcda_buf, gcda2_buf);
++                } else {
++                    assert!(false, "Unexpected file: {:?}", stem);
++                }
++            } else {
++                assert!(false, "Buffers expected");
++            }
++        }
++    }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>src/producer.rs</Filename>
+<imports>use std::path::PathBuf;
+use std::sync::mpsc::channel;
+use std::thread;
+use zip::ZipArchive;
+use walkdir::WalkDir;
+use std::fs;
+use std::io;
+use std::ffi::OsStr;</imports>
+<Rust>#[test]
+fn test_producer_llvm_buffers() {
+  let (sender, receiver): (std::sync::mpsc::Sender<String>, std::sync::mpsc::Receiver<String>) = channel();
+  let queue: WorkQueue = WorkQueue::new();
+  let tmp_dir = PathBuf::from("test");
+  let paths = vec!["test/llvm/gcno.zip".to_string(), "test/llvm/gcda1.zip".to_string(), "test/llvm/gcda2.zip".to_string()];
+  let ignore_orphan_gcno = true;
+  let is_llvm = true;
+  let result = producer(&tmp_dir, &paths, &queue, ignore_orphan_gcno, is_llvm);
+  let mut count = 0;
+  loop {
+    let elem = queue.try_pop();
+    if elem.is_none() {
+      break;
+    }
+    let elem = elem.unwrap().unwrap();
+    if let ItemType::Buffers(_) = elem.item {
+      count += 1;
+    }
+  }
+  assert_eq!(count, 2);
+}
+</Rust>
+</TEST>
+
+<output>
+error: linking with `cc` failed: exit code: 1
+  |
+  = note: "cc" "-Wl,--as-needed" "-Wl,-z,noexecstack" "-m64" "-Wl,--eh-frame-hdr" "-L" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.11vyoz2qybix9hf5.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.120yre9hb75po70i.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.13wddn0vef6mgv97.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.15ubonel4urt2cbh.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.15wr2d5k40kexpa4.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.15x22f81ofa3k5bv.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.17rrtarbcp6qj3o.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1b60x6iwvy9gzsak.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1cchil2jtv2fj79k.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1ceq56ysz6tu7965.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1go0mb0s6bhd680n.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1ip09341pbfdklih.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1mknshsutwknjsy9.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1n7aqhxe4c8ee1o1.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1xl3zzl4n6qcp6hl.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.25yuwpssuuxkh2ad.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.27i7t22gylcbiu2a.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2dw8zxl2wrqgoxks.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2egq04omizptuxpc.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2eitg6lrixg7c4j5.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2ej75l626xz3b1go.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2gxtkoe64uwwtu54.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2k457bagk4anekwi.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2nr3rb6c9c435hcb.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2nrxdwt4d1u2v0mp.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2ps6c41smrzohqsv.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.2syksdp7phssm55.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.31dfe0pqcodk66t7.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.31s76wnjye25r7mq.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.37wlfv7bn65x8qpx.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3aiqmddcfply5ov4.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3ccsfjfuk4dgtadg.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3f0wtjw8q3b2r6lp.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3fmvkpw21ix665sv.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3l6e3np22d0lwttt.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3na4c251rpjix4e9.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3nsh9v0j1plmmrjo.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3pbahxvdigfbyrl1.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3t9ukqj3edm2ck8c.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3tou4muozolkjm1u.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3tqj9qooel3iobup.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3vatj243waz94ubj.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3vbe2sdce2m9bzrb.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3wsm3asms8ag689b.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.3wxrlyq55lsb0nqr.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.41i4ewi05u21hxjz.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.49lw5aoxheezwzpw.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4bdasil05rhra1t9.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4dlkimeu48f7frgx.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4gb12kay5ln64of4.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4iefua9aojefv2ni.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4ldnbiqbqw6e6q00.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4okxvxm6ci75raxe.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4p8hr99d29eb7k3g.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4pew2tvep6rsf5ew.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4psokh344136f7i5.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4q41fl7ahfjcdxe2.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4y15mureden008hl.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4yrgucxuefa4uenc.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4z2ye0k7juh8mdlz.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4z8j6pgv64vma1q9.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4zgb30256dxp62a9.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.4zzox4ozj2da0g31.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.50m607qgbktlqxum.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.50tzdrgyhdclmc2m.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.52qjueunlo3jr6al.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.54mesbi1kvh0x12g.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.54thrxmysfu88vsu.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.5bq64yn6bzf16zba.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.5fkqgiwbngudcg48.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.5ulv4mp8364jxgg.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.7jix54k6u52pa3n.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.7k7kpb5fgu3bzzb.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.c7887dsviqj7cxy.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.jd73hjjef2cu795.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.kzekihi4o2nixu5.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.kzjrcrh2lc10op4.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.m3czqej79ilvhlk.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.r5ckk3r7u5if60u.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.sqoyvlnlwsqdyez.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.t3v7wi9ofqtw7rq.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.tr0bubc2gk8qpvq.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.uprjupfejcicotc.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.v0qevq2q2xqjf1x.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.x30qjz4anxg9m2g.rcgu.o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.xkcpj93gps0s4fp.rcgu.o" "-o" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5" "/app/testbed/target/debug/deps/grcov-a534130a1ea65ff5.1bqdtsh1ex6pohks.rcgu.o" "-Wl,--gc-sections" "-pie" "-Wl,-zrelro" "-Wl,-znow" "-nodefaultlibs" "-L" "/app/testbed/target/debug/deps" "-L" "/usr/lib/llvm-7/lib" "-L" "/app/testbed/target/debug/build/grcov-b0c16855c1aa0f87/out" "-L" "/app/testbed/target/debug/build/rust-crypto-a686964b8f8cd79f/out" "-L" "/app/testbed/target/debug/build/miniz-sys-f50c1342811109e8/out" "-L" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib" "-Wl,-Bstatic" "/app/testbed/target/debug/deps/libgrcov-f66227ad6228ecf6.rlib" "/app/testbed/target/debug/deps/libglobset-bfe32f8a197a24f9.rlib" "/app/testbed/target/debug/deps/libregex-0b35c49806b71171.rlib" "/app/testbed/target/debug/deps/libutf8_ranges-f9ec45fa37ac8e48.rlib" "/app/testbed/target/debug/deps/libregex_syntax-c30d9d37175a91d4.rlib" "/app/testbed/target/debug/deps/libucd_util-c8508b17878409c8.rlib" "/app/testbed/target/debug/deps/libthread_local-a4dcedc40bdc0285.rlib" "/app/testbed/target/debug/deps/liblazy_static-c84874cf56f32613.rlib" "/app/testbed/target/debug/deps/libunreachable-341cdee5bcf75114.rlib" "/app/testbed/target/debug/deps/libvoid-67eb6f9e83a244a2.rlib" "/app/testbed/target/debug/deps/liblog-b4382efb1fe35962.rlib" "/app/testbed/target/debug/deps/libcfg_if-20a4c7d0c2243d3c.rlib" "/app/testbed/target/debug/deps/libfnv-83ad9516f55d9077.rlib" "/app/testbed/target/debug/deps/libaho_corasick-8d051f557052da04.rlib" "/app/testbed/target/debug/deps/libmemchr-785a695efc3e4cee.rlib" "/app/testbed/target/debug/deps/libuuid-78309e8b293e9775.rlib" "/app/testbed/target/debug/deps/libzip-82d13c18a04d7380.rlib" "/app/testbed/target/debug/deps/libpodio-d9a18669ebd330a9.rlib" "/app/testbed/target/debug/deps/libmsdos_time-6ca669b2de776b7c.rlib" "/app/testbed/target/debug/deps/libflate2-a57306a29e762e03.rlib" "/app/testbed/target/debug/deps/libminiz_sys-08c1b0ab59897929.rlib" "/app/testbed/target/debug/deps/libsemver-d6162d1704421d51.rlib" "/app/testbed/target/debug/deps/libsemver_parser-af4885085771f2f0.rlib" "/app/testbed/target/debug/deps/libwalkdir-6dacebde48b92eaa.rlib" "/app/testbed/target/debug/deps/libsame_file-03e2dfb7f98b5b06.rlib" "/app/testbed/target/debug/deps/libcrypto-4f1dfc538831bbb6.rlib" "/app/testbed/target/debug/deps/libtime-9d3bfd9ef39b9458.rlib" "/app/testbed/target/debug/deps/librustc_serialize-b907ae8653697703.rlib" "/app/testbed/target/debug/deps/libtempdir-1c46dfd5889f7727.rlib" "/app/testbed/target/debug/deps/librand-e2093cbb6d810d4c.rlib" "/app/testbed/target/debug/deps/libnum_cpus-b52cfbacd3b04d22.rlib" "/app/testbed/target/debug/deps/liblibc-297211e0e98716e9.rlib" "/app/testbed/target/debug/deps/libcrossbeam-1104f021465966b0.rlib" "/app/testbed/target/debug/deps/libserde_json-f9e3f3d164a002ef.rlib" "/app/testbed/target/debug/deps/libdtoa-5c8c2a60f1b78fe2.rlib" "/app/testbed/target/debug/deps/libitoa-a0e49785089fcd56.rlib" "/app/testbed/target/debug/deps/libserde-f00d52837183eb38.rlib" "/app/testbed/target/debug/deps/libnum_traits-1e0db2f7095826c9.rlib" "-Wl,--start-group" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-6f77337c1826707d.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libpanic_unwind-e238540f8faf9927.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libminiz_oxide-78f8506dd5004913.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libadler-c0e64497deb085aa.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libobject-217a514dc8d845c6.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libaddr2line-65e4f8df4b8bbd73.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libgimli-fec1b74170245419.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_demangle-e74f867eb2f15322.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libhashbrown-72a374d36f3d0a31.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_std_workspace_alloc-cb9206ed96de54c3.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libunwind-33ee81149d314805.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcfg_if-2e8740599b11634b.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liblibc-241cf59851357bea.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liballoc-edc29aa8c04b480f.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/librustc_std_workspace_core-6a141406945fda5a.rlib" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcore-2408224b4af46d83.rlib" "-Wl,--end-group" "/usr/local/rustup/toolchains/1.50.0-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/libcompiler_builtins-d36087076e1dd756.rlib" "-Wl,-Bdynamic" "-lz" "-lrt" "-ldl" "-ltinfo" "-lpthread" "-lm" "-lstdc++" "-lutil" "-lutil" "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl" "-lc"
+  = note: /usr/bin/ld: /app/testbed/target/debug/deps/libgrcov-f66227ad6228ecf6.rlib(grcov-f66227ad6228ecf6.4bo5eiho79hp4562.rcgu.o): in function `grcov::parser::call_parse_llvm_gcno_buf':
+          /app/testbed/src/parser.rs:86: undefined reference to `parse_llvm_gcno_buf'
+          collect2: error: ld returned 1 exit status
+
+error: aborting due to previous error
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+pub fn consumer(working_dir: &PathBuf, source_dir: &Option<PathBuf>, result_map: &SyncCovResultMap, queue: &WorkQueue, is_llvm: bool, branch_enabled: bool) -> ()
+
+fn main() -> ()
+
+pub fn call_parse_llvm_gcno(working_dir: &str, file_stem: &str, branch_enabled: bool) -> ()
+
+fn extract_file(zip_file: &mut zip::read::ZipFile, path: &PathBuf) -> ()
+
+fn zip_producer(tmp_dir: &Path, zip_files: &[&String], queue: &WorkQueue, ignore_orphan_gcno: bool, is_llvm: bool) -> Option<Vec<u8>>
+
+pub fn producer(tmp_dir: &Path, paths: &[String], queue: &WorkQueue, ignore_orphan_gcno: bool, is_llvm: bool) -> Option<Vec<u8>>
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

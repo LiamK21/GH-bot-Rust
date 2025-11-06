@@ -1,0 +1,310 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Clean up path rewriting code
+It was rewritten several times to cope with new corner cases. Now that everything works, I think the code should be rewritten from scratch to make it cleaner and to make it clearer what the path-mapping, prefix and source-dir options do by untangling them.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -36,6 +36,67 @@ pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+     Ok(path)
+ }
+ 
++// Search the source file's path in the mapping.
++fn apply_mapping(mapping: &Option<Value>, path: &str) -> PathBuf {
++    if let Some(mapping) = mapping {
++        if let Some(p) = mapping.get(to_lowercase_first(path)) {
++            return PathBuf::from(p.as_str().unwrap());
++        } else if let Some(p) = mapping.get(to_uppercase_first(path)) {
++            return PathBuf::from(p.as_str().unwrap());
++        }
++    }
++
++    PathBuf::from(path)
++}
++
++// Remove prefix from the source file's path.
++fn remove_prefix(prefix_dir: &Option<PathBuf>, path: PathBuf) -> PathBuf {
++    if let Some(prefix_dir) = prefix_dir {
++        if path.starts_with(&prefix_dir) {
++            return path.strip_prefix(&prefix_dir).unwrap().to_path_buf();
++        }
++    }
++
++    path
++}
++
++fn fixup_rel_path(source_dir: &Option<PathBuf>, abs_path: &PathBuf, rel_path: PathBuf) -> PathBuf {
++    if let Some(ref source_dir) = source_dir {
++        if abs_path.starts_with(&source_dir) {
++            return abs_path.strip_prefix(&source_dir).unwrap().to_path_buf();
++        } else if !rel_path.is_relative() {
++            return abs_path.clone();
++        }
++    }
++
++    rel_path
++}
++
++// Get the absolute path for the source file's path, resolving symlinks.
++fn get_abs_path(source_dir: &Option<PathBuf>, rel_path: PathBuf) -> (PathBuf, PathBuf) {
++    let mut abs_path = if !rel_path.is_relative() {
++        rel_path.clone()
++    } else if let Some(ref source_dir) = source_dir {
++        if !cfg!(windows) {
++            PathBuf::from(&source_dir).join(&rel_path)
++        } else {
++            PathBuf::from(&source_dir).join(&rel_path.to_str().unwrap().replace("/", "\\"))
++        }
++    } else {
++        rel_path.clone()
++    };
++
++    // Canonicalize, if possible.
++    if let Ok(p) = canonicalize_path(&abs_path) {
++        abs_path = p;
++    }
++
++    // Fixup the relative path, in case the absolute path was a symlink.
++    let rel_path = fixup_rel_path(&source_dir, &abs_path, rel_path);
++
++    (abs_path, rel_path)
++}
++
+ pub fn rewrite_paths(
+     result_map: CovResultMap,
+     path_mapping: Option<Value>,
+@@ -45,72 +106,23 @@ pub fn rewrite_paths(
+     to_ignore_dirs: Vec<String>,
+     filter_option: Option<bool>,
+ ) -> CovResultIter {
+-    let path_mapping = if path_mapping.is_some() {
+-        path_mapping.unwrap()
+-    } else {
+-        json!({})
+-    };
+-
+-    let source_dir = if source_dir.is_some() {
+-        source_dir.unwrap()
+-    } else {
+-        PathBuf::from("")
+-    };
+-
+     let mut glob_builder = GlobSetBuilder::new();
+     for to_ignore_dir in to_ignore_dirs {
+         glob_builder.add(Glob::new(&to_ignore_dir).unwrap());
+     }
+     let to_ignore_globset = glob_builder.build().unwrap();
+ 
+-    let prefix_dir = if prefix_dir.is_some() {
+-        prefix_dir.unwrap()
+-    } else {
+-        PathBuf::from("")
+-    };
+-
+     Box::new(result_map.into_iter().filter_map(move |(path, result)| {
+-        let path = PathBuf::from(path.replace("\\", "/"));
+-
+-        // Get path from the mapping, or remove prefix from path.
+-        let (rel_path, found_in_mapping) =
+-            if let Some(p) = path_mapping.get(to_lowercase_first(path.to_str().unwrap())) {
+-                (PathBuf::from(p.as_str().unwrap()), true)
+-            } else if let Some(p) = path_mapping.get(to_uppercase_first(path.to_str().unwrap())) {
+-                (PathBuf::from(p.as_str().unwrap()), true)
+-            } else if path.starts_with(&prefix_dir) {
+-                (path.strip_prefix(&prefix_dir).unwrap().to_path_buf(), false)
+-            } else if path.starts_with(&source_dir) {
+-                (path.strip_prefix(&source_dir).unwrap().to_path_buf(), false)
+-            } else {
+-                (path, false)
+-            };
+-
+-        // Get absolute path to source file.
+-        let abs_path = if rel_path.is_relative() {
+-            if !cfg!(windows) {
+-                PathBuf::from(&source_dir).join(&rel_path)
+-            } else {
+-                PathBuf::from(&source_dir).join(&rel_path.to_str().unwrap().replace("/", "\\"))
+-            }
+-        } else {
+-            rel_path.clone()
+-        };
++        let path = path.replace("\\", "/");
+ 
+-        // Canonicalize, if possible.
+-        let abs_path = match canonicalize_path(&abs_path) {
+-            Ok(p) => p,
+-            Err(_) => abs_path,
+-        };
++        // Get path from the mapping.
++        let rel_path = apply_mapping(&path_mapping, &path);
+ 
+-        let rel_path = if found_in_mapping {
+-            rel_path
+-        } else if abs_path.starts_with(&source_dir) {
+-            // Remove source dir from path.
+-            abs_path.strip_prefix(&source_dir).unwrap().to_path_buf()
+-        } else {
+-            abs_path.clone()
+-        };
++        // Remove prefix from the path.
++        let rel_path = remove_prefix(&prefix_dir, rel_path);
++
++        // Get absolute path to the source file.
++        let (abs_path, rel_path) = get_abs_path(&source_dir, rel_path);
+ 
+         if to_ignore_globset.is_match(&rel_path) {
+             return None;
+@@ -120,6 +132,7 @@ pub fn rewrite_paths(
+             return None;
+         }
+ 
++        // Always return results with '/'.
+         let rel_path = PathBuf::from(rel_path.to_str().unwrap().replace("\\", "/"));
+ 
+         match filter_option {
+@@ -344,7 +357,7 @@ mod tests {
+         let mut count = 0;
+         for (abs_path, rel_path, result) in results {
+             count += 1;
+-            assert!(abs_path.is_absolute());
++            assert!(abs_path.is_absolute(), "{} is not absolute", abs_path.display());
+             assert!(abs_path.ends_with("tests/class/main.cpp"));
+             assert!(rel_path.ends_with("tests/class/main.cpp"));
+             assert_eq!(result, empty_result!());
+@@ -488,7 +501,7 @@ mod tests {
+         let results = rewrite_paths(
+             result_map,
+             None,
+-            Some(canonicalize_path("tests").unwrap()),
++            Some(PathBuf::from("tests")),
+             None,
+             true,
+             Vec::new(),
+@@ -513,7 +526,7 @@ mod tests {
+         let results = rewrite_paths(
+             result_map,
+             None,
+-            Some(canonicalize_path("tests").unwrap()),
++            Some(PathBuf::from("tests")),
+             None,
+             true,
+             Vec::new(),
+
+
+</patch>
+
+<TEST>
+<Filename>src/path_rewriting.rs</Filename>
+<imports>use crate::cov::CovResultMap;
+use crate::cov::empty_result;
+use crate::cov::CovResultIter;
+use crate::path_rewriting::rewrite_paths;
+use serde_json::Value;
+use std::path::PathBuf;</imports>
+<Rust>#[test]
+fn test_mapping_overrides_prefix() {
+    let mut result_map = CovResultMap::new();
+    result_map.insert(
+        "lib/old_path.c".to_string(),
+        empty_result!(),
+    );
+
+    let path_mapping = Some(serde_json::json!({
+        "lib/old_path.c": "lib/new_path.c"
+    }));
+
+    let prefix_dir = Some(PathBuf::from("lib"));
+
+    let results: Vec<_> = rewrite_paths(
+        result_map,
+        path_mapping,
+        None,
+        prefix_dir,
+        false,
+        Vec::new(),
+        None,
+    )
+    .collect();
+
+    assert_eq!(results.len(), 1);
+    let (_, rel_path, _) = &results[0];
+    assert_eq!(rel_path.to_str(), Some("new_path.c"));
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crate::cov`
+   --> src/path_rewriting.rs:157:16
+    |
+157 |     use crate::cov::CovResultMap;
+    |                ^^^ maybe a missing crate `cov`?
+
+error[E0432]: unresolved import `crate::cov`
+   --> src/path_rewriting.rs:158:16
+    |
+158 |     use crate::cov::empty_result;
+    |                ^^^ maybe a missing crate `cov`?
+
+error[E0432]: unresolved import `crate::cov`
+   --> src/path_rewriting.rs:159:16
+    |
+159 |     use crate::cov::CovResultIter;
+    |                ^^^ maybe a missing crate `cov`?
+
+error: aborting due to 3 previous errors; 12 warnings emitted
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<PathBuf>,
+prefix_dir: Option<PathBuf>,
+ignore_not_existing: bool,
+to_ignore_dirs: Vec<String>,
+filter_option: Option<bool>) -> CovResultIter
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

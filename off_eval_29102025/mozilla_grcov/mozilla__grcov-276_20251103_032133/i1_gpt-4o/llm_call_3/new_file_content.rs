@@ -1,0 +1,349 @@
+#src/main.rs
+#[macro_use]
+extern crate clap;
+extern crate crossbeam;
+extern crate grcov;
+extern crate num_cpus;
+extern crate rustc_hash;
+extern crate serde_json;
+extern crate tempfile;
+
+use clap::{App, Arg};
+use crossbeam::queue::MsQueue;
+use rustc_hash::FxHashMap;
+use serde_json::Value;
+use std::alloc::System;
+use std::fs::{self, File};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::{process, thread};
+
+#[global_allocator]
+static GLOBAL: System = System;
+
+use grcov::*;
+
+fn main() {
+    let default_num_threads = (num_cpus::get() * 2).to_string();
+
+    let matches = App::new("grcov")
+                          .author(crate_authors!("\n"))
+                          .about("Parse, collect and aggregate code coverage data for multiple source files")
+
+                          .arg(Arg::with_name("paths")
+                               .help("Sets the input paths to use")
+                               .required(true)
+                               .multiple(true)
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("output_type")
+                               .help("Sets a custom output type")
+                               .long_help(
+"Sets a custom output type:
+- *lcov* for the lcov INFO format;
+- *coveralls* for the Coveralls specific format;
+- *coveralls+* for the Coveralls specific format with function information;
+- *ade* for the ActiveData-ETL specific format;
+- *files* to only return a list of files.
+")
+                               .short("t")
+                               .long("output-type")
+                               .value_name("OUTPUT TYPE")
+                               .default_value("lcov")
+                               .possible_values(&["ade", "lcov", "coveralls", "coveralls+", "files"])
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("output_file")
+                               .help("Specifies the output file")
+                               .short("o")
+                               .long("output-file")
+                               .value_name("FILE")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("source_dir")
+                               .help("Specifies the root directory of the source files")
+                               .short("s")
+                               .long("source-dir")
+                               .value_name("DIRECTORY")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("prefix_dir")
+                               .help("Specifies a prefix to remove from the paths (e.g. if grcov is run on a different machine than the one that generated the code coverage information)")
+                               .short("p")
+                               .long("prefix-dir")
+                               .value_name("PATH")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("ignore_not_existing")
+                               .help("Ignore source files that can't be found on the disk")
+                               .long("ignore-not-existing"))
+
+                          .arg(Arg::with_name("ignore_dir")
+                               .help("Ignore files/directories specified as globs")
+                               .long("ignore-dir")
+                               .value_name("PATH")
+                               .multiple(true)
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("path_mapping")
+                               .long("path-mapping")
+                               .value_name("PATH")
+                               .multiple(true)
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("branch")
+                               .help("Enables parsing branch coverage information")
+                               .long("branch"))
+
+                          .arg(Arg::with_name("filter")
+                               .help("Filters out covered/uncovered files. Use 'covered' to only return covered files, 'uncovered' to only return uncovered files")
+                               .long("filter")
+                               .possible_values(&["covered", "uncovered"])
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("llvm")
+                               .help("Speeds-up parsing, when the code coverage information is exclusively coming from a llvm build")
+                               .long("llvm"))
+
+                          .arg(Arg::with_name("token")
+                               .help("Sets the repository token from Coveralls, required for the 'coveralls' and 'coveralls+' formats")
+                               .long("token")
+                               .value_name("TOKEN")
+                               .takes_value(true)
+                               .required_ifs(&[
+                                   ("output_type", "coveralls"),
+                                   ("output_type", "coveralls+")
+                               ]))
+
+                          .arg(Arg::with_name("commit_sha")
+                               .help("Sets the hash of the commit used to generate the code coverage data")
+                               .long("commit-sha")
+                               .value_name("COMMIT HASH")
+                               .takes_value(true)
+                               .required_ifs(&[
+                                   ("output_type", "coveralls"),
+                                   ("output_type", "coveralls+")
+                               ]))
+
+                          .arg(Arg::with_name("service_name")
+                               .help("Sets the service name")
+                               .long("service-name")
+                               .value_name("SERVICE NAME")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("service_number")
+                               .help("Sets the service number")
+                               .long("service-number")
+                               .value_name("SERVICE NUMBER")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("service_job_number")
+                               .help("Sets the service job number")
+                               .long("service-job-number")
+                               .value_name("SERVICE JOB NUMBER")
+                               .takes_value(true))
+
+                          .arg(Arg::with_name("threads")
+                               .long("threads")
+                               .value_name("NUMBER")
+                               .default_value(&default_num_threads)
+                               .takes_value(true))
+
+                          .get_matches();
+
+    let paths: Vec<_> = matches.values_of("paths").unwrap().collect();
+    let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
+    let output_type = matches.value_of("output_type").unwrap();
+    let output_file_path = matches.value_of("output_file");
+    let source_dir = matches.value_of("source_dir").unwrap_or("");
+    let prefix_dir = matches.value_of("prefix_dir").unwrap_or("");
+    let ignore_not_existing = matches.is_present("ignore_not_existing");
+    let mut to_ignore_dirs: Vec<_> = if let Some(to_ignore_dirs) = matches.values_of("ignore_dir") {
+        to_ignore_dirs.collect()
+    } else {
+        Vec::new()
+    };
+    let path_mapping_file = matches.value_of("path_mapping").unwrap_or("");
+    let branch_enabled = matches.is_present("branch");
+    let filter_option = if let Some(filter) = matches.value_of("filter") {
+        if filter == "covered" {
+            Some(true)
+        } else {
+            Some(false)
+        }
+    } else {
+        None
+    };
+    let is_llvm = matches.is_present("llvm");
+    let repo_token = matches.value_of("token").unwrap_or("");
+    let commit_sha = matches.value_of("commit_sha").unwrap_or("");
+    let service_name = matches.value_of("service_name").unwrap_or("");
+    let service_number = matches.value_of("service_number").unwrap_or("");
+    let service_job_number = matches.value_of("service_job_number").unwrap_or("");
+    let num_threads: usize = matches
+        .value_of("threads")
+        .unwrap()
+        .parse()
+        .expect("Number of threads should be a number");
+
+    let source_root = if source_dir != "" {
+        Some(canonicalize_path(&source_dir).expect("Source directory does not exist."))
+    } else {
+        None
+    };
+
+    let prefix_dir = if prefix_dir == "" {
+        source_root.clone()
+    } else {
+        Some(PathBuf::from(prefix_dir))
+    };
+
+    let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+    let tmp_path = tmp_dir.path().to_owned();
+    assert!(tmp_path.exists());
+
+    let result_map: Arc<SyncCovResultMap> = Arc::new(Mutex::new(FxHashMap::with_capacity_and_hasher(20_000, Default::default())));
+    let queue: Arc<WorkQueue> = Arc::new(MsQueue::new());
+    let path_mapping: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+
+    let producer = {
+        let queue = Arc::clone(&queue);
+        let tmp_path = tmp_path.clone();
+        let path_mapping_file = path_mapping_file.to_owned();
+        let path_mapping = Arc::clone(&path_mapping);
+
+        thread::Builder::new()
+            .name(String::from("Producer"))
+            .spawn(move || {
+                let producer_path_mapping_buf = producer(
+                    &tmp_path,
+                    &paths,
+                    &queue,
+                    filter_option.is_some() && filter_option.unwrap(),
+                    is_llvm,
+                );
+
+                let mut path_mapping = path_mapping.lock().unwrap();
+                *path_mapping = if path_mapping_file != "" {
+                    let file = File::open(path_mapping_file).unwrap();
+                    Some(serde_json::from_reader(file).unwrap())
+                } else if let Some(producer_path_mapping_buf) = producer_path_mapping_buf {
+                    Some(serde_json::from_slice(&producer_path_mapping_buf).unwrap())
+                } else {
+                    None
+                };
+            })
+            .unwrap()
+    };
+
+    let mut parsers = Vec::new();
+
+    for i in 0..num_threads {
+        let queue = Arc::clone(&queue);
+        let result_map = Arc::clone(&result_map);
+        let working_dir = tmp_path.join(format!("{}", i));
+        let source_root = source_root.clone();
+
+        let t = thread::Builder::new()
+            .name(format!("Consumer {}", i))
+            .spawn(move || {
+                fs::create_dir(&working_dir).expect("Failed to create working directory");
+                consumer(
+                    &working_dir,
+                    &source_root,
+                    &result_map,
+                    &queue,
+                    branch_enabled,
+                );
+            })
+            .unwrap();
+
+        parsers.push(t);
+    }
+
+    if let Err(_) = producer.join() {
+        process::exit(1);
+    }
+
+    // Poison the queue, now that the producer is finished.
+    for _ in 0..num_threads {
+        queue.push(None);
+    }
+
+    for parser in parsers {
+        if let Err(_) = parser.join() {
+            process::exit(1);
+        }
+    }
+
+    let result_map_mutex = Arc::try_unwrap(result_map).unwrap();
+    let result_map = result_map_mutex.into_inner().unwrap();
+
+    let path_mapping_mutex = Arc::try_unwrap(path_mapping).unwrap();
+    let path_mapping = path_mapping_mutex.into_inner().unwrap();
+
+    let iterator = rewrite_paths(
+        result_map,
+        path_mapping,
+        source_root,
+        prefix_dir,
+        ignore_not_existing,
+        &mut to_ignore_dirs,
+        filter_option,
+    );
+
+    if output_type == "ade" {
+        output_activedata_etl(iterator, output_file_path);
+    } else if output_type == "lcov" {
+        output_lcov(iterator, output_file_path);
+    } else if output_type == "coveralls" {
+        output_coveralls(
+            iterator,
+            repo_token,
+            service_name,
+            service_number,
+            service_job_number,
+            commit_sha,
+            false,
+            output_file_path,
+        );
+    } else if output_type == "coveralls+" {
+        output_coveralls(
+            iterator,
+            repo_token,
+            service_name,
+            service_number,
+            service_job_number,
+            commit_sha,
+            true,
+            output_file_path,
+        );
+    } else if output_type == "files" {
+        output_files(iterator, output_file_path);
+    } else {
+        assert!(false, "{} is not a supported output type", output_type);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+use std::process::Command;
+
+#[test]
+fn test_cli_options_with_clap() {
+    let output = Command::new("cargo")
+        .arg("run")
+        .arg("--")
+        .arg("test_dir")
+        .arg("-t")
+        .arg("lcov")
+        .arg("--ignore-not-existing")
+        .output()
+        .expect("Failed to execute command");
+
+    let expected_status = true;
+    let actual_status = output.status.success();
+
+    assert_eq!(expected_status, actual_status);
+}
+}

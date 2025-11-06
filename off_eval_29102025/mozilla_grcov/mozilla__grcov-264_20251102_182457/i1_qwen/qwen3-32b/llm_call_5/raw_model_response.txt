@@ -1,0 +1,377 @@
+<think>
+Okay, let's see why the test is failing. The user provided a test that checks for path collisions when there are multiple files with the same name. The original test expected two entries in the collected results, but the error message shows that only one was found.
+
+Hmm, the problem might be in how the test is structured. The test inserts two entries into the result_map: "src/lib.rs" and "src_other/lib.rs". The test then calls rewrite_paths and expects both entries to remain, but the actual result has collected only one. 
+
+Wait, looking at the patch, the fix for the issue involved checking if the file has a Java extension before doing partial path mapping. For Rust files (like .rs), they don't trigger the path mapping logic. But in the test, both entries are .rs files. So the existing code might still be mapping paths when it shouldn't. 
+
+In the original issue, the problem was that two different files (e.g., /src/lib.rs and /rustc/.../lib.rs) had their paths rewritten to the same location, causing coverage data to be merged. The patch added a check to only apply path mapping if the file has a .java extension, which would leave .rs files unchanged. But the current test's setup might not reflect the scenario where .rs files are being mapped.
+
+Ah, the test creates two entries with "src/lib.rs" and "src_other/lib.rs", but maybe they're being mapped to the same path when they shouldn't. Wait, in the test, the source directory is set to the current directory. However, if the path_rewriting logic is not handling the paths correctly when there are similar filenames but different directories, perhaps the map_partial_path function is merging them.
+
+Wait, in the original issue, the problem occurred when two different paths had the same filename (lib.rs), and path rewriting caused them to be considered the same. So the test needs to simulate two different paths (like src/lib.rs and /rustc/.../lib.rs) which, after rewriting, end up being considered the same. However, in the test, the paths in the result_map are src/lib.rs and src_other/lib.rs. These have different parent directories, but if the source_dir is set to the current directory, maybe the relative paths are being resolved in a way that they conflict?
+
+The original test's assert_eq!(collected.len(), 2) is failing because the rewrite_paths is returning only one entry. That suggests that during the rewrite process, the two entries are being considered the same and deduplicated. But why?
+
+Ah, in the patch, the key part is that the path mapping is done only for Java files. For other files, like .rs, the path mapping is not applied. So maybe the test's scenario is that without the patch, the path mapping is incorrectly applied to .rs files, causing the two entries to be mapped to the same path. But with the patch, since .rs files aren't mapped, the two entries remain distinct.
+
+But in the test, the result_map uses "src/lib.rs" and "src_other/lib.rs" which are distinct filenames. Let's look at the code for map_partial_path. The function maps a filename (from a GCNO/DA line) to a possible absolute path. For example, if the file_to_paths has entries for "lib.rs", then when a partial path like "src/lib.rs" is processed, it might map to the full path based on some partial path mapping rules.
+
+Wait, the test's setup might be missing the file_to_paths mapping, which is part of the data used in map_partial_path. Maybe the test isn't providing the necessary context for map_partial_path to trigger the original bug. 
+
+In the original issue, the problem was that two different absolute paths (src/lib.rs and /rustc/.../lib.rs) were being rewritten to the same relative path. The patch prevents this by not applying path mapping unless the file is Java. So, the test should simulate a scenario where two different absolute paths are mapped to the same relative path, but after the patch, they remain distinct.
+
+So the original test may not be setting up the correct scenario. Perhaps the test needs to have the file_to_paths map in such a way that the two paths are mapped to the same relative path under the old system but remain distinct under the new system.
+
+Alternatively, the test should ensure that two files with the same base name but different directories are correctly handled. The current test setup might not be correct because the relative paths are different enough not to be merged. 
+
+Wait, the current test uses "src/lib.rs" and "src_other/lib.rs". Let's think about how the code processes these. The rewrite_paths function, in the original code, would process the relative path and map it using map_partial_path. If the source_dir is the current directory, and the relative path is "src/lib.rs", then map_partial_path might be looking for a partial path "lib.rs" in the file_to_paths. Suppose there's an entry in file_to_paths for "lib.rs" that points to multiple paths. Then, when applying the mapping, both entries would be translated to the same path, causing duplication.
+
+But in the current test, the file_to_paths might not be part of the test setup, which uses the default parameters. So maybe the test isn't correctly simulating the scenario where two different absolute paths are being treated as the same by the path rewriting logic.
+
+Ah! The key issue is that the test's setup doesn't create multiple paths that would trigger the original bug. The test's result_map has entries with different paths (src/lib.rs vs src_other/lib.rs), but under the original behavior, these might not conflict. Perhaps the test should simulate two different absolute paths (like the real-world case in the issue) that resolve to the same relative path before the patch, and remain distinct after the patch.
+
+So maybe the test should set up the result_map with two different absolute paths (like /absolute/path1/src/lib.rs and /absolute/path2/src/lib.rs) but both have the same relative path (e.g., src/lib.rs), causing a conflict. With the patch applied, since .rs files are not subject to path mapping, the two absolute paths remain distinct, and the collected results should be two. Without the patch, they are deduplicated.
+
+In the current test, the source_dir is the current directory. So when the test inserts entries like "src/lib.rs" into the result_map, the code would resolve them as relative to the current directory. However, if the code uses the same relative path for two different physical files, they might be treated as the same because their relative paths are the same. But this isn't the scenario in the original issue, where the problem was that two different absolute paths were mapped to the same relative path.
+
+Therefore, the current test may not be reproducing the original issue. To make it pass, the test should simulate two different absolute paths that, under the original code, get mapped to the same relative path but, after the patch, stay as separate entries.
+
+Let me adjust the test. The test should create a scenario where two different files (with the same base name in different directories) are processed. But in the original code, the path rewriting logic may have merged them. The test should use a custom file_to_paths that maps the same filename to multiple paths. However, in the current test, the file_to_paths isn't being provided, so the default is used, which might not have those mappings.
+
+Wait, the test's code calls rewrite_paths with default parameters. So perhaps the test needs to inject the necessary mappings into the file_to_paths map.
+
+Looking at the code, the file_to_paths is a parameter to rewrite_paths, but in the test, it's not provided. So in the current setup, the test might not be simulating the correct scenario where multiple paths exist for the same filename.
+
+Hmm, this is getting complicated. The original problem is that the test is failing after the patch. The test is expecting two entries, but it's getting one. That suggests that in the current setup, the two entries are being merged into one, but the patch is supposed to prevent that. So perhaps the test is structured in a way that even after the patch, the two entries are being merged, but they shouldn't be.
+
+Wait, the patch adds the check_extension function to only apply path mapping for Java files. For .rs files, the path remains unchanged. So, if the test is using .rs files, then the path mapping is not applied. However, the test is passing the relative path as "src/lib.rs" and "src_other/lib.rs", which are different. So why does the rewrite_paths function collect only one entry?
+
+Ah, perhaps the current test is not correctly creating the input data. Let's check the code that's being tested. The rewrite_paths function returns a CovResultIter. The test is collecting it into a Vec and checking the length. If the two entries are being transformed into the same absolute path, then they would be considered the same key in the result_map, leading to deduplication.
+
+Wait, the result_map is a CovResultMap, which is a HashMap<String, CovResult>. So each key is the original file path. When rewrite_paths is called, it processes each key and returns a stream of (absolute path, relative path, CovResult) entries. However, if two different keys end up with the same absolute path, then in the output, they would be considered the same. But in the test, the keys are "src/lib.rs" and "src_other/lib.rs", which should have different paths when resolved.
+
+Wait, perhaps the test is not correctly handling the source_dir. Let's look at the current test code:
+
+source_dir is set to Some(std::env::current_dir().unwrap())
+
+For each key in the result_map, the function is trying to resolve them relative to this source_dir. For "src/lib.rs", the code would create an absolute path like current_dir/src/lib.rs. For "src_other/lib.rs", it would be current_dir/src_other/lib.rs. These are different paths. Therefore, the expected result should have two entries, each with different absolute paths.
+
+But the test is outputting collected.len() = 1 instead of 2. So something is going wrong here. Why?
+
+Ah, maybe the problem is that the current_dir is the same as the parent directory of "src", and perhaps in the test's setup, the code is merging these two files into one. Alternatively, perhaps the code is using some cache or other logic that is causing this.
+
+Wait, looking at the get_abs_path function:
+
+It generates the absolute path by joining source_dir and rel_path, and also keeps a rel_path. So if the two relative paths are different, then the absolute paths should be different. Hence, the test should collect two entries. But the test is failing, suggesting that only one is collected. That's strange. 
+
+Wait, the test may have an error in how it's being called. The current test uses the default parameters for the other arguments. Wait, the function signature of rewrite_paths includes a filter_option parameter. The test passes None for that. But maybe other parameters are not set correctly.
+
+Another thing to check: the test initializes the CovResult for each key in the result_map. But in the original issue, the coverage data from two different files were merged. The current test's scenario is that two different files (src/lib.rs and src_other/lib.rs) are being processed. The patch's fix would prevent them from being merged. But if in the test, the code is not merging them, then the test should pass. But the test is failing with len=1, implying that they are being merged. So why?
+
+Ah, perhaps the code for rewrite_paths is merging them under certain conditions. For example, in the code, after some processing, the same absolute path could be generated for both keys, leading to them being considered the same, and thus, in the result_map, only one is present. But how?
+
+Alternatively, maybe the code is deduplicating the results. For example, during the rewrite process, if two different keys end up with the same absolute path, they are merged. But in the current test scenario, the keys are "src/lib.rs" and "src_other/lib.rs", which, when resolved to absolute paths, should be different. Unless there's some error in the path processing.
+
+Wait, the test's source_dir is set to the current working directory. Suppose in the current working directory, there's a directory named "src" and another named "src_other". The relative paths would be resolved correctly, leading to two distinct absolute paths.
+
+But why is the test failing with collected.len()=1? The test is expecting 2 entries. So perhaps the test is not correct in how it's set up. Maybe the test is incorrect in its assumptions, or there is a bug in the test setup.
+
+Wait, maybe the code for CovResultIter is not designed to handle multiple entries for the same file. Or perhaps the code for the result_map is using a key that, after processing, maps to the same value.
+
+Alternatively, perhaps the test is incorrect in not providing the necessary parameters. For example, maybe the file_to_paths in the test is empty, causing the code to generate the same path for both entries, but after the patch, it's correct.
+
+Hmm. I'm a bit stuck. Let's try to approach this step by step.
+
+The goal is to write a test that fails before the patch and passes after. The original test is trying to ensure that two different files with the same base name are not merged into one. The patch's fix is that path mapping is only done for Java files, leaving .rs files as they are.
+
+The current test uses "src/lib.rs" and "src_other/lib.rs". If the path mapping isn't applied (as per the patch), then the absolute path for "src/lib.rs" would be current_dir/src/lib.rs, and for "src_other/lib.rs" it would be current_dir/src_other/lib.rs. So the test should collect two entries.
+
+But in the test output, collected.len() is 1, which suggests that both entries are being merged. That can only happen if the two entries are being mapped to the same absolute path. How is that possible?
+
+Ah! Wait, perhaps the test is not correctly setting the source_dir. The test uses Some(std::env::current_dir().unwrap()) as the source_dir. But if the current directory already has a "src/lib.rs", and "src_other/lib.rs" is a symlink or something else, but that's unlikely in a test setup.
+
+Alternatively, perhaps the code in rewrite_paths is applying the map_partial_path function to all files, but in the current test setup, because there's no source_dir provided, or other parameters, the code is merging them.
+
+Alternatively, maybe the test setup is incorrect. For example, the current directory might not have the "src" and "src_other" directories, so the code resolves them to the same path. But in the test, the code is using canonicalize_path, which may resolve different paths to the same one.
+
+Ah! That's a possibility. For example, if the current test uses "src/lib.rs" and "src_other/lib.rs", but these paths don't exist, then get_abs_path would resolve them differently. However, if the system is in a directory where both "src" and "src_other" directories exist and are separate, then they should resolve to different paths. 
+
+But in the test, the source_dir is set to the current directory, which includes "src" and "src_other" directories. Maybe the test setup is missing some directories, causing the code to resolve the paths in a way that they conflict.
+
+Alternatively, the problem could be that the code is using the file_to_paths in a way that, even if the relative paths are different, the code considers them the same. For example, if the file_to_paths is empty, then the code may not do any mapping, and the get_abs_path function is called with the same source_dir and relative path. But in that case, the absolute path should be correct.
+
+Wait, in the get_abs_path function, the code is building the absolute path by joining the source_dir with the rel_path. So "src/lib.rs" would become current_dir/src/lib.rs, and "src_other/lib.rs" would be current_dir/src_other/lib.rs. These are two different absolute paths. Unless the code has a bug where it's canonicalizing them in a way that they become the same, but that's a stretch.
+
+Hmm. Maybe the issue is in the way the test is generating the result_map. The result_map uses keys like "src/lib.rs" and "src_other/lib.rs". When rewrite_paths processes these keys, it maps them to (abs_path, rel_path, result). The test collects these as a Vec, and checks the length. If the code is generating two different entries, the Vec should have length 2.
+
+But according to the test output, the collected Vec has length 1. That suggests that both entries are being mapped to the same key and are thus merged in the result_map. How could that happen?
+
+Ah! If the code uses the absolute path as a key, and in the test both "src/lib.rs" and "src_other/lib.rs" resolve to the same absolute path, then they would be merged. But that's only if both relative paths resolve to the same absolute path, which shouldn't happen unless the source_dir is the same and the relative paths are the same.
+
+So maybe the test is incorrect in its setup. For example, if the current working directory has a "src/lib.rs" and another "src_other/lib.rs", which are actually the same file. But that's unlikely in a test.
+
+Wait, maybe the test is not using the correct paths. For example, if the test is using "src/lib.rs" and "lib.rs" as the two keys. Then, when processed with the same source_dir, they would resolve to different absolute paths. But with the current setup, it's "src/lib.rs" and "src_other/lib.rs".
+
+I'm not sure. Let's think of another approach. How to create a test that would fail before the patch and pass after. The original issue was that two different files with the same name were being merged. The patch fixes this by not applying the path mapping to .rs files. 
+
+The correct test scenario should have two different files with the same name but different paths. For example, one file is in the local project's src directory and another is in a different directory (like in the .rustup directory). However, in the test, it's hard to simulate real paths. So, perhaps the test should create a scenario where file_to_paths has two entries for the same filename, and with the original code, they are merged, but after the patch, they are not.
+
+To create such a test, we need to control the file_to_paths parameter. The test in the <TEST> block isn't passing any file_to_paths, so it uses the default. Maybe the test should create a file_to_paths with multiple entries for the same filename to trigger the conflict.
+
+So, the original test is missing the setup of the file_to_paths, leading to a situation where the test isn't simulating the actual issue.
+
+Thus, the solution is to modify the test to include a file_to_paths that maps the same filename to two different paths, which under the original code would be merged, but under the new code would remain separate.
+
+But how to do that in the test code? The test's current code calls rewrite_paths without passing a path_mapping, but in the function signature, the first parameter is result_map, then path_mapping (Option<Value>).
+
+Wait, the function signature is:
+
+pub fn rewrite_paths(
+    result_map: CovResultMap,
+    path_mapping: Option<Value>,
+    source_dir: Option<PathBuf>,
+    ...
+
+So, the path_mapping is an Option<Value> that represents the path mappings. The test isn't passing any path_mapping, so it's None. The code for rewrite_paths may process the path_mapping to build the file_to_paths map.
+
+But how is the file_to_paths created in the function? Looking at the code, the function uses the prefix_dir and source_dir to create the prefix_paths, which is then used in the map_partial_path function.
+
+Alternatively, perhaps the test should simulate a scenario where the file_to_paths has multiple entries for the same filename. For example, if there are two paths that map to the same filename, then the original code would have merged them, but the patch prevents this.
+
+In the current test, the file_to_paths is not set, so the test is not simulating the scenario where two different paths are present for the same filename.
+
+So the test as written is not correctly set up to reproduce the original issue. To fix this, the test needs to create a file_to_paths that maps the same filename to two different paths.
+
+But how to do that in the test? The path_mapping parameter is a JSON value that represents the path mappings. For example, if the path_mapping is a JSON object that maps "lib.rs" to two different paths, then the file_to_paths would have those mappings.
+
+Wait, in the patch's test cases, there are tests that set up path mappings. For example, the test_rewrite_paths_rewrite_path_using_absolute_source_directory test sets up a result_map with keys like "class/main.cpp" and "tests/class/main.cpp", and then a path_mapping is created which maps "class" to the "tests" subdirectory.
+
+Ah! Maybe the test needs to create a path_mapping that maps the same filename to different paths. However, the patch's fix is for cases when the file extension is not .java. For .rs files, the path mapping is not applied, so the original code would have merged them, but the new code would not.
+
+Thus, the correct test scenario should have two entries for the same filename but different paths. The original code would apply path rewriting (map_partial_path) if the extension is not .java, leading to a merge. The new code does not apply path rewriting, so the entries remain distinct.
+
+Wait, no. The patch adds a check so that path mapping is only applied if the file extension is .java. For .rs files, the path mapping is not applied. So in the original code, all files would undergo path mapping, but with the patch, only Java files do. 
+
+So to reproduce the original issue, the test should have two .rs files with the same filename but different paths that would be merged due to path mapping in the original code. The patch should prevent that.
+
+Thus, the test should simulate a scenario where, in the original code, the two .rs files are merged, but in the patched code, they remain separate.
+
+To do that, the test needs to create two entries in the result_map with the same filename but different paths. For example, "lib.rs" and another "lib.rs" with a different parent directory. However, since the keys are different, the original code may still handle them as separate. 
+
+Wait, maybe the test should use two result_map entries with the same key but different paths. But that's not possible because a HashMap cannot have duplicate keys.
+
+Alternatively, perhaps the two entries have different keys but the code, due to path mapping, maps them to the same key.
+
+For example, if the result_map has two keys that, after path rewriting, resolve to the same key, causing duplication.
+
+So, the test should create two different keys in the result_map that, when processed by the original code, map to the same absolute path, but after the patch, remain separate.
+
+For example, suppose the source_dir is set to a directory where both entries are mapped to the same absolute path when processed by map_partial_path. In the original code, they would be merged, but in the new code, since path mapping isn't applied to .rs files, they would remain separate.
+
+So how to set this up in the test?
+
+Let's say the result_map has two entries:
+
+key1: "lib.rs"
+key2: "subdirectory/lib.rs"
+
+But with a path_mapping that maps "lib.rs" to a certain path. Then, when the original code applies the path mapping, both entries might resolve to the same absolute path. However, with the patch, since .rs files don't use path mapping, the keys are resolved based on their paths.
+
+Wait, this is getting complicated. Let's think of a concrete example.
+
+Suppose there's a file_to_paths that maps "lib.rs" to two different paths. For instance, the prefix paths could include entries that cause different relative paths to resolve to the same key.
+
+But how to set this up in the test.
+
+Alternatively, maybe the test should simulate two result_map entries with keys that, after processing by the path rewriting logic, end up being the same key in the result_map. For example, if the original code merges them into one, but the patched code leaves them as two separate entries.
+
+To create such a scenario, the test needs to create a file_to_paths that maps different relative paths to the same filename. 
+
+But I'm not sure how to structure this in the test code. The current test setup isn't providing path_mapping.
+
+Perhaps the solution is to use the path_mapping parameter to simulate the conditions of the original issue.
+
+In the original issue, there are two lib.rs files:
+
+- src/lib.rs
+
+- /rustc/.../lib.rs 
+
+These two files are being mapped to the same key due to path rewriting. The test needs to simulate this scenario.
+
+So, in the test's result_map, we have two entries:
+
+key1: "lib.rs" (from src/lib.rs)
+
+key2: "lib.rs" (from /rustc/.../lib.rs)
+
+But a HashMap can't have duplicate keys. So this approach won't work.
+
+Alternatively, the keys are different in the result_map, but when processed by the code, they are merged into the same entry. For example, two result_map entries with different keys that, after processing, resolve to the same key in the result.
+
+For instance, the keys could be "src/lib.rs" and "other/lib.rs", and the code, under the original logic, maps both to the same absolute path. This could happen if the file_to_paths for these keys includes mappings that resolve to the same file.
+
+But to simulate this, the test needs to create a path_mapping that maps both keys to the same file.
+
+Alternatively, perhaps the test should not use path_mapping and rely on the default path rewriting behavior. For example, the test's current setup isn't using path_mapping, and the code is merging the two entries because of their relative paths.
+
+Ah! I think I see now. The current test is using "src/lib.rs" and "src_other/lib.rs" as keys in the result_map. These are different keys, but in the original code, they may resolve to the same absolute path, leading to duplication. However, the source_dir is set to the current directory, and if both "src/lib.rs" and "src_other/lib.rs" exist in the current working directory, then they would resolve to different absolute paths. But maybe the code is applying some canonicalization that makes them the same.
+
+But why would that happen?
+
+Wait, perhaps the code is using the canonicalize function, which resolves symbolic links. If "src_other" is a symlink to "src", then "src/lib.rs" and "src_other/lib.rs" would resolve to the same canonical path. But in a test scenario, this depends on the setup.
+
+The current test doesn't set up such a symlink, so this is unlikely the case.
+
+Given that, the test's failing indicates that something else is wrong. Let's look back at the test's code:
+
+The test inserts two entries into result_map:
+
+result_map.insert("src/lib.rs".to_string(), ...);
+result_map.insert("src_other/lib.rs".to_string(), ...);
+
+Then, calls rewrite_paths which returns an iterator of (PathBuf, PathBuf, CovResult), which the test collects into a Vec. The test expects collected.len() == 2, but it's 1. So both entries are being merged into one.
+
+This can only happen if both input keys in the result_map are being mapped to the same key in the result. How?
+
+Wait, perhaps the code for rewrite_paths is grouping the results by the absolute path. For example, if two different keys resolve to the same absolute path, the code may merge them into a single entry. This is a possibility if the code uses the absolute path as the key in the result_map.
+
+But in the current test setup, the two input keys should resolve to different absolute paths. Unless, somehow, the code is generating the same absolute path for both.
+
+Hmm. Another angle: maybe the test is being run in an environment where "src_other" is a subdirectory of "src", leading to the same path after some processing. But I don't think so.
+
+I'm stuck. Let's look at the patch again to see what the fix was. The issue was that the code was not correctly handling multiple files with the same name from different directories, leading to incorrect coverage. The patch adds a check to only apply path mapping to .java files. 
+
+Thus, the correct test should simulate two .rs files with the same filename but different paths. Under the original code, the path mapping logic (even for .rs files) was causing them to be merged. With the patch, the path mapping is not applied to .rs files, so they remain separate.
+
+The current test's failure indicates that even after the patch, the two entries are being merged into one. This suggests that the test is incorrect in its setup. 
+
+Perhaps the test should use a different setup where the path rewriting logic is applied to .rs files. Wait, but the patch explicitly disables path mapping for non-.java files. So in the patched code, for .rs files, the path mapping is not applied. 
+
+If the original code applied path mapping to all files, then the test should show that two entries are merged. After the patch, they are not. 
+
+Thus, the test should simulate a scenario where two different entries are merged in the original code but separated after the patch.
+
+To achieve this, the test must create a scenario where, in the original code, the two result_map entries are mapped to the same absolute path due to path mapping, but after the patch, they remain different.
+
+So to do this, the test should use result_map entries that, in the original code, map to the same key but in the patched code map to different keys.
+
+The correct setup is to use the path_mapping parameter to provide a mapping that causes two entries to be merged in the original code, but not in the patched code.
+
+For example, create a result_map with keys that, after path mapping in the original code, resolve to the same absolute path, but in the patched code, don't.
+
+How to do this in the test code?
+
+Let's create a result_map with two keys: "lib.rs" and "src/lib.rs". With path_mapping that maps "lib.rs" to "src/lib.rs", the original code would merge them into one. The patched code won't apply the mapping, leaving them as two entries.
+
+But how to represent this in the test's code.
+
+The test needs to create a path_mapping that causes this. For example:
+
+let path_mapping = json!({"paths": {"lib.rs": "src/lib.rs"}});
+
+Then, the two entries "lib.rs" and "src/lib.rs" would both resolve to "src/lib.rs" in the result.
+
+But with the patch, the path mapping is only applied if the file extension is .java. So, .rs files won't be affected.
+
+Wait, no. The patch adds a check: if the file has a .java extension, apply the path mapping. For other files, including .rs, don't. 
+
+So in the original code, path mapping was applied to all files, including .rs. After the patch, only .java files are processed.
+
+Thus, in the patched code, the original test scenario (with .rs files) would not have their paths mapped, so two different paths should remain as two entries.
+
+But in the current test, the entries are "src/lib.rs" and "src_other/lib.rs", and they're being merged despite being .rs files. That suggests that the code is applying path mapping to .rs files even after the patch, which is not the case.
+
+Wait no, in the patch's code, after the patch, the code checks if the file extension is .java before applying map_partial_path. For .rs files, map_partial_path is not applied. Thus, the relative path is taken as-is. 
+
+So, for the current test, the code is getting the relative paths as-is. These are different ("src/lib.rs" and "src_other/lib.rs"), so when processed by get_abs_path, they become two different absolute paths.
+
+But the test is failing, showing that collected has length 1 instead of 2. This suggests that the code is deduplicating entries for some reason, but why?
+
+Maybe the code is aggregating results into a single map, so if two different keys resolve to paths that are considered the same, they are merged. Or perhaps the code is aggregating all Coverage Results into the same map, leading to keys being overwritten.
+
+Looking at the rewrite_paths function's code:
+
+pub fn rewrite_paths( ... ) -> CovResultIter.
+
+Looking at the patch, the function signature returns a CovResultIter, which is likely an iterator over (PathBuf, PathBuf, CovResult) entries.
+
+Thus, the iterator should yield two distinct entries for each unique key in the result_map, unless the code is merging them during processing.
+
+If the test's collected Vec has length 1, it means that only one entry was processed. This could happen if, in the code, during the iteration, both entries are resolved to the same key and thus merged.
+
+But how?
+
+Maybe the code is grouping results by absolute path and, if two entries resolve to the same absolute path, they are merged. This would be a problem if the test's keys resolve to the same absolute path.
+
+But with the current setup, the two keys are different and would resolve to different absolute paths.
+
+Hmm. Another possibility is that the original code had a bug where the same filename in two different directories were being merged because the code used the filename without the directory, but that's unlikely as the code uses the relative path.
+
+I think I need to write a test that ensures that the code differentiates between two different paths with the same filename but different directories. To do this, the test should create two entries in the result_map with different keys and ensure that they are treated as separate entries after the patch.
+
+Perhaps the current test is correct, and the failure is due to a different issue. Let's think about what's happening when the test runs. 
+
+The test is using "src/lib.rs" and "src_other/lib.rs" as keys. The code processes these two keys in the result_map. For each, the code generates an absolute path by joining the source_dir with the relative path. If these two generate the same absolute path, they would be merged, leading to collected.len() = 1. Otherwise, it should be 2.
+
+If the test is failing with 1, it's possible that the code is generating the same absolute path for both.
+
+Perhaps the source_dir is not correctly set. Let's look at the code where the source_dir is set as Some(std::env::current_dir().unwrap()). 
+
+If the environment's current directory is such that "src/lib.rs" and "src_other/lib.rs" resolve to the same path, that would explain the issue. But why?
+
+Maybe the current directory is set to the "test" directory, and "src_other" is a symlink to "src". Or perhaps the test is structured in a way that "src_other" is part of the current directory's structure.
+
+But without knowing the test environment, it's hard to say. However, the test is supposed to simulate the scenario, not rely on the actual file system.
+
+The correct approach is to simulate two different absolute paths programmatically, not rely on the actual file system.
+
+Thus, the test should simulate two different absolute paths, ensuring that they are treated as separate entries.
+
+Maybe the test can hardcode the absolute paths directly to avoid relying on the current directory.
+
+For example, create a result_map with two entries where the absolute paths are clearly different. 
+
+But how to simulate that in the test. The test uses the result_map keys to generate absolute paths via the source_dir. 
+
+Let's say the source_dir is set to a directory that's known to have distinct paths. For example, create a mock source_dir by joining a temporary path with different subdirectories.
+
+But the user's test code uses std::env::current_dir().unwrap() as the source_dir. That might not be reliable. 
+
+The correct approach for the test is to use a known mock setup. For example, create two paths that are guaranteed to resolve to different absolute paths, like "test1/lib.rs" and "test2/lib.rs", and set the source_dir to the current directory.
+
+But if the current directory has both "test1" and "test2" subdirectories, this would work.
+
+But in the test, the current working directory may not have those directories. Hence, the code may return different results based on the actual file system.
+
+This suggests that the test is not self-contained and is relying on external factors, which makes it unreliable.
+
+To fix this, the test should create synthetic paths, perhaps with mock directories or by using a known base path.
+
+But since the test is written in Rust and must compile and run, it's challenging to create such a setup without the actual directories.
+
+An alternative approach is to modify the test to not rely on actual directories. For example, use a relative path that is guaranteed to resolve to a unique path.
+
+Wait, perhaps the issue is in the code's get_abs_path function. Let's look at that code:
+
+fn get_abs_path(
+    source_dir: &Option<PathBuf>,
+    rel_path: PathBuf,
+    cache: &mut Option<PathBuf>,
+) -> (PathBuf, PathBuf) {
+    // ...
+}
+
+The code builds the absolute path by joining the source_dir with the rel_path. The rel_path is computed by processing the original path through map_partial_path, or just using the original path if the extension is not Java.
+
+In the current test, the rel_path for the first entry is "src/lib.rs", and for the second is "src_other/lib.rs". If the source_dir is "current_dir", then:
+
+abs_path1 = current_dir.join("src/lib.rs")
+abs_path2 = current_dir.join("src_other/lib.rs")
+
+These are two different paths. Unless the actual current_dir has src and src_other directories that point to the same location (like symlinks), which is unlikely in a test environment.
+
+Thus, the test should collect two entries. But in the test output, it's returning one. This indicates that there's a problem either in the test setup or in the code logic.
+
+Maybe the code in the function is not using the correct rel_path. For example, if the rel_path is being modified in a way that src/lib.rs becomes the same as src_other/lib

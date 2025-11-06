@@ -1,0 +1,476 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Support showing branch coverage in the html report
+I used the options `--branch` and `-t html` to generate the html report but the branch information is missing from the report.
+
+There is only **Lines** and **Functions** information.
+
+Note: the branch coverage is available if exporting to lcov, then using genhtml.
+
+The version I use is grcov 0.5.15
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -93,6 +93,8 @@ pub struct HtmlStats {
+     pub covered_lines: usize,
+     pub total_funs: usize,
+     pub covered_funs: usize,
++    pub total_branches: usize,
++    pub covered_branches: usize,
+ }
+ 
+ #[derive(Clone, Debug)]
+
+diff --git a/src/html.rs b/src/html.rs
+--- a/src/html.rs
++++ b/src/html.rs
+@@ -27,6 +27,8 @@ impl HtmlStats {
+         self.covered_lines += stats.covered_lines;
+         self.total_funs += stats.total_funs;
+         self.covered_funs += stats.covered_funs;
++        self.total_branches += stats.total_branches;
++        self.covered_branches += stats.covered_branches;
+     }
+ }
+ 
+@@ -36,6 +38,8 @@ pub struct Config {
+     med_limit: f64,
+     fn_hi_limit: f64,
+     fn_med_limit: f64,
++    branch_hi_limit: f64,
++    branch_med_limit: f64,
+     date: DateTime<Utc>,
+ }
+ 
+@@ -45,6 +49,8 @@ pub fn get_config() -> Config {
+         med_limit: 75.,
+         fn_hi_limit: 90.,
+         fn_med_limit: 75.,
++        branch_hi_limit: 90.,
++        branch_med_limit: 75.,
+         date: Utc::now(),
+     }
+ }
+@@ -89,6 +95,16 @@ fn get_severity(conf: &Config, rate: f64) -> &str {
+     }
+ }
+ 
++fn get_branch_severity(conf: &Config, rate: f64) -> &str {
++    if conf.branch_hi_limit <= rate && rate <= 100. {
++        "branchHi"
++    } else if conf.branch_med_limit <= rate && rate < conf.branch_hi_limit {
++        "branchMed"
++    } else {
++        "branchLow"
++    }
++}
++
+ macro_rules! lines_iter {
+     ($data: expr) => {{
+         Lines {
+@@ -188,12 +204,20 @@ fn get_stats(result: &CovResult) -> HtmlStats {
+     let covered_lines = result.lines.values().filter(|x| **x > 0).count();
+     let total_funs = result.functions.len();
+     let covered_funs = result.functions.values().filter(|f| f.executed).count();
++    let total_branches = result.branches.values().map(|v| v.len()).sum();
++    let covered_branches = result
++        .branches
++        .values()
++        .map(|v| v.iter().filter(|x| **x).count())
++        .sum();
+ 
+     HtmlStats {
+         total_lines,
+         covered_lines,
+         total_funs,
+         covered_funs,
++        total_branches,
++        covered_branches,
+     }
+ }
+ 
+@@ -237,7 +261,7 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stat
+     };
+ }
+ 
+-pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf) {
++pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf, branch_enabled: bool) {
+     let output_file = output.join("index.html");
+     create_parent(&output_file);
+     let mut output_stream = match File::create(&output_file) {
+@@ -250,8 +274,11 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf) {
+ 
+     let covered_lines_per = get_percentage(global.stats.covered_lines, global.stats.total_lines);
+     let covered_funs_per = get_percentage(global.stats.covered_funs, global.stats.total_funs);
++    let covered_branches_per =
++        get_percentage(global.stats.covered_branches, global.stats.total_branches);
+     let funs_sev = get_fn_severity(&conf, covered_funs_per);
+     let lines_sev = get_severity(&conf, covered_lines_per);
++    let branches_sev = get_branch_severity(&conf, covered_branches_per);
+     let out = fomat!(
+             r#"<!DOCTYPE html>"# "\n"
+             r#"<html lang="en-us">"# "\n"
+@@ -290,17 +317,34 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf) {
+             r#"<span class="funsPercentage "# (funs_sev) r#"">"#
+             {(covered_funs_per):.1}
+             r#" %</span></div>"# "\n"
++            if branch_enabled {
++                r#"<div class="statsRow">"#
++                r#"<span class="statsBranches">Branches</span><span class="branchesHit">"#
++                (global.stats.covered_branches)
++                r#"</span>"#
++                r#"<span class="branchesTotal">"#
++                (global.stats.total_branches)
++                r#"</span>"#
++                r#"<span class="funsPercentage "# (branches_sev) r#"">"#
++                {(covered_branches_per):.1}
++                r#" %</span></div>"# "\n"
++            }
+             r#"</div>"# "\n"
+             r#"</div>"# "\n"
+             r#"<div class="dirStatsHeader"><div class="dirStatsLineHeader">"#
+             r#"<span class="dirNameHeader">Directory</span>"#
+             r#"<span class="dirLineCovHeader">Line Coverage</span>"#
+-            r#"<span class="dirFunsHeader">Functions</span></div></div>"# "\n"
++            r#"<span class="dirFunsHeader">Functions</span>"#
++            if branch_enabled {
++                r#"<span class="dirBranchesHeader">Branches</span>"#
++            }
++            r#"</div></div>"# "\n"
+             r#"<div class="dirStats">"# "\n"
+-            for (dir, stats, lines_percent, lines_sev, funs_percent, funs_sev) in global.dirs.iter().map(|(d, s)| {
++            for (dir, stats, lines_percent, lines_sev, funs_percent, funs_sev, branches_percent, branches_sev) in global.dirs.iter().map(|(d, s)| {
+                 let lp = get_percentage(s.stats.covered_lines, s.stats.total_lines);
+                 let fp = get_percentage(s.stats.covered_funs, s.stats.total_funs);
+-                (d, s, lp, get_severity(&conf, lp), fp, get_fn_severity(&conf, fp))
++                let bp = get_percentage(s.stats.covered_branches, s.stats.total_branches);
++                (d, s, lp, get_severity(&conf, lp), fp, get_fn_severity(&conf, fp), bp, get_branch_severity(&conf, bp))
+             }) {
+                 r#"<div class="lineDir">"#
+                     r#"<span class="dirName"><a href=""# (dir) r#"/index.html">"# (dir) r#"</a></span>"#
+@@ -309,6 +353,10 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf) {
+                     r#"<span class="dirLinesRatio "# (lines_sev) r#"">"# (stats.stats.covered_lines) " / " (stats.stats.total_lines) r#"</span>"#
+                     r#"<span class="dirFunsPer "# (funs_sev) r#"">"# {(funs_percent):.1} r#"%</span>"#
+                     r#"<span class="dirFunsRatio "# (funs_sev) r#"">"# (stats.stats.covered_funs) " / " (stats.stats.total_funs) r#"</span>"#
++                    if branch_enabled {
++                        r#"<span class="dirBranchesPer "# (branches_sev) r#"">"# {(branches_percent):.1} r#"%</span>"#
++                        r#"<span class="dirBranchesRatio "# (branches_sev) r#"">"# (stats.stats.covered_branches) " / " (stats.stats.total_branches) r#"</span>"#
++                    }
+                 r#"</div>"# "\n"
+             }
+             r#"</div>"# "\n"
+@@ -322,11 +370,17 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf) {
+     }
+ 
+     for (dir_name, dir_stats) in global.dirs.iter() {
+-        gen_dir_index(dir_name, dir_stats, &conf, output);
++        gen_dir_index(dir_name, dir_stats, &conf, output, branch_enabled);
+     }
+ }
+ 
+-pub fn gen_dir_index(dir_name: &str, dir_stats: &HtmlDirStats, conf: &Config, output: &PathBuf) {
++pub fn gen_dir_index(
++    dir_name: &str,
++    dir_stats: &HtmlDirStats,
++    conf: &Config,
++    output: &PathBuf,
++    branch_enabled: bool,
++) {
+     let index = PathBuf::from(dir_name).join("index.html");
+     let output_file = output.join(&index);
+     create_parent(&output_file);
+@@ -346,8 +400,13 @@ pub fn gen_dir_index(dir_name: &str, dir_stats: &HtmlDirStats, conf: &Config, ou
+     let covered_lines_per =
+         get_percentage(dir_stats.stats.covered_lines, dir_stats.stats.total_lines);
+     let covered_funs_per = get_percentage(dir_stats.stats.covered_funs, dir_stats.stats.total_funs);
++    let covered_branches_per = get_percentage(
++        dir_stats.stats.covered_branches,
++        dir_stats.stats.total_branches,
++    );
+     let funs_sev = get_fn_severity(&conf, covered_funs_per);
+     let lines_sev = get_severity(&conf, covered_lines_per);
++    let branches_sev = get_branch_severity(&conf, covered_branches_per);
+     let out = fomat!(
+             r#"<!DOCTYPE html>"# "\n"
+             r#"<html lang="en-us">"# "\n"
+@@ -386,17 +445,34 @@ pub fn gen_dir_index(dir_name: &str, dir_stats: &HtmlDirStats, conf: &Config, ou
+             r#"<span class="funsPercentage "# (funs_sev) r#"">"#
+             {(covered_funs_per):.1}
+             r#" %</span></div>"# "\n"
++            if branch_enabled {
++                r#"<div class="statsRow">"#
++                r#"<span class="statsBranches">Branches</span><span class="branchesHit">"#
++                (dir_stats.stats.covered_branches)
++                r#"</span>"#
++                r#"<span class="branchesTotal">"#
++                (dir_stats.stats.total_branches)
++                r#"</span>"#
++                r#"<span class="branchesPercentage "# (branches_sev) r#"">"#
++                {(covered_branches_per):.1}
++                r#" %</span></div>"# "\n"
++            }
+             r#"</div>"# "\n"
+             r#"</div>"# "\n"
+             r#"<div class="dirStatsHeader"><div class="dirStatsLineHeader">"#
+             r#"<span class="dirNameHeader">Filename</span>"#
+             r#"<span class="dirLineCovHeader">Line Coverage</span>"#
+-            r#"<span class="dirFunsHeader">Functions</span></div></div>"# "\n"
++            r#"<span class="dirFunsHeader">Functions</span>"#
++            if branch_enabled {
++                r#"<span class="dirBranchesHeader">Branches</span>"#
++            }
++            r#"</div></div>"# "\n"
+             r#"<div class="dirStats">"# "\n"
+-            for (file_name, stats, lines_percent, lines_sev, funs_percent, funs_sev) in dir_stats.files.iter().map(|fs| {
++            for (file_name, stats, lines_percent, lines_sev, funs_percent, funs_sev, branches_percent, branches_sev) in dir_stats.files.iter().map(|fs| {
+                 let lp = get_percentage(fs.stats.covered_lines, fs.stats.total_lines);
+                 let fp = get_percentage(fs.stats.covered_funs, fs.stats.total_funs);
+-                (&fs.file_name, &fs.stats, lp, get_severity(conf, lp), fp, get_fn_severity(conf, fp))
++                let bp = get_percentage(fs.stats.covered_branches, fs.stats.total_branches);
++                (&fs.file_name, &fs.stats, lp, get_severity(conf, lp), fp, get_fn_severity(conf, fp), bp, get_branch_severity(conf, bp))
+             }) {
+                 r#"<div class="lineDir">"#
+                     r#"<span class="dirName"><a href=""# (file_name) r#".html">"# (file_name) r#"</a></span>"#
+@@ -405,6 +481,10 @@ pub fn gen_dir_index(dir_name: &str, dir_stats: &HtmlDirStats, conf: &Config, ou
+                     r#"<span class="dirLinesRatio "# (lines_sev) r#"">"# (stats.covered_lines) " / " (stats.total_lines) r#"</span>"#
+                     r#"<span class="dirFunsPer "# (funs_sev) r#"">"# {(funs_percent):.1} r#"%</span>"#
+                     r#"<span class="dirFunsRatio "# (funs_sev) r#"">"# (stats.covered_funs) " / " (stats.total_funs) r#"</span>"#
++                    if branch_enabled {
++                        r#"<span class="dirBranchesPer "# (branches_sev) r#"">"# {(branches_percent):.1} r#"%</span>"#
++                        r#"<span class="dirBranchesRatio "# (branches_sev) r#"">"# (stats.covered_branches) " / " (stats.total_branches) r#"</span>"#
++                    }
+                 r#"</div>"# "\n"
+             }
+             r#"</div>"# "\n"
+@@ -424,6 +504,7 @@ fn gen_html(
+     output: &PathBuf,
+     rel_path: &PathBuf,
+     global: Arc<Mutex<HtmlGlobalStats>>,
++    branch_enabled: bool,
+ ) {
+     if !rel_path.is_relative() {
+         return;
+@@ -464,9 +545,11 @@ fn gen_html(
+ 
+     let covered_lines_per = get_percentage(stats.covered_lines, stats.total_lines);
+     let covered_funs_per = get_percentage(stats.covered_funs, stats.total_funs);
++    let covered_branches_per = get_percentage(stats.covered_branches, stats.total_branches);
+ 
+     let funs_sev = get_fn_severity(&conf, covered_funs_per);
+     let lines_sev = get_severity(&conf, covered_lines_per);
++    let branches_sev = get_branch_severity(&conf, covered_branches_per);
+ 
+     let out = fomat!(
+             r#"<!DOCTYPE html>"# "\n"
+@@ -506,6 +589,18 @@ fn gen_html(
+             r#"<span class="funsPercentage "# (funs_sev) r#"">"#
+             {(covered_funs_per):.1}
+             r#" %</span></div>"# "\n"
++            if branch_enabled {
++                r#"<div class="statsRow">"#
++                r#"<span class="statsBranches">Branches</span><span class="branchesHit">"#
++                (stats.covered_branches)
++                r#"</span>"#
++                r#"<span class="branchesTotal">"#
++                (stats.total_branches)
++                r#"</span>"#
++                r#"<span class="branchesPercentage "# (branches_sev) r#"">"#
++                {(covered_branches_per):.1}
++                r#" %</span></div>"# "\n"
++            }
+             r#"</div>"# "\n"
+             r#"</div>"# "\n"
+             r#"<div class="sourceCode">"# "\n"
+@@ -542,6 +637,7 @@ pub fn consumer_html(
+     global: Arc<Mutex<HtmlGlobalStats>>,
+     output: PathBuf,
+     conf: Config,
++    branch_enabled: bool,
+ ) {
+     while let Ok(job) = receiver.recv() {
+         if job.is_none() {
+@@ -555,6 +651,7 @@ pub fn consumer_html(
+             &output,
+             &job.rel_path,
+             global.clone(),
++            branch_enabled,
+         );
+     }
+ }
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -483,7 +483,7 @@ fn main() {
+     } else if output_type == "covdir" {
+         output_covdir(iterator, output_path);
+     } else if output_type == "html" {
+-        output_html(iterator, output_path, num_threads);
++        output_html(iterator, output_path, num_threads, branch_enabled);
+     } else {
+         assert!(false, "{} is not a supported output type", output_type);
+     }
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -475,7 +475,12 @@ pub fn output_files(results: CovResultIter, output_file: Option<&str>) {
+     }
+ }
+ 
+-pub fn output_html(results: CovResultIter, output_dir: Option<&str>, num_threads: usize) {
++pub fn output_html(
++    results: CovResultIter,
++    output_dir: Option<&str>,
++    num_threads: usize,
++    branch_enabled: bool,
++) {
+     let output = if let Some(output_dir) = output_dir {
+         PathBuf::from(output_dir)
+     } else {
+@@ -505,7 +510,7 @@ pub fn output_html(results: CovResultIter, output_dir: Option<&str>, num_threads
+         let t = thread::Builder::new()
+             .name(format!("Consumer HTML {}", i))
+             .spawn(move || {
+-                html::consumer_html(receiver, stats, output, config);
++                html::consumer_html(receiver, stats, output, config, branch_enabled);
+             })
+             .unwrap();
+ 
+@@ -534,7 +539,7 @@ pub fn output_html(results: CovResultIter, output_dir: Option<&str>, num_threads
+ 
+     let global = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
+ 
+-    html::gen_index(global, config, &output);
++    html::gen_index(global, config, &output, branch_enabled);
+     html::write_static_files(output);
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>src/html.rs</Filename>
+<imports>use super::get_config;
+use super::get_stats;
+use super::HtmlStats;
+use super::Config;
+use super::CovResult;
+use std::collections::BTreeMap;</imports>
+<Rust>#[test]
+fn test_branch_coverage_in_html_report() {
+  let config = get_config();
+  let result = CovResult {
+    lines: BTreeMap::new(),
+    functions: BTreeMap::new(),
+    branches: BTreeMap::new(),
+  };
+  let stats = get_stats(&result);
+  let expected_total_branches = 0;
+  let expected_covered_branches = 0;
+  assert_eq!(stats.total_branches, expected_total_branches);
+  assert_eq!(stats.covered_branches, expected_covered_branches);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+   --> src/html.rs:695:16
+    |
+695 |     functions: BTreeMap::new(),
+    |                ^^^^^^^^^^^^^^^ expected struct `HashMap`, found struct `std::collections::BTreeMap`
+    |
+    = note: expected struct `HashMap<std::string::String, defs::Function, BuildHasherDefault<FxHasher>>`
+               found struct `std::collections::BTreeMap<_, _>`
+
+error: aborting due to previous error; 2 warnings emitted
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+fn get_severity(conf: &Config, rate: f64) -> &str
+
+pub fn get_config() -> Config
+
+fn gen_html(
+path: PathBuf,
+result: &CovResult,
+conf: &Config,
+output: &PathBuf,
+rel_path: &PathBuf,
+global: Arc<Mutex<HtmlGlobalStats>>,
+branch_enabled: bool) -> ()
+
+fn get_stats(result: &CovResult) -> HtmlStats
+
+pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf, branch_enabled: bool) -> ()
+
+fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stats: &HtmlStats) -> ()
+
+pub fn consumer_html(
+receiver: HtmlJobReceiver,
+global: Arc<Mutex<HtmlGlobalStats>>,
+output: PathBuf,
+conf: Config,
+branch_enabled: bool) -> ()
+
+pub fn gen_dir_index(
+dir_name: &str,
+dir_stats: &HtmlDirStats,
+conf: &Config,
+output: &PathBuf,
+branch_enabled: bool) -> ()
+
+fn main() -> ()
+
+pub fn output_files(results: CovResultIter, output_file: Option<&str>) -> ()
+
+pub fn output_html(
+results: CovResultIter,
+output_dir: Option<&str>,
+num_threads: usize,
+branch_enabled: bool) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

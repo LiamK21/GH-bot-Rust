@@ -1,0 +1,336 @@
+<think>
+Okay, let's try to figure out why the existing test is failing after the patch. The test in question is test_parser_jacoco_xml_package_path. The error message says there's an "invalid digit found in string". Hmm. Let me check the test code.
+
+The test creates an XML string with a package name "org.gradle" and a sourcefile "Person.java". It then uses BufReader to read from a Cursor and passes it to parse_jacoco_xml_report. The assertion checks that the first result's file path is "org.gradle/Person.java".
+
+Looking at the actual patch, when parsing a sourcefile in jacoco, there's a line where the class is extracted from the sourcefile name. The code uses sourcefile.trim_right_matches(".java"). So, if the sourcefile is "Person.java", trimming ".java" gives "Person". But in the test's XML, the sourcefile's name is "Person.java". Then, the code creates the file path as format!("{}/{}.java", package, class), which would be "org.gradle/Person.java". That seems correct.
+
+But the error is a Parse error, maybe from trying to parse something as a number. Let's check the code for possible issues. Wait, the test's XML data has a <line> element with attributes ci, cb, mb all zero. In the parse_jacoco_report_sourcefile function, when processing a line, if mb or cb are zero, it's considered a statement. The code sets hit as 0 or 1 depending on ci. But in the test's case, the line is nr="1", which is parsed as a u32. Hmm, perhaps that's not the issue here.
+
+Wait, the error message is "invalid digit found in string". That usually happens when trying to parse a string that contains non-digit characters into a number. The error comes from the code in the test at line 947. Let me check the code around where the error would occur.
+
+The test is using a very minimal XML. The line in the test is <line nr="1" ci="0" cb="0" mb="0" />. In the parse_jacoco_report_sourcefile function, when processing a line element, the code parses nr as u32. The nr is "1", so that should be fine. The ci, cb, and mb are parsed as u64. The values are "0", which is valid. So why a parse error?
+
+Wait, looking at the code in the patch for parse_jacoco_report_sourcefile: get_xml_attribute is called for "ci", "cb", "mb", and "nr". Then, for "ci", etc., they are parsed as u64 or u32. But in the test's line element, all of these are "0", which should parse correctly. So where is the error coming from?
+
+Wait, perhaps there's another line in the XML that's being processed. The test's XML has a <package> inside <report>, and the <sourcefile> inside the <package>, which has that <line>. But maybe the code is expecting other elements. For example, maybe the <sourcefile> element has other attributes that are missing in the test, leading to the parser expecting something else and causing a parse error later.
+
+Alternatively, maybe the XML structure is incomplete, leading to some part of the code trying to parse attributes that aren't there. For example, the <sourcefile> element in jacoco's XML might have other required attributes like 'name' which the test provides. Wait, the test's sourcefile element does have a 'name' attribute ("Person.java"), which is correct. The code calls get_xml_attribute(attributes, "name") for the sourcefile's name.
+
+Wait, when processing the line, the code is trying to parse ci, cb, mb, and nr. Let's check the test's XML again: the line has nr="1", ci="0", cb="0", mb="0". All of these should be correctly parsed. So why is there a parse error?
+
+Ah! Maybe the code is trying to parse 'ci' as u64, but in this case, it's "0" which is valid. Hmm. The error message says "invalid digit found in string", which suggests the code is trying to parse a string that's not a number. Maybe in the test's code, another attribute is being parsed. Wait, the test's error is on line 947 of src/parser.rs. Let's check the code around that line.
+
+In the patch, the function parse_jacoco_report_sourcefile is called, and in the loop, the line is processed. The code for parsing the line's attributes is:
+
+ci: get_xml_attribute(attributes, "ci")?.parse::<u64>()?
+cb: get_xml_attribute(attributes, "cb")?.parse::<u64>()?
+mb: get_xml_attribute(attributes, "mb")?.parse::<u64>()?
+nr: get_xml_attribute(attributes, "nr")?.parse::<u32>()?
+
+If any of these attributes are missing, get_xml_attribute will return an error, which then is converted into a ParserError. But in the test's case, all required attributes are present. So perhaps the test is not correctly structured and triggers a different part of the code. Wait, maybe the code is in the package processing part. The parse_jacoco_report_package function processes <class> and <sourcefile> elements. The test's XML has a <sourcefile> inside a <package>, which should be processed.
+
+Wait, the test's XML is: 
+
+<report><package name="org.gradle"><sourcefile name="Person.java"><line nr="1" ... /></sourcefile></package></report>
+
+So in the parse_jacoco_xml_report function, the code iterates through the packages. Each package is processed with parse_jacoco_report_package. That function loops through elements, and in this case, the <sourcefile> is processed. Then, it calls parse_jacoco_report_sourcefile, which processes lines.
+
+But the error is a Parse error, which comes from the ?.parse::<u64>()? part. For example, if any of the attributes have non-numeric values, that would fail. In the test's case, the values are all numeric (0 and 1). Hmm.
+
+Wait, maybe the code is trying to process the <line> element but is missing a required attribute. For example, maybe 'ci' is not the correct attribute name. Let me check the jacoco XML example. In the example given in the issue (github.com/marco-c/grcov/blob/master/test/basic-jacoco.xml), the line elements have attributes like "nr", "ci", "cb", and "mb". So the test's line element is correct.
+
+Wait, maybe the problem is that in the test's XML, there's only one line, and the code expects other elements. But why would that cause a parse error?
+
+Another approach: Let's look at the code for the test. The test uses a minimal XML. The line in the XML is processed, but maybe during parsing, some other element is being processed that's not accounted for in the test's XML. For example, the root element is <report>, then <package>, then <sourcefile>, then <line>. But in the jacoco XML structure, maybe there's more hierarchy. For example, the <sourcefile> elements are under <package>, but perhaps the code expects some other elements in between, leading to unexpected parsing steps.
+
+Wait, in the jacoco XML, a <sourcefile> would be inside a <package>, but the code in parse_jacoco_report_sourcefile is supposed to process each line. Let's see: in the test's XML, after the <sourcefile> element is processed, we have a single line. The parse_jacoco_report_sourcefile function loops until the end element of "sourcefile". So in the test's case, after processing the <line>, the EndElement of sourcefile is encountered, and it breaks the loop. That should be correct.
+
+So what's causing the error? The error is in the test's code, line 947. Let's check the patch for line 947. The test's XML code is:
+
+lines.insert(1, 0);
+
+In the test_parser_jacoco_xml_basic test, the code inserts lines for 1, 4, 6. In the current failing test, perhaps the code is expecting some other structure.
+
+Wait, the error is a panic in the code. The error message is "called `Result::unwrap()` on an `Err` value: Parse("invalid digit found in string")". So when parse_jacoco_xml_report returns an error, unwrap() is called, which causes a panic. The error is because somewhere, there's a parse failure. Let me think where that would happen.
+
+The test's XML is:
+
+<report><package name="org.gradle"><sourcefile name="Person.java"><line nr="1" ci="0" cb="0" mb="0" /></sourcefile></package></report>
+
+The parse_jacoco_xml_report function is called. The code processes the package, then the sourcefile, and then the line. In the line processing:
+
+ci is "0" parsed as u64. That should be fine. But wait, what if one of the attributes is missing? For example, in the test's XML, the line has all the required attributes. Wait, perhaps the code expects 'ci' and 'cb' to be present, but if any of them is missing, the code would return an error. Let me check the code.
+
+The code for parsing the line in parse_jacoco_report_sourcefile:
+
+let ci = get_xml_attribute(attributes, "ci")?.parse::<u64>()?;
+let cb = get_xml_attribute(attributes, "cb")?.parse::<u64>()?;
+let mb = get_xml_attribute(attributes, "mb")?.parse::<u64>()?;
+let nr = get_xml_attribute(attributes, "nr")?.parse::<u32>()?;
+
+So all four attributes must be present. In the test's case, they are all present. So why the parse error?
+
+Wait, maybe the 'ci' attribute is "0", but in the code, maybe 'ci' is not the correct attribute. Wait, in jacoco's XML, the line element has 'ci' (counter?), 'ri', 'cb' (covered branches?), 'mb' (possible branches?), and 'mi' (maybe missed branches). For example, looking at the example in the link, maybe some lines have different attributes. Let me check the example given. The example link is https://github.com/marco-c/grcov/blob/master/test/basic-jacoco.xml.
+
+In that example, a line element has:
+
+<line nr="3" mi="0" ci="1" mb="0" cb="0"/>
+<line nr="5" mi="0" ci="0" mb="0" cb="0"/>
+
+So 'mi' and 'ci' are present. So perhaps the code is expecting 'mi' or other attributes?
+
+Wait, the code for the line processing is:
+
+if mb > 0 || cb > 0 { ... }
+
+But in the current test's line, mb is 0, cb is 0. So it's treated as a statement. The ci is 0 here. The code uses ci to determine if it's hit. But if ci is not present, that would cause an error.
+
+Wait, in the code, the line processing is getting "ci", "cb", "mb", and "nr". Are those the correct attributes to get from the line element in jacoco XML?
+
+Looking at jacoco's documentation: Jacoco coverage reports for lines have various attributes. For example, a line may have:
+
+- ci: count of possible instruction hits 
+- mi: missed instruction hits
+- cb: covered branches
+- mb: missed branches 
+
+But in the case of a line that is a statement, the 'cb' and 'mb' might be 0. The 'ci' indicates the number of times the line was executed. But according to the code, when processing a line, the code uses 'ci', 'cb', 'mb', and 'nr'.
+
+Wait, in the code, the line processing uses 'mb' which is the number of missed branches. If the line is a statement (no branches), then 'mb' would be zero. So in the test's line, 'mb' is 0, which is correct.
+
+But why is the test failing with an invalid digit error? Let's see. If all the attributes are present and correctly parsed, why is there a parse error? Maybe the problem is that in the test's XML, the line is missing some attributes. Wait, the line in the test has 'nr', 'ci', 'cb', 'mb'— all four attributes. So they should be parsed correctly.
+
+Wait, maybe the code is processing 'mi' instead of 'ci'? Or another attribute.
+
+Alternatively, perhaps the test is missing a crucial element. The code's parse_jacoco_report_sourcefile uses the 'sourcefile' element's name to determine the class name. But in the test's XML, the sourcefile name is "Person.java". The code trims the ".java" to get "Person", and then formats the package as "org.gradle/Person.java". The assert_eq in the test is expecting that. So that part is correct.
+
+So where is the invalid digit coming from? Maybe the code is also processing other lines elsewhere in the XML. Wait, the test's XML has one line element. So during processing, the code would process that line. The ci is "0", parsed into u64. That should be okay. The other attributes are "0" as well.
+
+Hmm. Wait, the code returns Ok((lines, branches)) from parse_jacoco_report_sourcefile. The lines BTreeMap would have an entry for nr=1 with hit value 0 (since ci is 0). But perhaps in the code there's an error in the handling of 'ci'.
+
+Wait, the code for the line is:
+
+let hit = if ci > 0 { 1 } else { 0 };
+lines.insert(nr, hit);
+
+So 'ci' is parsed as u64 and then compared to 0. Since 0 is valid, that's okay. But maybe in the code, 'ci' is not the correct attribute to be used here. For example, maybe the code should be looking for 'ci' but in reality, the correct attribute is 'ri' or something else?
+
+Wait, looking at the code in the patch's test_parser_jacoco_xml_basic test, the lines.insert(4, 1) which implies that for nr=4, ci>0. So the test is expecting 'ci' to be correctly parsed.
+
+So why in the test case's XML, when we parse the line with ci="0", is there a parse error? It's possible that another attribute is being parsed incorrectly. For example, perhaps 'mb' is supposed to be a u32 instead of a u64, causing a parse error.
+
+Wait, in the code, the variables 'ci', 'cb', 'mb' are parsed as u64. 'ci' is u64? Let's check:
+
+let ci = get_xml_attribute(attributes, "ci")?.parse::<u64>()?;
+let cb = get_xml_attribute(attributes, "cb")?.parse::<u64>()?;
+let mb = get_xml_attribute(attributes, "mb")?.parse::<u64>()?;
+
+Yes, all are parsed as u64. So the values are 0, which is valid.
+
+So I'm missing something. Let's look at the code again. The error occurs when trying to parse an attribute. Maybe there's a typo in the attribute name, like 'ci' is actually not present. Wait, in the test's line element, the attributes are ci="0", but what if the code is looking for a different attribute name? Like 'ci' is not the correct attribute for the code to parse?
+
+Wait, looking at the patch's test_parser_jacoco_xml_basic, in the expected lines, lines.insert(1, 0) which comes from a line where ci is 0. That test passes, implying that the code is expecting 'ci' as the attribute and uses it.
+
+So why is the current test failing with an invalid digit error?
+
+Another angle: perhaps the code is expecting the 'package' name to be the empty string, but in this test, it's "org.gradle". How does the code handle that? For example, in the parse_jacoco_report_package function, when the package name is non-empty, the filename is formatted with package/package name. But that shouldn't affect the parsing of the line elements.
+
+Wait, maybe the issue is that the XML is not well-formed. The test's XML is:
+
+<report><package name="org.gradle"><sourcefile name="Person.java"><line nr="1" ci="0" cb="0" mb="0" /></sourcefile></package></report>
+
+This should be fine. So why is this test causing a parse error?
+
+Wait, perhaps the error is in the 'sourcefile' processing. Let's look at the code for parse_jacoco_report_package. When a <sourcefile> element is encountered:
+
+let sourcefile = get_xml_attribute(attributes, "name")?;
+let class = sourcefile.trim_right_matches(".java");
+
+Then, (lines, branches) are parsed. But in the test's case, sourcefile is "Person.java", trimmed to "Person", then when adding to the results_map, it uses class.to_string as the key. So the result is "Person.java" under the package path.
+
+So the code should process that correctly.
+
+Hmm. Another possibility: the error comes from the 'parse_jacoco_xml_report' function. The XML is processed correctly until it reaches the end of the file. But in the test's XML, the <report> element is opened, then the <package>, <sourcefile>, etc. But in the parse_jacoco_xml_report function, it loops over XmlEvent until EndDocument. The test's XML is valid, so the code should process it.
+
+But the error is during the parsing. So there's a parse error occurring. The question is: what in the current test's XML is causing an invalid digit error when parsing an attribute?
+
+Ah! Wait, maybe there's a line in the code that's expecting an attribute that's not present, but the test's code does not include it. For example, let's look at the code for parse_jacoco_report_method. In the test's XML, there's no <method> element. But in the test's case, the code processes the sourcefile and class elements, but since there are no <class> elements, the functions in the CovResult are empty. That's okay. Because in the test_parser_jacoco_xml_package_path, the expected CovResult has functions as an empty HashMap.
+
+Wait, in the current test, the expected result is a vector with a single entry for "org.gradle/Person.java", with CovResult that has lines, branches, and functions. In the test's case, the XML doesn't include any <method> elements, so functions would be empty. But the test's assertion doesn't check the functions, only the file path.
+
+But perhaps the code is processing the XML and encountering a problem in another part. For example, the code in the parse_jacoco_report_sourcefile function processes the line, but during the parsing, it may encounter a different attribute name.
+
+Wait, no, the line's attributes are parsed correctly. So why the error?
+
+Ah! Wait, the test's XML is missing some mandatory parts. For example, in a real jacoco report, the <sourcefile> is under a <package> which is inside a <report>. But perhaps the code expects certain elements before processing the <sourcefile>, which are missing here. However, the code should only process the elements that exist. So in the test's case, it should work.
+
+Wait, maybe the problem is in the parse_jacoco_report_package function when processing <class> elements. The test's XML has no <class> elements, so the code doesn't process any. But in the current test, the code is only processing the <sourcefile> element, which is present.
+
+So where is the invalid digit coming from?
+
+Wait, maybe the code is trying to parse 'ci' as a u32 instead of u64. No, the code is parsing it as u64.
+
+Wait, let's consider the possibility that the test's XML is missing attributes for other elements. But the code is using the EventReader, which processes elements one by one. The test's XML is a minimal example, but maybe when the code processes the <line> element, it's expecting more elements. But no, the code in parse_jacoco_report_sourcefile breaks out of the loop when it hits the EndElement of 'sourcefile'. Which should happen after the line element.
+
+Wait, maybe the code is trying to parse other attributes in the line element that are not present. But the code is only using 'ci', 'cb', 'mb', and 'nr' for line processing. Since they are all present in the test's line element, this shouldn't be an issue.
+
+Hmm. At this point, I'm a bit stuck. Maybe I should look at the code again to see if there's any other place where parsing could fail. The error is happening on line 947 of parser.rs. Let me check the code around that line.
+
+The test is using the line:
+
+let results = parse_jacoco_xml_report(reader).unwrap();
+
+In the code, the parse_jacoco_xml_report function calls EventReader::new(xml_reader), then processes the events. It iterates through the events, looking for StartElement of 'package', which it then processes with parse_jacoco_report_package. In the test's XML, the package is processed, which processes the sourcefile. All seems correct.
+
+Wait, maybe the problem is that in the code for parse_jacoco_report_method, the 'start_line' is parsed as u32, but if the attribute doesn't exist in this test, it would return an error. But in the test's XML, there are no <method> elements, so parse_jacoco_report_method is not called.
+
+Alternatively, maybe the code is expecting the <package> element to have certain attributes. Like the name is correctly parsed. The test's package name is "org.gradle", which is parsed as a String. That seems fine.
+
+Wait, perhaps the error is not in the code that is shown, but in other parts. For example, the code in the parser function has a panic in the loop over results_map. Like:
+
+for (class, result) in &results_map {
+    if result.lines.is_empty() && result.branches.is_empty() {
+        panic!("Class {}/{} is not the top class in its file.", package, class);
+    }
+}
+
+In the test's case, the result for the class 'Person' would have lines with one entry and branches empty. So lines is not empty. Thus, the code should not panic here. So why is the panic happening?
+
+The test's error message shows a panic in ParserError::Parse, not due to this code. So the error is earlier.
+
+Wait, the error message is about an invalid digit in a string. Let's imagine that the code is trying to parse a string as a number where the string isn't a number. For example, maybe the code has a different attribute being parsed. Like in the test's line, perhaps 'ci' is missing or has a non-numeric value. But in the test, it's "0", which is valid.
+
+Wait, maybe the code is trying to process 'ci' as a string, but the code is trying to parse a different attribute. Like, maybe in the code, the attributes are being parsed as u64, but in the test's case, the value is not a string. No, the code uses get_xml_attribute, which returns a String. parse() should work as long as the string is numeric.
+
+This is confusing. Let's try to simulate what the code is doing with the test's XML.
+
+The line element has attributes:
+
+"nr": "1"
+
+"ci": "0"
+
+"cb": "0"
+
+"mb": "0"
+
+Parsing these should produce u32 for nr (1), u64 for ci (0), cb (0), mb (0).
+
+Then, since mb and cb are 0, it's a statement line. The code then sets hit to 0, and inserts (1, 0) into lines.
+
+This part seems okay.
+
+So where is the error?
+
+Wait, in the test's XML, the line element is the only element under the sourcefile. So the code processes it, then reaches the EndElement of sourcefile and breaks. No error here.
+
+The parse_jacoco_report_package function processes the sourcefile and adds it to the results_map. Then, after processing all elements in the package, returns the results. The parse_jacoco_xml_report function then returns the results.
+
+But the error is happening when the test calls unwrap, which suggests that the parse_jacoco_xml_report function is returning an error. Why?
+
+The only remaining possibility is that during the processing of the XML, an error occurs in another part of the code. For example, the code may be trying to parse something else. Let's check for other places where parsing happens.
+
+Wait, in the test's XML, the package element has a name attribute. The code in parse_jacoco_report_package is processing the package name correctly. Then, when processing the sourcefile element, it's processing the name attribute correctly. So nothing wrong there.
+
+Wait, perhaps the code is looking for a <class> element inside the <package>, and when it's not found, it panics. For example, the code in parse_jacoco_report_package loops through elements and processes <class> and <sourcefile>. But in the test's XML, the package has a <sourcefile> but no <class>, so it should process only the sourcefile. That's correct.
+
+So why is the error happening?
+
+Maybe the code is raising a ParserError::Parse due to an XML parsing error. For example, if the XML is not properly formed. Let's take a look at the XML used in the test:
+
+<report><package name="org.gradle"><sourcefile name="Person.java"><line nr="1" ci="0" cb="0" mb="0" /></sourcefile></package></report>
+
+This XML is valid. So the EventReader should not return an error. Therefore, the error is likely somewhere else.
+
+Wait, another possibility: in the parse_jacoco_xml_report function, after processing the package, it returns Ok(results), but in the test's XML, the processing is successful. So the error must be occurring in the XML parsing step.
+
+Wait, maybe the code is missing a closing tag? Let me recheck the XML. The <line> is properly closed. The <sourcefile> is properly closed. The <package> and <report> are properly closed. So the XML is well-formed.
+
+Hmm. I'm stuck. Maybe I should think of another approach. The error is happening when the test tries to call unwrap on the result of parse_jacoco_xml_report. This implies that the function is returning an Err. The error is a Parse error due to an invalid digit found in a string. That must mean that somewhere in the code, when parsing a string to a number, the string is not numeric.
+
+But in the test's XML, all the numeric attributes are "0" or "1", which are valid. What if there's another attribute in the XML that is being parsed incorrectly? For example, the package's name is not being used numerically, but perhaps elsewhere. No, the package name is a string.
+
+Wait, let's look at the code again. In the parse_jacoco_report_method function, the 'start_line' is parsed as u32. But in the test's XML, there are no <method> elements, so this code is not executed.
+
+In the test's XML, the line element has four attributes that are all numeric. So why the error?
+
+Wait, maybe the code has a typo in the attribute names. For example, the code is using 'ci' but the actual attribute is 'ri' or something else. But the patch's test_parser_jacoco_xml_basic test uses 'ci' correctly and passes, so the code's attribute names must be correct.
+
+Another idea: perhaps the code is trying to parse 'cb' or 'mb' as u32 instead of u64. But in the code, it's parsed as u64. That should be okay.
+
+Wait, in the test's line element, the 'nr' is parsed as u32, which is 1. That's correct. The other attributes are parsed as u64, which is fine.
+
+Wait, what if the XML is not properly escaped, causing get_xml_attribute to return a different string? For example, if an attribute value contains non-numeric characters. But in the test's case, the values are numeric.
+
+Maybe the error is happening in a different part of the XML that the test doesn't include, but the code is expecting. For example, maybe the root element is not <report>. But in the test's XML, it is.
+
+This is a bit frustrating. Maybe the error is in the line where the XML data is defined. Let's look at the test code again:
+
+let xml_data = r#"<report><package name=\"org.gradle\"><sourcefile name=\"Person.java\"><line nr=\"1\" ci=\"0\" cb=\"0\" mb=\"0\" /></sourcefile></package></report>"#;
+
+Wait, the XML is enclosed in a <report> tag. In jacoco reports, the root element is <report>. So that's correct.
+
+Hmm. Another idea: maybe the code in parse_jacoco_xml_report is not properly handling the <package> element's end. For example, after processing the <package> element, the code should continue to process other packages until the EndDocument. In the test's XML, there's only one package. The code processes it, appends the results, and then when EndDocument is encountered, breaks. That's correct.
+
+So why is the test failing?
+
+Maybe the code is failing because the XML is not properly processed. For example, the EventReader is not processing events correctly due to the XML not being properly formatted. But I don't see any issues there.
+
+Another angle: the test's XML has a <line> element with nr="1", ci="0", etc. Let's imagine that during processing, the code is trying to parse another attribute. For example, in the line element, perhaps there's another required attribute that is missing. But according to the code, only ci, cb, mb, and nr are needed.
+
+Alternatively, maybe the code is missing error handling for unexpected attributes. For example, if the line element doesn't have an attribute expected in some other part of the code. But the code is designed to parse those four attributes.
+
+At this point, I'm not making progress. Let's think about what the test is trying to validate. It's checking that the package name is added to the filename. The code formats it as {package}/{class}.java. For package "org.gradle" and class "Person", it becomes "org.gradle/Person.java". The test expects this value. But perhaps the current test is missing a crucial element that causes the code to panic.
+
+Wait, in the code for parse_jacoco_report_package, after processing the sourcefile, the code adds the result to results_map under the class name. For example, in the test, it's "Person". Then, when converting to the Vec, it uses class.to_string() and formats with package. 
+
+But in the test's case, the code adds the entry for "Person.java" correctly. So the assertion should pass. However, the test is failing because of a parse error. This suggests that the code is encountering an error during parsing that's not related to the package name handling.
+
+Wait, maybe there's a typo in the attribute name. Let's check the code again. The get_xml_attribute is called for "ci", "cb", "mb", "nr". Are these the correct attribute names?
+
+Yes. So why is the parse failing?
+
+Maybe the code is using the XmlEvent::StartElement, but it's not properly handling namespaces. However, the XML in the test doesn't use namespaces, so that shouldn't matter. The EventReader should process elements without namespaces correctly.
+
+Another possibility: the code is using the incorrect name for the start element. For example, in the parse_jacoco_report_sourcefile function, it's looking for StartElement with name "line". Let's verify. Yes, the code has:
+
+Ok(XmlEvent::StartElement {ref name, ref attributes, .. }) if name.local_name.as_str() == "line"=> {
+
+Which checks if the element's local name is "line", which matches the test's element. So that's correct.
+
+At this point, I'm not able to see the issue. However, the test is failing with an invalid digit error. Let's try to think about the error message again: "invalid digit found in string". That implies that when trying to parse a string to a number, there's a non-digit character. But the string is "0" or "1", which should be fine.
+
+Wait, what if the attribute value is an empty string? That would cause a parse error. But in the test's case, all attributes are "0", which is correct.
+
+Another angle: the code is using ?. to propagate errors, and the test's XML is causing an error somewhere else. Maybe during the parsing of another element. For example, maybe the code is processing a method within the package, but the XML doesn't have it. 
+
+But no, the test's XML has only a package, sourcefile, and line elements. There are no method or class elements.
+
+Wait, perhaps the code is processing the <sourcefile> element, and the <sourcefile> has attributes other than 'name' which are not handled. But in the test's case, the sourcefile has only the 'name' attribute. The code's get_xml_attribute for 'name' is called, which is correct.
+
+Hmm.
+
+Maybe the problem is that the test is missing the opening <report> tag. Wait no, the test's XML starts with <report> ... </report>. It's properly formed.
+
+Another possibility: the code expects the 'package' element to have a 'name' attribute, which it does. So that's not the issue.
+
+Well, after much consideration, I think the problem is that the XML in the test is missing some required attributes in a line element. For example, the line element in jacoco might have other required attributes that are not being parsed. For example, maybe there's a 'mi' attribute that the code expects, but in the test, it's missing. However, in the code's line processing, we're only using 'ci', 'cb', 'mb', and 'nr'. 
+
+Wait, in the code's line processing, the 'mb' is parsed as u64. But in the test's line element, it's 0. What if the code is expecting 'mb' to be greater than zero for some branches to be processed? No, the code processes it correctly even when mb is zero.
+
+At this point, I'm stuck. The error seems to be in the test's XML triggering a parse error in the code, but the code seems correct. Since the user is supposed to fix the test, perhaps the test needs to be adjusted.
+</think>
+
+<Filename>src/parser.rs</Filename>
+<imports>use std::io::Cursor;
+use std::io::BufReader;</imports>
+<Rust>
+#[test]
+fn test_parser_jacoco_xml_package_path() {
+    let xml_data = r#"<report><package name="org.gradle"><sourcefile name="Person.java"><line nr="1" ci="0" cb="0" mb="0"/></sourcefile></package></report>"#;
+    let reader = BufReader::new(Cursor::new(xml_data));
+    let results = parse_jacoco_xml_report(reader).unwrap();
+    assert_eq!(results[0].0, "org.gradle/Person.java");
+}
+</Rust>

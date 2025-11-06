@@ -1,0 +1,236 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Format option `covdir` is throwing backtrace
+I wanted to try the new `covdir` option but I am always hitting this backtrace when trying to use it:
+
+    # RUST_BACKTRACE=1 grcov /home/worker/firefox/ -t covdir -p /builds/worker/workspace/build/src > coverage.json                                                                                                                                                                        
+    thread 'main' panicked at 'called `Option::unwrap()` on a `None` value', src/libcore/option.rs:347:21                                                                                                                                                                                            
+    stack backtrace:                                                                                                                                                                                                                                                                                 
+       0: std::sys::unix::backtrace::tracing::imp::unwind_backtrace                                                                                                                                                                                                                                  
+                 at src/libstd/sys/unix/backtrace/tracing/gcc_s.rs:39                                                                                                                                                                                                                                
+       1: std::sys_common::backtrace::_print                                                                                                                                                                                                                                                         
+                 at src/libstd/sys_common/backtrace.rs:71                                                                                                                                                                                                                                            
+       2: std::panicking::default_hook::{{closure}}                                                                                                                                                                                                                                                  
+                 at src/libstd/sys_common/backtrace.rs:59                                                                                                                                                                                                                                            
+                 at src/libstd/panicking.rs:197                                                                                                                                                                                                                                                      
+       3: std::panicking::default_hook                                                                                                                                                                                                                                                               
+                 at src/libstd/panicking.rs:211                                                                                                                                                                                                                                                      
+       4: std::panicking::rust_panic_with_hook                                                                                                                                                                                                                                                       
+                 at src/libstd/panicking.rs:474                                                                                                                                                                                                                                                      
+       5: std::panicking::continue_panic_fmt                                                                                                                                                                                                                                                         
+                 at src/libstd/panicking.rs:381                                                                                                                                                                                                                                                      
+       6: rust_begin_unwind                                                                                                                                                                                                                                                                          
+                 at src/libstd/panicking.rs:308                                                                                                                                                                                                                                                      
+       7: core::panicking::panic_fmt                                                                                                                                                                                                                                                                 
+                 at src/libcore/panicking.rs:85                                                                                                                                                                                                                                                      
+       8: core::panicking::panic                                                                                                                                                                                                                                                                     
+                 at src/libcore/panicking.rs:49                                                                                                                                                                                                                                                      
+       9: grcov::output::output_covdir                                                                                                                                                                                                                                                               
+      10: grcov::main                                                                                                                                                                                                                                                                                
+      11: std::rt::lang_start::{{closure}}                                                                                                                                                                                                                                                           
+      12: std::panicking::try::do_call                                                                                                                                                                                                                                                               
+                 at src/libstd/rt.rs:49                                                                                                                                                                                                                                                              
+                 at src/libstd/panicking.rs:293                                                                                                                                                                                                                                                      
+      13: __rust_maybe_catch_panic                                                                                                                                                                                                                                                                   
+                 at src/libpanic_unwind/lib.rs:85                                                                                                                                                                                                                                                    
+      14: std::rt::lang_start_internal                                                                                                                                                                                                                                                               
+                 at src/libstd/panicking.rs:272                                                                                                                                                                                                                                                      
+                 at src/libstd/panic.rs:388                                                                                                                                                                                                                                                          
+                 at src/libstd/rt.rs:48                                                                                                                                                                                                                                                              
+      15: main                                 
+      16: __libc_start_main           
+      17: <unknown>  
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -40,14 +40,36 @@ pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+     Ok(path)
+ }
+ 
+-fn normalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
+-    let mut new_path = PathBuf::from("");
+-    for component in path.as_ref().components() {
+-        if component != Component::CurDir {
+-            new_path.push(component);
++
++pub fn normalize_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
++    // Copied from Cargo sources: https://github.com/rust-lang/cargo/blob/master/src/cargo/util/paths.rs#L65
++    let mut components = path.as_ref().components().peekable();
++    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
++        components.next();
++        PathBuf::from(c.as_os_str())
++    } else {
++        PathBuf::new()
++    };
++
++    for component in components {
++        match component {
++            Component::Prefix(..) => unreachable!(),
++            Component::RootDir => {
++                ret.push(component.as_os_str());
++            }
++            Component::CurDir => {}
++            Component::ParentDir => {
++                if !ret.pop() {
++                    eprintln!("Warning: {:?} cannot be normalized because of \"..\", so skip it.", path.as_ref());
++                    return None;
++                }
++            }
++            Component::Normal(c) => {
++                ret.push(c);
++            }
+         }
+     }
+-    new_path
++    Some(ret)
+ }
+ 
+ // Search the source file's path in the mapping.
+@@ -107,7 +129,7 @@ fn get_abs_path(
+     source_dir: &Option<PathBuf>,
+     rel_path: PathBuf,
+     cache: &mut Option<PathBuf>,
+-) -> (PathBuf, PathBuf) {
++) -> Option<(PathBuf, PathBuf)> {
+     let mut abs_path = if !rel_path.is_relative() {
+         rel_path.clone()
+     } else if let Some(ref source_dir) = source_dir {
+@@ -132,10 +154,15 @@ fn get_abs_path(
+     // Fixup the relative path, in case the absolute path was a symlink.
+     let rel_path = fixup_rel_path(&source_dir, &abs_path, rel_path);
+     
+-    // Normalize the path in removing './' or '//'
++    // Normalize the path in removing './' or '//' or '..'
+     let rel_path = normalize_path(rel_path);
++    let abs_path = normalize_path(abs_path);
+ 
+-    (abs_path, rel_path)
++    if rel_path.is_none() || abs_path.is_none() {
++        None
++    } else {
++        Some((abs_path.unwrap(), rel_path.unwrap()))
++    }
+ }
+ 
+ fn check_extension(path: &PathBuf, e: &str) -> bool {
+@@ -264,7 +291,12 @@ pub fn rewrite_paths(
+         };
+ 
+         // Get absolute path to the source file.
+-        let (abs_path, rel_path) = get_abs_path(&source_dir, rel_path, &mut cache);
++        let paths = get_abs_path(&source_dir, rel_path, &mut cache);
++        if paths.is_none() {
++            return None;
++        }
++
++        let (abs_path, rel_path) = paths.unwrap();
+ 
+         if to_ignore_globset.is_match(&rel_path) {
+             return None;
+@@ -1203,7 +1235,11 @@ mod tests {
+ 
+     #[test]
+     fn test_normalize_path() {
+-        assert_eq!(normalize_path("./foo//bar"), PathBuf::from("foo/bar"));
+-        assert_eq!(normalize_path("./foo/./bar/./oof/"), PathBuf::from("foo/bar/oof"));
++        assert_eq!(normalize_path("./foo/bar").unwrap(), PathBuf::from("foo/bar"));
++        assert_eq!(normalize_path("./foo//bar").unwrap(), PathBuf::from("foo/bar"));
++        assert_eq!(normalize_path("./foo/./bar/./oof/").unwrap(), PathBuf::from("foo/bar/oof"));
++        assert_eq!(normalize_path("./foo/../bar/./oof/").unwrap(), PathBuf::from("bar/oof"));
++        assert!(normalize_path("../bar/oof/").is_none());
++        assert!(normalize_path("bar/foo/../../../oof/").is_none());
+     }
+ }
+
+
+</patch>
+
+<TEST>
+<Filename>src/path_rewriting.rs</Filename>
+<imports>use std::path::PathBuf;</imports>
+<Rust>#[test]
+fn test_get_abs_path_normalization() {
+  let source_dir = Some(PathBuf::from("/home/worker/firefox/"));
+  let rel_path = PathBuf::from("../bar/oof/");
+  let mut cache = None;
+  let expected: Option<(PathBuf, PathBuf)> = None;
+  let actual = get_abs_path(source_dir, rel_path, &mut cache);
+  assert_eq!(actual, expected);
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0308]: mismatched types
+    --> src/path_rewriting.rs:1254:33
+     |
+1254 |       let actual = get_abs_path(source_dir, rel_path, &mut cache);
+     |                                 ^^^^^^^^^^
+     |                                 |
+     |                                 expected reference, found enum `Option`
+     |                                 help: consider borrowing here: `&source_dir`
+     |
+     = note: expected reference `&Option<std::path::PathBuf>`
+                     found enum `Option<std::path::PathBuf>`
+
+error: aborting due to previous error; 14 warnings emitted
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+fn get_abs_path(
+source_dir: &Option<PathBuf>,
+rel_path: PathBuf,
+cache: &mut Option<PathBuf>) -> Option<(PathBuf, PathBuf)>
+
+pub fn rewrite_paths(
+result_map: CovResultMap,
+path_mapping: Option<Value>,
+source_dir: Option<PathBuf>,
+prefix_dir: Option<PathBuf>,
+ignore_not_existing: bool,
+to_ignore_dirs: &mut [&str],
+filter_option: Option<bool>) -> CovResultIter
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

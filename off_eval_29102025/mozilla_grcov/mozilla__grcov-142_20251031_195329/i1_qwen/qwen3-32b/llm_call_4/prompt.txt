@@ -1,0 +1,386 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Actually "produce" and "consume" JaCoCo reports
+We have support for parsing JaCoCo coverage reports now, but we are not retrieving them from ZIP files/directories to actually parse them.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -26,10 +26,12 @@ pub struct GCOVResult {
+     pub branch_number: libc::uint32_t,
+ }
+ 
+-#[derive(Debug, PartialEq)]
++#[derive(Debug, PartialEq, Copy, Clone)]
++#[allow(non_camel_case_types)]
+ pub enum ItemFormat {
+     GCNO,
+     INFO,
++    JACOCO_XML,
+ }
+ 
+ #[derive(Debug)]
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -210,20 +210,18 @@ pub fn consumer(
+                     }
+                 }
+             }
+-            ItemFormat::INFO => match work_item.item {
+-                ItemType::Path(info_path) => {
+-                    let f = File::open(&info_path).expect("Failed to open lcov file");
+-                    let file = BufReader::new(&f);
+-                    try_parse!(parse_lcov(file, branch_enabled), work_item.name)
+-                }
+-                ItemType::Content(info_content) => {
+-                    let buffer = BufReader::new(Cursor::new(info_content));
+-                    try_parse!(parse_lcov(buffer, branch_enabled), work_item.name)
+-                }
+-                ItemType::Buffers(_) => {
+-                    panic!("Invalid content type");
++            ItemFormat::INFO | ItemFormat::JACOCO_XML => {
++                if let ItemType::Content(content) = work_item.item {
++                    let buffer = BufReader::new(Cursor::new(content));
++                    if work_item.format == ItemFormat::INFO {
++                        try_parse!(parse_lcov(buffer, branch_enabled), work_item.name)
++                    } else {
++                        try_parse!(parse_jacoco_xml_report(buffer), work_item.name)
++                    }
++                } else {
++                    panic!("Invalid content type")
+                 }
+-            },
++            }
+         };
+ 
+         add_results(new_results, result_map, source_dir);
+
+diff --git a/src/producer.rs b/src/producer.rs
+--- a/src/producer.rs
++++ b/src/producer.rs
+@@ -58,6 +58,7 @@ impl Archive {
+         gcno_stem_archives: &RefCell<HashMap<GCNOStem, &'a Archive>>,
+         gcda_stem_archives: &RefCell<HashMap<String, Vec<&'a Archive>>>,
+         infos: &RefCell<HashMap<String, Vec<&'a Archive>>>,
++        xmls: &RefCell<HashMap<String, Vec<&'a Archive>>>,
+         linked_files_maps: &RefCell<HashMap<String, &'a Archive>>,
+         is_llvm: bool,
+     ) {
+@@ -88,6 +89,10 @@ impl Archive {
+                     let filename = path.to_str().unwrap().to_string();
+                     self.insert_vec(filename, infos);
+                 }
++                "xml" => {
++                    let filename = path.to_str().unwrap().to_string();
++                    self.insert_vec(filename, xmls);
++                }
+                 "json" => {
+                     let filename = path.file_name().unwrap();
+                     if filename == "linked-files-map.json" {
+@@ -120,6 +125,7 @@ impl Archive {
+         gcno_stem_archives: &RefCell<HashMap<GCNOStem, &'a Archive>>,
+         gcda_stem_archives: &RefCell<HashMap<String, Vec<&'a Archive>>>,
+         infos: &RefCell<HashMap<String, Vec<&'a Archive>>>,
++        xmls: &RefCell<HashMap<String, Vec<&'a Archive>>>,
+         linked_files_maps: &RefCell<HashMap<String, &'a Archive>>,
+         is_llvm: bool,
+     ) {
+@@ -135,6 +141,7 @@ impl Archive {
+                         gcno_stem_archives,
+                         gcda_stem_archives,
+                         infos,
++                        xmls,
+                         linked_files_maps,
+                         is_llvm,
+                     );
+@@ -152,6 +159,7 @@ impl Archive {
+                             gcno_stem_archives,
+                             gcda_stem_archives,
+                             infos,
++                            xmls,
+                             linked_files_maps,
+                             is_llvm,
+                         );
+@@ -334,13 +342,17 @@ fn gcno_gcda_producer(
+     }
+ }
+ 
+-pub fn info_producer(infos: HashMap<String, Vec<&Archive>>, queue: &WorkQueue) {
+-    for (name, archives) in infos.iter() {
++fn file_content_producer(
++    files: HashMap<String, Vec<&Archive>>,
++    queue: &WorkQueue,
++    item_format: ItemFormat,
++) {
++    for (name, archives) in files.iter() {
+         for archive in archives {
+             let mut buffer = Vec::new();
+             archive.read_in_buffer(name, &mut buffer);
+             queue.push(Some(WorkItem {
+-                format: ItemFormat::INFO,
++                format: item_format,
+                 item: ItemType::Content(buffer),
+                 name: archive.get_name().to_string(),
+             }));
+@@ -398,6 +410,7 @@ pub fn producer(
+     let gcno_stems_archives: RefCell<HashMap<GCNOStem, &Archive>> = RefCell::new(HashMap::new());
+     let gcda_stems_archives: RefCell<HashMap<String, Vec<&Archive>>> = RefCell::new(HashMap::new());
+     let infos: RefCell<HashMap<String, Vec<&Archive>>> = RefCell::new(HashMap::new());
++    let xmls: RefCell<HashMap<String, Vec<&Archive>>> = RefCell::new(HashMap::new());
+     let linked_files_maps: RefCell<HashMap<String, &Archive>> = RefCell::new(HashMap::new());
+ 
+     for archive in archives.iter_mut() {
+@@ -405,16 +418,21 @@ pub fn producer(
+             &gcno_stems_archives,
+             &gcda_stems_archives,
+             &infos,
++            &xmls,
+             &linked_files_maps,
+             is_llvm,
+         );
+     }
+ 
+-    if gcno_stems_archives.borrow().is_empty() {
+-        assert!(!infos.borrow().is_empty());
+-    }
++    assert!(
++        !(gcno_stems_archives.borrow().is_empty()
++            && infos.borrow().is_empty()
++            && xmls.borrow().is_empty()),
++        "No input files found"
++    );
+ 
+-    info_producer(infos.into_inner(), queue);
++    file_content_producer(infos.into_inner(), queue, ItemFormat::INFO);
++    file_content_producer(xmls.into_inner(), queue, ItemFormat::JACOCO_XML);
+     gcno_gcda_producer(
+         tmp_dir,
+         gcno_stems_archives.into_inner(),
+@@ -582,6 +600,30 @@ mod tests {
+                 false,
+             ),
+             (ItemFormat::GCNO, false, "llvm/file_1", true),
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/basic-jacoco.xml",
++                false,
++            ),
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/inner-classes.xml",
++                false,
++            ),
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/multiple-top-level-classes.xml",
++                false,
++            ),
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/full-junit4-report-multiple-top-level-classes.xml",
++                false,
++            ),
+         ];
+ 
+         check_produced(tmp_path, &queue, expected);
+@@ -916,6 +958,82 @@ mod tests {
+         check_produced(tmp_path, &queue, expected);
+     }
+ 
++    // Test extracting jacoco report XML files.
++    #[test]
++    fn test_zip_producer_jacoco_xml_files() {
++        let queue: Arc<WorkQueue> = Arc::new(MsQueue::new());
++
++        let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
++        let tmp_path = tmp_dir.path().to_owned();
++        producer(
++            &tmp_path,
++            &[
++                "test/jacoco1.zip".to_string(),
++                "test/jacoco2.zip".to_string(),
++            ],
++            &queue,
++            false,
++            false,
++        );
++
++        let expected = vec![
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/basic-jacoco.xml",
++                true,
++            ),
++            (ItemFormat::JACOCO_XML, false, "inner-classes.xml", true),
++        ];
++
++        check_produced(tmp_path, &queue, expected);
++    }
++
++    // Test extracting both jacoco xml and info files.
++    #[test]
++    fn test_zip_producer_both_info_and_jacoco_xml() {
++        let queue: Arc<WorkQueue> = Arc::new(MsQueue::new());
++
++        let tmp_dir = TempDir::new("grcov").expect("Failed to create temporary directory");
++        let tmp_path = tmp_dir.path().to_owned();
++        producer(
++            &tmp_path,
++            &[
++                "test/jacoco1.zip".to_string(),
++                "test/jacoco2.zip".to_string(),
++                "test/info1.zip".to_string(),
++                "test/info2.zip".to_string(),
++            ],
++            &queue,
++            false,
++            false,
++        );
++
++        let expected = vec![
++            (
++                ItemFormat::JACOCO_XML,
++                false,
++                "jacoco/basic-jacoco.xml",
++                true,
++            ),
++            (ItemFormat::JACOCO_XML, false, "inner-classes.xml", true),
++            (ItemFormat::INFO, false, "1494603967-2977-2_0.info", true),
++            (ItemFormat::INFO, false, "1494603967-2977-3_0.info", true),
++            (ItemFormat::INFO, false, "1494603967-2977-4_0.info", true),
++            (ItemFormat::INFO, false, "1494603968-2977-5_0.info", true),
++            (ItemFormat::INFO, false, "1494603972-2977-6_0.info", true),
++            (ItemFormat::INFO, false, "1494603973-2977-7_0.info", true),
++            (ItemFormat::INFO, false, "1494603967-2977-2_1.info", true),
++            (ItemFormat::INFO, false, "1494603967-2977-3_1.info", true),
++            (ItemFormat::INFO, false, "1494603967-2977-4_1.info", true),
++            (ItemFormat::INFO, false, "1494603968-2977-5_1.info", true),
++            (ItemFormat::INFO, false, "1494603972-2977-6_1.info", true),
++            (ItemFormat::INFO, false, "1494603973-2977-7_1.info", true),
++        ];
++
++        check_produced(tmp_path, &queue, expected);
++    }
++
+     // Test extracting both info and gcno/gcda files.
+     #[test]
+     fn test_zip_producer_both_info_and_gcnogcda_files() {
+
+
+</patch>
+
+<TEST>
+<Filename>src/lib.rs</Filename>
+<imports>use std::path::PathBuf;
+use crossbeam_channel::MsQueue;
+use crate::defs::{ItemFormat, ItemType, WorkItem};</imports>
+<Rust>#[test]
+fn test_consumer_jacoco_xml_work_item() {
+    let working_dir = PathBuf::from("/");
+    let source_dir = Some(PathBuf::from(""));
+    let result_map = Mutex::new(std::collections::HashMap::new());
+    let queue = MsQueue::new();
+
+    let xml_content = b"<?xml version='1.0' encoding='UTF-8'?><coverage><class name='Test'/></coverage>";
+    let work_item = WorkItem {
+        format: ItemFormat::JACOCO_XML,
+        item: ItemType::Content(xml_content.to_vec()),
+        name: "test.xml".to_string(),
+    };
+
+    queue.send(work_item).expect("Failed to send work item");
+
+    consumer(
+        &working_dir,
+        &source_dir,
+        &result_map,
+        &queue,
+        false,
+        false,
+    );
+}
+</Rust>
+</TEST>
+
+<output>
+error[E0432]: unresolved import `crossbeam_channel`
+   --> src/lib.rs:238:9
+    |
+238 |     use crossbeam_channel::MsQueue;
+    |         ^^^^^^^^^^^^^^^^^ maybe a missing crate `crossbeam_channel`?
+
+error: aborting due to previous error; 7 warnings emitted
+
+error: build failed
+</output>
+
+Function signatures
+<Signatures>
+pub fn consumer(
+working_dir: &PathBuf,
+source_dir: &Option<PathBuf>,
+result_map: &SyncCovResultMap,
+queue: &WorkQueue,
+is_llvm: bool,
+branch_enabled: bool) -> ()
+
+fn gcno_gcda_producer(
+tmp_dir: &Path,
+gcno_stem_archives: HashMap<GCNOStem, &Archive>,
+gcda_stem_archives: HashMap<String, Vec<&Archive>>,
+queue: &WorkQueue,
+ignore_orphan_gcno: bool) -> ()
+
+pub fn producer(
+tmp_dir: &Path,
+paths: &[String],
+queue: &WorkQueue,
+ignore_orphan_gcno: bool,
+is_llvm: bool) -> Option<Vec<u8>>
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+A unit test has already been created for this PR and can be found alongside the filename and the imports used inside the <TEST> block.
+It currently fails on codebase after the patch, which the errors in the <output> block.
+Your task is to:
+1. Identify and understand the errors introduced by the unit test.
+2. Update the unit test in the <TEST> block in order for it to fail on the code before the patch, and pass after, hence verifying that the patch resolves the issue.
+3. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+4. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+5. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

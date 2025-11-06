@@ -1,0 +1,546 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Support coverage format used by FuzzManager
+The server-side structure can be described by the following recursive definition:
+
+pathObject
+- int: linesTotal
+- int: linesCovered
+- int: linesMissed
+- float: coveragePercent
+- dict(name -> pathObject): children iff pathObject is a directory
+- list(int): coverage iff pathObject is a file
+- string: name
+
+The coverage property is a list where each index represents the respective line in the file, starting with line 0 as the first line. If the value at a certain index is null, that means the line is not coverable. If the value is a positive integer or zero, then the value indicates how often the line has been covered.
+
+Fields linesMissed and coveragePercent are redundant but we can save these calculations by just doing them once and storing the results, rather than having to make all of the calculations in the client on every display.
+
+The name field is also redundant because it is identical to the key in the dict pointing to this pathObject, but it greatly helps the UI to have this property available.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/covdir.rs b/src/covdir.rs
+--- a/src/covdir.rs
++++ b/src/covdir.rs
+@@ -0,0 +1,119 @@
++use serde_json::map::Map;
++use std::collections::BTreeMap;
++
++pub use crate::defs::*;
++
++impl CDStats {
++
++    pub fn new(total: usize, covered: usize) -> Self {
++        let missed = total - covered;
++        Self {
++            total,
++            covered,
++            missed,
++            percent: Self::get_percent(covered, total),
++        }
++    }
++
++    pub fn add(&mut self, other: &Self) {
++        // Add stats to self without recomputing the percentage because it's time consuming.
++        // So once all the stats are merged into one for a directory
++        // then need to call set_percent()
++        self.total += other.total;
++        self.covered += other.covered;
++        self.missed += other.missed;
++    }
++
++    pub fn set_percent(&mut self) {
++        self.percent = Self::get_percent(self.covered, self.total);
++    }
++
++    pub fn get_percent(x: usize, y: usize) -> f64 {
++        if y != 0 {
++            f64::round(x as f64 / (y as f64) * 10_000.) / 100.
++        } else {
++            0.0
++        }
++    }
++}
++
++impl CDFileStats {
++
++    pub fn new(name: String, coverage: BTreeMap<u32, u64>) -> Self {
++        let (total, covered, lines) = Self::get_coverage(coverage);
++        Self {
++            name,
++            stats: CDStats::new(total, covered),
++            coverage: lines,
++        }
++    }
++
++    fn get_coverage(coverage: BTreeMap<u32, u64>) -> (usize, usize, Vec<i64>) {
++        let mut covered = 0;
++        let last_line = *coverage.keys().last().unwrap_or(&0) as usize;
++        let total = coverage.len();
++        let mut lines: Vec<i64> = vec![-1; last_line];
++        for (line_num, line_count) in coverage.iter() {
++            let line_count = *line_count;
++            unsafe {
++                *lines.get_unchecked_mut((*line_num - 1) as usize) = line_count as i64;
++            }
++            covered += (line_count > 0) as usize;
++        }
++        (total, covered, lines)
++    }
++
++    pub fn to_json(&self) -> serde_json::Value {
++        json!({
++            "name": self.name,
++            "linesTotal": self.stats.total,
++            "linesCovered": self.stats.covered,
++            "linesMissed": self.stats.missed,
++            "coveragePercent": self.stats.percent,
++            "coverage": self.coverage,
++        })
++    }
++}
++
++impl CDDirStats {
++
++    pub fn new(name: String) -> Self {
++        Self {
++            name,
++            files: Vec::new(),
++            dirs: Vec::new(),
++            stats: Default::default(),
++        }
++    }
++
++    pub fn set_stats(&mut self) {
++        for file in self.files.iter() {
++            self.stats.add(&file.stats);
++        }
++        for dir in self.dirs.iter() {
++            let mut dir = dir.borrow_mut();
++            dir.set_stats();
++            self.stats.add(&dir.stats);
++        }
++        self.stats.set_percent();
++    }
++
++    pub fn to_json(&mut self) -> serde_json::Value {
++        let mut children = Map::new();
++        for file in self.files.drain(..) {
++            children.insert(file.name.clone(), file.to_json());
++        }
++        for dir in self.dirs.drain(..) {
++            let mut dir = dir.borrow_mut();
++            children.insert(dir.name.clone(), dir.to_json());
++        }
++        json!({
++            "name": self.name,
++            "linesTotal": self.stats.total,
++            "linesCovered": self.stats.covered,
++            "linesMissed": self.stats.missed,
++            "coveragePercent": self.stats.percent,
++            "children": children,
++        })
++    }
++}
+
+diff --git a/src/defs.rs b/src/defs.rs
+--- a/src/defs.rs
++++ b/src/defs.rs
+@@ -1,7 +1,9 @@
+ use crossbeam::channel::{Receiver, Sender};
+ use rustc_hash::FxHashMap;
++use std::cell::RefCell;
+ use std::collections::BTreeMap;
+ use std::path::PathBuf;
++use std::rc::Rc;
+ use std::sync::Mutex;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -52,3 +54,26 @@ pub type JobSender = Sender<Option<WorkItem>>;
+ pub type CovResultMap = FxHashMap<String, CovResult>;
+ pub type SyncCovResultMap = Mutex<CovResultMap>;
+ pub type CovResultIter = Box<Iterator<Item = (PathBuf, PathBuf, CovResult)>>;
++
++#[derive(Debug, Default)]
++pub struct CDStats {
++    pub total: usize,
++    pub covered: usize,
++    pub missed: usize,
++    pub percent: f64,
++}
++
++#[derive(Debug)]
++pub struct CDFileStats {
++    pub name: String,
++    pub stats: CDStats,
++    pub coverage: Vec<i64>,
++}
++
++#[derive(Debug)]
++pub struct CDDirStats {
++    pub name: String,
++    pub files: Vec<CDFileStats>,
++    pub dirs: Vec<Rc<RefCell<CDDirStats>>>,
++    pub stats: CDStats,
++}
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,6 +35,9 @@ pub use crate::output::*;
+ mod reader;
+ pub use crate::reader::*;
+ 
++mod covdir;
++pub use crate::covdir::*;
++
+ use std::collections::{btree_map, hash_map};
+ use std::fs;
+ use std::io::{BufReader, Cursor};
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -45,7 +45,7 @@ fn main() {
+                                .long("output-type")
+                                .value_name("OUTPUT TYPE")
+                                .default_value("lcov")
+-                               .possible_values(&["ade", "lcov", "coveralls", "coveralls+", "files"])
++                               .possible_values(&["ade", "lcov", "coveralls", "coveralls+", "files", "covdir"])
+                                .takes_value(true))
+ 
+                           .arg(Arg::with_name("output_file")
+@@ -315,6 +315,8 @@ fn main() {
+         );
+     } else if output_type == "files" {
+         output_files(iterator, output_file_path);
++    } else if output_type == "covdir" {
++        output_covdir(iterator, output_file_path);
+     } else {
+         assert!(false, "{} is not a supported output type", output_type);
+     }
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -1,8 +1,11 @@
++use rustc_hash::FxHashMap;
+ use serde_json::{self, Value};
+-use std::collections::BTreeSet;
++use std::cell::RefCell;
++use std::collections::{hash_map, BTreeSet};
+ use std::fs::File;
+ use std::io::{self, BufWriter, Read, Write};
+ use std::path::PathBuf;
++use std::rc::Rc;
+ use uuid::Uuid;
+ use md5::{Md5, Digest};
+ 
+@@ -83,19 +86,19 @@ pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>)
+                 writer,
+                 "{}",
+                 json!({
+-                "language": "c/c++",
+-                "file": {
+-                    "name": rel_path,
+-                },
+-                "method": {
+-                    "name": name,
+-                    "covered": lines_covered,
+-                    "uncovered": lines_uncovered,
+-                    "total_covered": lines_covered.len(),
+-                    "total_uncovered": lines_uncovered.len(),
+-                    "percentage_covered": lines_covered.len() as f32 / (lines_covered.len() + lines_uncovered.len()) as f32,
+-                }
+-            })
++                    "language": "c/c++",
++                    "file": {
++                        "name": rel_path,
++                    },
++                    "method": {
++                        "name": name,
++                        "covered": lines_covered,
++                        "uncovered": lines_uncovered,
++                        "total_covered": lines_covered.len(),
++                        "total_uncovered": lines_uncovered.len(),
++                        "percentage_covered": lines_covered.len() as f32 / (lines_covered.len() + lines_uncovered.len()) as f32,
++                    }
++                })
+             ).unwrap();
+         }
+ 
+@@ -107,28 +110,82 @@ pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>)
+             writer,
+             "{}",
+             json!({
+-            "language": "c/c++",
+-            "is_file": true,
+-            "file": {
+-                "name": rel_path,
+-                "covered": covered,
+-                "uncovered": uncovered,
+-                "total_covered": covered.len(),
+-                "total_uncovered": uncovered.len(),
+-                "percentage_covered": covered.len() as f32 / (covered.len() + uncovered.len()) as f32,
+-            },
+-            "method": {
+-                "covered": orphan_covered,
+-                "uncovered": orphan_uncovered,
+-                "total_covered": orphan_covered.len(),
+-                "total_uncovered": orphan_uncovered.len(),
+-                "percentage_covered": orphan_covered.len() as f32 / (orphan_covered.len() + orphan_uncovered.len()) as f32,
+-            }
+-        })
++                "language": "c/c++",
++                "is_file": true,
++                "file": {
++                    "name": rel_path,
++                    "covered": covered,
++                    "uncovered": uncovered,
++                    "total_covered": covered.len(),
++                    "total_uncovered": uncovered.len(),
++                    "percentage_covered": covered.len() as f32 / (covered.len() + uncovered.len()) as f32,
++                },
++                "method": {
++                    "covered": orphan_covered,
++                    "uncovered": orphan_uncovered,
++                    "total_covered": orphan_covered.len(),
++                    "total_uncovered": orphan_uncovered.len(),
++                    "percentage_covered": orphan_covered.len() as f32 / (orphan_covered.len() + orphan_uncovered.len()) as f32,
++                }
++            })
+         ).unwrap();
+     }
+ }
+ 
++pub fn output_covdir(results: CovResultIter, output_file: Option<&str>) {
++    let mut writer = BufWriter::new(get_target_output_writable(output_file));
++    let mut relative: FxHashMap<PathBuf, Rc<RefCell<CDDirStats>>> = FxHashMap::default();
++    let global = Rc::new(RefCell::new(CDDirStats::new("".to_string())));
++    relative.insert(PathBuf::from(""), global.clone());
++    
++    for (abs_path, rel_path, result) in results {
++        let path = if rel_path.is_relative() {
++            rel_path
++        } else {
++            abs_path
++        };
++
++        let parent = path.parent().unwrap();
++        let mut ancestors = Vec::new();
++        for ancestor in parent.ancestors() {
++            ancestors.push(ancestor);
++            if relative.contains_key(ancestor) {
++                break;
++            }
++        }
++
++        let mut prev_stats = global.clone();
++
++        while let Some(ancestor) = ancestors.pop() {
++            prev_stats = match relative.entry(ancestor.to_path_buf()) {
++                hash_map::Entry::Occupied(s) => s.get().clone(),
++                hash_map::Entry::Vacant(p) => {
++                    let mut prev_stats = prev_stats.borrow_mut();
++                    let path_tail = if ancestor == PathBuf::from("/") {
++                        "/".to_string()
++                    } else {
++                        ancestor.file_name().unwrap().to_str().unwrap().to_string()
++                    };
++                    prev_stats.dirs.push(Rc::new(RefCell::new(CDDirStats::new(path_tail))));
++                    let last = prev_stats.dirs.last_mut().unwrap();
++                    p.insert(last.clone());
++                    last.clone()
++                },
++            };
++        }
++
++        prev_stats.borrow_mut().files.push(CDFileStats::new(path.file_name().unwrap().to_str().unwrap().to_string(), result.lines));
++    }
++
++    let mut global = global.borrow_mut();
++    global.set_stats();
++
++    serde_json::to_writer(
++        &mut writer,
++        &global.to_json(),
++    ).unwrap();
++}
++
+ pub fn output_lcov(results: CovResultIter, output_file: Option<&str>) {
+     let mut writer = BufWriter::new(get_target_output_writable(output_file));
+     writer.write_all(b"TN:\n").unwrap();
+@@ -296,3 +353,65 @@ pub fn output_files(results: CovResultIter, output_file: Option<&str>) {
+         writeln!(writer, "{}", rel_path.display()).unwrap();
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++
++    extern crate tempfile;
++    use super::*;
++    use std::collections::BTreeMap;
++
++    fn read_file(path: &PathBuf) -> String {
++        let mut f = File::open(path).expect(format!("{:?} file not found", path.file_name()).as_str());
++        let mut s = String::new();
++        f.read_to_string(&mut s).unwrap();
++        s
++    }
++    
++    #[test]
++    fn test_covdir() {
++        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
++        let file_name = "test_covdir.json";
++        let file_path = tmp_dir.path().join(&file_name);
++
++        let results = vec![
++            (PathBuf::from("foo/bar/a.cpp"),
++             PathBuf::from("foo/bar/a.cpp"),
++             CovResult {
++                 lines: [(1, 10), (2, 11)].iter().cloned().collect(),
++                 branches: BTreeMap::new(),
++                 functions: FxHashMap::default(),
++             }),
++            (PathBuf::from("foo/bar/b.cpp"),
++             PathBuf::from("foo/bar/b.cpp"),
++             CovResult {
++                 lines: [(1, 0), (2, 10), (4, 0)].iter().cloned().collect(),
++                 branches: BTreeMap::new(),
++                 functions: FxHashMap::default(),
++             }),
++            (PathBuf::from("foo/c.cpp"),
++             PathBuf::from("foo/c.cpp"),
++             CovResult {
++                 lines: [(1, 10), (4, 1)].iter().cloned().collect(),
++                 branches: BTreeMap::new(),
++                 functions: FxHashMap::default(),
++             }),
++            (PathBuf::from("/foo/d.cpp"),
++             PathBuf::from("/foo/d.cpp"),
++             CovResult {
++                 lines: [(1, 10), (2, 0)].iter().cloned().collect(),
++                 branches: BTreeMap::new(),
++                 functions: FxHashMap::default(),
++             }),
++        ];
++
++        let results = Box::new(results.into_iter());
++        output_covdir(results, Some(file_path.to_str().unwrap()));        
++
++        let results: Value = serde_json::from_str(&read_file(&file_path)).unwrap();
++        let expected_path = PathBuf::from("./test/").join(&file_name);
++        let expected: Value = serde_json::from_str(&read_file(&expected_path)).unwrap();
++
++        assert_eq!(results, expected);
++    }
++}
+
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -5,7 +5,7 @@ use std::collections::hash_map;
+ use std::fs;
+ use std::io;
+ use std::mem;
+-use std::path::{Path, PathBuf};
++use std::path::{Component, Path, PathBuf};
+ use walkdir::{DirEntry, WalkDir};
+ 
+ use crate::defs::*;
+@@ -40,6 +40,16 @@ pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+     Ok(path)
+ }
+ 
++fn normalize_path<P: AsRef<Path>>(path: P) -> PathBuf {
++    let mut new_path = PathBuf::from("");
++    for component in path.as_ref().components() {
++        if component != Component::CurDir {
++            new_path.push(component);
++        }
++    }
++    new_path
++}
++
+ // Search the source file's path in the mapping.
+ fn apply_mapping(mapping: &Option<Value>, path: &str) -> PathBuf {
+     if let Some(mapping) = mapping {
+@@ -121,6 +131,9 @@ fn get_abs_path(
+ 
+     // Fixup the relative path, in case the absolute path was a symlink.
+     let rel_path = fixup_rel_path(&source_dir, &abs_path, rel_path);
++    
++    // Normalize the path in removing './' or '//'
++    let rel_path = normalize_path(rel_path);
+ 
+     (abs_path, rel_path)
+ }
+@@ -1187,4 +1200,10 @@ mod tests {
+         }
+         assert_eq!(count, 1);
+     }
++
++    #[test]
++    fn test_normalize_path() {
++        assert_eq!(normalize_path("./foo//bar"), PathBuf::from("foo/bar"));
++        assert_eq!(normalize_path("./foo/./bar/./oof/"), PathBuf::from("foo/bar/oof"));
++    }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+pub fn output_files(results: CovResultIter, output_file: Option<&str>) -> ()
+
+pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>) -> ()
+
+fn get_abs_path(
+source_dir: &Option<PathBuf>,
+rel_path: PathBuf,
+cache: &mut Option<PathBuf>) -> (PathBuf, PathBuf)
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

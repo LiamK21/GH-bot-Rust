@@ -1,0 +1,208 @@
+<think>
+Okay, let's see. The issue is about supporting excluding directories with wildcards. The user wants to exclude directories like vs2017_* without having to update the exclusion list every time the version changes. The patch adds globset for pattern matching.
+
+Looking at the existing tests in the patch, they modified some test cases to use "mydir/*" instead of just "mydir". The tests check if files in those directories are excluded. The existing tests probably ensure that using a wildcard in the exclusion works as intended.
+
+But maybe there's a case not covered. For example, what if the directory path has multiple parts with wildcards? Like, excluding "vs2017_*/include", but the current code might not handle that. Or maybe the pattern should match nested directories.
+
+Wait, the problem is about making sure that the pattern can match directories with wildcards. The current code uses globset's Glob to build patterns. So, the test case should verify that a pattern with a wildcard correctly excludes the directory.
+
+Looking at the existing test in the patch, they have a test where the exclusion is "mydir/*". The file "mydir/prova.h" is excluded because it matches the pattern. But maybe the test should check that a pattern like "vs2017_*" would exclude subdirectories.
+
+Wait, in the existing test case, they changed the exclusion to "mydir/*", which matches files in the mydir directory, but not its subdirectories. If someone wants to exclude all subdirectories under a pattern, like "vs2017_*/*", perhaps that's another case. But the issue is specifically about excluding a directory with a wildcard in its name, like vs2017_*.
+
+So maybe the test should check that a pattern like "vs2017_*" (without the /) matches any directory named like that. For example, if there's a directory named "vs2017_123", then excluding "vs2017_*" should ignore all files under that directory.
+
+But the current test cases in the patch don't cover that. Let me check the existing tests. The existing tests in the patch use "mydir/*" which matches files directly in the directory. To test the directory name with a wildcard, perhaps a test where the exclusion is "vs2017_*", and the file path is "vs2017_1.2.3/somefile.h".
+
+So a new test case would: create a result_map with a file in a directory named vs2017_15.6.6, then check that passing "vs2017_*" to exclude causes that file to be excluded.
+
+But how does the glob pattern work here? The glob "vs2017_*" would match the directory name. But in the code, the Glob is built for the to_ignore_dir, which is the directory pattern. When the code checks if the rel_path starts with a directory (before patch) or matches the glob (now), the pattern needs to match the directory part.
+
+So, for example, if rel_path is "vs2017_15.6.6/header.h", then the pattern "vs2017_*" would match the whole path. Wait, glob patterns in Rust's globset: * matches any number of characters except /, and ** would match with directories. Wait, actually, the Glob is parsed as a standard glob pattern. So "vs2017_*" would match any path that starts with "vs2017_" followed by any character (since * is greedy). But maybe the code is using it to match directory names.
+
+Wait, in the current code, the to_ignore_dirs are added as glob patterns. The code then checks if the rel_path is matched by any of the globset. The rel_path is the relative path of the file. For instance, if the file is in a directory that needs to be excluded, then the path would start with that directory. So for a file in vs2017_15.6.6/include/file.h, the rel_path would be "vs2017_15.6.6/include/file.h". If the exclusion is "vs2017_*", then the glob pattern would match the beginning of the path. So the code would correctly exclude it.
+
+So a test case could be: have a file in a directory that matches the pattern, and another that doesn't. For example, create a result_map with keys like "vs2017_123/file.h", "vs2017_456/file.h", and "other/file.h". The exclusion patterns are "vs2017_*". The test should check that the first two are excluded and the third is included.
+
+So the test would set up a CovResultMap with those entries, call rewrite_paths with the exclusion patterns, and verify that the resulting iterator contains the correct entries.
+
+The existing tests in the patch already check that "mydir/*" excludes files in mydir, but not the directory itself. So for the case of the directory name pattern, the test should have a pattern that matches the directory name exactly.
+
+Wait, the user's example is to exclude "vs2017_*", which is a directory name. So the to_ignore_dir is "vs2017_*", which in the code is treated as a glob pattern. But glob patterns in globset don't do directory name matching directly. Wait, the rel_path is the path of the file. For example, if the exclusion is "vs2017_*", then the glob pattern would match any file path that starts with that pattern, including files in subdirectories of the directory.
+
+So, if a directory is named "vs2017_15.6.6", and the file is in that directory, the rel_path is "vs2017_15.6.6/file.h", then the pattern "vs2017_*" would match. So the code would exclude it.
+
+So a test case could be:
+
+- Create a CovResultMap with two entries: "vs2017_15.6.6/include/file.h" and "other/file.h".
+- Exclude pattern is "vs2017_*".
+- After processing, the first file should be excluded, the second included.
+
+So the test would check that the result only has the second entry.
+
+So the test would look like this:
+
+Use super::rewrite_paths, create a result_map with those keys. Call the function with to_ignore_dirs as ["vs2017_*"], and check the output.
+
+The existing tests in the patch handle the case where the exclusion is "mydir/*", which matches files in mydir. The new test here is about excluding a directory with a wildcard in its name, not the files inside.
+
+Wait, the user's example is excluding a directory named vs2017_*, so the exclusion pattern is "vs2017_*", which would match any file whose path starts with that pattern. That includes files in that directory and subdirectories.
+
+So the test should have a file in the directory and another not. The code would exclude all files that start with the pattern.
+
+In the test, if the to_ignore_dirs is ["vs2017_*"], then the code would build a globset for "vs2017_*", which matches any path that starts with "vs2017_" followed by at least one character. The test should verify that files in such directories are excluded.
+
+So the test would create a result_map with:
+
+- "vs2017_15.6.6/file.h"
+- "vs2017_123/file.cpp"
+- "other/file.h"
+
+Then call rewrite_paths with to_ignore_dirs as ["vs2017_*"], and check that the first two are excluded, and the third is included.
+
+So the test would count the number of entries in the iterator. The expected count should be 1 (only "other/file.h").
+
+Thus, the test would set up the result_map, call rewrite_paths, collect the results, and assert that the count is correct.
+
+Now, to write this as a test in Rust.
+
+First, the function under test is rewrite_paths in path_rewriting.rs. The test is in that module.
+
+In the test, we need to use super::rewrite_paths.
+
+We also need to import CovResultMap and related structures. Looking at the function signature, the function returns a Box<dyn Iterator<Item=...>>. The test will need to iterate over the results.
+
+But since we're using the test code in the same module, perhaps the helpers like empty_result!() are available. But in the test, we need to create a CovResultMap. Based on the existing tests, maybe the CovResultMap is a HashMap with String keys and CovResult values. So we need to construct such a map.
+
+Assuming that CovResultMap is a HashMap<String, CovResult>, and CovResult is some struct. The existing code has an empty_result!() macro, which creates an empty result.
+
+In the test, the code would create a result_map with the keys as mentioned. Then call rewrite_paths with the exclusion pattern and check the output.
+
+So, the test would look like:
+
+use super::rewrite_paths;
+use std::collections::HashMap;
+
+#[test]
+fn test_exclude_directory_with_wildcard() {
+    let mut result_map: std::collections::HashMap<String, CovResult> = HashMap::new();
+    result_map.insert("vs2017_15.6.6/file.h".to_string(), empty_result!());
+    result_map.insert("vs2017_123/file.cpp".to_string(), empty_result!());
+    result_map.insert("other/file.h".to_string(), empty_result!());
+
+    let results = rewrite_paths(
+        result_map,
+        None,
+        "",
+        "",
+        false,
+        false,
+        vec!["vs2017_*".to_string()]
+    );
+
+    let mut count = 0;
+    for (abs_path, rel_path, result) in results {
+        count += 1;
+        assert!(rel_path == "other/file.h" && result.is_empty());
+    }
+    assert_eq!(count, 1);
+}
+
+But wait, the existing tests use Box::new(result_map.into_iter().filter_map(...)), so the returned iterator is a Box<dyn Iterator<...>>. The test would need to collect the items and verify that only the 'other' entry remains.
+
+But since the original function returns an iterator, the test can collect all items and count them, or check their contents.
+
+In the existing test in the patch, they have:
+
+count += 1;
+after asserting on the expected entries.
+
+In the new test, after calling rewrite_paths with the correct parameters, the count should be 1 for the "other/file.h" entry.
+
+But to make sure that the other entries are excluded, the test should verify that.
+
+Thus, the code in the test would create the result_map as described, call rewrite_paths with the exclusion pattern, collect all entries, and check that only the expected one remains.
+
+Potential issues:
+
+- The empty_result!() macro might not be available in the test context. But in the existing tests, they use that macro. So if the test is added inside the same module, it's available.
+
+So, the imports would be:
+
+use super::rewrite_paths;
+use super::empty_result;
+use std::collections::HashMap;
+
+But perhaps 'empty_result' is a macro. Wait, looking at the code in the existing tests, they use 'empty_result!()' which is a macro. In the patch's test cases, the code uses 'empty_result!()', so the test would need to use that as well. So, the test code would need to import the macro from the module.
+
+However, macros are a bit tricky in Rust. If the existing code defines the 'empty_result!' macro in the module, then the test can use it as long as it's in the same scope.
+
+Assuming that the macro is available, the test can proceed.
+
+Now, writing the test code.
+
+The correct filename is src/path_rewriting.rs, as the existing mod tests block is there.
+
+The imports required would be:
+
+- use std::collections::HashMap;
+- use super::rewrite_paths;
+- use super::empty_result;
+
+But since the test is written in the same module, perhaps the macro is accessible.
+
+Thus, the test function is:
+
+#[test]
+fn test_wildcard_directory_exclusion() {
+    let mut result_map = HashMap::new();
+    result_map.insert("vs2017_15.6.6/file.h".to_string(), empty_result!());
+    result_map.insert("vs2017_123/file.cpp".to_string(), empty_result!());
+    result_map.insert("other/file.h".to_string(), empty_result!());
+    
+    let results = rewrite_paths(result_map, None, "", "", false, false, vec!["vs2017_*".to_string()]);
+    
+    let mut count = 0;
+    for (path, _, _) in results {
+        count += 1;
+    }
+    assert_eq!(count, 1);
+}
+
+Wait, but the iterator returns (abs_path, rel_path, result). So in the loop, path is the abs_path. But the test may also need to check that the path is "other/file.h", but perhaps counting is sufficient. If before the patch, the count was 3 (if old code didn't exclude), and after the patch, it's 1. Wait, what was the code before?
+
+Before the patch, the code checked if the rel_path starts_with(to_ignore_dir). So, for the exclusion directories, it would check if the rel_path starts with the directory name. So, if the exclusion is "vs2017_*", the original code would check if the rel_path starts with "vs2017_*" which is impossible since * isn't a literal. Therefore, in the old code, this pattern would not match, and the test would return all entries (count 3). With the new code, the pattern is treated as a glob, so "vs2017_*" matches any rel_path that starts with "vs2017_" followed by any character. So the test would pass after the patch, but fail before. 
+
+So the test will fail without the patch because the original code checks for a literal string, which is not a directory name. So before the patch, the code in 'rewrite_paths' would not filter out the entries. After applying the patch, with glob patterns, the code would filter them. Thus, the test will count 1 in the new code and 3 in the old code. Hence, the test is correct.
+
+Thus, the test would ensure that the new code is working.
+</think>
+
+<Filename> src/path_rewriting.rs </Filename>
+<imports>
+use std::collections::HashMap;
+use super::rewrite_paths;
+use super::CovResultMap;
+use super::empty_result;
+</imports>
+<Rust>
+#[test]
+fn test_wildcard_directory_exclusion() {
+    let mut result_map: CovResultMap = HashMap::new();
+    result_map.insert("vs2017_15.6.6/file.h".to_string(), empty_result!());
+    result_map.insert("vs2017_123/another.cpp".to_string(), empty_result!());
+    result_map.insert("mycode/main.rs".to_string(), empty_result!());
+    
+    let results = rewrite_paths(result_map, None, "", "", false, false, vec!["vs2017_*".to_string()]);
+    
+    let mut count = 0;
+    let mut included = String::new();
+    for (abs_path, rel_path, _) in results {
+        count += 1;
+        included = rel_path;
+    }
+    assert_eq!(count, 1);
+    assert_eq!(included, "mycode/main.rs");
+}
+</Rust>
