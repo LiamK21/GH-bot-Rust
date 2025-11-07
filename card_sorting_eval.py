@@ -36,14 +36,15 @@ RUST_COMMON_ERROR_NON_ERRORS = [
 
 class Model(StrEnum):
     GPT_4O = "gpt-4o"
-    DEEPSEEK = "deepseek-r1-distill-llama-70b"
     LLAMA = "llama-3.3-70b-versatile"
+    QWEN3 = "qwen/qwen3-32b"
 
+
+MODELS = [m.value for m in Model]
 
 class Repository(StrEnum):
     GLEAN = "glean"
     GRCOV = "grcov"
-    NEQO = "neqo"
     RUST_CODE_ANALYSIS = "rust-code-analysis"
 
 
@@ -60,6 +61,7 @@ class FailureType(StrEnum):
     TIMEOUT = "Timeout"
     SHARED_OBJECT_NOT_FOUND = "SharedObjectNotFound"
     THREAD_PANIC = "ThreadPanic"
+    PATCH_ERROR = "PatchError"
 
 
 class EvaluationMetrics:
@@ -68,9 +70,9 @@ class EvaluationMetrics:
         self.passed_tests = 0
         self.total_runs = 0
         self.model_stats = {
-            Model.GPT_4O: {"passed": 0, "runs": 0},
-            Model.DEEPSEEK: {"passed": 0, "runs": 0},
-            Model.LLAMA: {"passed": 0, "runs": 0},
+            Model.GPT_4O: {"passed": 0, "runs": 0, "passed_call": [0, 0, 0, 0, 0]},
+            Model.LLAMA: {"passed": 0, "runs": 0, "passed_call": [0, 0, 0, 0, 0]},
+            Model.QWEN3: {"passed": 0, "runs": 0, "passed_call": [0, 0, 0, 0, 0]},
         }
         self.failures_count: dict[str, int] = {
             failure.value: 0 for failure in FailureType
@@ -81,13 +83,13 @@ class EvaluationMetrics:
 @dataclass
 class RepositoryStats:
     total_runs: dict[str, int] = field(
-        default_factory=lambda: {"total": 0, **{m.value: 0 for m in Model}}
+        default_factory=lambda: {"total": 0, **{m: 0 for m in MODELS}}
     )
     passed_tests: dict[str, int] = field(
-        default_factory=lambda: {"total": 0, **{m.value: 0 for m in Model}}
+        default_factory=lambda: {"total": 0, **{m: 0 for m in MODELS}}
     )
     erroneous_tests: dict[str, int] = field(
-        default_factory=lambda: {"total": 0, **{m.value: 0 for m in Model}}
+        default_factory=lambda: {"total": 0, **{m: 0 for m in MODELS}}
     )
     fail2pr: dict[str, list[str]] = field(
         default_factory=lambda: {f.value: [] for f in FailureType}
@@ -103,6 +105,7 @@ def main(eval_dir: Path):
     plotting_data["pie_chart"] = {}
     plotting_data["stacked_bar_chart"] = {}
     plotting_data["horizontal_bar_chart"] = {}
+    plotting_data["pass_per_llm_call"] = {}
 
     _write_to_output_file(
         eval_dir,
@@ -127,12 +130,12 @@ def main(eval_dir: Path):
         f"Total Tests: {evaluation_metrics.total_tests}\n"
         f"Total Passed Tests: {evaluation_metrics.passed_tests}\n"
         f"- GPT-4o Passed Tests: {evaluation_metrics.model_stats[Model.GPT_4O]["passed"]}\n"
-        f"- DeepSeek Passed Tests: {evaluation_metrics.model_stats[Model.DEEPSEEK]["passed"]}\n"
-        f"- Llama Passed Tests: {evaluation_metrics.model_stats[Model.LLAMA]["passed"]}\n\n"
+        f"- Llama Passed Tests: {evaluation_metrics.model_stats[Model.LLAMA]["passed"]}\n"
+        f"- Qwen3 Passed Tests: {evaluation_metrics.model_stats[Model.QWEN3]["passed"]}\n\n"
         f"Total Runs: {evaluation_metrics.total_runs}\n"
         f"- GPT-4o Test Runs: {evaluation_metrics.model_stats[Model.GPT_4O]["runs"]}\n"
-        f"- DeepSeek Test Runs: {evaluation_metrics.model_stats[Model.DEEPSEEK]["runs"]}\n"
-        f"- Llama Test Runs: {evaluation_metrics.model_stats[Model.LLAMA]["runs"]}\n\n"
+        f"- Llama Test Runs: {evaluation_metrics.model_stats[Model.LLAMA]["runs"]}\n"
+        f"- Qwen3 Test Runs: {evaluation_metrics.model_stats[Model.QWEN3]["runs"]}\n\n"
         "Total Failure per Group:\n"
         "----------------------------------------\n"
         + "\n".join(f"{k}: {v}" for k, v in evaluation_metrics.failures_count.items())
@@ -210,7 +213,20 @@ def _is_pr_dir(dir_name: str) -> bool:
 def _handle_pr_dir(
     pr_dir: Path, curr_repo: Repository, evaluation_metrics: EvaluationMetrics
 ):
-    model_attempts = os.listdir(pr_dir)
+    dir_content = os.listdir(pr_dir)
+    
+    attempts = set([int(content.split("_")[0].removeprefix("i")) for content in dir_content if content.startswith("i")])
+    
+    model_attempts = []
+    
+    
+    for model in MODELS:
+        for attempt in sorted(attempts):
+            attempt_dir_name = f"i{attempt}_{model}"
+            attempt_dir_path = Path(pr_dir, attempt_dir_name)
+            if attempt_dir_path.is_dir():
+                model_attempts.append(attempt_dir_name)
+         
     repo_stats = evaluation_metrics.repository_stats[curr_repo.value]
     evaluation_metrics.total_tests += 1
 
@@ -223,11 +239,12 @@ def _handle_pr_dir(
         model_attempt_path = Path(pr_dir, model_attempt)
         if model_attempt_path.is_dir() and _is_model_dir(model_attempt):
             curr_model = model_attempt.split("_")[1]
+            curr_model = next(m for m in MODELS if curr_model in m)
             repo_stats.total_runs[curr_model] += 1
             repo_stats.total_runs["total"] += 1
             pr_dir_name = pr_dir.name.rsplit("_", 2)[0].split("__")[1]
             _handle_model_attempt_dir(
-                model_attempt_path, pr_dir_name, curr_repo, evaluation_metrics
+                model_attempt_path, pr_dir_name, curr_repo, evaluation_metrics, curr_model
             )
         else:
             continue
@@ -242,7 +259,7 @@ def _is_model_dir(dir_name: str) -> bool:
     attempt, model = dir_parts
     if not attempt.startswith("i"):
         return False
-    if model not in [m.value for m in Model]:
+    if model not in [m for m in MODELS]:
         return False
     return True
 
@@ -252,19 +269,22 @@ def _handle_model_attempt_dir(
     pr_dir_name: str,
     repo: Repository,
     evaluation_metrics: EvaluationMetrics,
+    model: str
 ):
     repo_stats = evaluation_metrics.repository_stats[repo.value]
-    model = Model(model_dir.name.split("_")[1])
-
     def _add_to_failure_count(failure_type: FailureType | str):
         if failure_type not in repo_stats.fail2pr and type(failure_type) is str:
             repo_stats.fail2pr[failure_type] = []
         repo_stats.fail2pr[failure_type].append(pr_dir_name)
 
-    files = os.listdir(model_dir)
+    llm_calls = os.listdir(model_dir)
+    
+    final_llm_call = max(llm_calls, key=lambda x: int(x.split("_")[2]))
+    llm_call_dir = next(f for f in llm_calls if f.endswith(final_llm_call))
+    target_dir = Path(model_dir, llm_call_dir)
 
-    failure_type = _categorize_failure_by_file_count(files, model_dir, pr_dir_name)
-
+    failure_type = _handle_llm_call_dir(target_dir)
+    
     if type(failure_type) is str or type(failure_type) is FailureType:
         _add_to_failure_count(failure_type)
         repo_stats.erroneous_tests[model] += 1
@@ -276,11 +296,18 @@ def _handle_model_attempt_dir(
         repo_stats.erroneous_tests["total"] += 1
     elif failure_type is None:
         repo_stats.passed_tests[model] += 1
+        llm_call_number = int(final_llm_call.split("_")[2])
+        evaluation_metrics.model_stats[model]["passed_call"][llm_call_number - 1] += 1
         repo_stats.passed_tests["total"] += 1
+    
 
+def _handle_llm_call_dir(curr_dir: Path):
+    files = os.listdir(curr_dir)
+    return _categorize_failure_by_file_count(files, curr_dir)
+    
 
 def _categorize_failure_by_file_count(
-    files: list, model_dir: Path, pr_dir_name: str
+    files: list, model_dir: Path
 ) -> None | FailureType | list[str]:
     file_count = len(files)
 
@@ -297,9 +324,11 @@ def _categorize_failure_by_file_count(
         )
     elif file_count == 3:
         return FailureType.RESPONSE_FILENAME_NOT_EXISTENT
+    elif file_count == 4:
+        return FailureType.PATCH_ERROR
     elif file_count == 5:
         return FailureType.TEST_PASS_PRE_PR
-    elif file_count == 6:
+    elif file_count >= 7:
         after_content = Path(model_dir, "after.txt").read_text()
         if after_content:
             test_passed, error_codes = _analyze_test_results(after_content)
@@ -307,9 +336,7 @@ def _categorize_failure_by_file_count(
                 return None
             elif test_passed is False:
                 return error_codes
-    elif file_count == 7:
-        return None
-
+    
     raise Exception(
         f"Unexpected number of files in model attempt directory: {file_count}"
     )
@@ -393,13 +420,20 @@ def _create_plotting_data(plotting_data: dict, evaluation_metrics: EvaluationMet
 
     total_data = _compute_horizontal_bar_chart_data(evaluation_metrics.failures_count)
     plotting_data["horizontal_bar_chart"]["total"] = total_data
+    plotting_data["pass_per_llm_call"] = {
+        model.value: evaluation_metrics.model_stats[model]["passed_call"]
+        for model in Model
+    }
 
 
 def _compute_horizontal_bar_chart_data(fail_2_amount: dict[str, int]):
     fail_2_amount_sorted = dict(
         sorted(fail_2_amount.items(), key=lambda item: item[1], reverse=True)
     )
-
+    
+    if len(fail_2_amount_sorted) <= PLOTTING_DATA_FAILURE_CUTOFF:
+        return fail_2_amount_sorted
+    
     cutoff_idx = PLOTTING_DATA_FAILURE_CUTOFF - 1
     cutoff_value = [*fail_2_amount_sorted.values()][cutoff_idx]
     while len(fail_2_amount_sorted) > cutoff_idx:
@@ -430,17 +464,17 @@ def _aggregate_data(evaluation_metrics: EvaluationMetrics):
         evaluation_metrics.model_stats[Model.GPT_4O]["runs"] += repo_stats.total_runs[
             Model.GPT_4O
         ]
-        evaluation_metrics.model_stats[Model.DEEPSEEK][
-            "passed"
-        ] += repo_stats.passed_tests[Model.DEEPSEEK]
-        evaluation_metrics.model_stats[Model.DEEPSEEK]["runs"] += repo_stats.total_runs[
-            Model.DEEPSEEK
-        ]
         evaluation_metrics.model_stats[Model.LLAMA][
             "passed"
         ] += repo_stats.passed_tests[Model.LLAMA]
         evaluation_metrics.model_stats[Model.LLAMA]["runs"] += repo_stats.total_runs[
             Model.LLAMA
+        ]
+        evaluation_metrics.model_stats[Model.QWEN3][
+            "passed"
+        ] += repo_stats.passed_tests[Model.QWEN3]
+        evaluation_metrics.model_stats[Model.QWEN3]["runs"] += repo_stats.total_runs[
+            Model.QWEN3
         ]
         evaluation_metrics.passed_tests += repo_stats.passed_tests["total"]
         for failure_type, pr_list in repo_stats.fail2pr.items():
