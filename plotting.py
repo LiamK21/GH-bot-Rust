@@ -20,7 +20,7 @@ type HorizontalBarChartData = dict[str, dict[str, int]]
 
 class Model(StrEnum):
     GPT_4O = "gpt-4o"
-    DEEPSEEK = "deepseek-r1-distill-llama-70b"
+    QWEN3 = "qwen/qwen3-32b"
     LLAMA = "llama-3.3-70b-versatile"
 
 
@@ -54,6 +54,10 @@ def main(eval_dir: Path, plot_dir: Path):
     if horizontal_bar_chart_data:
         _plot_horizontal_bar_chart(horizontal_bar_chart_data, plot_dir)
 
+    # Pass per LLM Call Chart
+    pass_per_llm_call_data = content.get("pass_per_llm_call", {})
+    if pass_per_llm_call_data:
+        _plot_pass_per_llm_call(pass_per_llm_call_data, plot_dir)
 
 def _plot_pie_chart(data: PieChartData, plot_dir: Path):
     labels, sizes = zip(*data.items())
@@ -142,6 +146,71 @@ def _plot_horizontal_bar_chart(data: HorizontalBarChartData, plot_dir: Path):
         fig.savefig(
             fname=plot_dir / f"horizontal_bar_chart_{identifier}.png",
         )
+
+
+def _plot_pass_per_llm_call(data: dict[str, list[int]], plot_dir: Path):
+    """
+    Plot a vertical bar chart showing the number of passed tests per LLM call iteration.
+    
+    Args:
+        data: Dictionary mapping model names to arrays of 5 integers representing
+              pass counts for LLM calls 1-5
+        plot_dir: Directory to save the plot
+    """
+    # X-axis labels for LLM call numbers
+    llm_calls = ["Call 1", "Call 2", "Call 3", "Call 4", "Call 5"]
+    x = np.arange(len(llm_calls))
+    
+    # Bar width and spacing
+    width = 0.25
+    multiplier = 0
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Colors for different models
+    colors = {
+        Model.GPT_4O: "#96CEB4",
+        Model.LLAMA: "#FF9FF3",
+        Model.QWEN3: "#45B7D1"
+    }
+    
+    # Plot bars for each model
+    for model_name, pass_counts in data.items():
+        offset = width * multiplier
+        bars = ax.bar(x + offset, pass_counts, width, 
+                     label=model_name, 
+                     color=colors.get(model_name, "#FECA57"))
+        
+        # Add value labels on top of each bar
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:  # Only show label if count is greater than 0
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    height + 0.5,
+                    str(int(height)),
+                    ha="center",
+                    va="bottom",
+                    fontweight="400",
+                    fontsize=9
+                )
+        
+        multiplier += 1
+    
+    # Customize the plot
+    ax.set_xlabel("LLM Call Iteration", fontweight="bold", fontsize=11)
+    ax.set_ylabel("Number of Passed Tests", fontweight="bold", fontsize=11)
+    ax.set_title("Test Pass Rate per LLM Call Iteration by Model", 
+                fontweight="bold", fontsize=13, pad=20)
+    ax.set_xticks(x + width)
+    ax.set_xticklabels(llm_calls)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    fig.savefig(fname=plot_dir / "pass_per_llm_call.png", 
+               bbox_inches="tight", dpi=300)
+    plt.close(fig)
 
 
 def _setup_dirs(eval_dir_name: str) -> Path:
