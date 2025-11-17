@@ -62,6 +62,7 @@ class FailureType(StrEnum):
     SHARED_OBJECT_NOT_FOUND = "SharedObjectNotFound"
     THREAD_PANIC = "ThreadPanic"
     PATCH_ERROR = "PatchError"
+    UNIT_TESTS_IN_SEPARATE_FILE = "TestsInTestFile"
 
 
 class EvaluationMetrics:
@@ -283,7 +284,7 @@ def _handle_model_attempt_dir(
     llm_call_dir = next(f for f in llm_calls if f.endswith(final_llm_call))
     target_dir = Path(model_dir, llm_call_dir)
 
-    failure_type = _handle_llm_call_dir(target_dir)
+    failure_type = _handle_llm_call_dir(target_dir, model)
     
     if type(failure_type) is str or type(failure_type) is FailureType:
         _add_to_failure_count(failure_type)
@@ -301,13 +302,13 @@ def _handle_model_attempt_dir(
         repo_stats.passed_tests["total"] += 1
     
 
-def _handle_llm_call_dir(curr_dir: Path):
+def _handle_llm_call_dir(curr_dir: Path, model: str):
     files = os.listdir(curr_dir)
-    return _categorize_failure_by_file_count(files, curr_dir)
+    return _categorize_failure_by_file_count(files, curr_dir, model)
     
 
 def _categorize_failure_by_file_count(
-    files: list, model_dir: Path
+    files: list[str], curr_invocation_dir: Path, model: str
 ) -> None | FailureType | list[str]:
     file_count = len(files)
 
@@ -316,20 +317,27 @@ def _categorize_failure_by_file_count(
     elif file_count == 1:
         return FailureType.MODEL_QUERY_FAILURE
     elif file_count == 2:
-        raw_response = Path(model_dir, "raw_model_response.txt").read_text()
+        raw_response = Path(curr_invocation_dir, "raw_model_response.txt").read_text()
         return (
             FailureType.NO_TEST_NEEDED
             if "<NO>" in raw_response
             else FailureType.MODEL_RESPONSE_PARSING_FAILURE
         )
     elif file_count == 3:
-        return FailureType.RESPONSE_FILENAME_NOT_EXISTENT
+        grandparent_dir = curr_invocation_dir.parent.parent
+        if model == Model.QWEN3.value:
+            grandparent_dir = grandparent_dir.parent
+        grandparent_files = os.listdir(grandparent_dir)
+        log_file_name = next(f for f in grandparent_files if f.endswith(".log"))
+        log_content = Path(grandparent_dir, log_file_name).read_text()
+        
+        return _determine_error_from_log_content(log_content, model)
     elif file_count == 4:
         return FailureType.PATCH_ERROR
     elif file_count == 5:
         return FailureType.TEST_PASS_PRE_PR
     elif file_count >= 7:
-        after_content = Path(model_dir, "after.txt").read_text()
+        after_content = Path(curr_invocation_dir, "after.txt").read_text()
         if after_content:
             test_passed, error_codes = _analyze_test_results(after_content)
             if test_passed is True:
@@ -340,6 +348,34 @@ def _categorize_failure_by_file_count(
     raise Exception(
         f"Unexpected number of files in model attempt directory: {file_count}"
     )
+    
+    
+def _determine_error_from_log_content(log_content: str, model: str) -> FailureType:
+    log_content_lines = log_content.splitlines()
+    if MODELS[2] == model:
+        log_content_lines.reverse()
+        prev_model = MODELS[1]
+        for line in log_content_lines:
+            if "Expected a declaration_list in the mod tests module, no mod block exists!" in line:
+                return FailureType.UNIT_TESTS_IN_SEPARATE_FILE
+            elif prev_model in line:
+                return FailureType.RESPONSE_FILENAME_NOT_EXISTENT
+    
+    next_model = MODELS[MODELS.index(model) + 1]
+    curr_model_found = False
+    for line in log_content_lines:
+        if model in line:
+            curr_model_found = True
+        elif next_model in line:
+            break
+        elif curr_model_found:
+            if "Filename not found in response" in line:
+                return FailureType.RESPONSE_FILENAME_NOT_EXISTENT
+            elif "Expected a declaration_list in the mod tests module, no mod block exists!" in line:
+               return FailureType.UNIT_TESTS_IN_SEPARATE_FILE 
+        
+        
+    return FailureType.RESPONSE_FILENAME_NOT_EXISTENT
 
 
 def _analyze_test_results(after_content: str) -> tuple[bool, list[str]]:
