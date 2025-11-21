@@ -117,7 +117,7 @@ class DockerService:
         """Returns the Docker image"""
         repo = self._pr_data.repo.lower()
         pr_number = self._pr_data.number
-        if repo == "grcov" and int(self._pr_data.number) < 703:
+        if repo == "grcov" and int(self._pr_data.number) < 700:
             logger.info("Using old Dockerfile for grcov")  
             return "Dockerfile_grcov_old"
         elif repo == "rust-code-analysis" and int(pr_number) <699:
