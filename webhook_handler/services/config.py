@@ -14,7 +14,7 @@ from webhook_handler.models import LLM
 class Config:
     """Configuration for the bot runner"""
 
-    def __init__(self):
+    def __init__(self, llm_calls: int = 5):
         load_dotenv()  # take environment variables from .env.
         self.github_webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
         self.github_token = os.getenv("GITHUB_TOKEN")
@@ -28,7 +28,7 @@ class Config:
 
         self.execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.curr_attempt = 0
-        self.MAX_LLM_CALLS = 5
+        self.MAX_LLM_CALLS = llm_calls
         self.root_dir = Path.cwd()
         self.is_server = Path("/home/runner").is_dir()
 
