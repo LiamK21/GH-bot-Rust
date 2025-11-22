@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Check if Python 3.12 is installed
+python3.12 --version >/dev/null
+
+if [ $? -ne 0 ]; then
+    echo "Python 3.12 is not installed. Please install Python 3.12 and try again."
+    exit 1
+fi
+
 # Retrieve absolute path to cli script
 TARGET_DIR="$( cd "$( dirname "$0")" &&  pwd)"
 CLI_SCRIPT_PATH="$TARGET_DIR/cli.py"
@@ -28,7 +36,7 @@ ALIAS_CMD="alias testgen='python3.12 $CLI_SCRIPT'"
 # Check if the alias already exists in the shell config
 if grep -Fxq "$ALIAS_CMD" "$SHELL_CONFIG"; then
     echo "Alias 'testgen' already exists in $SHELL_CONFIG"
-    
+
 # Else, append the alias to the shell config
 else 
     echo "" >> "$SHELL_CONFIG"
@@ -40,3 +48,9 @@ fi
 
 # Make the python script executable
 chmod +x "$CLI_SCRIPT"
+
+# Remove .git directory 
+rm -rf "$TARGET_DIR/.git"
+
+# Run command to verify installation and setup GH-Bot-Rust
+testgen --config
