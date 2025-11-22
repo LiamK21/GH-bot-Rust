@@ -10,11 +10,10 @@ from typing import cast
 import requests
 from dotenv import load_dotenv, set_key
 
+from payload_generator import PayloadGenerator
 from webhook_handler import BotRunner
 from webhook_handler.models import LLM
 from webhook_handler.services import Config
-
-from .payload_generator import PayloadGenerator
 
 # List of allowed repositories (or patterns)
 ALLOWED_REPOS = ["grcov", "glean", "rust-code-analysis"]
@@ -81,9 +80,6 @@ def is_valid_repo(url):
 def remove_directory(dir: Path):
     """Removes a directory and all its contents."""
     try:
-        print(
-            f"Removing directory: {dir} with contents: {list(dir.iterdir()) if dir.exists() else 'N/A'}"
-        )
         if dir.exists():
             shutil.rmtree(dir)
             print(f"✅ Successfully removed directory: {dir}")
@@ -121,7 +117,7 @@ def update_env_variables():
             print(f"❌ Failed to update {key_title}")
 
 def run_bot(repo: str, args: argparse.Namespace): 
-    pr_number = args.pull_request
+    pr_number = args.pull_request[0]
     
     num_invocations = args.num_invocations
     
@@ -154,10 +150,17 @@ def run_bot(repo: str, args: argparse.Namespace):
     if generation_completed:
         print("✅ Test generation completed successfully.")
         new_filename = (f"{bot_runner._execution_id}_{config.output_dir.name}.txt") # type: ignore[attr-defined]
-        generated_test = Path(config.gen_test_dir, new_filename).read_text(encoding="utf-8")
-        print(f"Generated Test Content:\n{generated_test}")
+        comment_path = Path(config.pass_generation_dir, "comment_incl_coverage.txt") # type: ignore[attr-defined]
+        if comment_path.exists():
+            comment_content = comment_path.read_text(encoding="utf-8")
+            print(f"\nComment with Coverage Info:\n\n{comment_content}\n\n")
+        else:
+            generated_test = Path(config.gen_test_dir, new_filename).read_text(encoding="utf-8")
+            print(f"\nGenerated Test Content:\n\n{generated_test}\n\n")
+        print(f"Check out the further information in: {config.pass_generation_dir}")  # type: ignore[attr-defined]
     else:
         print("❌ Test generation did not complete successfully.")   
+    bot_runner.teardown()
 
 def delete_bot_from_system(repo: Path):
     confirmation = input(
@@ -205,7 +208,7 @@ def main():
         "command", nargs="?", default="help", help="Command to execute (e.g., run)"
     )
     parser.add_argument(
-        Commands.RUN, nargs=0, help="Command to execute (e.g., run)"
+        Commands.RUN, nargs="?", help="Command to execute (e.g., run)"
     )
     parser.add_argument(
         RunFlags.PULL_REQUEST.value[0],
@@ -216,20 +219,20 @@ def main():
     )
     parser.add_argument(
         Commands.DELETE,
-        nargs=0,
+        nargs="?",
         help="Delete the CLI tool from the system",
     )
     parser.add_argument(
         Commands.CLEAR,
-        nargs=0,
+        nargs="?",
         help="Remove all cached data from previous runs",
     )
     parser.add_argument(
-        Commands.CONFIGURE, nargs=0, help="Reconfigure API keys and settings"
+        Commands.CONFIGURE, nargs="?", help="Reconfigure API keys and settings"
     )
     parser.add_argument(
         RunFlags.LLMS_USED.value[0],
-        nargs="1",
+        nargs=1,
         type=str,
         default=ALLOWED_MODELS,
         help="Specify which LLMs to use (comma-separated)",
@@ -237,13 +240,11 @@ def main():
     parser.add_argument(
         RunFlags.NUMBER_INVOCATIONS.value[0],
         RunFlags.NUMBER_INVOCATIONS.value[1],
-        nargs="?",
+        nargs=1,
         type=int,
         default=3,
         help="Number of invocations per LLM model",
     )
-
-    # parser.print_help()
 
     args = parser.parse_args()
     repo = Path(__file__).parent
@@ -265,8 +266,6 @@ def main():
     repository_name = next(repo for repo in ALLOWED_REPOS if repo in remote_url)
 
     print(f"✅ Verified repository: {remote_url}")
-
-    print(f"args.command: {args.command}")
 
     # 3. Execute Bot Logic
     if args.command == "run":
