@@ -11,6 +11,25 @@ fi
 # Retrieve absolute path to cli script
 TARGET_DIR="$( cd "$( dirname "$0")" &&  pwd)"
 CLI_SCRIPT_PATH="$TARGET_DIR/cli.py"
+REQUIREMENTS_PATH="$TARGET_DIR/requirements.txt"
+
+VENV_DIR="$TARGET_DIR/.venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment in $VENV_DIR..."
+    python3.12 -m venv "$VENV_DIR"
+else
+    echo "Virtual environment already exists."
+fi
+
+# 2. Install dependencies
+if [ -f "$REQUIREMENTS_PATH" ]; then
+    echo "Installing/Updating dependencies..."
+    "$VENV_DIR/bin/pip" install -r "$REQUIREMENTS_PATH" > /dev/null
+else
+    echo "⚠️ Warning: requirements.txt not found at $REQUIREMENTS_PATH"
+fi
+
 
 # Retrieve current shell by checking parent process ID
 # This should always give the correct shell no matter how the script is invoked
@@ -31,7 +50,7 @@ else
 fi
 
 # Prepare the alias command to add
-ALIAS_CMD="alias testgen='python3.12 $CLI_SCRIPT'"
+ALIAS_CMD="alias testgen='$VENV_DIR/bin/python3 $CLI_SCRIPT_PATH'"
 
 # Check if the alias already exists in the shell config
 if grep -Fxq "$ALIAS_CMD" "$SHELL_CONFIG"; then
@@ -47,10 +66,10 @@ else
 fi
 
 # Make the python script executable
-chmod +x "$CLI_SCRIPT"
+chmod +x "$CLI_SCRIPT_PATH"
 
 # Remove .git directory 
-rm -rf "$TARGET_DIR/.git"
+#rm -rf "$TARGET_DIR/.git"
 
 # Run command to verify installation and setup GH-Bot-Rust
-testgen --config
+"$VENV_DIR/bin/python3 $CLI_SCRIPT_PATH configure"
