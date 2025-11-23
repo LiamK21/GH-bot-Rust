@@ -62,7 +62,6 @@ else
     echo "# Added by GH-Bot-Rust installer" >> "$SHELL_CONFIG"
     echo "$ALIAS_CMD" >> "$SHELL_CONFIG"
     echo "Alias 'testgen' added to $SHELL_CONFIG"
-    echo "Please source $SHELL_CONFIG"
 fi
 
 # Make the python script executable
@@ -72,4 +71,14 @@ chmod +x "$CLI_SCRIPT_PATH"
 #rm -rf "$TARGET_DIR/.git"
 
 # Run command to verify installation and setup GH-Bot-Rust
-"$VENV_DIR/bin/python3 $CLI_SCRIPT_PATH configure"
+"$VENV_DIR/bin/python3" "$CLI_SCRIPT_PATH" configure
+
+echo ""
+echo "Installation complete!"
+read -p "Do you want to restart your shell to apply the 'testgen' alias immediately? (y/n) " -n 1 -r
+echo ""
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    exec "$CURRENT_SHELL"
+else 
+    echo "Please restart your shell or run 'source $SHELL_CONFIG' to apply the alias."
+fi
