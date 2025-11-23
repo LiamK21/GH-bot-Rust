@@ -18,6 +18,33 @@ This is part of our research at the [ZEST](https://www.ifi.uzh.ch/en/zest.html) 
 If you have any suggestions, questions, or simply want to learn more, feel free to contact us at konstantinos.kitsios@uzh.ch and mcastelluccio@mozilla.com.
 """
 
+def get_augmented_test_template(filename: str, imports: str, test: str, line_coverage_before: str | None, line_coverage_after: str | None) -> str:
+    coverage_info = f"- increases line coverage from {line_coverage_before} to {line_coverage_after}.\n" if line_coverage_before and line_coverage_after else ""
+    
+    return ("The test below:\n"
+            f"- is generated for the file `{filename}`,\n"
+            "- passes on the PR, \n"
+            "- fails in the codebase before the PR, \n"
+            f"{coverage_info}"
+            "\n"
+            "```"
+            f"{imports}\n\n"
+            f"{test}\n"
+            "```")
+    
+    
+AUGMENTED_TEST_TEMPLATE = """The test below:
+- is generated for the file `%s`,
+- passes on the PR, 
+- fails in the codebase before the PR, and 
+- increases line coverage from %s to %s.
+
+%s
+
+%s
+
+"""
+
 GUIDELINES: str = (
     "Before you begin:\n"
     "- Keep going until the job is completely solved — don’t stop halfway.\n"

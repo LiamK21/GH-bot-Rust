@@ -66,6 +66,7 @@ class TestGenerator:
                     filename, imports, line_coverage_before, line_coverage_after
                 )
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
+            self._create_augmented_test(llm_response, line_coverage_before, line_coverage_after, coverage_passed)
             return True, self._generation_dir
         else:
             logger.info("No Fail-to-Pass test generated")
@@ -479,3 +480,14 @@ class TestGenerator:
         file_content = general.get_candidate_file(base_commit, filename, repo_dir)
 
         return filename, file_content
+
+    def _create_augmented_test(self, llm_response: LLMResponse, line_coverage_before: float, line_coverage_after: float, coverage_passed: bool) -> None: 
+        assert self._generation_dir is not None
+        f, i, t = llm_response.filename, "\n".join(llm_response.imports), llm_response.test_code
+        if coverage_passed:
+            augmented_test_content = templates.get_augmented_test_template(f, i, t, str(line_coverage_before), str(line_coverage_after))
+        else:
+            augmented_test_content = templates.get_augmented_test_template(f, i, t, None, None)
+        (self._generation_dir / "augmented_test.txt").write_text(
+            augmented_test_content, encoding="utf-8"
+        )

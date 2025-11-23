@@ -215,22 +215,17 @@ class TestGenCLI:
             config.setup_output_dir(0, model)
             generation_completed = bot_runner.execute_runner(0, model)
 
+        bot_runner.teardown()
         if generation_completed:
             print("✅ Test generation completed successfully.")
             new_filename = f"{bot_runner._execution_id}_{config.output_dir.name}.txt"  # type: ignore[attr-defined]
-            comment_path = Path(config.pass_generation_dir, "comment_incl_coverage.txt")  # type: ignore[attr-defined]
-            if comment_path.exists():
-                comment_content = comment_path.read_text(encoding="utf-8")
-                print(f"\nComment with Coverage Info:\n\n{comment_content}\n\n")
-            else:
-                generated_test = Path(config.gen_test_dir, new_filename).read_text(
-                    encoding="utf-8"
-                )
-                print(f"\nGenerated Test Content:\n\n{generated_test}\n\n")
+            generated_test = Path(config.gen_test_dir, new_filename).read_text(
+                encoding="utf-8"
+            )
+            print(f"\nGenerated Test Content:\n\n{generated_test}\n")
             print(f"Check out the further information in: {config.pass_generation_dir}")  # type: ignore[attr-defined]
         else:
-            print("❌ Test generation did not complete successfully.")
-        bot_runner.teardown()
+            print("❌ No test was generated.")
         sys.exit(0)
 
     def handle_delete(self):
