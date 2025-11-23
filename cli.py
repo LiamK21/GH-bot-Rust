@@ -169,6 +169,20 @@ class TestGenCLI:
         sys.exit(0)
 
     def handle_run(self):
+        # Check if .env exists and all variables are set
+        env_path = self.repo_path / ".env"
+        if not env_path.exists():
+            print("❌ Error: .env file not found. Please run 'testgen configure' first.")
+            sys.exit(1)
+
+        load_dotenv(env_path)
+        missing_vars = [var for var in ENV_VARIABLES if not os.getenv(var)]
+        if missing_vars:
+            print(
+                f"❌ Error: Missing environment variables: {', '.join(missing_vars)}. Please run 'testgen configure'."
+            )
+            sys.exit(1)
+
         print("🚀 Starting test generation...")
 
         if not self.args.pull_request:
