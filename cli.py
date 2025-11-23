@@ -279,24 +279,21 @@ class TestGenCLI:
 
     def run(self):
         self.args = self.parser.parse_args()
-
-        # Check CWD is inside a git repository and it is an allowed repo
-        remote_url = self._get_git_remote()
-        if not remote_url:
-            print("Error: You must run 'testgen' inside a git repository.")
-            sys.exit(1)
-        if not self._is_valid_repo(remote_url):
-            print(
-                f"Error: This repository ({remote_url}) is not linked to grcov, glean, or rust-code-analysis."
-            )
-            sys.exit(1)
-
-        self.repository_name = next(
-            repo for repo in ALLOWED_REPOS if repo in remote_url
-        )
-
-        # Execute Bot Logic
         if self.args.command == Commands.RUN:
+            # Check CWD is inside a git repository and it is an allowed repo
+            remote_url = self._get_git_remote()
+            if not remote_url:
+                print("Error: You must run 'testgen' inside a git repository.")
+                sys.exit(1)
+            if not self._is_valid_repo(remote_url):
+                print(
+                    f"Error: This repository ({remote_url}) is not linked to grcov, glean, or rust-code-analysis."
+                )
+                sys.exit(1)
+
+            self.repository_name = next(
+                repo for repo in ALLOWED_REPOS if repo in remote_url
+            )    
             self.handle_run()
         elif self.args.command == Commands.CONFIGURE:
             self.handle_configure()
