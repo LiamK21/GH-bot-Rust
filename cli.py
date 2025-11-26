@@ -104,11 +104,12 @@ class TestGenCLI:
         if not any(repo in url for repo in ALLOWED_REPOS):
             return False
 
-        try:
-            response = requests.get(url)
-            if response.status_code != 200:
-                return False
-        except requests.RequestException:
+        valid_patterns = [
+            "github.com/mozilla/",  # HTTPS
+            "github.com:mozilla/",  # SSH
+        ]
+        
+        if not any(pattern in url for pattern in valid_patterns):
             return False
 
         return True
