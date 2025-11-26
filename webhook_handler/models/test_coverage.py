@@ -6,17 +6,17 @@ class TestCoverage:
     """
     Holds all data about the generated test's coverage.
     """
-    augmented_line_coverage: float | None
-    non_augmented_line_coverage: float | None
-    augmented_coverage: float | None
-    non_augmented_coverage: float | None
+    file_line_coverage_with: float | None
+    file_line_coverage_without: float | None
+    suite_coverage_with: float | None
+    suite_coverage_without: float | None
     
     def coverage_exists(self) -> bool:
         return (
-            self.augmented_line_coverage is not None
-            and self.non_augmented_line_coverage is not None
-            and self.augmented_coverage is not None
-            and self.non_augmented_coverage is not None
+            self.file_line_coverage_with is not None
+            and self.file_line_coverage_without is not None
+            and self.suite_coverage_with is not None
+            and self.suite_coverage_without is not None
         )
         
     def coverage_improved(self) -> bool:
@@ -24,6 +24,6 @@ class TestCoverage:
             return False
         
         return (
-            self.augmented_line_coverage > self.non_augmented_line_coverage # type: ignore[comparison-overlap]
-            and self.augmented_coverage > self.non_augmented_coverage # type: ignore[comparison-overlap]
+            self.file_line_coverage_with > self.file_line_coverage_without # type: ignore[comparison-overlap]
+            and self.suite_coverage_with > self.suite_coverage_without # type: ignore[comparison-overlap]
         )
