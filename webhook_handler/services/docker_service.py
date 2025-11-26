@@ -308,7 +308,7 @@ class DockerService:
 
         logger.info("[+] Patch applied successfully.")
 
-    def run_coverage_in_container(self, filename: str, patch: str) -> float | None:
+    def run_coverage_in_container(self, filename: str, patch: str) -> tuple[float | None, float | None]:
         container: Container | None = None
         try:
             logger.marker("Creating container...")  # type: ignore[attr-defined]
@@ -334,25 +334,35 @@ class DockerService:
             logger.marker("Running coverage generation...")  # type: ignore[attr-defined]
             coverage_generation_command: str = (
             f"/bin/sh -c 'cd {path_to_file} && "
-            "timeout 300s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib " 
-            f"{file_basename}::tests '" 
+            "timeout 300s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib '" 
             )
             exec_result = container.exec_run(coverage_generation_command, stdout=True, stderr=True)
             
             logger.marker("Retrieving line coverage...")  # type: ignore[attr-defined]
-            coverage_retrieval_command: str = (
+            file_coverage_retrieval_command: str = (
                 "/bin/sh -c 'cd /app/testbed && "
                 f"python3 /app/retrieve_line_coverage.py {filename}'"
             )
+            exec_result = container.exec_run(file_coverage_retrieval_command, stdout=True, stderr=True)
+            stdout_file_coverage = exec_result.output.decode()
+            
+            coverage_retrieval_command: str = (
+                "/bin/sh -c 'cd /app/testbed && "
+                f"python3 /app/retrieve_line_coverage.py'"
+            )
             exec_result = container.exec_run(coverage_retrieval_command, stdout=True, stderr=True)
-            stdout = exec_result.output.decode()
+            stdout_coverage = exec_result.output.decode()
             try:
-                stdout = float(stdout.strip())
+                stdout_file_coverage = float(stdout_file_coverage.strip())
+                stdout_coverage = float(stdout_coverage.strip())
             except ValueError:
-                stdout = None
-            logger.info(f"[+] Line Coverage: {stdout}")
+                stdout_file_coverage = None
+                stdout_coverage = None
+                
+            logger.info(f"[+] File Line Coverage: {stdout_file_coverage}")
+            logger.info(f"[+] Test Suite Line Coverage: {stdout_coverage}")
                         
-            return stdout
+            return stdout_file_coverage, stdout_coverage
 
         except ImageNotFound as e:
             logger.critical(f"Docker image not found: {e}")
