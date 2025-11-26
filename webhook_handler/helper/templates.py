@@ -1,4 +1,4 @@
-from webhook_handler.models.prompt_type_enum import PromptType
+from webhook_handler.models import PromptType, TestCoverage
 
 COMMENT_TEMPLATE = """Hi! 🤖 The test below is automatically generated and could serve as a regression test for this PR because it:
 - passes on the PR, 
@@ -19,14 +19,27 @@ This is part of our research at the [ZEST](https://www.ifi.uzh.ch/en/zest.html) 
 If you have any suggestions, questions, or simply want to learn more, feel free to contact us at konstantinos.kitsios@uzh.ch and mcastelluccio@mozilla.com.
 """
 
-def get_augmented_test_template(filename: str, imports: str, test: str, line_coverage_before: str | None, line_coverage_after: str | None) -> str:
-    coverage_info = f"- increases line coverage from {line_coverage_before} to {line_coverage_after}.\n" if line_coverage_before and line_coverage_after else ""
+def get_augmented_test_template(filename: str, imports: str, test: str, test_coverage: TestCoverage | None) -> str:
+    file_line_coverage_info = ""
+    suite_line_coverage_info = ""
+    if test_coverage is not None:
+        line_coverage_before = test_coverage.file_line_coverage_without
+        line_coverage_after = test_coverage.file_line_coverage_with
+        suite_line_coverage_before = test_coverage.suite_line_coverage_without
+        suite_line_coverage_after = test_coverage.suite_line_coverage_with    
+        if line_coverage_before and line_coverage_before:
+            file_line_coverage_info = f"- increases file line coverage from {line_coverage_before} to {line_coverage_after},\n"    
+        
+        if suite_line_coverage_before and suite_line_coverage_after:
+            suite_line_coverage_info = f"- increases test suite line coverage from {suite_line_coverage_before} to {suite_line_coverage_after}\n"
+        
     
     return ("The test below:\n"
             f"- is generated for the file `{filename}`,\n"
             "- passes on the PR, \n"
             "- fails in the codebase before the PR, \n"
-            f"{coverage_info}"
+            f"{file_line_coverage_info}"
+            f"{suite_line_coverage_info}"
             "\n"
             "```"
             f"{imports}\n\n"
