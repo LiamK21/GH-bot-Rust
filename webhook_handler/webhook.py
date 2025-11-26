@@ -5,16 +5,11 @@ import logging
 import threading
 from pathlib import Path
 
-from django.http import (
-    HttpRequest,
-    HttpResponse,
-    HttpResponseForbidden,
-    HttpResponseNotAllowed,
-    JsonResponse,
-)
+from django.http import (HttpRequest, HttpResponse, HttpResponseForbidden,
+                         HttpResponseNotAllowed, JsonResponse)
 from django.views.decorators.csrf import csrf_exempt
 
-from webhook_handler.constants import USED_MODELS, get_total_attempts
+from webhook_handler.constants import USED_MODELS
 
 from .bot_runner import BotRunner
 from .services.config import Config
@@ -93,18 +88,11 @@ def github_webhook(request: HttpRequest) -> HttpResponse | JsonResponse:
     def _execute_runner_in_background():
         try:
             bootstrap.info(f"[#{pr_number}] Starting runner execution...")
-            total_attempts_per_model = get_total_attempts()
             generation_completed = False
             for model in USED_MODELS:
-                curr_attempt = 0
-                while curr_attempt < total_attempts_per_model:
-                    generation_completed = runner.execute_runner(curr_attempt, model)
-                    if generation_completed:
-                        break
-                    curr_attempt += 1
-
                 if generation_completed:
                     break
+                generation_completed = runner.execute_runner(0, model)
 
             completed_message = (
                 "Test generated successfully"

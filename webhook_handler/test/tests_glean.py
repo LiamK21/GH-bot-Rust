@@ -4,8 +4,7 @@ import os
 from django.test import TestCase
 
 from webhook_handler.bot_runner import BotRunner
-from webhook_handler.constants import USED_MODELS, get_total_attempts
-from webhook_handler.models import LLM
+from webhook_handler.constants import USED_MODELS
 from webhook_handler.services.config import Config
 
 

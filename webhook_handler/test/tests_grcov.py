@@ -4,8 +4,7 @@ import os
 from django.test import TestCase
 
 from webhook_handler.bot_runner import BotRunner
-from webhook_handler.constants import USED_MODELS, get_total_attempts
-from webhook_handler.models import LLM
+from webhook_handler.constants import USED_MODELS
 from webhook_handler.services.config import Config
 
 
@@ -68,31 +67,6 @@ class TestGeneration1394(TestCase):
             generation_completed = self.runner.execute_runner(0, model)
 
        self.assertTrue(generation_completed)
-
-
-# class TestGeneration34(TestCase):
-#     def setUp(self) -> None:
-#         self.payload = _get_payload("test_data/grcov/pr_34.json")
-#         self.config = Config()
-#         self.runner = BotRunner(self.payload, self.config)
-#         _setup_dirs(self.config, self.runner, self.payload)
-
-#     def tearDown(self) -> None:
-#         self.runner.teardown()
-
-#     def test_generation1394(self):
-#         generation_completed = False
-#         total_attempts = get_total_attempts()
-#         # This approach is only temporary until prompt combinations are defined
-#         model = LLM.GPT4o
-#         # for model in USED_MODELS:
-#         # # for curr_attempt in range(total_attempts):
-#         #     if generation_completed:
-#         #         break
-#         self.config.setup_output_dir(0, model)
-#         generation_completed = self.runner.execute_runner(0, model)
-
-#         self.assertTrue(generation_completed)
 
 
 class TestGeneration1326(TestCase):
