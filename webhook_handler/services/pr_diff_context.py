@@ -75,18 +75,6 @@ class PullRequestDiffContext:
         )
 
     @property
-    def code_names(self) -> list[str]:
-        return [code_file_diff.name for code_file_diff in self.source_code_file_diffs]
-
-    @property
-    def code_before(self) -> list[str]:
-        return [code_file_diff.before for code_file_diff in self.source_code_file_diffs]
-
-    @property
-    def code_after(self) -> list[str]:
-        return [code_file_diff.after for code_file_diff in self.source_code_file_diffs]
-
-    @property
     def golden_code_patch(self) -> str:
         return (
             "\n\n".join(
