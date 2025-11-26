@@ -14,7 +14,7 @@ from webhook_handler.models import LLM
 class Config:
     """Configuration for the bot runner"""
 
-    def __init__(self):
+    def __init__(self, llm_calls: int = 5):
         load_dotenv()  # take environment variables from .env.
         self.github_webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
         self.github_token = os.getenv("GITHUB_TOKEN")
@@ -28,8 +28,8 @@ class Config:
 
         self.execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.curr_attempt = 0
-        self.MAX_LLM_CALLS = 5
-        self.root_dir = Path.cwd()
+        self.MAX_LLM_CALLS = llm_calls
+        self.root_dir = Path(__file__).parent.parent.parent.resolve()
         self.is_server = Path("/home/runner").is_dir()
 
         self.parsing_language = Language(tree_sitter_rust.language())
@@ -46,6 +46,7 @@ class Config:
         self.output_dir = None
         self.cloned_repo_dir = None
         self.executed_tests = None
+        self.pass_generation_dir: Path | None = None
 
         Path(self.webhook_raw_log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.bot_log_dir).mkdir(parents=True, exist_ok=True)
