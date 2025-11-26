@@ -8,15 +8,15 @@ class TestCoverage:
     """
     file_line_coverage_with: float | None
     file_line_coverage_without: float | None
-    suite_coverage_with: float | None
-    suite_coverage_without: float | None
+    suite_line_coverage_with: float | None
+    suite_line_coverage_without: float | None
     
     def coverage_exists(self) -> bool:
         return (
             self.file_line_coverage_with is not None
             and self.file_line_coverage_without is not None
-            and self.suite_coverage_with is not None
-            and self.suite_coverage_without is not None
+            and self.suite_line_coverage_with is not None
+            and self.suite_line_coverage_without is not None
         )
         
     def coverage_improved(self) -> bool:
@@ -25,5 +25,5 @@ class TestCoverage:
         
         return (
             self.file_line_coverage_with > self.file_line_coverage_without # type: ignore[comparison-overlap]
-            and self.suite_coverage_with > self.suite_coverage_without # type: ignore[comparison-overlap]
+            and self.suite_line_coverage_with > self.suite_line_coverage_without # type: ignore[comparison-overlap]
         )
