@@ -4,7 +4,8 @@ from pathlib import Path
 
 from webhook_handler.helper import general, git_diff, templates
 from webhook_handler.helper.custom_errors import *
-from webhook_handler.models import LLM, LLMResponse, PipelineInputs, PromptType
+from webhook_handler.models import (LLM, LLMResponse, PipelineInputs,
+                                    PromptType, TestCoverage)
 from webhook_handler.services import Config
 from webhook_handler.services.cst_builder import CSTBuilder
 from webhook_handler.services.docker_service import DockerService
@@ -42,7 +43,6 @@ class TestGenerator:
         self._llm_handler = llm_handler
         self._i_attempt = i_attempt
         self._model = model
-
         self._generation_dir: Path | None = None
 
     def generate(self) -> tuple[bool, Path | None]:
@@ -56,14 +56,15 @@ class TestGenerator:
         if fail_2_pass:
             logger.success("Fail-to-Pass test generated")  # type: ignore[attr-defined]
             logger.marker("Running code coverage to verify usability of generated test")  # type: ignore[attr-defined]
-            coverage_passed, line_coverage_before, line_coverage_after = (
+            coverage_passed, test_coverage = (
                 self._determine_test_usability(llm_response)
             )
             if coverage_passed:
                 logger.marker("[*] Handling commenting on PR")  # type: ignore[attr-defined]
                 filename, imports = llm_response.filename, llm_response.imports
+                assert test_coverage is not None
                 self._handle_commenting(
-                    filename, imports, line_coverage_before, line_coverage_after
+                    filename, imports, test_coverage
                 )
             logger.marker("=============== Test Generation Finished =============")  # type: ignore[attr-defined]
             self._create_augmented_test(llm_response, line_coverage_before, line_coverage_after, coverage_passed)
@@ -390,7 +391,7 @@ class TestGenerator:
 
     def _determine_test_usability(
         self, llm_response: LLMResponse
-    ) -> tuple[bool, float, float]:
+    ) -> tuple[bool, TestCoverage | None]:
         if not self._config.cloned_repo_dir:
             raise DataMissingError(
                 "cloned_repo_dir", "None", "Cloned repo dir should not be None"
@@ -421,7 +422,7 @@ class TestGenerator:
         # We first want to run code coverage in a container only with the golden patch to evaluate it before the auto-generated test
         logger.marker("Running code coverage with golden patch only...")  # type: ignore[attr-defined]
         golden_code_patch = self._pr_diff_ctx.golden_code_patch
-        non_augmented_line_coverage = self._docker_service.run_coverage_in_container(
+        file_line_coverage_without, suite_line_coverage_without = self._docker_service.run_coverage_in_container(
             filename, golden_code_patch
         )
 
@@ -429,35 +430,39 @@ class TestGenerator:
         golden_code_patch: str = self._pr_diff_ctx.get_updated_golden_code_patch(
             filename, new_file_content
         )
-        augmented_line_coverage = self._docker_service.run_coverage_in_container(
+        file_line_coverage_with, suite_line_coverage_with = self._docker_service.run_coverage_in_container(
             filename, golden_code_patch
         )
+        test_coverage = TestCoverage(
+            file_line_coverage_with=file_line_coverage_with,
+            suite_line_coverage_with=suite_line_coverage_with,
+            file_line_coverage_without=file_line_coverage_without,
+            suite_line_coverage_without=suite_line_coverage_without,
+        )
 
-        if augmented_line_coverage is None:
+        if not test_coverage.coverage_exists():
             logger.error("Could not retrieve line coverage, marking test as non-usable")
-            return False, 0.0, 0.0
+            return False, None
 
-        elif non_augmented_line_coverage is None:
-            logger.success("Generated test increases line coverage, marking as usable")  # type: ignore[attr-defined]
-            return True, 0.0, augmented_line_coverage
-
-        elif augmented_line_coverage <= non_augmented_line_coverage:
-            logger.warning("Generated test does not improve line coverage, marking as non-usable")  # type: ignore[attr-defined]
-            return False, non_augmented_line_coverage, augmented_line_coverage
+        elif test_coverage.coverage_improved():
+            logger.success("Generated test does improve line coverage, marking as non-usable")  # type: ignore[attr-defined]
+            return True, test_coverage
         else:
-            return True, non_augmented_line_coverage, augmented_line_coverage
+            return False, test_coverage
 
     def _handle_commenting(
         self,
         filename: str,
         imports: list[str],
-        line_coverage_before: float,
-        line_coverage_after: float,
+        test_coverage: TestCoverage
+        
     ) -> None:
         assert self._generation_dir is not None
         comment = templates.COMMENT_TEMPLATE % (
-            f"{line_coverage_before:.2f}%",
-            f"{line_coverage_after:.2f}%",
+            f"{test_coverage.file_line_coverage_without:.2f}%",
+            f"{test_coverage.file_line_coverage_with:.2f}%",
+            f"{test_coverage.suite_line_coverage_without:.2f}%",
+            f"{test_coverage.suite_line_coverage_with:.2f}%",
             "\n".join(imports),
             (self._generation_dir / "generated_test.txt").read_text(encoding="utf-8"),
             filename,
