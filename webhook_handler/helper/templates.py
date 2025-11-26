@@ -34,14 +34,13 @@ def get_augmented_test_template(filename: str, imports: str, test: str, test_cov
             suite_line_coverage_info = f"- increases test suite line coverage from {suite_line_coverage_before} to {suite_line_coverage_after}\n"
         
     
-    return ("The test below:\n"
-            f"- is generated for the file `{filename}`,\n"
-            "- passes on the PR, \n"
-            "- fails in the codebase before the PR, \n"
+    return (f"The test below is generated for the file `{filename}` and:\n"
+            "- fails on the codebase before the PR, \n"
+            "- passes on the codebase after the PR,"
             f"{file_line_coverage_info}"
             f"{suite_line_coverage_info}"
             "\n"
-            "```"
+            "```\n"
             f"{imports}\n\n"
             f"{test}\n"
             "```")
