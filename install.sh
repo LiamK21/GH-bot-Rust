@@ -74,10 +74,15 @@ fi
 chmod +x "$CLI_SCRIPT_PATH"
 
 # Remove .git directory 
-#rm -rf "$TARGET_DIR/.git"
+rm -rf "$TARGET_DIR/.git"
 
 # Run command to verify installation and setup GH-Bot-Rust
-"$VENV_DIR/bin/python3" "$CLI_SCRIPT_PATH" configure
+if ! "$VENV_DIR/bin/python3" "$CLI_SCRIPT_PATH" configure; then
+    echo "Error: Configuration failed. Please check that all dependencies are properly installed."
+    echo "You can try manually installing requirements with:"
+    echo "  $VENV_DIR/bin/pip install -r $REQUIREMENTS_PATH"
+    exit 1
+fi
 
 echo ""
 echo "Installation complete!"
