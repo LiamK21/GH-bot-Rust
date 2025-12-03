@@ -284,12 +284,12 @@ The CLI tool enables locally running the bot to generate a test.
 
    ```bash
    python3.12 -m venv .venv
-   source .venv/bin/activate
    ```
 
 3. Install the required dependencies
 
    ```bash
+   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
