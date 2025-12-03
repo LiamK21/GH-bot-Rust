@@ -16,18 +16,24 @@ REQUIREMENTS_PATH="$TARGET_DIR/requirements.txt"
 VENV_DIR="$TARGET_DIR/.venv"
 
 if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating virtual environment in $VENV_DIR..."
-    python3.12 -m venv "$VENV_DIR"
-else
-    echo "Virtual environment already exists."
+    echo "$VENV_DIR does not exist. Please create a virtual environment and try again."
+    exit 1
 fi
 
 # 2. Install dependencies
 if [ -f "$REQUIREMENTS_PATH" ]; then
-    echo "Installing/Updating dependencies..."
-    "$VENV_DIR/bin/pip" install -r "$REQUIREMENTS_PATH" > /dev/null
+    echo "Verifying dependencies..."
+    if "$VENV_DIR/bin/pip" install --dry-run -r "$REQUIREMENTS_PATH" > /dev/null 2>&1; then
+        echo "Dependencies installed"
+    else
+        echo "Dependencies missing"
+        echo "Please install them by running:"
+        echo "  $VENV_DIR/bin/pip install -r $REQUIREMENTS_PATH"
+        exit 1
+    fi
 else
-    echo "⚠️ Warning: requirements.txt not found at $REQUIREMENTS_PATH"
+    echo "Warning: requirements.txt not found at $REQUIREMENTS_PATH"
+    exit 1
 fi
 
 
