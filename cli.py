@@ -27,7 +27,7 @@ CLI_DESCRIPTION = (
     f"This tool automatically runs test generation for supported repositories: {', '.join(ALLOWED_REPOS)}.\n"
     f"Supported LLM Models include: {', '.join(ALLOWED_MODELS)}.\n"
     "It uses LLM models from the OpenAI and Groq APIs to generate unit tests on pull requests.\n\n"
-    "This is part of our research at the [ZEST](https://www.ifi.uzh.ch/en/zest.html) group of University of Zurich in collaboration with [Mozilla](https://www.mozilla.org).\n"
+    "This is part of our research at the ZEST (https://www.ifi.uzh.ch/en/zest.html) group of University of Zurich in collaboration with Mozilla (https://www.mozilla.org).\n"
     "If you have any suggestions, questions, or simply want to learn more, feel free to contact us at konstantinos.kitsios@uzh.ch and mcastelluccio@mozilla.com."
 )
 
@@ -192,12 +192,10 @@ class TestGenCLI:
 
         pr_number = self.args.pull_request[0]
 
-        # Handle num_invocations which might be a list due to nargs=1 or int due to default
         num_invocations = self.args.num_invocations
         if isinstance(num_invocations, list):
             num_invocations = num_invocations[0]
 
-        # Handle llms which might be a list due to nargs=1 or list due to default
         llms = self.args.llms
         llms = self._parse_llms(llms)
 
