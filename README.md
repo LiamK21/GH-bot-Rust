@@ -1,6 +1,6 @@
 # GH-Bot Rust
 
-This project represents a tool for automated regression test generation for Rust. It does so by analyzing a pull request along its accompanying issue and querying an LLM to produce a regression test to ensure that the issue has been resolved. It is inspired by prior versions for [JavaScript] (https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs) and [Python] (https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs/tree/6e3d8a2be3be19a24efaae3742848d726653d073). Currently, there is support for automated test generation using a webhook and manual generation using the CLI-tool.
+This project represents a tool for automated regression test generation for Rust. It does so by analyzing a pull request along its accompanying issue and querying an LLM to produce a regression test to ensure that the issue has been resolved. It is inspired by prior versions for [JavaScript](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs) and [Python](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs/tree/6e3d8a2be3be19a24efaae3742848d726653d073). Currently, there is support for automated test generation using a webhook and manual generation using the CLI-tool.
 
 ## Overview
 
@@ -280,7 +280,20 @@ The CLI tool enables locally running the bot to generate a test.
 
 1. Clone the repository: See Local Setup
 
-2. Run the installation script:
+2. Setup a Python3.12 virtual environment named `.venv`
+
+   ```bash
+   python3.12 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. Install the required dependencies
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Run the installation script:
 
    ```bash
    ./install.sh
@@ -289,12 +302,11 @@ The CLI tool enables locally running the bot to generate a test.
    The installer will:
 
    - Check for Python 3.12
-   - Create a virtual environment in `.venv`
-   - Install required dependencies
+   - Check for a virtual environment named `.venv`
    - Add a `testgen` alias to your shell configuration
    - Prompt you to configure API keys
 
-3. Restart your shell or source your config file:
+5. Restart your shell or source your config file:
    ```bash
    source ~/.zshrc  # for zsh
    source ~/.bashrc # for bash
