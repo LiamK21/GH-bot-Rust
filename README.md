@@ -303,7 +303,6 @@ The CLI tool enables locally running the bot to generate a test.
 
    - Check for Python 3.12
    - Check for a virtual environment named `.venv`
-   - Add a `testgen` alias to your shell configuration
    - Prompt you to configure API keys
 
 5. Restart your shell or source your config file:
