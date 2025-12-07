@@ -12,7 +12,7 @@ from dotenv import load_dotenv, set_key
 
 from payload_generator import PayloadGenerator
 from webhook_handler import BotRunner
-from webhook_handler.models import LLM
+from webhook_handler.models import LLM, GitHubEvent
 from webhook_handler.services import Config
 
 # List of allowed repositories (or patterns)
@@ -41,6 +41,7 @@ class Commands(StrEnum):
 
 class RunFlags(Enum):
     PULL_REQUEST = ["-pr", "--pull-request"]
+    ISSUE = ["-i", "--issue"]
     LLMS_USED = ["--llms"]
     NUMBER_INVOCATIONS = ["-n", "--num-invocations"]
 
@@ -66,6 +67,13 @@ class TestGenCLI:
             nargs=1,
             type=int,
             help="Specify pull request number to analyze",
+        )
+        parser.add_argument(
+            RunFlags.ISSUE.value[0],
+            RunFlags.ISSUE.value[1],
+            nargs=1,
+            type=int,
+            help="Specify issue number for local test generation (compares uncommitted changes vs HEAD)",
         )
         parser.add_argument(
             RunFlags.LLMS_USED.value[0],
@@ -184,10 +192,18 @@ class TestGenCLI:
             )
             sys.exit(1)
 
+        # Check if either --pull-request or --issue is provided (mutually exclusive)
+        if self.args.issue and self.args.pull_request:
+            print("❌ Error: Cannot use both --pull-request and --issue flags. Choose one.")
+            sys.exit(1)
+
+        if self.args.issue:
+            return self.handle_run_issue()
+
         print("🚀 Starting test generation...")
 
         if not self.args.pull_request:
-            print("❌ Error: --pull-request argument is required for 'run' command.")
+            print("❌ Error: Either --pull-request or --issue argument is required for 'run' command.")
             sys.exit(1)
 
         pr_number = self.args.pull_request[0]
@@ -219,6 +235,68 @@ class TestGenCLI:
         bot_runner = BotRunner(config=config, payload=pr_payload)
         pr_id = bot_runner._pr_data.id
         config.setup_pr_related_dirs(pr_id, pr_payload)
+
+        generation_completed = False
+        for model in llms:
+            if generation_completed:
+                break
+            model = cast(LLM, model)
+            config.setup_output_dir(0, model)
+            generation_completed = bot_runner.execute_runner(0, model)
+
+        bot_runner.teardown()
+        if generation_completed:
+            print("✅ Test generation completed successfully.")
+            new_filename = f"{bot_runner._execution_id}_{config.output_dir.name}.txt"  # type: ignore[attr-defined]
+            generated_test = Path(config.gen_test_dir, new_filename).read_text(
+                encoding="utf-8"
+            )
+            print(f"\nGenerated Test Content:\n\n{generated_test}\n")
+            print(f"Check out the further information in: {config.pass_generation_dir}")  # type: ignore[attr-defined]
+        else:
+            print("❌ No test was generated.")
+        sys.exit(0)
+
+    def handle_run_issue(self):
+        """Handle test generation for a GitHub issue using local uncommitted changes."""
+        print("🚀 Starting local test generation for issue...")
+
+        issue_number = self.args.issue[0]
+        
+        if issue_number is None:
+            print("❌ Error: --issue argument is required for 'run' command.")
+            sys.exit(1)
+        
+        repo_path = Path.cwd()
+
+        # Parse LLM and invocation settings
+        num_invocations = self.args.num_invocations
+        if isinstance(num_invocations, list):
+            num_invocations = num_invocations[0]
+
+        llms = self._parse_llms(self.args.llms)
+        if not llms:
+            print(
+                f"❌ Error: No valid LLMs specified. Allowed: {', '.join(ALLOWED_MODELS)}"
+            )
+            sys.exit(1)
+
+        # Pass local_repo_path to Config so BotRunner can use it
+        config = Config(llm_calls=num_invocations, gh_event=GitHubEvent.ISSUE, local_repo_path=repo_path)
+
+        payload_generator = PayloadGenerator(
+            repo=self.repository_name, issue_number=issue_number
+        )
+
+        try:
+            issue_payload = payload_generator.generate_payload()
+        except Exception as e:
+            print(f"❌ Error generating payload: {e}")
+            sys.exit(1)
+
+        bot_runner = BotRunner(config=config, payload=issue_payload)
+        pr_id = bot_runner._pr_data.id
+        config.setup_pr_related_dirs(pr_id, issue_payload)
 
         generation_completed = False
         for model in llms:
@@ -293,7 +371,6 @@ class TestGenCLI:
     def run(self):
         self.args = self.parser.parse_args()
         if self.args.command == Commands.RUN:
-            # Check CWD is inside a git repository and it is an allowed repo
             remote_url = self._get_git_remote()
             if not remote_url:
                 print("Error: You must run 'testgen' inside a git repository.")
@@ -306,7 +383,7 @@ class TestGenCLI:
 
             self.repository_name = next(
                 repo for repo in ALLOWED_REPOS if repo in remote_url
-            )    
+            )
             self.handle_run()
         elif self.args.command == Commands.CONFIGURE:
             self.handle_configure()
