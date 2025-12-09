@@ -1,9 +1,9 @@
 import logging
-from typing import cast
 
 from webhook_handler.helper import git_diff
 from webhook_handler.models import PullRequestFileDiff
 from webhook_handler.services.gh_service import GitHubService
+from webhook_handler.services.local_diff_service import LocalDiffService
 
 logger = logging.getLogger(__name__)
 
@@ -141,3 +141,47 @@ class PullRequestDiffContext:
             ),
             None,
         )
+
+    @classmethod
+    def from_local_git(
+        cls,
+        base_commit: str,
+        local_service: LocalDiffService,
+    ) -> "PullRequestDiffContext":
+        """
+        Create a PullRequestDiffContext from the local git repository.
+        Args:
+            base_commit: The HEAD commit to compare against
+            local_service: LocalDiffService instance
+
+        Returns:
+            PullRequestDiffContext: Instance with file diffs from local git (working dir vs HEAD)
+        """
+        instance = cls.__new__(cls)
+        instance._gh_service = None 
+        instance._pr_file_diffs = []
+
+        changed_files = local_service.get_changed_files()
+
+        logger.info(f"Processing {len(changed_files)} changed files from local git")
+
+        for filepath in changed_files:
+            try:
+                before = local_service.get_file_content(base_commit, filepath)
+
+                after = local_service.get_working_directory_content(filepath)
+
+                # Only add if there's an actual difference
+                if before != after:
+                    instance._pr_file_diffs.append(
+                        PullRequestFileDiff(filepath, before, after)
+                    )
+                    logger.debug(f"Added file diff for: {filepath}")
+            except Exception as e:
+                logger.warning(f"Failed to process file {filepath}: {e}")
+                continue
+
+        logger.info(
+            f"Created PullRequestDiffContext with {len(instance._pr_file_diffs)} file diffs"
+        )
+        return instance
