@@ -1,12 +1,12 @@
 # GH-Bot Rust
 
-This project represents a tool for automated regression test generation for Rust. It does so by analyzing a pull request along its accompanying issue and querying an LLM to produce a regression test to ensure that the issue has been resolved. It is inspired by prior versions for [JavaScript](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs) and [Python](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs/tree/6e3d8a2be3be19a24efaae3742848d726653d073). Currently, there is support for automated test generation using a webhook and manual generation using the CLI-tool.
+This project represents a tool for automated regression test generation for Rust. It analyzes pull requests or local changes along with accompanying GitHub or Bugzilla issues and queries an LLM to produce regression tests. It is inspired by prior versions for [JavaScript](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs) and [Python](https://github.com/maettuu/Thesis-on-Test-Generation-Using-LLMs/tree/6e3d8a2be3be19a24efaae3742848d726653d073).
 
 ## Overview
 
-The bot automates the process of generating unit tests for Rust pull requests by:
+The bot automates the process of generating unit tests for Rust code by:
 
-1. **Analyzing PR Context**: Fetches PR data, linked issues, and code changes
+1. **Analyzing Code Context**: Fetches PR data or analyzes local changes, along with linked issues
 2. **Building Docker Environments**: Creates isolated testing environments for each repository
 3. **Generating Tests with LLMs**: Uses multiple LLM models to generate test code
 4. **Validating Tests**: Compiles, runs, and verifies test correctness
@@ -337,7 +337,7 @@ testgen run -pr <PR_NUMBER> [OPTIONS]
 
 **Options:**
 
-- `-pr, --pull-request <NUMBER>` (required): Pull request number to analyze
+- `-pr, --pull-request <NUMBER>`: Pull request number to analyze
 - `--llms <MODEL>`: Specify which LLMs to use (comma-separated). Default: all models
   - Available: `gpt-4o`, `llama-3.3-70b-versatile`, `qwen3-32b`
 - `-n, --num-invocations <NUMBER>`: Number of invocations per LLM model. Default: 3
@@ -354,6 +354,54 @@ testgen run -pr 1180 --llms gpt-4o -n 5
 # Use multiple specific models
 testgen run -pr 1180 --llms gpt-4o,llama-3.3-70b-versatile
 ```
+
+#### Generate Tests for an Issue (Local Development)
+
+For local development, you can generate tests based on uncommitted changes in your working directory:
+
+```bash
+testgen run -i <ISSUE_NUMBER> [OPTIONS]
+```
+
+This mode:
+
+- Compares your **uncommitted changes** (working directory) against **HEAD**
+- Generates tests that should fail on HEAD and pass with your changes
+- Uses the specified GitHub issue for context. As Glean uses Bugzilla issues, they are supported
+- Requires you to be in a local clone of a supported repository
+
+**Options:**
+
+- `-i --issue <NUMBER>`: GitHub or BugZilla issue (glean) number for context
+- `--llms <MODEL>`: Specify which LLMs to use (comma-separated). Default: all models
+- `-n, --num-invocations <NUMBER>`: Number of invocations per LLM model. Default: 3
+
+**Examples:**
+
+```bash
+# Navigate to your local repository
+cd /path/to/grcov
+
+# Make changes to source files (don't commit yet)
+vim src/lib.rs
+
+# Generate tests for issue #123
+testgen run --issue 123
+
+# Use specific model with multiple invocations
+testgen run --issue 123 --llms gpt-4o -n 5
+```
+
+**Requirements for Issue Mode:**
+
+- Must be run from within a local clone of a supported repository (grcov, glean, rust-code-analysis)
+- Repository must have a `.git` directory
+- Must have uncommitted changes in your working directory
+- The specified issue number must exist in the repository's GitHub issues or BugZilla issues (glean)
+
+**Limitation**
+
+- For the issue-based test generation to run, `.dockerignore` files may not contain a `.git` entry
 
 #### Clear Cached Data
 
