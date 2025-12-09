@@ -102,17 +102,31 @@ class PayloadGenerator:
             ValueError: If the issue fails validation or git operations fail.
         """
         assert self.issue_number is not None
+        issue_data = {}
+        glean_is_bugzilla_linked = False
+        # For Glean, check Bugzilla first
+        if self.repo == "glean":
+            bug_data = self._fetch_bugzilla_data(self.issue_number)
+            if "bugs" in bug_data and len(bug_data["bugs"]) > 0:
+                glean_is_bugzilla_linked = True
+                issue_data = {"number": bug_data["bugs"][0].get("id", self.issue_number),
+                              "title": bug_data["bugs"][0].get("summary", ""),
+                              "body": bug_data["bugs"][0].get("description", ""),
+                              "url": bug_data["bugs"][0].get("url", ""),}
         
+        if not glean_is_bugzilla_linked:
         # Fetch issue data from GitHub
-        issue_data = self._fetch_github_data(
-            f"{MOZILLA_API_URL}/{self.repo}/issues/{self.issue_number}"
-        )
-        issue_data = cast(dict, issue_data)
+            issue_data = self._fetch_github_data(
+                f"{MOZILLA_API_URL}/{self.repo}/issues/{self.issue_number}"
+            )
+            issue_data = cast(dict, issue_data)
+            # Validate the issue
+            if not self._validate_issue(issue_data):
+                raise ValueError(f"Issue #{self.issue_number} failed validation checks")
+            
 
-        # Validate the issue
-        if not self._validate_issue(issue_data):
-            raise ValueError(f"Issue #{self.issue_number} failed validation checks")
 
+        print(f"[*] Issue #{self.issue_number} passed validation checks")
         # Build PR-like data structure from local git state
         issue_payload = self._build_issue_payload_from_local_git(issue_data)
 
@@ -511,7 +525,7 @@ class PayloadGenerator:
         Returns:
             dict: Data.
         """
-        url = f"https://bugzilla.mozilla.org/rest/bug?id={bug_nr}&include_fields=id,summary,component,description"
+        url = f"https://bugzilla.mozilla.org/rest/bug?id={bug_nr}&include_fields=id,summary,component,description,url,"
         response = requests.get(url, headers=BUGZILLA_HEADERS)
         if response.status_code == 403 and "X-RateLimit-Reset" in response.headers:
             print("[*] Sleeping...")
