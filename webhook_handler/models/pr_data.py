@@ -29,23 +29,29 @@ class PullRequestData:
     @classmethod
     def from_payload(cls, payload: dict) -> "PullRequestData":
         """
-        Extracts data from a pull request payload.
+        Extracts data from a pull request or issue payload.
 
         Parameters:
-            payload (dict): A pull request payload
+            payload (dict): A pull request or issue payload
 
         Returns:
             PullRequestData: The data extracted from the payload
         """
-
-        pr = payload["pull_request"]
+        # Handle both pull_request and issue payloads
+        if "pull_request" in payload:
+            pr = payload["pull_request"]
+        elif "issue" in payload:
+            pr = payload["issue"]
+        else:
+            raise ValueError("Payload must contain either 'pull_request' or 'issue' key")
+        
         repo = payload["repository"]
         return cls(
             number=pr["number"],
             title=pr["title"],
             description=pr["body"],
             url=pr["url"],
-            diff_url=pr["diff_url"],
+            diff_url=pr.get("diff_url", ""),  # Issues don't have diff_url
             base_branch=pr["base"]["ref"],
             base_commit=pr["base"]["sha"],
             head_branch=pr["head"]["ref"],
