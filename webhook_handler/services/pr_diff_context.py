@@ -163,8 +163,6 @@ class PullRequestDiffContext:
 
         changed_files = local_service.get_changed_files()
 
-        logger.info(f"Processing {len(changed_files)} changed files from local git")
-
         for filepath in changed_files:
             try:
                 before = local_service.get_file_content(base_commit, filepath)

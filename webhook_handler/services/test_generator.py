@@ -318,9 +318,6 @@ class TestGenerator:
             )
         # Try to get the direct file content from the head commit instead of checking out the commit
         # This is to avoid issues where PRs or such are from forked repos and the commit does not exist in the main repo
-        logger.info(
-            "Getting file content from head commit rather than checking out commit..."
-        )
         pr_file_diff = self._pr_diff_ctx.get_specific_file_diff(filename)
         file_content = pr_file_diff.after if pr_file_diff else ""
 

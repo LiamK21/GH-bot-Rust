@@ -209,20 +209,15 @@ class BotRunner:
                 self._pr_diff_ctx = PullRequestDiffContext.from_local_git(
                     self._pr_data.base_commit, local_service
                 )
-                self._logger.info("Built diff context from local git (uncommitted changes vs HEAD)")
             else:
                 self._pr_diff_ctx = PullRequestDiffContext(
                     self._pr_data.base_commit, self._pr_data.head_commit, self._gh_service
                 )
-                self._logger.info("Built diff context from GitHub API")
         
         if len(self._pr_diff_ctx.source_code_file_diffs) == 0:
             raise ExecutionError("No source code changes found")
 
-        # Clone repository unless we're using a local repo
-        if self._config.local_repo_path:
-            self._logger.info(f"Using local repository at {self._config.local_repo_path}")
-        else:
+        if self._config._gh_event == GitHubEvent.PULL_REQUEST:
             # Clone repository and checkout to the PR branch
             if self._config.cloned_repo_dir is None:
                 raise DataMissingError(
