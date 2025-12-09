@@ -7,9 +7,38 @@ import subprocess
 import time
 from pathlib import Path
 
-from webhook_handler.models import LLMResponse
+from webhook_handler.models import GitHubEvent, LLMResponse
 
 logger = logging.getLogger(__name__)
+
+
+def get_changed_files_from_git(
+    repo_path: Path | str
+) -> list[str]:
+    """
+    Get list of changed files between two git references.
+    
+    Parameters:
+        repo_path (Path | str): Path to the git repository
+        
+    Returns:
+        list[str]: List of changed file paths relative to repo root
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        
+        files = result.stdout.strip().split("\n")
+        return [f for f in files if f]
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error getting changed files: {e.stderr}")
+        return []
 
 
 def remove_dir(
@@ -71,31 +100,49 @@ def run_command(command: str, cwd: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def get_candidate_file(commit_hash: str, filename: str, tmp_repo_dir: str) -> str:
+def get_candidate_file(commit_hash: str, filename: str, tmp_repo_dir: str, gh_event: GitHubEvent) -> str:
     """
-    Finds a fitting test file and its content to inject the newly generated test into.
+    Gets file content at a specific commit without modifying working directory.
 
     Parameters:
-        base_commit (str): The base commit used to check out
-        patch (str): The golden code patch
-        tmp_repo_dir (str): The directory to look for test files in
+        commit_hash (str): The commit hash to get file from
+        filename (str): The file path relative to repo root
+        tmp_repo_dir (str): The directory of the git repository
+        gh_event (GitHubEvent): The type of GitHub event (PR or Issue)
 
     Returns:
-        str: The name of the test file
-        bool: if the file is from the base commit
+        str: The file content at the specified commit, or empty string if file doesn't exist
     """
-    current_branch = run_command("git rev-parse --abbrev-ref HEAD", cwd=tmp_repo_dir)
-    run_command(f"git checkout {commit_hash}", cwd=tmp_repo_dir)
-
     file_content = ""
-    file_path = Path(tmp_repo_dir, filename)
-    if file_path.exists():
-        logger.marker(f"File {filename} exists in commit {commit_hash}")  # type: ignore[attr-defined]
-        file_content = file_path.read_text(encoding="utf-8")
+    
+    if gh_event == GitHubEvent.ISSUE:
+        # For issues, use git show to get file from HEAD without touching working directory
+        # This preserves uncommitted changes (the fix) in the working directory
+        try:
+            result = subprocess.run(
+                ["git", "show", f"{commit_hash}:{filename}"],
+                cwd=tmp_repo_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            file_content = result.stdout
+            logger.marker(f"File {filename} exists in commit {commit_hash}")  # type: ignore[attr-defined]
+        except subprocess.CalledProcessError:
+            logger.marker(f"File {filename} does not exist in commit {commit_hash}")  # type: ignore[attr-defined]
     else:
-        logger.marker(f"File {filename} does not exist in commit {commit_hash}")  # type: ignore[attr-defined]
-
-    run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
+        # For PRs, checkout the commit (original behavior)
+        current_branch = run_command("git rev-parse --abbrev-ref HEAD", cwd=tmp_repo_dir)
+        run_command(f"git checkout {commit_hash}", cwd=tmp_repo_dir)
+        
+        file_path = Path(tmp_repo_dir, filename)
+        if file_path.exists():
+            logger.marker(f"File {filename} exists in commit {commit_hash}")  # type: ignore[attr-defined]
+            file_content = file_path.read_text(encoding="utf-8")
+        else:
+            logger.marker(f"File {filename} does not exist in commit {commit_hash}")  # type: ignore[attr-defined]
+        
+        run_command(f"git checkout {current_branch}", cwd=tmp_repo_dir)
 
     return file_content
 
