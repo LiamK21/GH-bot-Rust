@@ -1,0 +1,22 @@
+#glean-core/rlb/src/private/uuid.rs
+#[cfg(test)]
+mod tests {
+use super::UuidMetric;
+use uuid::Uuid;
+
+#[test]
+fn test_uuid_metric_get_value() {
+    let metric = UuidMetric::new(glean_core::CommonMetricData {
+        identifier: "test_uuid".into(),
+        send_in_pings: vec!["test_ping".into()],
+        ..Default::default()
+    });
+
+    let expected_uuid = Uuid::new_v4();
+    metric.set(expected_uuid);
+
+    let actual_uuid = metric.test_get_value(None).unwrap();
+
+    assert_eq!(expected_uuid, actual_uuid);
+}
+}

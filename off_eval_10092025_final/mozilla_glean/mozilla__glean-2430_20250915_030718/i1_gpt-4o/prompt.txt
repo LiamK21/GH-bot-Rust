@@ -1,0 +1,112 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Glean iOS UniffiInternalError.rustPanic("No database found") crash during tests
+While upgrading Glean iOS to 52.2.0 from 51.8.3, we experienced a crash in unit tests when using the `Glean.shared.resetGlean(clearStores: true)` API. When we set this to `false` with `Glean.shared.resetGlean(clearStores: false)` then this fixes the crash, but makes tests harder to write since they can depend on previous states (since store isn't reset).
+
+The stacktrace looks like:
+```
+2023-02-22 15:49:09.396363-0500 Client[91860:558780] [glean_core::dispatcher::global] Failed to launch a task on the queue. Discarding task.
+2023-02-22 15:49:09.397620-0500 Client[91860:558780] [glean_core::metrics::counter] Couldn't get storage. Can't record counter 'glean.upload.pending_pings'.
+thread '<unnamed>' panicked at 'No database found', glean-core/src/core/mod.rs:531:34
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2023-02-22 15:49:09.397877-0500 Client[91860:558780] [uniffi_core::ffi::rustcalls] Caught a panic calling rust code: "No database found"
+2023-02-22 15:49:09.397967-0500 Client[91860:558795] [glean_core::core] Creating new Glean v52.2.0
+2023-02-22 15:49:09.398393-0500 Client[91860:558795] [glean_core::database] Database initialized
+Glean/glean.swift:4858: Fatal error: 'try!' expression unexpectedly raised an error: Glean.(unknown context at $10c453aa4).UniffiInternalError.rustPanic("No database found")
+2023-02-22 15:49:09.400177-0500 Client[91860:558780] Glean/glean.swift:4858: Fatal error: 'try!' expression unexpectedly raised an error: Glean.(unknown context at $10c453aa4).UniffiInternalError.rustPanic("No database found")
+(lldb) 
+```
+
+More details in [the upgrade PR](https://github.com/mozilla-mobile/firefox-ios/pull/13323). We turned off the `clearStores` parameter to false for now to unblock the version upgrade.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -527,6 +527,7 @@ impl Glean {
+     }
+ 
+     /// Gets a handle to the database.
++    #[track_caller] // If this fails we're interested in the caller.
+     pub fn storage(&self) -> &Database {
+         self.data_store.as_ref().expect("No database found")
+     }
+
+diff --git a/glean-core/src/metrics/memory_distribution.rs b/glean-core/src/metrics/memory_distribution.rs
+--- a/glean-core/src/metrics/memory_distribution.rs
++++ b/glean-core/src/metrics/memory_distribution.rs
+@@ -112,9 +112,14 @@ impl MemoryDistributionMetric {
+             sample = MAX_BYTES;
+         }
+ 
+-        glean
+-            .storage()
+-            .record_with(glean, &self.meta, |old_value| match old_value {
++        // Let's be defensive here:
++        // The uploader tries to store some memory distribution metrics,
++        // but in tests that storage might be gone already.
++        // Let's just ignore those.
++        // We do the same for counters and timing distributions.
++        // This should never happen in real app usage.
++        if let Some(storage) = glean.storage_opt() {
++            storage.record_with(glean, &self.meta, |old_value| match old_value {
+                 Some(Metric::MemoryDistribution(mut hist)) => {
+                     hist.accumulate(sample);
+                     Metric::MemoryDistribution(hist)
+@@ -125,6 +130,12 @@ impl MemoryDistributionMetric {
+                     Metric::MemoryDistribution(hist)
+                 }
+             });
++        } else {
++            log::warn!(
++                "Couldn't get storage. Can't record memory distribution '{}'.",
++                self.meta.base_identifier()
++            );
++        }
+     }
+ 
+     /// Accumulates the provided signed samples in the metric.
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

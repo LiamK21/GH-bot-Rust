@@ -1,0 +1,109 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+glean-core's "metrics" ping scheduler never sends pings with reason "upgrade"
+The core MPS very cleverly checks the stored value of the app build id that last sent a "metrics" ping of reason "upgrade" and, if it's different from the current app build id, sends a new ping and sets the value.
+
+...only problem is the first case: the core MPS doesn't set a value to that internal storage if there isn't already one in there.
+
+This bug's about making the core MPS properly send "metrics" pings with reason "upgrade". And also ensuring we (per [docs](https://mozilla.github.io/glean/book/user/pings/metrics.html)) send a ping with reason "overdue" if in fact this is the first time we've ever started since being installed.
+
+Might be worth filing a follow-up to update [notable historic events](https://docs.telemetry.mozilla.org/concepts/analysis_gotchas.html#notable-historic-events) with this after it gets in a release and is vendored.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/scheduler.rs b/glean-core/src/scheduler.rs
+--- a/glean-core/src/scheduler.rs
++++ b/glean-core/src/scheduler.rs
+@@ -115,6 +115,9 @@ fn schedule_internal(
+             scheduler.start_scheduler(submitter, now, When::Reschedule);
+             return;
+         }
++    } else {
++        // No value in last_sent_build. Better set one.
++        last_sent_build_metric.set_sync(glean, &glean.app_build);
+     }
+ 
+     let last_sent_time = get_last_sent_time_metric().get_value(glean, INTERNAL_STORAGE);
+@@ -325,6 +328,35 @@ mod test {
+         (submitter, submitter_count, scheduler, scheduler_count)
+     }
+ 
++    // Ensure on first run that we actually set the last sent build metric.
++    // (and that we send an "overdue" ping if it's after the scheduled hour)
++    #[test]
++    fn first_run_last_sent_build() {
++        let (mut glean, _t) = new_glean(None);
++
++        glean.app_build = "a build".into();
++        let lsb_metric = get_last_sent_build_metric();
++        assert_eq!(None, lsb_metric.get_value(&glean, Some(INTERNAL_STORAGE)));
++
++        let fake_now = FixedOffset::east(0)
++            .ymd(2022, 11, 15)
++            .and_hms(SCHEDULED_HOUR, 0, 1);
++
++        let (submitter, submitter_count, scheduler, scheduler_count) = new_proxies(
++            |_, reason| assert_eq!(reason, Some("overdue")),
++            |_, when| assert_eq!(when, When::Reschedule),
++        );
++
++        schedule_internal(&glean, submitter, scheduler, fake_now);
++        assert_eq!(1, submitter_count.swap(0, Ordering::Relaxed));
++        assert_eq!(1, scheduler_count.swap(0, Ordering::Relaxed));
++
++        assert_eq!(
++            Some(glean.app_build.to_string()),
++            lsb_metric.get_value(&glean, Some(INTERNAL_STORAGE))
++        );
++    }
++
+     // Ensure that if we have a different build, we immediately submit an "upgrade" ping
+     // and schedule a "reschedule" ping for tomorrow.
+     #[test]
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn schedule_internal(
+glean: &Glean,
+submitter: impl MetricsPingSubmitter + Send + 'static,
+scheduler: impl MetricsPingScheduler,
+now: DateTime<FixedOffset>) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

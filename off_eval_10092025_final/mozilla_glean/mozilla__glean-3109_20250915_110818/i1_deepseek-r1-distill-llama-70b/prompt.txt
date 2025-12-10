@@ -1,0 +1,146 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Global Glean object init race with `PRE_INIT_*` patterns
+`glean_core` has a pattern in its General APIs that, to handle APIs being called before Glean has been init, we [save the provided information to `PRE_INIT_` static data](https://searchfox.org/glean/search?q=static+PRE_INIT_&path=&case=false&regexp=false), and [process it later](https://searchfox.org/glean/rev/7840c163efa5652ebf50b5ad4dd8225d9a23ddcd/glean-core/src/lib.rs#415).
+
+To determine the difference between "before Glean has been init" and "later", we use [`was_initialize_called`](https://searchfox.org/glean/search?q=was_initialize_called&redirect=false). If it has, we assume it's "later" so we can call `with_glean(_mut)`. 
+
+However, this creates a race where initialize has been called (and the "glean.init" thread spawned, and so forth), but the global `Glean` object has not yet been set up (ie, `setup_glean` has yet to return (or even be called) in the "glean.init" thread).
+
+A more correct and safer definition of "later" would be to check if the Global `Glean` has been initialized. An actually correct and safe one would be to check if the `PRE_INIT_` static data has been consumed.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -887,7 +887,7 @@ pub fn glean_set_collection_enabled(enabled: bool) {
+ /// and all pending pings of that type to be deleted.
+ pub fn set_ping_enabled(ping: &PingType, enabled: bool) {
+     let ping = ping.clone();
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         crate::launch_with_glean_mut(move |glean| glean.set_ping_enabled(&ping, enabled));
+     } else {
+         let m = &PRE_INIT_PING_ENABLED;
+@@ -902,7 +902,7 @@ pub(crate) fn register_ping_type(ping: &PingType) {
+     // we dispatch ping registration on the thread pool.
+     // Registering a ping should not block the application.
+     // Submission itself is also dispatched, so it will always come after the registration.
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         let ping = ping.clone();
+         crate::launch_with_glean_mut(move |glean| {
+             glean.register_ping_type(&ping);
+@@ -1016,7 +1016,7 @@ pub fn glean_apply_server_knobs_config(json: String) {
+ /// This will return `false` in case `tag` is not a valid tag and `true` otherwise.
+ /// If called before Glean is initialized it will always return `true`.
+ pub fn glean_set_debug_view_tag(tag: String) -> bool {
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         crate::launch_with_glean_mut(move |glean| {
+             glean.set_debug_view_tag(&tag);
+         });
+@@ -1054,7 +1054,7 @@ pub fn glean_get_debug_view_tag() -> Option<String> {
+ /// * `tags` - A vector of at most 5 valid HTTP header values. Individual
+ ///   tags must match the regex: "[a-zA-Z0-9-]{1,20}".
+ pub fn glean_set_source_tags(tags: Vec<String>) -> bool {
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         crate::launch_with_glean_mut(|glean| {
+             glean.set_source_tags(tags);
+         });
+@@ -1079,7 +1079,7 @@ pub fn glean_set_source_tags(tags: Vec<String>) -> bool {
+ ///
+ /// * `value` - The value of the log pings option
+ pub fn glean_set_log_pings(value: bool) {
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         crate::launch_with_glean_mut(move |glean| {
+             glean.set_log_pings(value);
+         });
+@@ -1176,7 +1176,8 @@ pub fn glean_submit_ping_by_name_sync(ping_name: String, reason: Option<String>)
+         return false;
+     }
+ 
+-    core::with_glean(|glean| glean.submit_ping_by_name(&ping_name, reason.as_deref()))
++    core::with_opt_glean(|glean| glean.submit_ping_by_name(&ping_name, reason.as_deref()))
++        .unwrap_or(false)
+ }
+ 
+ /// EXPERIMENTAL: Register a listener object to recieve notifications of event recordings.
+@@ -1271,7 +1272,7 @@ pub fn glean_set_dirty_flag(new_value: bool) {
+ /// Updates attribution fields with new values.
+ /// AttributionMetrics fields with `None` values will not overwrite older values.
+ pub fn glean_update_attribution(attribution: AttributionMetrics) {
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         core::with_glean(|glean| glean.update_attribution(attribution));
+     } else {
+         PRE_INIT_ATTRIBUTION
+@@ -1294,7 +1295,7 @@ pub fn glean_test_get_attribution() -> AttributionMetrics {
+ /// Updates distribution fields with new values.
+ /// DistributionMetrics fields with `None` values will not overwrite older values.
+ pub fn glean_update_distribution(distribution: DistributionMetrics) {
+-    if was_initialize_called() {
++    if was_initialize_called() && core::global_glean().is_some() {
+         core::with_glean(|glean| glean.update_distribution(distribution));
+     } else {
+         PRE_INIT_DISTRIBUTION
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn glean_test_get_attribution() -> AttributionMetrics
+
+pub fn glean_apply_server_knobs_config(json: String) -> ()
+
+pub fn glean_set_collection_enabled(enabled: bool) -> ()
+
+pub fn glean_get_debug_view_tag() -> Option<String>
+
+pub fn glean_submit_ping_by_name_sync(ping_name: String, reason: Option<String>) -> bool
+
+pub fn glean_set_dirty_flag(new_value: bool) -> ()
+
+pub fn glean_set_source_tags(tags: Vec<String>) -> bool
+
+fn register_ping_type(ping: &PingType) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

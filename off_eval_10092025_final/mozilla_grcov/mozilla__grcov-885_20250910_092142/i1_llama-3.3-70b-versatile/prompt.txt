@@ -1,0 +1,242 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Add a Text/Markdown output
+It would be nice to have an output that's readable from the shell.
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -28,6 +28,7 @@ enum OutputType {
+     Covdir,
+     Html,
+     Cobertura,
++    Markdown,
+ }
+ 
+ impl FromStr for OutputType {
+@@ -43,6 +44,7 @@ impl FromStr for OutputType {
+             "covdir" => Self::Covdir,
+             "html" => Self::Html,
+             "cobertura" => Self::Cobertura,
++            "markdown" => Self::Markdown,
+             _ => return Err(format!("{} is not a supported output type", s)),
+         })
+     }
+@@ -90,6 +92,7 @@ struct Opt {
+             - *coveralls+* for the Coveralls specific format with function information;\n\
+             - *ade* for the ActiveData-ETL specific format;\n\
+             - *files* to only return a list of files.\n\
++            - *markdown* for human easy read.\n\
+         ",
+         value_name = "OUTPUT TYPE",
+         default_value = "lcov",
+@@ -106,6 +109,7 @@ struct Opt {
+             "covdir",
+             "html",
+             "cobertura",
++            "markdown",
+         ],
+     )]
+     output_type: OutputType,
+@@ -457,5 +461,6 @@ fn main() {
+             opt.output_path.as_deref(),
+             demangle,
+         ),
++        OutputType::Markdown => output_markdown(iterator, opt.output_path.as_deref()),
+     };
+ }
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -3,7 +3,7 @@ use md5::{Digest, Md5};
+ use rustc_hash::FxHashMap;
+ use serde_json::{self, json, Value};
+ use std::cell::RefCell;
+-use std::collections::{hash_map, BTreeSet};
++use std::collections::{hash_map, BTreeMap, BTreeSet};
+ use std::ffi::OsStr;
+ use std::fs::File;
+ use std::io::{self, BufWriter, Read, Write};
+@@ -16,6 +16,7 @@ use std::{
+ };
+ use symbolic_common::Name;
+ use symbolic_demangle::{Demangle, DemangleOptions};
++use tabled::{Style, Table, Tabled};
+ use uuid::Uuid;
+ 
+ use crate::defs::*;
+@@ -586,6 +587,72 @@ pub fn output_html(
+     html::gen_coverage_json(&global.stats, &config, &output);
+ }
+ 
++pub fn output_markdown(results: CovResultIter, output_file: Option<&Path>) {
++    #[derive(Tabled)]
++    struct LineSummary {
++        file: String,
++        coverage: String,
++        covered: String,
++        missed_lines: String,
++    }
++
++    fn format_pair(start: u32, end: u32) -> String {
++        if start == end {
++            start.to_string()
++        } else {
++            format!("{}-{}", start, end)
++        }
++    }
++
++    fn format_lines(lines: &BTreeMap<u32, u64>) -> (usize, String) {
++        let mut total_missed = 0;
++        let mut missed = Vec::new();
++        let mut start: u32 = 0;
++        let mut end: u32 = 0;
++        for (&line, &hits) in lines {
++            if hits == 0 {
++                total_missed += 1;
++                if start == 0 {
++                    start = line;
++                }
++                end = line;
++            } else if start != 0 {
++                missed.push(format_pair(start, end));
++                start = 0;
++            }
++        }
++        if start != 0 {
++            missed.push(format_pair(start, end));
++        }
++        (total_missed, missed.join(", "))
++    }
++
++    let mut summary = Vec::new();
++    let mut total_lines: usize = 0;
++    let mut total_covered: usize = 0;
++    for (_, rel_path, result) in results {
++        let (missed, missed_lines) = format_lines(&result.lines);
++        let covered: usize = result.lines.len() - missed;
++        summary.push(LineSummary {
++            file: rel_path.display().to_string(),
++            coverage: format!("{}%", covered * 100 / result.lines.len()),
++            covered: format!("{} / {}", covered, result.lines.len()),
++            missed_lines,
++        });
++        total_lines += result.lines.len();
++        total_covered += covered;
++    }
++    let mut writer = BufWriter::new(get_target_output_writable(output_file));
++    writeln!(writer, "{}", Table::new(summary).with(Style::markdown())).unwrap();
++    writeln!(writer).unwrap();
++    writeln!(
++        writer,
++        "Total coverage: {}%",
++        total_covered * 100 / total_lines
++    )
++    .unwrap()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -856,4 +923,48 @@ mod tests {
+         assert_eq!(results.get("service_name"), None);
+         assert_eq!(results.get("service_job_id"), None);
+     }
++
++    #[test]
++    fn test_markdown() {
++        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
++        let file_name = "test_markdown";
++        let file_path = tmp_dir.path().join(&file_name);
++
++        let results = vec![
++            (
++                PathBuf::from("foo/bar/a.cpp"),
++                PathBuf::from("foo/bar/a.cpp"),
++                CovResult {
++                    lines: [(1, 10), (2, 11)].iter().cloned().collect(),
++                    branches: BTreeMap::new(),
++                    functions: FxHashMap::default(),
++                },
++            ),
++            (
++                PathBuf::from("foo/bar/b.cpp"),
++                PathBuf::from("foo/bar/b.cpp"),
++                CovResult {
++                    lines: [(1, 0), (2, 10), (4, 10), (5, 0), (7, 0)]
++                        .iter()
++                        .cloned()
++                        .collect(),
++                    branches: BTreeMap::new(),
++                    functions: FxHashMap::default(),
++                },
++            ),
++        ];
++
++        let results = Box::new(results.into_iter());
++        output_markdown(results, Some(&file_path));
++
++        let results = &read_file(&file_path);
++        let expected = "| file          | coverage | covered | missed_lines |
++|---------------|----------|---------|--------------|
++| foo/bar/a.cpp | 100%     | 2 / 2   |              |
++| foo/bar/b.cpp | 40%      | 2 / 5   | 1, 5-7       |
++
++Total coverage: 57%
++";
++        assert_eq!(results, expected);
++    }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn main() -> ()
+
+pub fn output_html(
+results: CovResultIter,
+output_dir: Option<&Path>,
+num_threads: usize,
+branch_enabled: bool,
+output_config_file: Option<&Path>) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,154 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+RLB: Panic on `glean.dispatcher` thread if calling `destroy_glean` before init is complete
+[GTest failures in Firefox Desktop](https://treeherder.mozilla.org/jobs?repo=try&revision=43b89aa6e1275b5ed7b4be3557f83163764f193b&selectedTaskRun=L07B-kHFSbmb-8hCzm9c2g.0) contain `MOZ_CRASH(Global Glean object not initialized)`. It shows the `glean.dispatcher` thread running a task that uses `launch_with_glean` while the `main` thread is in `test_reset_glean`.
+
+I think I understand this to mean that `test_reset_glean` is draining the dispatcher which allows its tasks to execute which includes one that uses `launch_with_glean`. This wouldn't be a problem if there were a Global glean (ie, if init had completed), but this is happening shortly after a call to `initialize` meaning that, though initialize has been _called_, it hasn't necessarily completed.
+
+( [in at least one of these crashing cases the `glean.init` thread is in the crashdump, which is evidence that RLB's `initalize` did not in fact complete](https://treeherder.mozilla.org/logviewer?job_id=364078740&repo=try&lineNumber=14242) )
+
+So I think what we need to do is come up with a dispatcher shutdown that discards queued  tasks instead of executing them. And we need to call it in `test_reset_glean` even if initialize wasn't called yet since there may be pre-init operations that we'd like to have cleared.
+
+(( One alternative approach of only resetting the dispatcher if init has completed probably will not work since that would make `test_reset_glean` not actually fully reset (pending operations will execute) ))
+
+Or... I suppose we could have `test_reset_glean` block on initialize completing if initialize has been called. That might be easier to code (though we'll need to store that init thread handle someplace so we can join on it) than some sort of hardened dispatcher reset. It's not performant, but these are test-only APIs so I specifically don't care about that.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -39,10 +39,10 @@
+ //! prototype_ping.submit(None);
+ //! ```
+ 
+-use once_cell::sync::OnceCell;
++use once_cell::sync::{Lazy, OnceCell};
+ use std::collections::HashMap;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ 
+ pub use configuration::Configuration;
+ use configuration::DEFAULT_GLEAN_ENDPOINT;
+@@ -101,6 +101,12 @@ static PRE_INIT_PING_REGISTRATION: OnceCell<Mutex<Vec<private::PingType>>> = Onc
+ /// Requires a Mutex, because in tests we can actual reset this.
+ static STATE: OnceCell<Mutex<RustBindingsState>> = OnceCell::new();
+ 
++/// Global singleton of the handles of the glean.init threads.
++/// For joining. For tests.
++/// (Why a Vec? There might be more than one concurrent call to initialize.)
++static INIT_HANDLES: Lazy<Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>> =
++    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
++
+ /// Get a reference to the global state object.
+ ///
+ /// Panics if no global state object was set.
+@@ -173,16 +179,9 @@ fn launch_with_glean_mut(callback: impl FnOnce(&mut Glean) + Send + 'static) {
+ /// * `client_info` - the [`ClientInfoMetrics`] values used to set Glean
+ ///   core metrics.
+ pub fn initialize(cfg: Configuration, client_info: ClientInfoMetrics) {
+-    initialize_internal(cfg, client_info);
+-}
+-
+-fn initialize_internal(
+-    cfg: Configuration,
+-    client_info: ClientInfoMetrics,
+-) -> Option<std::thread::JoinHandle<()>> {
+     if was_initialize_called() {
+         log::error!("Glean should not be initialized multiple times");
+-        return None;
++        return;
+     }
+ 
+     let init_handle = std::thread::Builder::new()
+@@ -351,10 +350,21 @@ fn initialize_internal(
+         })
+         .expect("Failed to spawn Glean's init thread");
+ 
++    // For test purposes, store the glean init thread's JoinHandle.
++    INIT_HANDLES.lock().unwrap().push(init_handle);
++
+     // Mark the initialization as called: this needs to happen outside of the
+     // dispatched block!
+     INITIALIZE_CALLED.store(true, Ordering::SeqCst);
+-    Some(init_handle)
++}
++
++/// TEST ONLY FUNCTION
++/// Waits on all the glean.init threads' join handles.
++pub fn join_init() {
++    let mut handles = INIT_HANDLES.lock().unwrap();
++    for handle in handles.drain(..) {
++        handle.join().unwrap();
++    }
+ }
+ 
+ /// Shuts down Glean in an orderly fashion.
+@@ -668,6 +678,9 @@ pub fn test_get_experiment_data(experiment_id: String) -> RecordedExperimentData
+ pub(crate) fn destroy_glean(clear_stores: bool) {
+     // Destroy the existing glean instance from glean-core.
+     if was_initialize_called() {
++        // Just because initialize was called doesn't mean it's done.
++        join_init();
++
+         // Reset the dispatcher first (it might still run tasks against the database)
+         dispatcher::reset_dispatcher();
+ 
+@@ -709,9 +722,8 @@ pub(crate) fn destroy_glean(clear_stores: bool) {
+ pub fn test_reset_glean(cfg: Configuration, client_info: ClientInfoMetrics, clear_stores: bool) {
+     destroy_glean(clear_stores);
+ 
+-    if let Some(handle) = initialize_internal(cfg, client_info) {
+-        handle.join().unwrap();
+-    }
++    initialize(cfg, client_info);
++    join_init();
+ }
+ 
+ /// Sets a debug view tag.
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn destroy_glean(clear_stores: bool) -> ()
+
+fn launch_with_glean_mut(callback: impl FnOnce(&mut Glean) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,137 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+HTTP `Date` header set at ping submission time, not when uploaded - does that meet expectations?
+We [set the `Date` header of the HTTP request](https://github.com/mozilla/glean/blob/4525045599c96d23f74e10b269299d62549facdc/glean-core/src/upload/request.rs#L71) as [per the HTTP edge spec](https://docs.telemetry.mozilla.org/concepts/pipeline/http_edge_spec.html#supported-http-headers).
+
+In Glean this is [done when enqueuing a ping](https://github.com/mozilla/glean/blob/main/glean-core/src/upload/mod.rs#L384).
+
+Enqueuing happens in two cases:
+
+* The app is running and a ping is submitted
+* The app launches and pending pings are loaded from disk
+
+In both cases the data is not sent immediately, and depending on circumstances the actual HTTP request can be some seconds, minutes or, according to our data, hours in the future.
+That makes this value effectively useless for any skew calculation.
+
+Now to my knowledge no one really depends on this value.
+Everyone just uses the `submission_timestamp` anyway (the server's time when ingesting the ping).
+
+We could still consider changing this value and only setting the date header before handing out the request to the uploader.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -21,11 +21,15 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
+ use std::thread;
+ use std::time::{Duration, Instant};
+ 
++use chrono::Utc;
++
+ use crate::error::ErrorKind;
+ use crate::TimerId;
+ use crate::{internal_metrics::UploadMetrics, Glean};
+ use directory::{PingDirectoryManager, PingPayloadsByDirectory};
+ use policy::Policy;
++use request::create_date_header_value;
++
+ pub use request::{HeaderMap, PingRequest};
+ pub use result::{UploadResult, UploadTaskAction};
+ 
+@@ -605,9 +609,14 @@ impl PingUploadManager {
+                     in_flight.insert(request.document_id.clone(), (success_id, failure_id));
+                 }
+ 
+-                PingUploadTask::Upload {
+-                    request: queue.pop_front().unwrap(),
+-                }
++                let mut request = queue.pop_front().unwrap();
++
++                // Adding the `Date` header just before actual upload happens.
++                request
++                    .headers
++                    .insert("Date".to_string(), create_date_header_value(Utc::now()));
++
++                PingUploadTask::Upload { request }
+             }
+             None => {
+                 log::info!("No more pings to upload! You are done.");
+
+diff --git a/glean-core/src/upload/request.rs b/glean-core/src/upload/request.rs
+--- a/glean-core/src/upload/request.rs
++++ b/glean-core/src/upload/request.rs
+@@ -18,7 +18,7 @@ use crate::system;
+ pub type HeaderMap = HashMap<String, String>;
+ 
+ /// Creates a formatted date string that can be used with Date headers.
+-fn create_date_header_value(current_time: DateTime<Utc>) -> String {
++pub(crate) fn create_date_header_value(current_time: DateTime<Utc>) -> String {
+     // Date headers are required to be in the following format:
+     //
+     // <day-name>, <day> <month> <year> <hour>:<minute>:<second> GMT
+@@ -68,7 +68,6 @@ impl Builder {
+     /// Creates a new builder for a PingRequest.
+     pub fn new(language_binding_name: &str, body_max_size: usize) -> Self {
+         let mut headers = HashMap::new();
+-        headers.insert("Date".to_string(), create_date_header_value(Utc::now()));
+         headers.insert(
+             "X-Telemetry-Agent".to_string(),
+             create_x_telemetry_agent_header_value(
+@@ -265,10 +264,12 @@ mod test {
+         assert_eq!(request.path, "/random/path/doesnt/matter");
+ 
+         // Make sure all the expected headers were added.
+-        assert!(request.headers.contains_key("Date"));
+         assert!(request.headers.contains_key("X-Telemetry-Agent"));
+         assert!(request.headers.contains_key("Content-Type"));
+         assert!(request.headers.contains_key("Content-Length"));
++
++        // the `Date` header is added by the `get_upload_task` just before
++        // returning the upload request
+     }
+ 
+     #[test]
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

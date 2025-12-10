@@ -1,0 +1,54 @@
+#src/summary.rs
+#[cfg(test)]
+mod tests {
+use std::path::PathBuf;
+use super::print_summary;
+use crate::{CovResult, Function};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
+
+#[test]
+fn test_print_summary() {
+    let results = vec![(
+        PathBuf::from("main.rs"),
+        PathBuf::from("main.rs"),
+        CovResult {
+            lines: [
+                (1, 1),
+                (2, 1),
+                (3, 2),
+                (4, 1),
+                (5, 0),
+                (6, 0),
+                (8, 1),
+                (9, 1),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
+            branches: {
+                let mut map = BTreeMap::new();
+                map.insert(3, vec![true, false]);
+                map.insert(5, vec![false, false]);
+                map
+            },
+            functions: {
+                let mut map = FxHashMap::default();
+                map.insert(
+                    "_ZN8cov_test4main17h7eb435a3fb3e6f20E".to_string(),
+                    Function {
+                        start: 1,
+                        executed: true,
+                    },
+                );
+                map
+            },
+        },
+    )];
+
+    print_summary(&results);
+    // Expected output:
+    // lines: 75.0% (6 out of 8)
+    // branches: 25.0% (1 out of 4)
+}
+}

@@ -1,0 +1,677 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Implement ping uploading logic in glean-core
+This is a bug to implement what gets decided in [Bug 1605076](https://bugzilla.mozilla.org/show_bug.cgi?id=1605076).
+
+It is worth noting that this shouldn't break current implementation of ping uploading that lives in the bindings, there are follow-up bugs to deal with swapping the logic in them.
+
+Also this bug is only about implementing the minimum possible to get this off the ground, follow ups exist for things such as:
+- Adding throttling
+- Adding jitter delay
+- Not uploading pings that are too big
+- Adding metrics to record possible errors in uploading
+- Persisting HTTP Headers
+- Adding size quota to pending pings directory
+- etc
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -10,8 +10,11 @@ use crate::metrics::RecordedExperimentData;
+ use crate::metrics::StringMetric;
+ 
+ const GLOBAL_APPLICATION_ID: &str = "org.mozilla.glean.test.app";
+-pub fn new_glean() -> (Glean, tempfile::TempDir) {
+-    let dir = tempfile::tempdir().unwrap();
++pub fn new_glean(tempdir: Option<tempfile::TempDir>) -> (Glean, tempfile::TempDir) {
++    let dir = match tempdir {
++        Some(tempdir) => tempdir,
++        None => tempfile::tempdir().unwrap(),
++    };
+     let tmpname = dir.path().display().to_string();
+     let glean = Glean::with_options(&tmpname, GLOBAL_APPLICATION_ID, true).unwrap();
+     (glean, dir)
+@@ -19,7 +22,7 @@ pub fn new_glean() -> (Glean, tempfile::TempDir) {
+ 
+ #[test]
+ fn path_is_constructed_from_data() {
+-    let (glean, _) = new_glean();
++    let (glean, _) = new_glean(None);
+ 
+     assert_eq!(
+         "/submit/org-mozilla-glean-test-app/baseline/1/this-is-a-docid",
+@@ -200,7 +203,7 @@ fn client_id_and_first_run_date_must_be_regenerated() {
+ 
+ #[test]
+ fn basic_metrics_should_be_cleared_when_uploading_is_disabled() {
+-    let (mut glean, _t) = new_glean();
++    let (mut glean, _t) = new_glean(None);
+     let metric = StringMetric::new(CommonMetricData::new(
+         "category",
+         "string_metric",
+@@ -225,7 +228,7 @@ fn basic_metrics_should_be_cleared_when_uploading_is_disabled() {
+ 
+ #[test]
+ fn first_run_date_is_managed_correctly_when_toggling_uploading() {
+-    let (mut glean, _) = new_glean();
++    let (mut glean, _) = new_glean(None);
+ 
+     let original_first_run_date = glean
+         .core_metrics
+@@ -253,7 +256,7 @@ fn first_run_date_is_managed_correctly_when_toggling_uploading() {
+ 
+ #[test]
+ fn client_id_is_managed_correctly_when_toggling_uploading() {
+-    let (mut glean, _) = new_glean();
++    let (mut glean, _) = new_glean(None);
+ 
+     let original_client_id = glean
+         .core_metrics
+
+diff --git a/glean-core/src/ping/mod.rs b/glean-core/src/ping/mod.rs
+--- a/glean-core/src/ping/mod.rs
++++ b/glean-core/src/ping/mod.rs
+@@ -301,7 +301,7 @@ mod test {
+ 
+     #[test]
+     fn sequence_numbers_should_be_reset_when_toggling_uploading() {
+-        let (mut glean, _) = new_glean();
++        let (mut glean, _) = new_glean(None);
+         let ping_maker = PingMaker::new();
+ 
+         assert_eq!(0, ping_maker.get_ping_seq(&glean, "custom"));
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -0,0 +1,192 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++//! Manages the pending pings queue and directory.
++//!
++//! * Keeps track of pending pings, loading any unsent ping from disk on startup;
++//! * Exposes `get_next_ping` API for the platform layer to request next ping in line;
++//! * Exposes `process_ping_upload_response` API to check the HTTP response from the ping upload
++//!   and either delete the corresponding ping from disk or re-enqueue it for sending.
++
++// !IMPORTANT!
++// Remove the next line when this module's functionality is in the Glean object.
++// This is here just to not have lint error for now.
++#![allow(dead_code)]
++
++use std::collections::VecDeque;
++use std::path::PathBuf;
++use std::str::FromStr;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, RwLock};
++use std::thread;
++
++use log;
++use serde_json::Value as JsonValue;
++
++use request::PingRequest;
++use util::process_pings_dir;
++
++mod request;
++mod util;
++
++/// Manages the pending pings queue and directory.
++#[derive(Debug)]
++pub struct PingUploadManager {
++    /// A FIFO queue storing a `PingRequest` for each pending ping.
++    queue: Arc<RwLock<VecDeque<PingRequest>>>,
++    /// A flag, signaling if we are done processing the pending pings directories.
++    processed_pending_pings: Arc<AtomicBool>,
++}
++
++impl PingUploadManager {
++    /// Create a new PingUploadManager.
++    ///
++    /// This will spawn a new thread and processes the pending pings folder
++    /// filling up the queue with whatever pings are in there
++    /// ordered by oldest to newest file modified.
++    pub fn new(data_path: &str) -> Self {
++        let queue = Arc::new(RwLock::new(VecDeque::new()));
++        let processed_pending_pings = Arc::new(AtomicBool::new(false));
++
++        let data_path = PathBuf::from_str(&data_path).expect("data_path must be a valid path.");
++        let local_queue = queue.clone();
++        let local_flag = processed_pending_pings.clone();
++        let _ = thread::Builder::new()
++            .name("glean.upload_manager.process_pings_directory".to_string())
++            .spawn(move || match process_pings_dir(&data_path) {
++                Ok(requests) => {
++                    let mut local_queue = local_queue
++                        .write()
++                        .expect("Can't write to pending pings queue.");
++                    local_queue.extend(requests.into_iter());
++                    local_flag.store(true, Ordering::SeqCst);
++                }
++                Err(e) => log::info!("Error processing pending pings directories! {}", e),
++            });
++
++        Self {
++            queue,
++            processed_pending_pings,
++        }
++    }
++
++    fn has_processed_pending_pings(&self) -> bool {
++        self.processed_pending_pings.load(Ordering::SeqCst)
++    }
++
++    /// Creates a `PingRequest` and adds it to the queue.
++    pub fn enqueue_ping(&self, uuid: &str, url: &str, body: JsonValue) {
++        let mut queue = self
++            .queue
++            .write()
++            .expect("Can't write to pending pings queue.");
++        let request = PingRequest::new(uuid, url, body);
++        queue.push_back(request);
++    }
++
++    /// Clear pending pings queue.
++    pub fn clear_ping_queue(&self) {
++        let mut queue = self
++            .queue
++            .write()
++            .expect("Can't write to pending pings queue.");
++        queue.clear();
++    }
++
++    /// Get the next `PingRequest` in queue.
++    pub fn get_next_ping(&self) -> Option<PingRequest> {
++        let mut queue = self
++            .queue
++            .write()
++            .expect("Can't write to pending pings queue.");
++        queue.pop_front()
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use crate::metrics::PingType;
++    use serde_json::Value as JsonValue;
++
++    let uuid = "c0ffeec0-ffee-c0ff-eec0-ffeec0ffeec0";
++    let url = "http://example.com";
++    let body = json!("{}")
++
++    #[test]
++    fn test_doesnt_error_when_there_are_no_pending_pings() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let tmpname = data_dir.path().display().to_string();
++
++        // Create a new upload_manager
++        let upload_manager = PingUploadManager::new(&tempname);
++
++        // Try and get the next request
++        let request = upload_manager.get_next_ping();
++
++        // Verify request was not returned
++        assert!(request.is_none());
++    }
++
++    #[test]
++    fn test_returns_ping_request_when_there_is_one() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let tmpname = data_dir.path().display().to_string();
++
++        // Create a new upload_manager
++        let upload_manager = PingUploadManager::new(&tempname);
++
++        // Enqueue a ping
++        upload_manager.enqueue_ping(uuid, url, body);
++
++        // Try and get the next request
++        let request = upload_manager.get_next_ping();
++
++        // Verify request was returned
++        assert!(request.is_some());
++    }
++
++    #[test]
++    fn test_returns_as_many_ping_request_as_there_are() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let tmpname = data_dir.path().display().to_string();
++
++        // Create a new upload_manager
++        let upload_manager = PingUploadManager::new(&tempname);
++
++        // Enqueue a ping multiple times
++        let n = 10;
++        for _ in 0..n {
++            upload_manager.enqueue_ping(uuid, url, body);
++        }
++
++        // Verify a request is returned for each submitted ping
++        for _ in 0..n {
++            assert!(upload_manager.get_next_ping().is_some());
++        }
++
++        // Verify that after all requests are returned, none are left
++        assert!(upload_manager.get_next_ping().is_none());
++    }
++
++    #[test]
++    fn clearing_the_queue_works_correctly() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let tmpname = data_dir.path().display().to_string();
++
++        // Create a new upload_manager
++        let upload_manager = PingUploadManager::new(&tempname);
++
++        // Submit the ping multiple times
++        let n = 10;
++        for _ in 0..n {
++            upload_manager.enqueue_ping(uuid, url, body);
++        }
++
++        // Clear the queue
++        glean.upload_manager.clear_ping_queue();
++
++        // Verify there really isn't any ping in the queue.
++        assert!(glean.upload_manager.get_next_ping().is_none());
++    }
++}
+
+diff --git a/glean-core/src/upload/request.rs b/glean-core/src/upload/request.rs
+--- a/glean-core/src/upload/request.rs
++++ b/glean-core/src/upload/request.rs
+@@ -0,0 +1,56 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++//! Ping request representation.
++
++use std::collections::HashMap;
++
++use chrono::prelude::{DateTime, Utc};
++use serde_json::Value as JsonValue;
++
++/// Represents a request to upload a ping.
++#[derive(Debug)]
++pub struct PingRequest {
++    /// The Job ID to identify this request,
++    /// this is the same as the ping UUID.
++    pub uuid: String,
++    /// The path for the server to upload the ping to.
++    pub url: String,
++    /// The body of the request.
++    pub body: JsonValue,
++    /// A map with all the headers to be sent with the request.
++    pub headers: HashMap<String, String>,
++}
++
++impl PingRequest {
++    /// Creates a new PingRequest.
++    ///
++    /// Automatically creates the default request headers.
++    /// Clients may add more headers such as `userAgent` to this list.
++    pub fn new(uuid: &str, url: &str, body: JsonValue) -> Self {
++        Self {
++            uuid: uuid.into(),
++            url: url.into(),
++            body,
++            headers: Self::create_request_headers(),
++        }
++    }
++
++    /// Creates the default request headers.
++    fn create_request_headers() -> HashMap<String, String> {
++        let mut headers = HashMap::new();
++        let date: DateTime<Utc> = Utc::now();
++        headers.insert("Date".to_string(), date.to_string());
++        headers.insert("X-Client-Type".to_string(), "Glean".to_string());
++        headers.insert(
++            "Content-Type".to_string(),
++            "application/json; charset=utf-8".to_string(),
++        );
++        headers.insert(
++            "X-Client-Version".to_string(),
++            env!("CARGO_PKG_VERSION").to_string(),
++        );
++        headers
++    }
++}
+
+diff --git a/glean-core/src/upload/util.rs b/glean-core/src/upload/util.rs
+--- a/glean-core/src/upload/util.rs
++++ b/glean-core/src/upload/util.rs
+@@ -0,0 +1,281 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++//! Pings directory processing utilities.
++
++use std::cmp::Ordering;
++use std::fs::{self, File};
++use std::io::{BufRead, BufReader};
++use std::path::{Path, PathBuf};
++
++use log;
++use serde_json::Value as JsonValue;
++use uuid::Uuid;
++
++use super::PingRequest;
++use crate::Result;
++
++/// Attempt to delete a file.
++///
++/// This won't panic if not able to delete, just log.
++fn delete_file(path: &Path) {
++    match fs::remove_file(path) {
++        Err(e) => log::error!("Error deleting file {}. {}", path.display(), e),
++        _ => log::info!("Deleted file {}", path.display()),
++    };
++}
++
++/// Get the file name from a path as a &str.
++///
++/// This won't panic if not able to get file name, just log.
++fn get_file_name_as_str(path: &Path) -> Option<&str> {
++    match path.file_name() {
++        None => {
++            log::warn!("Error getting file name from path: {}", path.display());
++            None
++        }
++        Some(file_name) => {
++            let file_name = file_name.to_str();
++            if file_name.is_none() {
++                log::warn!("File name is not valid unicode: {}", path.display());
++            }
++            file_name
++        }
++    }
++}
++
++/// Get the pending pings directory path.
++fn get_pings_dir(data_path: &Path) -> PathBuf {
++    data_path.join("pending_pings")
++}
++
++/// Reads a ping file and returns a `PingRequest` from it.
++///
++/// If the file is not properly formatted, it will be deleted.
++///
++/// ## Panics
++///
++/// Will panic if unable to read the file.
++fn process_ping_file(uuid: &str, path: &Path) -> Option<PingRequest> {
++    let file = File::open(path).expect("Should be able to read ping file.");
++    let mut lines = BufReader::new(file).lines();
++    // The way the ping file is structured,
++    // first line should always have the url
++    // and second line should have the body with the ping contents in JSON format
++    if let (Some(Ok(url)), Some(Ok(body))) = (lines.next(), lines.next()) {
++        if let Ok(parsed_body) = serde_json::from_str::<JsonValue>(&body) {
++            return Some(PingRequest::new(uuid, &url, parsed_body));
++        } else {
++            log::warn!("Can't parse ping contents as JSON.");
++        }
++    } else {
++        log::warn!("Ping file is not formatted as expected.");
++    }
++    delete_file(path);
++    None
++}
++
++/// Process the pings directory and return a vector of `PingRequest`s
++/// corresponding to each valid ping file in the directory.
++/// This vector will be ordered by file `modified_date`.
++///
++/// Any files that don't match the UUID regex will be deleted
++/// to prevent files from polluting the pings directory.
++///
++/// Files that are not correctly formatted will also be deleted.
++pub fn process_pings_dir(data_path: &Path) -> Result<Vec<PingRequest>> {
++    let pings_dir = get_pings_dir(data_path);
++    let mut pending_pings: Vec<_> = pings_dir
++        .read_dir()?
++        .filter_map(|entry| entry.ok())
++        .filter_map(|entry| {
++            let path = entry.path();
++            if let Some(file_name) = get_file_name_as_str(&path) {
++                // Delete file if it doesn't match the pattern.
++                if Uuid::parse_str(file_name).is_err() {
++                    log::warn!("Pattern mismatch {}", path.display());
++                    delete_file(&path);
++                    return None;
++                }
++                // In case we can't process the file we just ignore it.
++                if let Some(request) = process_ping_file(file_name, &path) {
++                    // Get the modified date of the file, which will later be used
++                    // for sorting the resulting vector.
++                    let modified_date = fs::metadata(&path).and_then(|data| data.modified());
++                    return Some((modified_date, request));
++                }
++            };
++            None
++        })
++        .collect();
++
++    // Sort by `modified_date`.
++    pending_pings.sort_by(|(a, _), (b, _)| {
++        // We might not be able to get the modified date for a given file,
++        // in which case we just put it at the end.
++        if let (Ok(a), Ok(b)) = (a, b) {
++            a.partial_cmp(b).unwrap()
++        } else {
++            Ordering::Less
++        }
++    });
++
++    // Return the vector leaving only the `PingRequest`s in it
++    Ok(pending_pings
++        .into_iter()
++        .map(|(_, request)| request)
++        .collect())
++}
++
++#[cfg(test)]
++mod test {
++    use std::fs::File;
++    use std::io::prelude::*;
++    use uuid::Uuid;
++
++    use super::*;
++    use crate::metrics::PingType;
++    use crate::tests::new_glean;
++
++    #[test]
++    fn test_doesnt_panic_if_no_pending_pings_directory() {
++        let dir = tempfile::tempdir().unwrap();
++        assert!(process_pings_dir(&dir.path()).is_err());
++    }
++
++    #[test]
++    fn test_creates_requests_correctly_from_valid_ping_file() {
++        let (mut glean, dir) = new_glean(None);
++        let data_path = dir.path();
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, true);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping to populate the pending_pings directory
++        glean.submit_ping(&ping_type).unwrap();
++
++        // Try and process the pings folder
++        let requests = process_pings_dir(&data_path).unwrap();
++
++        // Verify there is just the one request
++        assert_eq!(requests.len(), 1);
++
++        // Verify request was returned for the "test" ping
++        let request_ping_type = requests[0]
++            .body
++            .get("ping_info")
++            .and_then(|value| value.get("ping_type"))
++            .unwrap();
++        assert_eq!(request_ping_type, "test");
++    }
++
++    #[test]
++    fn test_non_uuid_files_are_deleted_and_ignored() {
++        let (mut glean, dir) = new_glean(None);
++        let data_path = dir.path();
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, true);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping to populate the pending_pings directory
++        glean.submit_ping(&ping_type).unwrap();
++
++        // Add non uuid file to pending_pings directory
++        let not_uuid_path = get_pings_dir(&data_path).join("not-uuid-file-name.txt");
++        File::create(&not_uuid_path).unwrap();
++
++        // Try and process the pings folder
++        let requests = process_pings_dir(&data_path).unwrap();
++
++        // Verify there is just the one request
++        assert_eq!(requests.len(), 1);
++
++        // Verify request was returned for the "test" ping
++        let request_ping_type = requests[0]
++            .body
++            .get("ping_info")
++            .and_then(|value| value.get("ping_type"))
++            .unwrap();
++        assert_eq!(request_ping_type, "test");
++
++        // Verify that file was indeed deleted
++        assert!(!not_uuid_path.exists());
++    }
++
++    #[test]
++    fn test_wrongly_formatted_files_are_deleted_and_ignored() {
++        let (mut glean, dir) = new_glean(None);
++        let data_path = dir.path();
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, true);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping to populate the pending_pings directory
++        glean.submit_ping(&ping_type).unwrap();
++
++        // Create a file that will have wrong format contents
++        let wrong_contents_file_path = get_pings_dir(&data_path).join(Uuid::new_v4().to_string());
++        File::create(&wrong_contents_file_path).unwrap();
++
++        // Try and process the pings folder
++        let requests = process_pings_dir(&data_path).unwrap();
++
++        // Verify there is just the one request
++        assert_eq!(requests.len(), 1);
++
++        // Verify request was returned for the "test" ping
++        let request_ping_type = requests[0]
++            .body
++            .get("ping_info")
++            .and_then(|value| value.get("ping_type"))
++            .unwrap();
++        assert_eq!(request_ping_type, "test");
++
++        // Verify that file was indeed deleted
++        assert!(!wrong_contents_file_path.exists());
++    }
++
++    #[test]
++    fn test_non_json_ping_body_files_are_deleted_and_ignored() {
++        let (mut glean, dir) = new_glean(None);
++        let data_path = dir.path();
++
++        // Register a ping for testing
++        let ping_type = PingType::new("test", true, true);
++        glean.register_ping_type(&ping_type);
++
++        // Submit the ping to populate the pending_pings directory
++        glean.submit_ping(&ping_type).unwrap();
++
++        // Create a file that will have wrong format contents
++        let non_json_body_file_path = get_pings_dir(&data_path).join(Uuid::new_v4().to_string());
++        let mut non_json_body_file = File::create(&non_json_body_file_path).unwrap();
++        non_json_body_file
++            .write_all(
++                b"https://doc.rust-lang.org/std/fs/struct.File.html
++                This is not JSON!!!!",
++            )
++            .unwrap();
++
++        // Try and process the pings folder
++        let requests = process_pings_dir(&data_path).unwrap();
++
++        // Verify there is just the one request
++        assert_eq!(requests.len(), 1);
++
++        // Verify request was returned for the "test" ping
++        let request_ping_type = requests[0]
++            .body
++            .get("ping_info")
++            .and_then(|value| value.get("ping_type"))
++            .unwrap();
++        assert_eq!(request_ping_type, "test");
++
++        // Verify that file was indeed deleted
++        assert!(!non_json_body_file_path.exists());
++    }
++}
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn new_glean(tempdir: Option<tempfile::TempDir>) -> (Glean, tempfile::TempDir)
+
+fn basic_metrics_should_be_cleared_when_uploading_is_disabled() -> ()
+
+fn client_id_and_first_run_date_must_be_regenerated() -> ()
+
+fn first_run_date_is_managed_correctly_when_toggling_uploading() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

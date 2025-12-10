@@ -1,0 +1,61 @@
+<think>
+Okay, I need to determine if a unit test is necessary based on the provided patch and issue. Let's start by understanding the problem.
+
+The issue is about the RLB testing API blocking on the dispatcher. The current behavior blocks on the dispatcher being outside of test mode, which makes it different from other bindings. The user provided a test case where creating a metric, checking it, and then initializing Glean should be possible without blocking.
+
+Looking at the patch, it replaces calls to `dispatcher::block_on_queue()` with a new function `block_on_dispatcher()`. This new function includes an assertion that `was_initialize_called()`, which checks if Glean was initialized. If not, it panics.
+
+Now, I need to see if this change requires a test. Since the behavior has changed, a test is needed to ensure that using the testing API before Glean is initialized correctly panics. Without a test, we can't be sure the patch works as intended.
+
+The test should simulate using the testing API before initialization. It should create a metric and call `test_get_value`, which now uses `block_on_dispatcher()`. This should panic because Glean wasn't initialized. The test should catch this panic and verify the error message.
+
+I'll structure the test to acquire the test lock, destroy any existing Glean instance, create a metric, and then attempt to get its value. Using `std::panic::catch_unwind` will capture the panic. I'll check that the panic message includes the expected error.
+
+So, the test is necessary to validate the new behavior introduced by the patch.
+</think>
+
+<Filename>glean-core/rlb/src/test.rs</Filename>
+<imports>
+use super::block_on_dispatcher;
+use super::BooleanMetric;
+use super::CommonMetricData;
+use super::Lifetime;
+use super::destroy_glean;
+use super::lock_test;
+use super::was_initialize_called;
+</imports>
+<Rust>
+#[test]
+fn blocking_before_init_panics() {
+    let _lock = lock_test();
+
+    // We need to ensure Glean is uninitialized.
+    destroy_glean(true);
+    assert!(!was_initialize_called());
+
+    let metric = BooleanMetric::new(CommonMetricData {
+        name: "bool_metric".into(),
+        category: "test".into(),
+        send_in_pings: vec!["store1".into()],
+        lifetime: Lifetime::Application,
+        disabled: false,
+        dynamic_label: None,
+    });
+
+    // It would be nice to just use `#[should_panic]` on this test method,
+    // but then we poison the `lock_test` lock and thus breaks other tests.
+    // Instead we catch the panic here.
+    let result = std::panic::catch_unwind(|| {
+        // Try to get a value. This should panic.
+        let _ = metric.test_get_value("store1");
+    });
+    let err = result.unwrap_err();
+
+    assert!(err.is::<&str>());
+    let err = err.downcast_ref::<&str>().unwrap();
+    assert!(
+        err.contains("initialize was never called"),
+        "Got the wrong panic message"
+    );
+}
+</Rust>

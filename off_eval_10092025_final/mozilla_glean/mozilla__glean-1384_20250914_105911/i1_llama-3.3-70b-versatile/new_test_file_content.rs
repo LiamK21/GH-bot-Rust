@@ -1,0 +1,26 @@
+#glean-core/rlb/src/private/datetime.rs
+#[cfg(test)]
+mod tests {
+use super::DatetimeMetric;
+use chrono::prelude::*;
+use chrono::FixedOffset;
+
+#[test]
+fn test_datetime_metric() {
+  let metric: DatetimeMetric = DatetimeMetric::new(
+      glean_core::CommonMetricData {
+          name: "datetime".into(),
+          category: "test".into(),
+          send_in_pings: vec!["test1".into()],
+          ..Default::default()
+      },
+      TimeUnit::Day,
+  );
+
+  let sample_date = FixedOffset::east(0).ymd(2018, 2, 25).and_hms(11, 5, 0);
+  metric.set(Some(sample_date));
+
+  let date = metric.test_get_value(None).unwrap();
+  assert_eq!(date, FixedOffset::east(0).ymd(2018, 2, 25).and_hms(0, 0, 0));
+}
+}

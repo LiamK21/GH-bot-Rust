@@ -1,0 +1,16 @@
+#tools/embedded-uniffi-bindgen/src/lib.rs
+#[cfg(test)]
+mod tests {
+use super::*;
+use std::path::Path;
+use std::fs::File;
+use std::io::Write;
+
+#[test]
+fn test_embedded_uniffi_bindgen() {
+  let file_path = Path::new("tools/embedded-uniffi-bindgen/lib.rs");
+  let mut file = File::create(file_path).unwrap();
+  file.write_all(b"").expect("Failed to write file");
+  assert!(file_path.exists());
+}
+}

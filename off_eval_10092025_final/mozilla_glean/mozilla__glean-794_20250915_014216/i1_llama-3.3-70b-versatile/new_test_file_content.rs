@@ -1,0 +1,15 @@
+#glean-core/src/system.rs
+#[cfg(test)]
+mod tests {
+use super::Glean;
+use super::CoreMetrics;
+use super::system;
+
+#[test]
+fn test_os_detection() {
+  let glean = Glean::new();
+  let expected_os = system::OS;
+  let actual_os = glean.core_metrics.os.test_get_value(&glean, "glean_client_info").unwrap();
+  assert_eq!(expected_os, actual_os);
+}
+}

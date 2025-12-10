@@ -1,0 +1,35 @@
+#glean-core/rlb/src/private/custom_distribution.rs
+#[cfg(test)]
+mod tests {
+use super::CustomDistributionMetric;
+use glean_core::metrics::MetricType;
+use glean_core::{CommonMetricData, HistogramType};
+
+#[test]
+fn test_custom_distribution_metric_creation() {
+    let meta = CommonMetricData {
+        name: "test_metric".into(),
+        category: "test_category".into(),
+        send_in_pings: vec!["test_ping".into()],
+        lifetime: glean_core::Lifetime::Ping,
+        disabled: false,
+        ..Default::default()
+    };
+    let range_min = 1;
+    let range_max = 100;
+    let bucket_count = 10;
+    let histogram_type = HistogramType::Linear;
+
+    let custom_metric = CustomDistributionMetric::new(meta, range_min, range_max, bucket_count, histogram_type);
+
+    assert_eq!(custom_metric.0.meta().name, "test_metric");
+    assert_eq!(custom_metric.0.meta().category, "test_category");
+    assert_eq!(custom_metric.0.meta().send_in_pings, vec!["test_ping"]);
+    assert_eq!(custom_metric.0.meta().lifetime, glean_core::Lifetime::Ping);
+    assert_eq!(custom_metric.0.meta().disabled, false);
+    assert_eq!(custom_metric.0.range_min(), range_min);
+    assert_eq!(custom_metric.0.range_max(), range_max);
+    assert_eq!(custom_metric.0.bucket_count(), bucket_count);
+    assert_eq!(custom_metric.0.histogram_type(), histogram_type);
+}
+}

@@ -1,0 +1,422 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Use if-let chains when available to clean up some code
+https://github.com/rust-lang/rust/issues/53667
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/gcov.rs b/src/gcov.rs
+--- a/src/gcov.rs
++++ b/src/gcov.rs
+@@ -4,9 +4,10 @@ use std::path::PathBuf;
+ use std::process::Command;
+ 
+ fn get_gcov() -> String {
+-    match env::var("GCOV") {
+-        Ok(s) => s,
+-        Err(_) => "gcov".to_string(),
++    if let Ok(s) = env::var("GCOV") {
++        s
++    } else {
++        "gcov".to_string()
+     }
+ }
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -95,9 +95,10 @@ fn add_results(
+         let path = match source_dir {
+             Some(source_dir) => {
+                 // the goal here is to be able to merge results for paths like foo/./bar and foo/bar
+-                match canonicalize_path(source_dir.join(&result.0)) {
+-                    Ok(p) => String::from(p.to_str().unwrap()),
+-                    Err(_) => result.0,
++                if let Ok(p) = canonicalize_path(source_dir.join(&result.0)) {
++                    String::from(p.to_str().unwrap())
++                } else {
++                    result.0
+                 }
+             }
+             None => result.0,
+
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -137,7 +137,7 @@ pub fn output_covdir(results: CovResultIter, output_file: Option<&str>) {
+     let mut relative: FxHashMap<PathBuf, Rc<RefCell<CDDirStats>>> = FxHashMap::default();
+     let global = Rc::new(RefCell::new(CDDirStats::new("".to_string())));
+     relative.insert(PathBuf::from(""), global.clone());
+-    
++
+     for (abs_path, rel_path, result) in results {
+         let path = if rel_path.is_relative() {
+             rel_path
+@@ -253,15 +253,14 @@ pub fn output_lcov(results: CovResultIter, output_file: Option<&str>) {
+ }
+ 
+ fn get_digest(path: PathBuf) -> String {
+-    match File::open(path) {
+-        Ok(mut f) => {
+-            let mut buffer = Vec::new();
+-            f.read_to_end(&mut buffer).unwrap();
+-            let mut hasher = Md5::new();
+-            hasher.input(buffer.as_slice());
+-            format!("{:x}", hasher.result())
+-        }
+-        Err(_) => Uuid::new_v4().to_string(),
++    if let Ok(mut f) = File::open(path) {
++        let mut buffer = Vec::new();
++        f.read_to_end(&mut buffer).unwrap();
++        let mut hasher = Md5::new();
++        hasher.input(buffer.as_slice());
++        format!("{:x}", hasher.result())
++    } else {
++        Uuid::new_v4().to_string()
+     }
+ }
+ 
+@@ -367,7 +366,7 @@ mod tests {
+         f.read_to_string(&mut s).unwrap();
+         s
+     }
+-    
++
+     #[test]
+     fn test_covdir() {
+         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+@@ -406,7 +405,7 @@ mod tests {
+         ];
+ 
+         let results = Box::new(results.into_iter());
+-        output_covdir(results, Some(file_path.to_str().unwrap()));        
++        output_covdir(results, Some(file_path.to_str().unwrap()));
+ 
+         let results: Value = serde_json::from_str(&read_file(&file_path)).unwrap();
+         let expected_path = PathBuf::from("./test/").join(&file_name);
+
+diff --git a/src/parser.rs b/src/parser.rs
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -53,9 +53,10 @@ macro_rules! try_parse {
+ 
+ macro_rules! try_next {
+     ($v:expr, $l:expr) => {
+-        match $v.next() {
+-            Some(val) => val,
+-            None => return Err(ParserError::InvalidRecord($l.to_string())),
++        if let Some(val) = $v.next() {
++            val
++        } else {
++            return Err(ParserError::InvalidRecord($l.to_string()))
+         }
+     };
+ }
+
+diff --git a/src/path_rewriting.rs b/src/path_rewriting.rs
+--- a/src/path_rewriting.rs
++++ b/src/path_rewriting.rs
+@@ -156,7 +156,7 @@ fn get_abs_path(
+ 
+     // Fixup the relative path, in case the absolute path was a symlink.
+     let rel_path = fixup_rel_path(&source_dir, &abs_path, rel_path);
+-    
++
+     // Normalize the path in removing './' or '//' or '..'
+     let rel_path = normalize_path(rel_path);
+     let abs_path = normalize_path(abs_path);
+@@ -207,9 +207,10 @@ fn map_partial_path(file_to_paths: &FxHashMap<String, Vec<PathBuf>>, path: PathB
+         }
+     }
+ 
+-    match result {
+-        Some(result) => result.clone(),
+-        None => path,
++    if let Some(result) = result {
++        result.clone()
++    } else {
++        path
+     }
+ }
+
+diff --git a/src/producer.rs b/src/producer.rs
+--- a/src/producer.rs
++++ b/src/producer.rs
+@@ -250,23 +250,19 @@ impl Archive {
+     pub fn extract(&self, name: &str, path: &PathBuf) -> bool {
+         let dest_parent = path.parent().unwrap();
+         if !dest_parent.exists() {
+-            match fs::create_dir_all(dest_parent) {
+-                Ok(_) => {}
+-                Err(_) => panic!("Cannot create parent directory"),
+-            };
++            fs::create_dir_all(dest_parent).expect("Cannot create parent directory");
+         }
+ 
+         match *self.item.borrow_mut() {
+             ArchiveType::Zip(ref mut zip) => {
+                 let mut zip = zip.borrow_mut();
+                 let zipfile = zip.by_name(&name);
+-                match zipfile {
+-                    Ok(mut f) => {
+-                        let mut file = File::create(&path).expect("Failed to create file");
+-                        io::copy(&mut f, &mut file).expect("Failed to copy file from ZIP");
+-                        true
+-                    }
+-                    Err(_) => false,
++                if let Ok(mut f) = zipfile {
++                    let mut file = File::create(&path).expect("Failed to create file");
++                    io::copy(&mut f, &mut file).expect("Failed to copy file from ZIP");
++                    true
++                } else {
++                    false
+                 }
+             }
+             ArchiveType::Dir(ref dir) => {
+@@ -309,79 +305,76 @@ fn gcno_gcda_producer(
+ 
+     for (gcno_stem, gcno_archive) in gcno_stem_archives {
+         let stem = &gcno_stem.stem;
+-        match gcda_stem_archives.get(stem) {
+-            Some(gcda_archives) => {
++        if let Some(gcda_archives) = gcda_stem_archives.get(stem) {
++            let gcno_archive = *gcno_archive;
++            let gcno = format!("{}.gcno", stem).to_string();
++            let physical_gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, 1));
++            if gcno_stem.llvm {
++                let mut gcno_buffer: Vec<u8> = Vec::new();
++                let mut gcda_buffers: Vec<Vec<u8>> = Vec::with_capacity(gcda_archives.len());
++                gcno_archive.read_in_buffer(&gcno, &mut gcno_buffer);
++                for gcda_archive in gcda_archives {
++                    let mut gcda_buf: Vec<u8> = Vec::new();
++                    let gcda = format!("{}.gcda", stem).to_string();
++                    if gcda_archive.read_in_buffer(&gcda, &mut gcda_buf) {
++                        gcda_buffers.push(gcda_buf);
++                    }
++                }
++                send_job(
++                    ItemType::Buffers(GcnoBuffers {
++                        stem: stem.clone(),
++                        gcno_buf: gcno_buffer,
++                        gcda_buf: gcda_buffers,
++                    }),
++                    "".to_string(),
++                );
++            } else {
++                gcno_archive.extract(&gcno, &physical_gcno_path);
++                for (num, &gcda_archive) in gcda_archives.iter().enumerate() {
++                    let gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, num + 1));
++                    let gcda = format!("{}.gcda", stem).to_string();
++
++                    // Create symlinks.
++                    if num != 0 {
++                        fs::hard_link(&physical_gcno_path, &gcno_path).unwrap_or_else(|_| {
++                            panic!("Failed to create hardlink {:?}", gcno_path)
++                        });
++                    }
++
++                    let gcda_path = tmp_dir.join(format!("{}_{}.gcda", stem, num + 1));
++                    if gcda_archive.extract(&gcda, &gcda_path)
++                        || (num == 0 && !ignore_orphan_gcno)
++                    {
++                        send_job(
++                            ItemType::Path((stem.clone(), gcno_path)),
++                            gcda_archive.get_name().to_string(),
++                        );
++                    }
++                }
++            }
++        } else {
++            if !ignore_orphan_gcno {
+                 let gcno_archive = *gcno_archive;
+                 let gcno = format!("{}.gcno", stem).to_string();
+-                let physical_gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, 1));
+                 if gcno_stem.llvm {
+-                    let mut gcno_buffer: Vec<u8> = Vec::new();
+-                    let mut gcda_buffers: Vec<Vec<u8>> = Vec::with_capacity(gcda_archives.len());
+-                    gcno_archive.read_in_buffer(&gcno, &mut gcno_buffer);
+-                    for gcda_archive in gcda_archives {
+-                        let mut gcda_buf: Vec<u8> = Vec::new();
+-                        let gcda = format!("{}.gcda", stem).to_string();
+-                        if gcda_archive.read_in_buffer(&gcda, &mut gcda_buf) {
+-                            gcda_buffers.push(gcda_buf);
+-                        }
+-                    }
++                    let mut buffer: Vec<u8> = Vec::new();
++                    gcno_archive.read_in_buffer(&gcno, &mut buffer);
++
+                     send_job(
+                         ItemType::Buffers(GcnoBuffers {
+                             stem: stem.clone(),
+-                            gcno_buf: gcno_buffer,
+-                            gcda_buf: gcda_buffers,
++                            gcno_buf: buffer,
++                            gcda_buf: Vec::new(),
+                         }),
+-                        "".to_string(),
++                        gcno_archive.get_name().to_string(),
+                     );
+                 } else {
+-                    gcno_archive.extract(&gcno, &physical_gcno_path);
+-                    for (num, &gcda_archive) in gcda_archives.iter().enumerate() {
+-                        let gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, num + 1));
+-                        let gcda = format!("{}.gcda", stem).to_string();
+-
+-                        // Create symlinks.
+-                        if num != 0 {
+-                            fs::hard_link(&physical_gcno_path, &gcno_path).unwrap_or_else(|_| {
+-                                panic!("Failed to create hardlink {:?}", gcno_path)
+-                            });
+-                        }
+-
+-                        let gcda_path = tmp_dir.join(format!("{}_{}.gcda", stem, num + 1));
+-                        if gcda_archive.extract(&gcda, &gcda_path)
+-                            || (num == 0 && !ignore_orphan_gcno)
+-                        {
+-                            send_job(
+-                                ItemType::Path((stem.clone(), gcno_path)),
+-                                gcda_archive.get_name().to_string(),
+-                            );
+-                        }
+-                    }
+-                }
+-            }
+-            None => {
+-                if !ignore_orphan_gcno {
+-                    let gcno_archive = *gcno_archive;
+-                    let gcno = format!("{}.gcno", stem).to_string();
+-                    if gcno_stem.llvm {
+-                        let mut buffer: Vec<u8> = Vec::new();
+-                        gcno_archive.read_in_buffer(&gcno, &mut buffer);
+-
++                    let physical_gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, 1));
++                    if gcno_archive.extract(&gcno, &physical_gcno_path) {
+                         send_job(
+-                            ItemType::Buffers(GcnoBuffers {
+-                                stem: stem.clone(),
+-                                gcno_buf: buffer,
+-                                gcda_buf: Vec::new(),
+-                            }),
++                            ItemType::Path((stem.clone(), physical_gcno_path)),
+                             gcno_archive.get_name().to_string(),
+                         );
+-                    } else {
+-                        let physical_gcno_path = tmp_dir.join(format!("{}_{}.gcno", stem, 1));
+-                        if gcno_archive.extract(&gcno, &physical_gcno_path) {
+-                            send_job(
+-                                ItemType::Path((stem.clone(), physical_gcno_path)),
+-                                gcno_archive.get_name().to_string(),
+-                            );
+-                        }
+                     }
+                 }
+             }
+@@ -408,13 +401,12 @@ fn file_content_producer(
+ }
+ 
+ pub fn get_mapping(linked_files_maps: &FxHashMap<String, &Archive>) -> Option<Vec<u8>> {
+-    match linked_files_maps.iter().next() {
+-        Some((ref name, archive)) => {
+-            let mut buffer = Vec::new();
+-            archive.read_in_buffer(name, &mut buffer);
+-            Some(buffer)
+-        }
+-        None => None,
++    if let Some((ref name, archive)) = linked_files_maps.iter().next() {
++        let mut buffer = Vec::new();
++        archive.read_in_buffer(name, &mut buffer);
++        Some(buffer)
++    } else {
++        None
+     }
+ }
+ 
+@@ -1464,15 +1456,12 @@ mod tests {
+ 
+         let expected = vec![(ItemFormat::INFO, false, "prova_1.info", true)];
+ 
+-        match File::open(json_path) {
+-            Ok(mut reader) => {
+-                let mut json = Vec::new();
+-                reader.read_to_end(&mut json).unwrap();
+-                assert_eq!(json, mapping);
+-            }
+-            Err(_) => {
+-                assert!(false, format!("Failed to read the file: {}", json_path));
+-            }
++        if let Ok(mut reader) = File::open(json_path) {
++            let mut json = Vec::new();
++            reader.read_to_end(&mut json).unwrap();
++            assert_eq!(json, mapping);
++        } else {
++            assert!(false, format!("Failed to read the file: {}", json_path));
+         }
+ 
+         check_produced(tmp_path, &receiver, expected);
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn add_results(
+mut results: Vec<(String, CovResult) -> ()
+
+pub fn output_covdir(results: CovResultIter, output_file: Option<&str>) -> ()
+
+pub fn output_lcov(results: CovResultIter, output_file: Option<&str>) -> ()
+
+fn get_abs_path(
+source_dir: &Option<PathBuf>,
+rel_path: PathBuf,
+cache: &mut Option<PathBuf>) -> Option<(PathBuf, PathBuf)>
+
+fn map_partial_path(file_to_paths: &FxHashMap<String, Vec<PathBuf>>, path: PathBuf) -> PathBuf
+
+fn file_content_producer(
+files: &FxHashMap<String, Vec<&Archive>>,
+sender: &JobSender,
+item_format: ItemFormat) -> ()
+
+fn gcno_gcda_producer(
+tmp_dir: &Path,
+gcno_stem_archives: &FxHashMap<GCNOStem, &Archive>,
+gcda_stem_archives: &FxHashMap<String, Vec<&Archive>>,
+sender: &JobSender,
+ignore_orphan_gcno: bool) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block.
+ Use `use super::<function name> for the function under test.
+.If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+- name
+- parameters
+- Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
