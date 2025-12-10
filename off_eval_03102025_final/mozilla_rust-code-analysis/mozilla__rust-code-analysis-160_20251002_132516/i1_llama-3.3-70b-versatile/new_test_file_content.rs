@@ -1,0 +1,32 @@
+#src/output/dump_formats.rs
+#[cfg(test)]
+mod tests {
+use std::io::Write;
+use crate::spaces::FuncSpace;
+use crate::dump_formats::*;
+
+#[test]
+fn test_dump_json_to_stdout() {
+  let space = FuncSpace {
+    name: Some("test_function"),
+    kind: crate::spaces::SpaceKind::Function,
+    start_line: 1,
+    end_line: 10,
+    spaces: vec![],
+    metrics: crate::spaces::CodeMetrics {
+      nargs: fn_args::Stats { n_args: 2 },
+      nexits: exit::Stats { exit: 1 },
+      cyclomatic: cyclomatic::Stats { cyclomatic: 1.0 },
+      halstead: halstead::Stats { length: 10.0, operators: 5, operands: 5, u_operators: 2, u_operands: 2 },
+      loc: loc::Stats { sloc: 10, ploc: 5, lloc: 5, cloc: 5, blank: 5 },
+      nom: nom::Stats { functions: 1, closures: 0, total: 1 },
+      mi: mi::Stats { mi_original: 10.0, mi_sei: 5.0, mi_visual_studio: 5.0 }
+    }
+  };
+  let mut stdout = Vec::new();
+  dump_formats(&space, &std::path::PathBuf::from("/"), &None, Format::Json, true).unwrap();
+  let expected = "{\"name\":\"test_function\",\"kind\":\"function\",\"start_line\":1,\"end_line\":10,\"spaces\":[],\"metrics\":{\"nargs\":{\"n_args\":2},\"nexits\":{\"exit\":1},\"cyclomatic\":{\"cyclomatic\":1.0},\"halstead\":{\"length\":10.0,\"operators\":5,\"operands\":5,\"u_operators\":2,\"u_operands\":2},\"loc\":{\"sloc\":10,\"ploc\":5,\"lloc\":5,\"cloc\":5,\"blank\":5},\"nom\":{\"functions\":1,\"closures\":0,\"total\":1},\"mi\":{\"mi_original\":10.0,\"mi_sei\":5.0,\"mi_visual_studio\":5.0}}}";
+  let actual = String::from_utf8_lossy(&stdout);
+  assert_eq!(actual, expected);
+}
+}

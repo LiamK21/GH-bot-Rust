@@ -1,0 +1,227 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Windows "The filename or extension is too long"
+Seeing this weird issue where grcov (I think) fails with "The filename or extension is too long. (os error 206)" when trying to run on Windows with a bunch of sources. You can see the output here: https://github.com/moonrepo/moon/runs/6747703502?check_suite_focus=true
+
+When looking at the list of file paths, _none_ of these are long, nor do they have incorrect file names/extensions. I'm confused on how to fix this. Maybe it's `/` instead of `\`?
+
+Another related issue is that grcov fails, but the build is still green. Can this error be bubbled up to not be a 0 exit code?
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -34,6 +34,7 @@ mod reader;
+ pub use crate::reader::*;
+ 
+ mod covdir;
++pub use crate::covdir::*;
+ 
+ pub mod html;
+ 
+@@ -57,7 +58,7 @@ pub fn merge_results(result: &mut CovResult, result2: CovResult) -> bool {
+             btree_map::Entry::Occupied(c) => {
+                 let v = c.get().checked_add(execution_count).unwrap_or_else(|| {
+                     warn_overflow = true;
+-                    u64::MAX
++                    std::u64::MAX
+                 });
+ 
+                 *c.into_mut() = v;
+@@ -140,7 +141,7 @@ fn rename_single_files(results: &mut [(String, CovResult)], stem: &str) {
+     if let Some(parent) = Path::new(stem).parent() {
+         for (file, _) in results.iter_mut() {
+             if has_no_parent(file) {
+-                *file = parent.join(file.as_str()).to_str().unwrap().to_string();
++                *file = parent.join(&file).to_str().unwrap().to_string();
+             }
+         }
+     }
+@@ -175,7 +176,6 @@ pub fn consumer(
+     branch_enabled: bool,
+     guess_directory: bool,
+     binary_path: Option<&Path>,
+-    ignore_parsing_error: bool,
+ ) {
+     let mut gcov_type = GcovType::Unknown;
+ 
+@@ -190,8 +190,7 @@ pub fn consumer(
+                     ItemType::Path((stem, gcno_path)) => {
+                         // GCC
+                         if let Err(e) = run_gcov(&gcno_path, branch_enabled, working_dir) {
+-                            error!("Error when running gcov: {e}");
+-                            continue;
++                            panic!("Error when running gcov: {}", e);
+                         };
+                         let gcov_ext = get_gcov_output_ext();
+                         let gcov_path =
+@@ -221,7 +220,7 @@ pub fn consumer(
+                         } else {
+                             let mut new_results: Vec<(String, CovResult)> = Vec::new();
+ 
+-                            for entry in WalkDir::new(working_dir).min_depth(1) {
++                            for entry in WalkDir::new(&working_dir).min_depth(1) {
+                                 let gcov_path = entry.unwrap();
+                                 let gcov_path = gcov_path.path();
+ 
+@@ -261,29 +260,26 @@ pub fn consumer(
+                             }
+                             Err(e) => {
+                                 // Just print the error, don't panic and continue
+-                                error!("Error in computing counters: {e}");
++                                error!("Error in computing counters: {}", e);
+                                 Vec::new()
+                             }
+                         }
+                     }
+                     ItemType::Content(_) => {
+-                        error!("Invalid content type");
+-                        continue;
++                        panic!("Invalid content type");
+                     }
+                     ItemType::Paths(_) => {
+-                        error!("Invalid content type");
+-                        continue;
++                        panic!("Invalid content type");
+                     }
+                 }
+             }
+-            ItemFormat::Profdata | ItemFormat::Profraw => {
++            ItemFormat::Profraw => {
+                 if binary_path.is_none() {
+-                    error!("The path to the compiled binary must be given as an argument when source-based coverage is used");
+-                    continue;
++                    panic!("The path to the compiled binary must be given as an argument when source-based coverage is used");
+                 }
+ 
+                 if let ItemType::Paths(profraw_paths) = work_item.item {
+-                    match llvm_tools::llvm_profiles_to_lcov(
++                    match llvm_tools::profraws_to_lcov(
+                         profraw_paths.as_slice(),
+                         binary_path.as_ref().unwrap(),
+                         working_dir,
+@@ -293,7 +289,7 @@ pub fn consumer(
+ 
+                             for lcov in lcovs {
+                                 new_results.append(&mut try_parse!(
+-                                    parse_lcov(lcov, branch_enabled, ignore_parsing_error),
++                                    parse_lcov(lcov, branch_enabled),
+                                     work_item.name
+                                 ));
+                             }
+@@ -301,32 +297,23 @@ pub fn consumer(
+                             new_results
+                         }
+                         Err(e) => {
+-                            error!("Error while executing llvm tools: {e}");
+-                            continue;
++                            panic!("Error while executing llvm tools: {}", e);
+                         }
+                     }
+                 } else {
+-                    error!("Invalid content type");
+-                    continue;
++                    panic!("Invalid content type");
+                 }
+             }
+-            ItemFormat::Info | ItemFormat::JacocoXml | ItemFormat::Gocov => {
++            ItemFormat::Info | ItemFormat::JacocoXml => {
+                 if let ItemType::Content(content) = work_item.item {
+                     if work_item.format == ItemFormat::Info {
+-                        try_parse!(
+-                            parse_lcov(content, branch_enabled, ignore_parsing_error),
+-                            work_item.name
+-                        )
+-                    } else if work_item.format == ItemFormat::JacocoXml {
++                        try_parse!(parse_lcov(content, branch_enabled), work_item.name)
++                    } else {
+                         let buffer = BufReader::new(Cursor::new(content));
+                         try_parse!(parse_jacoco_xml_report(buffer), work_item.name)
+-                    } else {
+-                        let mut buffer = BufReader::new(Cursor::new(content));
+-                        try_parse!(parse_gocov(&mut buffer), work_item.name)
+                     }
+                 } else {
+-                    error!("Invalid content type");
+-                    continue;
++                    panic!("Invalid content type");
+                 }
+             }
+         };
+@@ -439,7 +426,7 @@ mod tests {
+             .expect("Failed to open lcov file");
+         let mut buf = Vec::new();
+         f.read_to_end(&mut buf).unwrap();
+-        let results = parse_lcov(buf, false, false).unwrap();
++        let results = parse_lcov(buf, false).unwrap();
+         let result_map: Arc<SyncCovResultMap> = Arc::new(Mutex::new(
+             FxHashMap::with_capacity_and_hasher(1, Default::default()),
+         ));
+@@ -473,7 +460,7 @@ mod tests {
+             .expect("Failed to open lcov file");
+         let mut buf = Vec::new();
+         f.read_to_end(&mut buf).unwrap();
+-        let results = parse_lcov(buf, false, false).unwrap();
++        let results = parse_lcov(buf, false).unwrap();
+         let result_map: Arc<SyncCovResultMap> = Arc::new(Mutex::new(
+             FxHashMap::with_capacity_and_hasher(3, Default::default()),
+         ));
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn consumer(
+working_dir: &Path,
+source_dir: Option<&Path>,
+result_map: &SyncCovResultMap,
+receiver: JobReceiver,
+branch_enabled: bool,
+guess_directory: bool,
+binary_path: Option<&Path>) -> ()
+
+fn rename_single_files(results: &mut [(String, CovResult) -> ()
+
+pub fn merge_results(result: &mut CovResult, result2: CovResult) -> bool
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,234 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Fill out `git` key in Coveralls report
+Coveralls docs [say](https://docs.coveralls.io/api-reference) that `git` can contain a lot more than grcov [currently supplies](https://github.com/mozilla/grcov/blob/b151dc60dacb091864be0735f7a369535623acd4/src/output.rs#L342-L347):
+
+```json
+{
+    "git": {
+        "head": {
+            "id": "b31f08d07ae564b08237e5a336e478b24ccc4a65",
+            "author_name": "Nick Merwin",
+            "author_email": "...",
+            "committer_name": "Nick Merwin",
+            "committer_email": "...",
+            "message": "version bump"
+        },
+        "branch": "master",
+        "remotes": [
+            {
+                "name": "origin",
+                "url": "git@github.com:lemurheavy/coveralls-ruby.git"
+            }
+        ]
+    }
+}
+```
+
+I'm not entirely sure, but I think the missing `author_name` etc. are the reason why grcov reports don't list this info: compare [this `grcov` report](https://coveralls.io/builds/27746263) with [this `cpp-coveralls` report](https://coveralls.io/builds/27040174).
+
+I'm happy to add `--author-name`, `--author-email` etc., but won't it be too much? An alternative approach is to read this info directly from Git when `--commit-sha` is specified—but that means either adding `git2` crate as a dependency, or requiring `git` to be installed.
+
+How should I proceed? (And should I proceed at all?)
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -4,12 +4,16 @@ use rustc_hash::FxHashMap;
+ use serde_json::{self, json, Value};
+ use std::cell::RefCell;
+ use std::collections::{hash_map, BTreeSet};
++use std::ffi::OsStr;
+ use std::fs::File;
+ use std::io::{self, BufWriter, Read, Write};
+ use std::path::PathBuf;
+ use std::rc::Rc;
+ use std::sync::{Arc, Mutex};
+-use std::{process, thread};
++use std::{
++    process::{self, Command, Stdio},
++    thread,
++};
+ use uuid::Uuid;
+ 
+ use crate::defs::*;
+@@ -270,6 +274,96 @@ fn get_digest(path: PathBuf) -> String {
+     }
+ }
+ 
++/// Runs git with given array of arguments (as strings), and returns whatever git printed to
++/// stdout. On error, returns empty string. Standard input and error are redirected from/to null.
++fn get_git_output<I, S>(args: I) -> String
++where
++    I: IntoIterator<Item = S>,
++    S: AsRef<OsStr>,
++{
++    Command::new("git")
++        .args(args)
++        .stdin(Stdio::null())
++        .stderr(Stdio::null())
++        .stdout(Stdio::piped())
++        .spawn()
++        .and_then(|child| child.wait_with_output())
++        .ok() // Discard the error type -- we won't handle it anyway
++        .and_then(|output| String::from_utf8(output.stdout).ok())
++        .unwrap_or_else(|| String::new())
++}
++
++/// Returns a JSON object describing the given commit. Coveralls uses that to display commit info.
++///
++/// \a vcs_branch is what user passed on the command line via `--vcs-branch`. This is included in
++/// the output, but doesn't affect the rest of the info (e.g. this function doesn't check if that
++/// branch actually points to the given commit).
++fn get_coveralls_git_info(commit_sha: &str, vcs_branch: &str) -> Value {
++    let status = Command::new("git")
++        .arg("status")
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .status()
++        .map(|exit_status| exit_status.success());
++    if let Ok(true) = status {
++        // We have a valid Git repo -- the rest of the function will handle this case
++    } else {
++        return json!({
++            "head": {
++                "id": commit_sha,
++            },
++            "branch": vcs_branch,
++        });
++    }
++
++    // Runs `git log` with a given format, to extract some piece of commit info. On failure,
++    // returns empty string.
++    let gitlog = |format| -> String {
++        get_git_output(&[
++            "log",
++            "--max-count=1",
++            &format!("--pretty=format:{}", format),
++            commit_sha,
++        ])
++    };
++
++    let author_name = gitlog("%aN");
++    let author_email = gitlog("%ae");
++    let committer_name = gitlog("%cN");
++    let committer_email = gitlog("%ce");
++    let message = gitlog("%s");
++
++    let remotes: Value = {
++        let output = get_git_output(&["remote", "--verbose"]);
++
++        let mut remotes = Vec::<Value>::new();
++        for line in output.lines() {
++            if line.ends_with(" (fetch)") {
++                let mut fields = line.split_whitespace();
++                match (fields.next(), fields.next()) {
++                    (Some(name), Some(url)) => remotes.push(json!({"name": name, "url": url})),
++                    _ => (),
++                };
++            }
++        }
++        json!(remotes)
++    };
++
++    json!({
++        "head": {
++            "id": commit_sha,
++            "author_name": author_name,
++            "author_email": author_email,
++            "committer_name": committer_name,
++            "committer_email": committer_email,
++            "message": message,
++        },
++        "branch": vcs_branch,
++        "remotes": remotes,
++    })
++}
++
+ pub fn output_coveralls(
+     results: CovResultIter,
+     repo_token: &str,
+@@ -335,17 +429,14 @@ pub fn output_coveralls(
+         }
+     }
+ 
++    let git = get_coveralls_git_info(commit_sha, vcs_branch);
++
+     let mut writer = BufWriter::new(get_target_output_writable(output_file));
+     serde_json::to_writer(
+         &mut writer,
+         &json!({
+             "repo_token": repo_token,
+-            "git": {
+-              "head": {
+-                "id": commit_sha,
+-              },
+-              "branch": vcs_branch,
+-            },
++            "git": git,
+             "source_files": source_files,
+             "service_name": service_name,
+             "service_number": service_number,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn get_digest(path: PathBuf) -> String
+
+pub fn output_coveralls(
+results: CovResultIter,
+repo_token: &str,
+service_name: &str,
+service_number: &str,
+service_job_number: &str,
+service_pull_request: &str,
+commit_sha: &str,
+with_function_info: bool,
+output_file: Option<&str>,
+vcs_branch: &str,
+parallel: bool) -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

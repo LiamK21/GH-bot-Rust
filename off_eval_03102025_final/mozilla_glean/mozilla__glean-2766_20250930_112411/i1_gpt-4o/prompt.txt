@@ -1,0 +1,108 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Language Bindings have difficulty recording errors
+The Glean SDK has a lovely Error Reporting mechanism for metrics. Our specific metrics APIs trie to forbid any and all misuse, but for the ones that sneak in despite our best efforts we need to record and report them.
+
+Some errors of usage are only known and checked deep in the core. What is the length for an event extra value? What is the regex for valid labels? What is the maximum value we permit in a Memory Distribution?
+
+Some errors are known at the Language Binding layer, but are passed deep into the core anyway so that we can record errors about them. Counters cannot count backwards, so negative values are an error. We could forbid them at the API by using an unsigned type... but not all of our language bindings support unsigned types. So we weaken our specific metrics API to accept a signed type just so negative values can reach the error reporting machinery in glean-core.
+
+And then there's errors known at the Language Binding layer that we can't pass down.  [FOG forbids certain operations over IPC](https://searchfox.org/mozilla-central/search?q=TODO%3A+record+an+error&path=&case=false&regexp=false).  It would be nice to be able to report errors in the same place that our users expect to find them, and in the same ways.
+
+LBs could manufacture their own `labeled_counter`-based error system, but that would have some notable flaws:
+* It'd live in a different place from glean-core error reporting, making life difficult for testing, analysis, and tooling.
+* It has a Ping Problem: errors in glean-core are reported on all pings in which the offending metric is sent (and the "metrics" ping). That is straight up impossible to do with `labeled_counter`s.
+* It'd be limited to sixteen erroring metrics, which is a limit that glean-core errors doesn't seem to share.
+
+I suggest maybe we should open up core error reporting to the Language Binding layer.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -1213,6 +1213,7 @@ pub fn glean_enable_logging_to_fd(_fd: u64) {
+ #[allow(missing_docs)]
+ mod ffi {
+     use super::*;
++    use crate::metrics::MetricType;
+     uniffi::include_scaffolding!("glean");
+ 
+     type CowString = Cow<'static, str>;
+
+diff --git a/glean-core/src/metrics/mod.rs b/glean-core/src/metrics/mod.rs
+--- a/glean-core/src/metrics/mod.rs
++++ b/glean-core/src/metrics/mod.rs
+@@ -43,7 +43,7 @@ pub use crate::event_database::RecordedEvent;
+ use crate::histogram::{Functional, Histogram, PrecomputedExponential, PrecomputedLinear};
+ pub use crate::metrics::datetime::Datetime;
+ use crate::util::get_iso_time_string;
+-use crate::Glean;
++use crate::{error_recording, Glean};
+ 
+ pub use self::boolean::BooleanMetric;
+ pub use self::counter::CounterMetric;
+@@ -229,6 +229,14 @@ pub trait MetricType {
+         // Return a boolean indicating whether or not the metric should be recorded
+         current_disabled == 0
+     }
++
++    /// Record an error for this
++    fn record_error(&self, error: crate::ErrorType, count: i32) {
++        let meta = self.meta().clone();
++        crate::launch_with_glean(move |glean| {
++            error_recording::record_error(glean, &meta, error, "external error", count);
++        })
++    }
+ }
+ 
+ impl Metric {
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn glean_enable_logging_to_fd(fd: u64) -> ()
+
+pub fn glean_enable_logging_to_fd(_fd: u64) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

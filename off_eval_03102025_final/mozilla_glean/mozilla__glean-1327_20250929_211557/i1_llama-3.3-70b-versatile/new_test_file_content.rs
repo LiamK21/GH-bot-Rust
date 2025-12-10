@@ -1,0 +1,26 @@
+#glean-core/rlb/src/private/labeled.rs
+#[cfg(test)]
+mod tests {
+use crate::private::CounterMetric;
+use crate::private::LabeledMetric;
+use crate::common_test::new_glean;
+use crate::destroy_glean;
+use crate::private::CommonMetricData;
+
+#[test]
+fn test_labeled_metric_init() {
+  let _lock = new_glean(None, true);
+  destroy_glean(true);
+  let metric: LabeledMetric<CounterMetric> = LabeledMetric::new(
+    CommonMetricData {
+        name: "labeled_counter".into(),
+        category: "labeled".into(),
+        send_in_pings: vec!["test1".into()],
+        ..Default::default()
+    },
+    None,
+  );
+  metric.get("label1").add(1);
+  assert_eq!(1, metric.get("label1").test_get_value(None).unwrap());
+}
+}

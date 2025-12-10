@@ -1,0 +1,23 @@
+#glean-core/src/thread.rs
+#[cfg(test)]
+mod tests {
+use super::spawn;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+#[test]
+fn test_thread_registration_and_unregistration() {
+    let counter = Arc::new(Mutex::new(0));
+    let counter_clone = Arc::clone(&counter);
+
+    let handle = spawn("test_thread", move || {
+        let mut num = counter_clone.lock().unwrap();
+        *num += 1;
+    }).expect("Failed to spawn thread");
+
+    handle.join().expect("Thread panicked");
+
+    let result = *counter.lock().unwrap();
+    assert_eq!(result, 1);
+}
+}

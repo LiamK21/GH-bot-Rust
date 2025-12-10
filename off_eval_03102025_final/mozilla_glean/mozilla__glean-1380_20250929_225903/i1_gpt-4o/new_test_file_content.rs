@@ -1,0 +1,34 @@
+#glean-core/rlb/src/private/string_list.rs
+#[cfg(test)]
+mod tests {
+use super::StringListMetric;
+use crate::common_test::lock_test;
+use crate::common_test::new_glean;
+use crate::CommonMetricData;
+use crate::ErrorType;
+
+#[test]
+fn test_string_list_metric_add_and_set() {
+    let _lock = lock_test();
+    let _t = new_glean(None, true);
+
+    let engine_metric: StringListMetric = StringListMetric::new(CommonMetricData {
+        name: "event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["test1".into()],
+        ..Default::default()
+    });
+
+    let engines: Vec<String> = vec!["Google".to_string(), "DuckDuckGo".to_string()];
+
+    engines.iter().for_each(|x| engine_metric.add(x));
+    engine_metric.set(engines.clone());
+
+    assert!(engine_metric.test_get_value(None).is_some());
+    assert_eq!(engines, engine_metric.test_get_value(None).unwrap());
+    assert_eq!(
+        0,
+        engine_metric.test_get_num_recorded_errors(ErrorType::InvalidValue, None)
+    );
+}
+}

@@ -1,0 +1,262 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Handle possible failure cases in `OnGleanEvents` callbacks
+The [recent Glean upgrade in Focus](https://github.com/mozilla-mobile/focus-android/pull/7902) showed a new failure case uncovered by the UniFFI changes.
+Our callbacks can be potentially fallible and we should handle that.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -81,8 +81,9 @@ impl glean_core::OnGleanEvents for GleanEvents {
+         // intentionally left empty
+     }
+ 
+-    fn trigger_upload(&self) {
++    fn trigger_upload(&self) -> Result<(), glean_core::CallbackError> {
+         self.upload_manager.trigger_upload();
++        Ok(())
+     }
+ 
+     fn start_metrics_ping_scheduler(&self) -> bool {
+@@ -91,8 +92,9 @@ impl glean_core::OnGleanEvents for GleanEvents {
+         true
+     }
+ 
+-    fn cancel_uploads(&self) {
++    fn cancel_uploads(&self) -> Result<(), glean_core::CallbackError> {
+         // intentionally left empty
++        Ok(())
+     }
+ }
+
+diff --git a/glean-core/src/error.rs b/glean-core/src/error.rs
+--- a/glean-core/src/error.rs
++++ b/glean-core/src/error.rs
+@@ -16,7 +16,7 @@ use rkv::StoreError;
+ ///
+ /// [`Result`]: https://doc.rust-lang.org/stable/std/result/enum.Result.html
+ /// [`Error`]: std.struct.Error.html
+-pub type Result<T> = result::Result<T, Error>;
++pub type Result<T, E = Error> = result::Result<T, E>;
+ 
+ /// A list enumerating the categories of errors in this crate.
+ ///
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -15,6 +15,7 @@
+ //! ## [The Glean SDK Book](https://mozilla.github.io/glean)
+ 
+ use std::collections::HashMap;
++use std::fmt;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+@@ -189,6 +190,25 @@ fn setup_state(state: State) {
+     }
+ }
+ 
++/// An error returned from callbacks.
++#[derive(Debug)]
++pub enum CallbackError {
++    /// An unexpected error occured.
++    UnexpectedError,
++}
++
++impl fmt::Display for CallbackError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "Unexpected error")
++    }
++}
++
++impl From<uniffi::UnexpectedUniFFICallbackError> for CallbackError {
++    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> CallbackError {
++        CallbackError::UnexpectedError
++    }
++}
++
+ /// A callback object used to trigger actions on the foreign-language side.
+ ///
+ /// A callback object is stored in glean-core for the entire lifetime of the application.
+@@ -204,13 +224,13 @@ pub trait OnGleanEvents: Send {
+     ///
+     /// This should not block.
+     /// The uploader needs to asynchronously poll Glean for new pings to upload.
+-    fn trigger_upload(&self);
++    fn trigger_upload(&self) -> Result<(), CallbackError>;
+ 
+     /// Start the Metrics Ping Scheduler.
+     fn start_metrics_ping_scheduler(&self) -> bool;
+ 
+     /// Called when upload is disabled and uploads should be stopped
+-    fn cancel_uploads(&self);
++    fn cancel_uploads(&self) -> Result<(), CallbackError>;
+ }
+ 
+ /// Initializes Glean.
+@@ -348,7 +368,9 @@ fn initialize_inner(
+                 // 1. Pings were submitted through Glean and it is ready to upload those pings;
+                 // 2. Upload is disabled, to upload a possible deletion-request ping.
+                 if pings_submitted || !upload_enabled {
+-                    state.callbacks.trigger_upload();
++                    if let Err(e) = state.callbacks.trigger_upload() {
++                        log::error!("Triggering upload failed. Error: {}", e);
++                    }
+                 }
+             }
+ 
+@@ -371,7 +393,9 @@ fn initialize_inner(
+                 // ping startup check should be performed before any other ping, since it relies
+                 // on being dispatched to the API context before any other metric.
+                 if state.callbacks.start_metrics_ping_scheduler() {
+-                    state.callbacks.trigger_upload();
++                    if let Err(e) = state.callbacks.trigger_upload() {
++                        log::error!("Triggering upload failed. Error: {}", e);
++                    }
+                 }
+             }
+ 
+@@ -388,7 +412,9 @@ fn initialize_inner(
+                     // Note that unwrapping below is safe: the function will return an
+                     // `Ok` value for a known ping.
+                     if glean.submit_ping_by_name("baseline", Some("dirty_startup")) {
+-                        state.callbacks.trigger_upload();
++                        if let Err(e) = state.callbacks.trigger_upload() {
++                            log::error!("Triggering upload failed. Error: {}", e);
++                        }
+                     }
+                 }
+ 
+@@ -599,7 +625,9 @@ pub fn glean_set_upload_enabled(enabled: bool) {
+             // Stop the MPS if its handled within Rust.
+             glean.cancel_metrics_ping_scheduler();
+             // Stop wrapper-controlled uploader.
+-            state.callbacks.cancel_uploads();
++            if let Err(e) = state.callbacks.cancel_uploads() {
++                log::error!("Canceling upload failed. Error: {}", e);
++            }
+         }
+ 
+         glean.set_upload_enabled(enabled);
+@@ -609,7 +637,9 @@ pub fn glean_set_upload_enabled(enabled: bool) {
+         }
+ 
+         if original_enabled && !enabled {
+-            state.callbacks.trigger_upload();
++            if let Err(e) = state.callbacks.trigger_upload() {
++                log::error!("Triggering upload failed. Error: {}", e);
++            }
+         }
+     })
+ }
+@@ -756,7 +786,9 @@ pub fn glean_handle_client_active() {
+         // the uploader. It's fine to trigger it if no ping was generated:
+         // it will bail out.
+         let state = global_state().lock().unwrap();
+-        state.callbacks.trigger_upload();
++        if let Err(e) = state.callbacks.trigger_upload() {
++            log::error!("Triggering upload failed. Error: {}", e);
++        }
+     });
+ 
+     // The previous block of code may send a ping containing the `duration` metric,
+@@ -787,7 +819,9 @@ pub fn glean_handle_client_inactive() {
+         // the uploader. It's fine to trigger it if no ping was generated:
+         // it will bail out.
+         let state = global_state().lock().unwrap();
+-        state.callbacks.trigger_upload();
++        if let Err(e) = state.callbacks.trigger_upload() {
++            log::error!("Triggering upload failed. Error: {}", e);
++        }
+     })
+ }
+ 
+@@ -799,7 +833,9 @@ pub fn glean_submit_ping_by_name(ping_name: String, reason: Option<String>) {
+ 
+         if sent {
+             let state = global_state().lock().unwrap();
+-            state.callbacks.trigger_upload();
++            if let Err(e) = state.callbacks.trigger_upload() {
++                log::error!("Triggering upload failed. Error: {}", e);
++            }
+         }
+     })
+ }
+
+diff --git a/glean-core/src/metrics/ping.rs b/glean-core/src/metrics/ping.rs
+--- a/glean-core/src/metrics/ping.rs
++++ b/glean-core/src/metrics/ping.rs
+@@ -107,7 +107,9 @@ impl PingType {
+                 crate::core::with_glean(move |glean| ping.submit_sync(glean, reason.as_deref()));
+             if sent {
+                 let state = crate::global_state().lock().unwrap();
+-                state.callbacks.trigger_upload();
++                if let Err(e) = state.callbacks.trigger_upload() {
++                    log::error!("Triggering upload failed. Error: {}", e);
++                }
+             }
+         })
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn glean_handle_client_inactive() -> ()
+
+pub fn glean_submit_ping_by_name(ping_name: String, reason: Option<String>) -> ()
+
+pub fn glean_handle_client_active() -> ()
+
+pub fn glean_set_upload_enabled(enabled: bool) -> ()
+
+fn setup_state(state: State) -> ()
+
+fn initialize_inner(
+cfg: InternalConfiguration,
+client_info: ClientInfoMetrics,
+callbacks: Box<dyn OnGleanEvents>) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Here is an example structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
