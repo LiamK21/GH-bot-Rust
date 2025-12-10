@@ -95,6 +95,7 @@ class RepositoryStats:
     fail2pr: dict[str, list[str]] = field(
         default_factory=lambda: {f.value: [] for f in FailureType}
     )
+    passed_per_call: list[int] = field(default_factory=lambda: [0, 0, 0, 0, 0])
 
 
 PLOTTING_DATA_FAILURE_CUTOFF = 10  # Only show top 10 failure reasons
@@ -299,6 +300,7 @@ def _handle_model_attempt_dir(
         repo_stats.passed_tests[model] += 1
         llm_call_number = int(final_llm_call.split("_")[2])
         evaluation_metrics.model_stats[model]["passed_call"][llm_call_number - 1] += 1
+        repo_stats.passed_per_call[llm_call_number - 1] += 1
         repo_stats.passed_tests["total"] += 1
     
 
@@ -459,6 +461,10 @@ def _create_plotting_data(plotting_data: dict, evaluation_metrics: EvaluationMet
     plotting_data["pass_per_llm_call"] = {
         model.value: evaluation_metrics.model_stats[model]["passed_call"]
         for model in Model
+    }
+    plotting_data["pass_per_llm_call_by_repo"] = {
+        repo: repo_stats.passed_per_call
+        for repo, repo_stats in evaluation_metrics.repository_stats.items()
     }
 
 
