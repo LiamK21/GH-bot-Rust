@@ -59,6 +59,11 @@ def main(eval_dir: Path, plot_dir: Path):
     if pass_per_llm_call_data:
         _plot_pass_per_llm_call(pass_per_llm_call_data, plot_dir)
 
+    # Pass per LLM Call by Repository Chart
+    pass_per_llm_call_by_repo_data = content.get("pass_per_llm_call_by_repo", {})
+    if pass_per_llm_call_by_repo_data:
+        _plot_llm_call_stacked_bar_chart(pass_per_llm_call_by_repo_data, plot_dir)
+
 def _plot_pie_chart(data: PieChartData, plot_dir: Path):
     labels, sizes = zip(*data.items())
     fig, ax = plt.subplots()
@@ -106,10 +111,10 @@ def _plot_stacked_bar_chart(data: StackedBarChartData, plot_dir: Path):
         )
         color_index += 1
 
-        # Add text labels with exact numbers inside the bars
+        
         for i, (bar, count) in enumerate(zip(bars, counts)):
-            if count > 0:  # Only show label if count is greater than 0
-                height = count / 2  # Position text in the middle of the bar segment
+            if count > 0: 
+                height = count / 2
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
                     bottom[i] + height,
@@ -122,7 +127,6 @@ def _plot_stacked_bar_chart(data: StackedBarChartData, plot_dir: Path):
 
         bottom += counts
     ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1))
-    ax.title.set_text("Distribution of Fail-to-Pass Tests by Model and Repository")
     plt.tight_layout()
     fig.savefig(fname=plot_dir / "stacked_bar_chart.png", bbox_inches="tight")
 
@@ -136,13 +140,8 @@ def _plot_horizontal_bar_chart(data: HorizontalBarChartData, plot_dir: Path):
         ax.barh(y_pos, sizes, xerr=error, align="center")
         ax.set_yticks(y_pos, labels=labels)
         ax.set_yticklabels(labels)
+        ax.set_xlabel("Number of failures", fontweight=500, fontsize=11)
         ax.invert_yaxis()  # labels read top-to-bottom
-        repo = ""
-        if identifier == "total":
-            repo = "All Repositories"
-        else:
-            repo = identifier.capitalize()
-        ax.title.set_text(f"Failure Types for {repo}")
         fig.savefig(
             fname=plot_dir / f"horizontal_bar_chart_{identifier}.png",
         )
@@ -157,17 +156,14 @@ def _plot_pass_per_llm_call(data: dict[str, list[int]], plot_dir: Path):
               pass counts for LLM calls 1-5
         plot_dir: Directory to save the plot
     """
-    # X-axis labels for LLM call numbers
     llm_calls = ["Call 1", "Call 2", "Call 3", "Call 4", "Call 5"]
     x = np.arange(len(llm_calls))
     
-    # Bar width and spacing
     width = 0.25
     multiplier = 0
     
     fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Colors for different models
     colors = {
         Model.GPT_4O: "#96CEB4",
         Model.LLAMA: "#FF9FF3",
@@ -198,10 +194,8 @@ def _plot_pass_per_llm_call(data: dict[str, list[int]], plot_dir: Path):
         multiplier += 1
     
     # Customize the plot
-    ax.set_xlabel("LLM Call Iteration", fontweight="bold", fontsize=11)
-    ax.set_ylabel("Number of Passed Tests", fontweight="bold", fontsize=11)
-    ax.set_title("Test Pass Rate per LLM Call Iteration by Model", 
-                fontweight="bold", fontsize=13, pad=20)
+    ax.set_xlabel("LLM Call Iteration", fontweight=500, fontsize=11)
+    ax.set_ylabel("Number of F2PTs generated", fontweight=500, fontsize=11)
     ax.set_xticks(x + width)
     ax.set_xticklabels(llm_calls)
     ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
@@ -209,6 +203,69 @@ def _plot_pass_per_llm_call(data: dict[str, list[int]], plot_dir: Path):
     
     plt.tight_layout()
     fig.savefig(fname=plot_dir / "pass_per_llm_call.png", 
+               bbox_inches="tight", dpi=300)
+    plt.close(fig)
+
+
+def _plot_llm_call_stacked_bar_chart(data: dict[str, list[int]], plot_dir: Path):
+    """
+    Plot a stacked bar chart showing tests passed at each LLM call iteration by repository.
+    
+    Args:
+        data: Dictionary mapping repository names to arrays of 5 integers representing
+              pass counts for LLM calls 1-5
+        plot_dir: Directory to save the plot
+    """
+    repositories = list(data.keys())
+    x = np.arange(len(repositories))
+    
+    call_colors = ["#bfdbfe", "#93c5fd", "#60a5fa", "#3b82f6", "#1e3a8a"]
+    call_labels = ["Call 1", "Call 2", "Call 3", "Call 4", "Call 5"]
+    
+    fig, ax = plt.subplots(figsize=(10, 7))
+    
+    # Initialize bottom array for stacking
+    bottom = np.zeros(len(repositories))
+    
+    # Plot each LLM call as a stack segment
+    for call_idx in range(5):
+        counts = np.array([data[repo][call_idx] for repo in repositories])
+        
+        bars = ax.bar(
+            x,
+            counts,
+            bottom=bottom,
+            label=call_labels[call_idx],
+            color=call_colors[call_idx]
+        )
+        
+        # Add text labels inside bars
+        for i, (bar, count) in enumerate(zip(bars, counts)):
+            if count > 0: 
+                height = count / 2 
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    bottom[i] + height,
+                    str(int(count)),
+                    ha="center",
+                    va="center",
+                    fontweight="400",
+                    color="white",
+                    fontsize=10
+                )
+        
+        bottom += counts
+    
+    # Customize the plot
+    ax.set_xlabel("Repository", fontweight=500, fontsize=11)
+    ax.set_ylabel("Number of F2PTs generated", fontweight=500, fontsize=11)
+    ax.set_xticks(x)
+    ax.set_xticklabels([repo for repo in repositories])
+    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0))
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    fig.savefig(fname=plot_dir / "llm_call_stacked_bar_chart.png", 
                bbox_inches="tight", dpi=300)
     plt.close(fig)
 
