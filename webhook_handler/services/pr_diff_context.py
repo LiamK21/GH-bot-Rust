@@ -179,7 +179,4 @@ class PullRequestDiffContext:
                 logger.warning(f"Failed to process file {filepath}: {e}")
                 continue
 
-        logger.info(
-            f"Created PullRequestDiffContext with {len(instance._pr_file_diffs)} file diffs"
-        )
         return instance
