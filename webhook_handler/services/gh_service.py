@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubService:
-    def __init__(self, config: Config, pr_data: PullRequestData) -> None:
+    def __init__(self, config: Config, pr_data: PullRequestData | None = None) -> None:
         self._config = config
         self._pr_data = pr_data
 
@@ -27,6 +27,8 @@ class GitHubService:
         Returns:
             dict: All raw files
         """
+        if self._pr_data is None:
+            raise ValueError("PR data is required for fetch_pr_files()")
 
         url = f"{GH_API_URL}/{self._pr_data.owner}/{self._pr_data.repo}/pulls/{self._pr_data.number}/files"
         response = requests.get(url, headers=self._config.HEADER)
@@ -47,6 +49,9 @@ class GitHubService:
         Returns:
             str: The linked issue title and description
         """
+        if self._pr_data is None:
+            raise ValueError("PR data is required for get_linked_data()")
+        
         owner = self._pr_data.owner
         repo = self._pr_data.repo
         pr_description = self._pr_data.description
@@ -93,6 +98,8 @@ class GitHubService:
         Returns:
             str | bytes: File contents
         """
+        if self._pr_data is None:
+            raise ValueError("PR data is required for fetch_file_version()")
 
         url = f"{GH_RAW_URL}/{self._pr_data.owner}/{self._pr_data.repo}/{commit}/{file_name}"
         try:
@@ -108,6 +115,8 @@ class GitHubService:
         """
         Clones a GitHub repository.
         """
+        if self._pr_data is None:
+            raise ValueError("PR data is required for clone_repo()")
         if self._config.cloned_repo_dir is None:
             raise DataMissingError(
                 "cloned_repo_dir", "None", "Path to cloned repository directory not set"
@@ -133,17 +142,26 @@ class GitHubService:
 
         logger.success(f"Cloning successful")  # type: ignore[attr-defined]
 
-    def _get_github_issue(self, number: int) -> str | None:
+    def fetch_issue_description(self, owner: str, repo: str, number: int) -> str | None:
         """
-        Fetches a GitHub issue.
+        Fetches a GitHub issue description (public method).
 
         Parameters:
+            owner (str): Repository owner
+            repo (str): Repository name
             number (int): The number of the issue
 
         Returns:
             str | None: The GitHub issue title and description
         """
-        url = f"{GH_API_URL}/{self._pr_data.owner}/{self._pr_data.repo}/issues/{number}"
+        if repo == "glean":
+            logger.marker(f"Checking for linked Bugzilla Glean issue in PR #{self._pr_data.number}") # type: ignore[attr-defined]
+            linked_issue_description = self._fetch_bugzilla_data(number)
+            if linked_issue_description:
+                return linked_issue_description 
+        
+        
+        url = f"{GH_API_URL}/{owner}/{repo}/issues/{number}"
         try:
             response = requests.get(url, headers=self._config.HEADER, timeout=10)
         except requests.Timeout:
@@ -159,24 +177,20 @@ class GitHubService:
                 )
                 return None
 
-            # Check that it is a bug issue (label contains 'bug')
-            # issue_is_bug = False
-            # issue_type: str | None = issue_data.get("type", "")
-            # if issue_type != None and issue_type.lower() == "bug":
-            #     issue_is_bug = True
-
-            # issue_labels: list[dict[str, str]] = issue_data.get("labels", [])
-            # if any(label.get("name", "").__contains__("bug") for label in issue_labels):
-            #     issue_is_bug = True
-            # if issue_is_bug:
             return "\n".join(
                 value for value in (issue_data["title"], issue_data["body"]) if value
             )
 
-            # return None
-
         logger.error("No GitHub issue found")
         return None
+
+    def _get_github_issue(self, number: int) -> str | None:
+        """Fetches a GitHub issue"""
+        if self._pr_data is None:
+            raise ValueError("PR data is required for _get_github_issue()")
+        return self.fetch_issue_description(
+            self._pr_data.owner, self._pr_data.repo, number
+        )
 
     def _get_bugzilla_issue(self, issue_description: str) -> str | None:
         bugzilla_url_pattern = r"\bhttps://bugzilla\.mozilla\.org/show_bug\.cgi\?id=(\d+)\b"
@@ -249,6 +263,8 @@ class GitHubService:
             int: Status code
             dict: The response data
         """
+        if self._pr_data is None:
+            raise ValueError("PR data is required for add_comment_to_pr()")
 
         url = f"{GH_API_URL}/{self._pr_data.owner}/{self._pr_data.repo}/issues/{self._pr_data.number}/comments"
         data = {"body": comment}

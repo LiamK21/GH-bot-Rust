@@ -3,6 +3,7 @@ from .cst_builder import CSTBuilder
 from .docker_service import DockerService
 from .gh_service import GitHubService
 from .llm_handler import LLMHandler
+from .local_diff_service import LocalDiffService
 from .pr_diff_context import PullRequestDiffContext
 from .test_generator import TestGenerator
 
@@ -14,4 +15,5 @@ __all__ = [
     "CSTBuilder",
     "DockerService",
     "TestGenerator",
+    "LocalDiffService",
 ]

@@ -8,13 +8,13 @@ from dotenv import load_dotenv
 from tree_sitter import Language
 
 from webhook_handler.helper import general
-from webhook_handler.models import LLM
+from webhook_handler.models import LLM, GitHubEvent
 
 
 class Config:
     """Configuration for the bot runner"""
 
-    def __init__(self, llm_calls: int = 5):
+    def __init__(self, llm_calls: int = 5, gh_event: GitHubEvent = GitHubEvent.PULL_REQUEST, local_repo_path: Path | str | None = None):
         load_dotenv()  # take environment variables from .env.
         self.github_webhook_secret = os.getenv("GITHUB_WEBHOOK_SECRET")
         self.github_token = os.getenv("GITHUB_TOKEN")
@@ -44,7 +44,11 @@ class Config:
 
         self.pr_log_dir = None
         self.output_dir = None
+        
+        self._gh_event = gh_event 
         self.cloned_repo_dir = None
+        self.local_repo_path = Path(local_repo_path) if local_repo_path else None
+        
         self.executed_tests = None
         self.pass_generation_dir: Path | None = None
 
@@ -65,10 +69,10 @@ class Config:
 
     def _setup_pr_log_dir(self, pr_id: str, payload: dict) -> None:
         """
-        Sets up directory for logger output file (one directory per PR)
+        Sets up directory for logger output file (one directory per PR/Issue)
 
         Parameters:
-            pr_id (str): ID of the PR
+            pr_id (str): ID of the PR or Issue
         """
 
         owner = payload["repository"]["owner"]["login"]
@@ -78,7 +82,9 @@ class Config:
             f"{owner}_{repo}",
             pr_id + "_%s" % self.execution_timestamp,
         )
-        self.cloned_repo_dir = f"tmp_repo_dir_{owner}_{repo}_{pr_id}"
+        # Only set cloned_repo_dir if we don't have a local repo path
+        if not self.local_repo_path:
+            self.cloned_repo_dir = f"tmp_repo_dir_{owner}_{repo}_{pr_id}"
         Path(self.pr_log_dir).mkdir(parents=True, exist_ok=True)
         with open(
             Path(
@@ -121,7 +127,8 @@ class Config:
         """
         Cleans up resources, if any.
         """
-        if self.cloned_repo_dir:
+        # Only clean up cloned repos, not local repos
+        if self.cloned_repo_dir and not self.local_repo_path:
             cloned_repo_dir = Path(Path.cwd(), self.cloned_repo_dir)
             if cloned_repo_dir.exists():
                 general.remove_dir(cloned_repo_dir)

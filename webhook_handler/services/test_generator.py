@@ -4,8 +4,8 @@ from pathlib import Path
 
 from webhook_handler.helper import general, git_diff, templates
 from webhook_handler.helper.custom_errors import *
-from webhook_handler.models import (LLM, LLMResponse, PipelineInputs,
-                                    PromptType, TestCoverage)
+from webhook_handler.models import (LLM, GitHubEvent, LLMResponse,
+                                    PipelineInputs, PromptType, TestCoverage)
 from webhook_handler.services import Config
 from webhook_handler.services.cst_builder import CSTBuilder
 from webhook_handler.services.docker_service import DockerService
@@ -31,6 +31,7 @@ class TestGenerator:
         llm_handler: LLMHandler,
         i_attempt: int,
         model: LLM,
+        gh_event: GitHubEvent
     ):
         self._config = config
         self._pipeline_inputs = data
@@ -43,6 +44,7 @@ class TestGenerator:
         self._llm_handler = llm_handler
         self._i_attempt = i_attempt
         self._model = model
+        self._gh_event = gh_event
         self._generation_dir: Path | None = None
 
     def generate(self) -> tuple[bool, Path | None]:
@@ -110,7 +112,7 @@ class TestGenerator:
         )
 
         # print("Mocking response for debugging...")
-        # response = Path(Path.cwd(), "bot_logs", "raw_model_response.txt").read_text(
+        # response = Path(self._config.bot_log_dir, "raw_model_response.txt").read_text(
         #     encoding="utf-8"
         # )
         logger.info("Querying LLM...")
@@ -229,9 +231,10 @@ class TestGenerator:
             return False, llm_response
 
     def check_for_linting_issues(self, llm_response: LLMResponse) -> tuple[bool, str]:
-        if not self._config.cloned_repo_dir:
+        repo_path = self._config.local_repo_path or self._config.cloned_repo_dir
+        if not repo_path:
             raise DataMissingError(
-                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+                "repo_path", "None", "Either local_repo_path or cloned_repo_dir must be set"
             )
         if not self._generation_dir:
             raise DataMissingError(
@@ -271,9 +274,10 @@ class TestGenerator:
     def run_test_pre_pr(
         self, filename: str, new_test: str, imports: list[str], test_to_run: str
     ) -> bool:
-        if not self._config.cloned_repo_dir:
+        repo_path = self._config.local_repo_path or self._config.cloned_repo_dir
+        if not repo_path:
             raise DataMissingError(
-                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+                "repo_path", "None", "Either local_repo_path or cloned_repo_dir must be set"
             )
         if not self._generation_dir:
             raise DataMissingError(
@@ -281,7 +285,7 @@ class TestGenerator:
             )
 
         file_content = general.get_candidate_file(
-            self._pr_data.base_commit, filename, self._config.cloned_repo_dir
+            self._pr_data.base_commit, filename, str(repo_path), self._gh_event
         )
 
         if file_content:
@@ -303,9 +307,10 @@ class TestGenerator:
     def run_test_post_pr(
         self, filename: str, new_test: str, imports: list[str], test_to_run: str
     ) -> tuple[bool, str]:
-        if not self._config.cloned_repo_dir:
+        repo_path = self._config.local_repo_path or self._config.cloned_repo_dir
+        if not repo_path:
             raise DataMissingError(
-                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+                "repo_path", "None", "Either local_repo_path or cloned_repo_dir must be set"
             )
         if not self._generation_dir:
             raise DataMissingError(
@@ -313,9 +318,6 @@ class TestGenerator:
             )
         # Try to get the direct file content from the head commit instead of checking out the commit
         # This is to avoid issues where PRs or such are from forked repos and the commit does not exist in the main repo
-        logger.info(
-            "Getting file content from head commit rather than checking out commit..."
-        )
         pr_file_diff = self._pr_diff_ctx.get_specific_file_diff(filename)
         file_content = pr_file_diff.after if pr_file_diff else ""
 
@@ -392,9 +394,10 @@ class TestGenerator:
     def _determine_test_usability(
         self, llm_response: LLMResponse
     ) -> tuple[bool, TestCoverage | None]:
-        if not self._config.cloned_repo_dir:
+        repo_path = self._config.local_repo_path or self._config.cloned_repo_dir
+        if not repo_path:
             raise DataMissingError(
-                "cloned_repo_dir", "None", "Cloned repo dir should not be None"
+                "repo_path", "None", "Either local_repo_path or cloned_repo_dir must be set"
             )
         if not self._generation_dir:
             raise DataMissingError(
@@ -475,16 +478,6 @@ class TestGenerator:
             else:
                 logger.error(f"Failed to add comment: {status_code}", response_data)
         return
-
-    def _get_relevant_file(
-        self, rel_filename: str, repo_dir: str, base_commit: str
-    ) -> tuple[str, str]:
-        filename = self._pr_diff_ctx.get_absolute_file_path(rel_filename)
-        assert filename is not None, "Absolute filename should not be None"
-
-        file_content = general.get_candidate_file(base_commit, filename, repo_dir)
-
-        return filename, file_content
 
     def _create_augmented_test(self, llm_response: LLMResponse, test_coverage: TestCoverage | None, coverage_passed: bool) -> None: 
         assert self._generation_dir is not None

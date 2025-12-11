@@ -6,10 +6,12 @@ from docker.errors import ImageNotFound
 
 from webhook_handler.helper import logger
 from webhook_handler.helper.custom_errors import *
-from webhook_handler.models import LLM, PipelineInputs, PullRequestData
+from webhook_handler.models import (LLM, GitHubEvent, PipelineInputs,
+                                    PullRequestData)
 from webhook_handler.services import (Config, CSTBuilder, DockerService,
                                       GitHubService, LLMHandler,
-                                      PullRequestDiffContext, TestGenerator)
+                                      LocalDiffService, PullRequestDiffContext,
+                                      TestGenerator)
 
 
 class BotRunner:
@@ -48,7 +50,6 @@ class BotRunner:
         self._logger.marker("================ Preparing Environment ===============")  # type: ignore[attr-defined]
         self._issue_statement = self._gh_service.get_linked_data()
         if not self._issue_statement:
-            # helpers.remove_dir(self._config.pr_log_dir)
             self._gh_api = None
             self._issue_statement = None
             self._pdf_candidate = None
@@ -58,7 +59,6 @@ class BotRunner:
             self._pr_data.base_commit, self._pr_data.head_commit, self._gh_service
         )
         if not self._pr_diff_ctx.fulfills_requirements:
-            # helpers.remove_dir(self._config.pr_log_dir)
             self._gh_api = None
             self._issue_statement = None
             self._pdf_candidate = None
@@ -102,10 +102,21 @@ class BotRunner:
         if self._config.output_dir is None:
             raise DataMissingError("output_dir", "None", "Output directory not set")
 
+
+        if self._gh_service is None and self._config._gh_event == GitHubEvent.PULL_REQUEST:
+            raise DataMissingError(
+                "gh_service", "None", "GitHub Service not prepared"
+            )
+        
+        if self._config.local_repo_path is None and self._config._gh_event == GitHubEvent.ISSUE:
+            raise DataMissingError(
+                "local_repo_path", "None", "Local repository path not set for issue event"
+            )
+        
+        
         generator = TestGenerator(
             self._config,
             self._pipeline_inputs,
-            # self._mock_response,
             self._post_comment,
             self._gh_service,
             self._cst_builder,
@@ -113,6 +124,7 @@ class BotRunner:
             self._llm_handler,
             i_attempt=curr_attempt,
             model=model,
+            gh_event=self._config._gh_event,
         )
 
         try:
@@ -161,45 +173,71 @@ class BotRunner:
             return
 
         self._setup_logging()
-        # Check if PR has a linked issue (and verify that it is a bug)
-        self._issue_statement = self._gh_service.get_linked_data()
-        if self._issue_statement:
-            self._logger.info("Linked issue found")
+        
+        if self._config._gh_event == GitHubEvent.ISSUE:
+            # For issues, fetch the issue description directly
+            self._issue_statement = self._gh_service.fetch_issue_description(
+                self._pr_data.owner, self._pr_data.repo, int(self._pr_data.number)
+            )
+            if self._issue_statement:
+                self._logger.info("Issue description fetched")
+            else:
+                self._logger.critical("Failed to fetch issue description")
+                raise ExecutionError("Could not fetch issue description")
         else:
-            self._logger.critical("No Linked issue found, raising exception")
-            raise ExecutionError("No linked issue found for PR")
-
-        # Prepare directories
+            # For PRs, check for linked issue (and verify that it is a bug)
+            self._issue_statement = self._gh_service.get_linked_data()
+            if self._issue_statement:
+                self._logger.info("Linked issue found")
+            else:
+                self._logger.critical("No Linked issue found, raising exception")
+                raise ExecutionError("No linked issue found for PR")
 
         # Get the file contents
         if self._pr_diff_ctx is None:
-            self._pr_diff_ctx = PullRequestDiffContext(
-                self._pr_data.base_commit, self._pr_data.head_commit, self._gh_service
-            )
+            if self._config._gh_event == GitHubEvent.ISSUE:
+
+                # Determine repo path: use local_repo_path if available, otherwise cloned_repo_dir
+                if self._config.local_repo_path is None:
+                    raise DataMissingError(
+                        "repo_path", "None", "Either local_repo_path or cloned_repo_dir must be set"
+                    )
+                
+                local_service = LocalDiffService(self._config.local_repo_path)
+                
+                # Compare working directory (uncommitted changes) vs HEAD
+                self._pr_diff_ctx = PullRequestDiffContext.from_local_git(
+                    self._pr_data.base_commit, local_service
+                )
+            else:
+                self._pr_diff_ctx = PullRequestDiffContext(
+                    self._pr_data.base_commit, self._pr_data.head_commit, self._gh_service
+                )
+        
         if len(self._pr_diff_ctx.source_code_file_diffs) == 0:
-            raise ExecutionError("No source code changes found in PR")
+            raise ExecutionError("No source code changes found")
 
-        # Clone repository and checkout to the PR branch
-        if self._config.cloned_repo_dir is None:
-            raise DataMissingError(
-                "cloned_repo_dir", "None", "Path to cloned repository directory not set"
-            )
+        if self._config._gh_event == GitHubEvent.PULL_REQUEST:
+            # Clone repository and checkout to the PR branch
+            if self._config.cloned_repo_dir is None:
+                raise DataMissingError(
+                    "cloned_repo_dir", "None", "Path to cloned repository directory not set"
+                )
 
-        # If repository has not been cloned yet, clone it
-        if not Path(self._config.cloned_repo_dir).exists():
-            self._logger.info("Repository does not exist yet, cloning...")
-            self._gh_service.clone_repo()
+            # If repository has not been cloned yet, clone it
+            if not Path(self._config.cloned_repo_dir).exists():
+                self._logger.info("Repository does not exist yet, cloning...")
+                self._gh_service.clone_repo()
 
-        # If it is a different repository, clone the new one
-        if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
-            self._logger.info("Different repository exists, cloning new one...")
-            self._gh_service.clone_repo()
+            # If it is a different repository, clone the new one
+            if self._config.cloned_repo_dir.find(self._pr_data.repo) == -1:
+                self._logger.info("Different repository exists, cloning new one...")
+                self._gh_service.clone_repo()
 
         self._cst_builder = CSTBuilder(self._config.parsing_language, self._pr_diff_ctx)
-        # code_sliced = self._cst_builder.get_sliced_code_files()
 
         # Build docker image if not exists
-        self._docker_service = DockerService(self._config.root_dir, self._pr_data)
+        self._docker_service = DockerService(self._config.root_dir, self._pr_data, self._config.local_repo_path)
         self._docker_service.check_and_build_image()
 
         # Gather Pipeline data

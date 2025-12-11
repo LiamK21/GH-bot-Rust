@@ -24,9 +24,10 @@ class DockerService:
     Used for Docker operations.
     """
 
-    def __init__(self, project_root: Path, pr_data: PullRequestData) -> None:
+    def __init__(self, project_root: Path, pr_data: PullRequestData, local_repo_path: Path | None = None) -> None:
         self._project_root = project_root
         self._pr_data = pr_data
+        self._local_repo_path = local_repo_path
         self._client = docker.from_env()
 
     def check_and_build_image(self) -> None:
@@ -54,13 +55,19 @@ class DockerService:
 
     def _build_image(self, tag: str) -> None:
         """Builds the Docker image from the Dockerfiles in the dockerfile directory"""
-        build_args = {"commit_hash": self._pr_data.base_commit}
         dockerfile_name = self._get_docker_image()
         dockerfile_path = Path(self._project_root, "dockerfiles", dockerfile_name)
         build_succeeded = False
+        
+        # issues build local repository, PRs build from project root
+        build_path = str(self._local_repo_path) if self._local_repo_path else self._project_root.as_posix()
+        
+        # Only pass commit_hash for PR-based Test Generation
+        build_args = {} if self._local_repo_path else {"commit_hash": self._pr_data.base_commit}
+        
         try:
             self._client.images.build(
-                path=self._project_root.as_posix(),
+                path=build_path,
                 tag=tag,
                 dockerfile=dockerfile_path.as_posix(),
                 buildargs=build_args,
@@ -108,7 +115,7 @@ class DockerService:
                             self._client.images.remove(image=img.id, force=True)
                         except APIError as img_err:
                             logger.error(
-                                f"Failed to remove image {img.id[:12]}: {img_err}"
+                                f"Failed to remove image {img.id[:12]}: {img_err}" # type: ignore[attr-defined]
                             )
                 except APIError as list_err:
                     logger.error(f"Error listing dangling images: {list_err}")
@@ -117,6 +124,11 @@ class DockerService:
         """Returns the Docker image"""
         repo = self._pr_data.repo.lower()
         pr_number = self._pr_data.number
+        
+        if self._local_repo_path:
+            logger.info(f"Using local Dockerfile for {repo} (issue mode)")
+            return f"Dockerfile_{repo}_local"
+        
         if repo == "grcov" and int(self._pr_data.number) < 700:
             logger.info("Using old Dockerfile for grcov")  
             return "Dockerfile_grcov_old"
@@ -163,6 +175,13 @@ class DockerService:
             # Add the patch file to the container and apply it
             self._add_file_and_apply_patch_in_container(
                 container, patch, is_golden_patch
+            )
+            
+            # Add retrieve_line_coverage.py to the container
+            self._add_file_to_container( 
+                container,
+                Path(self._project_root, "retrieve_line_coverage.py"),
+                Path("/app", "retrieve_line_coverage.py")
             )
 
             logger.marker("Tests to run: %s" % ", ".join(tests_to_run))  # type: ignore[attr-defined]
@@ -231,7 +250,7 @@ class DockerService:
                     )
                     if exec_result.exit_code != 0:
                         logger.warning(
-                            f"Error creating directory: {exec_result.stderr.decode()}"
+                            f"Error creating directory: {exec_result.stderr.decode()}" # type: ignore[attr-defined]
                         )
 
                 # Create the empty file inside the Docker container
@@ -240,7 +259,7 @@ class DockerService:
                 )
                 if exec_result.exit_code != 0:
                     logger.warning(
-                        f"Error creating file: {exec_result.stderr.decode()}"
+                        f"Error creating file: {exec_result.stderr.decode()}" # type: ignore[attr-defined]
                     )
 
                 logger.marker(f"Created empty file in Docker: {current_file}")  # type: ignore[attr-defined]
@@ -273,18 +292,12 @@ class DockerService:
             logger.marker("[+] Applying golden code patch")  # type: ignore[attr-defined]
         else:
             patch_fname: str = "test_patch.diff"
-        # Create a tar archive
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-            tar.add(patch_file_path, arcname=patch_fname)
-        tar_stream.seek(0)
-        try:
-            # Copy the tar archive to the container
-            container.put_archive("/app/testbed", tar_stream.read())
-            logger.marker(f"File {patch_file_path} added to container successfully")  # type: ignore[attr-defined]
-        except APIError as e:
-            logger.critical(f"Docker API error: {e}")
-            raise ExecutionError("Docker API error")
+        
+        DockerService._add_file_to_container(
+            container,
+            Path(patch_file_path),
+            Path("/app/testbed", patch_fname), # I think
+        )
 
         DockerService._apply_patch_in_container(container, patch_fname)
 
@@ -308,6 +321,29 @@ class DockerService:
 
         logger.info("[+] Patch applied successfully.")
 
+    @staticmethod
+    def _add_file_to_container(container: Container, file_path: Path, dest_path: Path):
+        """
+        Adds a file to the Docker container.
+
+        Parameters:
+            container (Container): Container to add the file to
+            file_path (Path): Path of the file to add
+            dest_path (Path): Destination path inside the container
+        """
+        # Create a tar archive
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            tar.add(file_path.as_posix(), arcname=dest_path.name)
+        tar_stream.seek(0)
+        try:
+            # Copy the tar archive to the container
+            container.put_archive(dest_path.parent.as_posix(), tar_stream.read())
+            logger.marker(f"File {file_path} added to container successfully")  # type: ignore[attr-defined]
+        except APIError as e:
+            logger.critical(f"Docker API error: {e}")
+            raise ExecutionError("Docker API error")
+
     def run_coverage_in_container(self, filename: str, patch: str) -> tuple[float | None, float | None]:
         container: Container | None = None
         try:
@@ -328,13 +364,21 @@ class DockerService:
             self._add_file_and_apply_patch_in_container(
                 container, patch, True
             )
-            file_path_prefix, file_basename = "/".join(filename.split("/")[: -1]), filename.split("/")[-1].removesuffix(".rs")
+            
+            # Add retrieve_line_coverage.py to the container
+            self._add_file_to_container(
+                container,
+                Path(self._project_root, "retrieve_line_coverage.py"),
+                Path("/app", "retrieve_line_coverage.py")
+            )
+            
+            file_path_prefix = "/".join(filename.split("/")[: -1])
             path_to_file = "/app/testbed/" + file_path_prefix
 
             logger.marker("Running coverage generation...")  # type: ignore[attr-defined]
             coverage_generation_command: str = (
             f"/bin/sh -c 'cd {path_to_file} && "
-            "timeout 300s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --no-fail-fast --lib '" 
+            "timeout 300s cargo llvm-cov test --json --output-path /app/testbed/coverage.json --ignore-run-fail --lib --bins '" 
             )
             exec_result = container.exec_run(coverage_generation_command, stdout=True, stderr=True)
             
