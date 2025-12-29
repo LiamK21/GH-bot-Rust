@@ -1,0 +1,268 @@
+<think>
+Okay, let's see. The user wants me to write a regression test for a patch that fixed a crash in the ConcurrentHandleMap's insert method. The issue was that next_index pointed to a non-free entry. The patch modifies the labeled.rs file, specifically the $get_name function, introducing a LABEL_MAP to cache submetrics based on handle and label.
+
+First, I need to understand what the original problem was. The crash happened when inserting into the handle map, possibly because the next_index was invalid. The patch introduces a static LABEL_MAP to track submetric handles for each (handle, label) pair. This caching was missing before, leading to repeated calls to insert_with_log, which might have caused the invalid state.
+
+To create a test that fails before the patch and passes after, I should simulate a scenario where the same (handle, label) pair is accessed multiple times. Without the cache, each call would trigger the insert_with_log again, possibly leading to incorrect handle management. With the cache, subsequent accesses retrieve the existing handle, preventing multiple inserts and thus avoiding the invalid state.
+
+The function under test is the $get_name macro-generated function. The test needs to exercise the code in labeled.rs. Specifically, the test should call the get_labeled_counter_metric function (assuming the macro uses this name) with the same handle and label multiple times and ensure that it doesn't cause the invalid state that leads to the crash.
+
+I need to structure the test to simulate concurrent or repeated calls that would have caused the crash before the patch. Since the problem was in the insert method of ConcurrentHandleMap, the test should create a scenario where multiple insertions are attempted for the same key.
+
+In the test, I can create a mock or use the existing structures. However, since the patch uses a global LABEL_MAP, the test should call the function multiple times with the same parameters to check if the cache works. The test should verify that after the first call, subsequent calls return the same handle, which avoids triggering the insert logic again.
+
+But how to set up the necessary mocks for the global variables? The code uses $global.call_infallible_mut, which presumably handles the actual metric. The test may need to use a mock for $global. However, without the actual implementation of the $global, perhaps I can use a dummy or a mock. Alternatively, since the test is in the same module, maybe I can create a fake $global structure.
+
+Alternatively, since the patch is in the labeled.rs file, the test should be written there. The test would need to create a handle and a label, then call the function multiple times and check the returned handles. But the actual implementation might require initializing some global state, which may not be feasible in a unit test. Hmm.
+
+Wait, the LABEL_MAP in the code is a static once_cell::sync::Lazy Mutex. The test needs to exercise the scenario where the same (handle, label) is processed multiple times. So, in the test, if I call the generated function (like glean_labeled_counter_metric_get) with the same handle and label, the first call inserts into the map, and subsequent calls use the cached value. This should prevent multiple inserts into the ConcurrentHandleMap. 
+
+So the test should check that the same handle and label produce the same submetric handle (using the cache) and that subsequent calls don't trigger the insert again. If the test can verify that after the first insertion, other calls don't cause an extra insert, it would prevent the crash.
+
+The problem is that the code uses some macros and may be hard to test directly. However, the test can be written as a unit test in the same module. Let me think about how to structure it using the code from the patch.
+
+In the patched code, the LABEL_MAP is a static Mutex that stores the handles. The test can create a mock environment by using a real handle. But how to create the 'global'? The $global variable might be another shared state. For example, in the code, $global is probably a global handle for the labeled metric.
+
+But since the test is for the labeled.rs file, perhaps the test can use the macro-generated functions. Suppose the macro generates functions like 'glean_labeled_counter_metric_get', which is the function under test. The test would need to setup a handle that points to a labeled metric. However, without knowing how the actual metrics are initialized, this might be challenging.
+
+Alternatively, the test can simulate the scenario by creating a mock structure that mimics the global state. For example, the test can use a mock 'global' that, when accessed, returns a known handle. But how to do that without the actual implementation?
+
+Wait, perhaps in the test, the $global can be a OnceCell that contains a LabeledMetric, and then we can have a handle to that. For example, the test can initialize a global LabeledMetric instance and create a handle for it. Then, when calling the get function with the same label, it should use the cached value.
+
+But since the code is using macros, perhaps the actual test would require some boilerplate. However, given the constraints of a unit test, maybe the test can be written as follows:
+
+- Create a LabeledCounter metric (or whatever the type is).
+- Get a handle to this metric.
+- Call the get function with a specific label multiple times.
+- Check that the returned handles are the same (thus, the cache is working).
+- Then, perhaps simulate a scenario where the cache is not used (before the patch), leading to multiple inserts and causing the crash.
+
+But without the actual implementation of the global state, maybe this is not straightforward. Alternatively, since the LABEL_MAP is a static, the test can force multiple calls to the function with the same parameters and assert that the handles are the same. 
+
+So the test can be written as:
+
+1. Call the function with a certain handle and label, store the result.
+2. Call the same function again with the same parameters, check that the result is the same. This indicates that the cache is working.
+3. If without the patch, the second call would attempt to insert again, leading to the invalid state. With the patch, the second call retrieves from the cache, avoiding the insert.
+
+Therefore, the test is to check that the same (handle, label) combination returns the same submetric handle. The test would need to use a real handle to a labeled metric. But how to create that handle in the test? This might require some setup.
+
+Assuming that the test can create a labeled metric, get its handle, and then use that handle in the test. For example, using the 'once_cell' and 'std::sync::Mutex' for the global metric.
+
+Let me think of the code structure. In the patched code, the 'LabeledMetric' type would probably be managed through some global registry. However, without knowing the actual implementation, perhaps the test can use mock structures. For example, the test could use a mock 'LabeledMetric' and get its handle via a once_cell, then check the function's behavior.
+
+But since the test is in the same module as the code being tested, perhaps the test can use the same macros. However, macros can make testing a bit tricky. Alternatively, perhaps the test uses a concrete example. For instance, the patched code is in 'labeled.rs', perhaps the test for the LabeledCounter metric can be written.
+
+Putting this together, the test could look like this:
+
+- Use a LabeledCounter metric, initialized and stored in a OnceCell.
+- Create a handle to this metric.
+- Call the get function with a specific label, which would trigger the code path in the patch.
+- Call it again with the same label and ensure the same handle is returned.
+
+So in code:
+
+In the test code, the steps would be:
+
+1. Create a LabeledMetricCounter (hypothetically) and store it in a static global variable.
+2. Get the handle for this metric (the address, perhaps).
+3. Call the generated get function (like 'glean_labeled_counter_metric_get') with the same handle and label twice.
+4. Check that the returned handles are the same.
+
+If the LABEL_MAP is not present (before the patch), each call would create a new submetric handle, leading to possible invalid insertions. After the patch, the first call creates and stores it, subsequent calls reuse the existing one.
+
+But how to implement this in Rust? For example, using once_cell for the labeled metric, then using the 'handle' which could be a raw pointer or another identifier.
+
+But the actual code uses 'u64' for handles. So the test needs to create a valid u64 handle. However, the actual handle management is probably done in another part of the codebase. Since this is a unit test, perhaps the test can use a dummy handle.
+
+Wait, perhaps in the test, the 'global' variable (like the LabeledMetric) is a OnceCell, and the handle is a unique number assigned when the metric is registered. So in the test, the handle can be a dummy value, like 1.
+
+So in the test:
+
+- Use a OnceCell to hold the LabeledCounter metric.
+- The handle is the address of this OnceCell or a u64 value assigned in the system.
+- The test can pass this handle into the $get_name function (the generated function).
+
+But perhaps the test can be written with a mock setup where the handle is known, and the 'global.call_infallible_mut' retrieves the labeled metric. So the test would need to setup a global metric and handle.
+
+An example test might look like this:
+
+use once_cell::sync::OnceCell;
+use std::sync::Mutex;
+
+static GLOBAL_LABELED: OnceCell<LabeledMetric<CounterMetricType>> = OnceCell::new();
+static GLOBAL_LABELED_HANDLE: u64 = 1; 
+
+// Initialize the global before the test
+#[test]
+fn test_label_cache() {
+    let labeled_metric = LabeledMetric::new(CounterMetricType::new(...));
+    GLOBAL_LABELED.set(labeled_metric).unwrap();
+
+    // Now call the function under test with the same handle and label twice
+    let label = "test_label";
+    let handle1 = unsafe {
+        glean_labeled_counter_metric_get(GLOBAL_LABELED_HANDLE, label.as_ptr() as *const _, label.len())
+    };
+    let handle2 = unsafe {
+        glean_labeled_counter_metric_get(GLOBAL_LABELED_HANDLE, label.as_ptr() as *const _, label.len())
+    };
+
+    assert_eq!(handle1, handle2);
+}
+
+This test checks that the two calls return the same handle, indicating that the cache is working. However, the code may need to handle FfiStr, which is a type alias for a C-compatible string. Also, in the actual code, the function is marked as 'extern "C"', so the test would have to call it correctly.
+
+But in the test, using the FfiStr would require a proper setup. The FfiStr is probably a struct that wraps a *const libc::c_char and a length. So in the test, we need to create a valid FfiStr instance.
+
+Alternatively, the actual function in the code is written to accept a u64 handle and a label as FfiStr. The FfiStr might be a type that requires a pointer to a C string and length. So in the test, perhaps the label is converted into a FfiStr.
+
+Assuming that FfiStr is a type that can be created with a raw pointer and length, the test would need to create such an instance. For example:
+
+struct FfiStr {
+    ptr: *const c_char,
+    len: usize,
+}
+
+Then, in the test, passing "test_label" as a FfiStr would involve creating a static string, getting its pointer and length.
+
+But the test code would need to handle this. For example, using a static string:
+
+static TEST_LABEL: &str = "test_label";
+
+let label = FfiStr {
+    ptr: TEST_LABEL.as_ptr() as *const c_char,
+    len: TEST_LABEL.len(),
+};
+
+But in the test function, for the purpose of testing the cache, the FfiStr can be constructed as such.
+
+Putting it all together, the test would need to create the FfiStr correctly and pass it to the extern function.
+
+However, the patch uses 'label.as_str()' which implies that the FfiStr has a method to convert to a Rust string. So perhaps in the test, the code can be simplified by using a valid FfiStr instance.
+
+In any case, the test should call the function twice with the same handle and label and check that the handles are the same.
+
+So the final test would involve setting up the necessary global state (a labeled metric), then calling the function multiple times.
+
+The key is that without the patch, each call would go through the insert_with_log, which might have caused the crash due to invalid handling. With the patch, the second call would retrieve from the cache, avoiding the insert.
+
+Therefore, the test should pass after the patch and fail before it, since before the patch, the code would not have the cache and might have generated different handles, but more importantly, would have attempted multiple inserts leading to the crash.
+
+But wait, the test as written would pass in both cases if the handles are the same. How does this verify the crash?
+
+Actually, the crash was caused by the insert logic. The test may not directly verify the crash, but ensuring that the cache is in place prevents multiple calls to insert. If the test is structured such that multiple insertions would lead to the crash, then the test would pass after the patch.
+
+But the test may not directly check the crash scenario, but it's a regression test that verifies that the cache is functioning, which the patch introduced to prevent the crash. So if the cache is working, the patch is applied correctly.
+
+So, the test is correct in that it verifies that after the first insertion, subsequent calls retrieve from the cache. Without the cache, each call would generate a new handle and cause an insertion, leading to potential corruption in the handle map.
+
+Thus, this test should pass after the patch and fail before, as before the patch, the LABEL_MAP is not in place, so each call to the function would trigger the insert again. However, if the insert_with_log is idempotent, perhaps the test wouldn't fail. But in the problem scenario, the insert_with_log was being called multiple times, leading to a corrupted state in the handle map, hence the crash. By caching, it's only called once, thus preventing the corruption.
+
+The test needs to fail before the patch. Before the patch, every call to the function would trigger the insert_with_log, which may have caused the next_index issue if the map was being manipulated in a way that invalidated the indices. So, the test would cause a panic in the code before the patch. But in the test, since we're asserting that the handles are the same, before the patch, the handles may be different (if the insert_with_log is called every time), but wait, how does the insert_with_log generate a handle?
+
+Actually, the insert_with_log function returns a u64 handle. The problem is that calling it multiple times for the same key (same label) would generate different handles, which may not be safe for the handle map. By caching, the patch ensures that only one insert_with_log call is made per (handle, label) pair.
+
+So, the test may pass after the patch because the handle is cached, and thus only one insert_with_log is called, preventing the invalid state. Before the patch, each call would trigger an insert, leading to possible invalid map state and a crash.
+
+But in the test, if the handles are different before the patch, then the assert_eq!(handle1, handle2) would fail, causing the test to fail. With the patch, the handles are the same, so the test passes.
+
+Thus, this test would serve as a regression test for the patch.
+
+Now, the code for the test needs to be written in Rust, using the proper imports.
+
+The imports would include once_cell, std::sync::Mutex, the necessary metric types. For example, using 'use super::*' to get the functions under test.
+
+But the exact imports need to be specified. The user instructions say that the imports must be listed in the <imports> block, and each on a separate line.
+
+Assuming that the test is in the same module as the labeled.rs code, the 'use super::*' would include the necessary functions and types.
+
+The test would need to use FfiStr, which is probably a type defined in the codebase. So, the test would have to include the necessary import for that.
+
+Putting it all together, the test code would look something like:
+
+use once_cell::sync::OnceCell;
+use std::sync::Mutex;
+use std::ffi::CStr;
+use super::*;
+
+#[test]
+fn test_label_cache_prevents_multiple_insertions() {
+    // Setup a labeled metric
+    static GLOBAL_LABELED: OnceCell<LabeledMetric<CounterMetricType>> = OnceCell::new();
+    static GLOBAL_HANDLE: u64 = 1;
+
+    let labeled_metric = LabeledMetric::new(CounterMetricType {
+        send_in_pings: Vec::new(),
+        name: "test".to_string(),
+        category: Some("test".to_string()),
+        disabled: false,
+        ... // other fields necessary for initialization
+    });
+    GLOBAL_LABELED.set(labeled_metric).unwrap();
+
+    // Create a label
+    let label = "test_label";
+    let c_label = CString::new(label).unwrap();
+    let ffi_label = FfiStr {
+        ptr: c_label.as_ptr(),
+        len: label.len(),
+    };
+
+    unsafe {
+        let handle1 = glean_labeled_counter_metric_get(GLOBAL_HANDLE, ffi_label);
+        let handle2 = glean_labeled_counter_metric_get(GLOBAL_HANDLE, ffi_label);
+        assert_eq!(handle1, handle2);
+    }
+}
+
+But this is speculative. The actual code would require that the 'glean_labeled_counter_metric_get' function is the one generated by the macro. Also, the 'LabeledMetric' and 'CounterMetricType' need to be properly initialized. However, for the test to be self-contained, the setup may need to be simplified.
+
+Given that the test is supposed to be self-contained, perhaps the necessary types can be mocked. However, the actual code may require more setup. Since the user provided the patch, perhaps the test can use a simplified version of the global metric setup.
+
+In the final code, the test needs to be written in Rust, using the correct imports and calling the correct function. The function under test is the $get_name function, which in the example is 'glean_labeled_counter_metric_get' (as seen in the patch's 'glean_labeled.rs').
+
+In conclusion, the test should call this function with the same handle and label twice and ensure that the handles are the same. The imports needed are for OnceCell, Mutex, and possibly FfiStr. The code inside the test would handle the setup of a global labeled metric and call the extern function.
+</think>
+
+<Filename>glean-core/ffi/src/labeled.rs</Filename>
+<imports>
+use once_cell::sync::OnceCell;
+use std::sync::Mutex;
+use std::ffi::CStr;
+use super::*;
+</imports>
+<Rust>
+#[test]
+fn test_label_cache_prevents_multiple_insertions() {
+    // Setup global metric for the test
+    static GLOBAL_LABELED: OnceCell<LabeledMetric<CounterMetricType>> = OnceCell::new();
+    static GLOBAL_HANDLE: u64 = 1;
+
+    // Initialize a mock labeled metric (minimal setup for test)
+    let labeled_metric = LabeledMetric::new(CounterMetricType {
+        send_in_pings: Vec::new(),
+        name: "test".to_string(),
+        category: Some("test".to_string()),
+        disabled: false,
+        ..Default::default()
+    });
+    GLOBAL_LABELED.set(labeled_metric).unwrap();
+
+    // Create a valid C-compatible string label
+    let label = "test_label";
+    let c_label = unsafe { std::ffi::CString::from_vec_with_nul_unchecked(label.as_bytes().to_vec()) };
+    let ffi_label = FfiStr {
+        ptr: c_label.as_ptr(),
+        len: label.len(),
+    };
+
+    // First call inserts the submetric
+    unsafe {
+        let first_call = glean_labeled_counter_metric_get(GLOBAL_HANDLE, ffi_label);
+        let second_call = glean_labeled_counter_metric_get(GLOBAL_HANDLE, ffi_label);
+        // With caching enabled, both calls return the same handle
+        assert_eq!(first_call, second_call);
+    }
+}
+</Rust>

@@ -1,0 +1,58 @@
+#[test]
+fn test_source_tags_after_init_race_condition() {
+    let _lock = lock_test();
+
+    destroy_glean(true);
+    assert!(!was_initialize_called());
+
+    let (s, r) = bounded::<Vec<(String, String)>>(1);
+
+    #[derive(Debug)]
+    pub struct FakeUploader {
+        sender: Sender<Vec<(String, String)>>,
+    }
+    impl PingUploader for FakeUploader {
+        fn upload(
+            &self,
+            _url: String,
+            _body: Vec<u8>,
+            headers: Vec<(String, String)>,
+        ) -> UploadResult {
+            self.sender.send(headers).unwrap();
+            UploadResult::HttpStatus(200)
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let cfg = crate::Configuration {
+        data_path: tmpname,
+        application_id: "rlb-test".to_string(),
+        upload_enabled: true,
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: Some("testing".to_string()),
+        server_endpoint: Some("invalid-test-host".to_string()),
+        uploader: Some(Box::new(FakeUploader { sender: s })),
+    };
+
+    let _t = new_glean(Some(cfg), true);
+
+    assert!(was_initialize_called());
+    crate::set_source_tags(vec!["valid-tag1".to_string(), "valid-tag2".to_string()]);
+
+    crate::block_on_dispatcher();
+
+    submit_ping_by_name("baseline", Some("background"));
+
+    let headers = r.recv().unwrap();
+    assert_eq!(
+        "valid-tag1,valid-tag2",
+        headers
+            .iter()
+            .find(|kv| kv.0 == "X-Source-Tags")
+            .unwrap()
+            .1
+    );
+}

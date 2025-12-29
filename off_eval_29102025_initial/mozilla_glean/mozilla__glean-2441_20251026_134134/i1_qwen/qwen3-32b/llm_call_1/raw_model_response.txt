@@ -1,0 +1,510 @@
+<think>
+Okay, let's tackle this. The issue is that when the max_events limit is hit, the events ping is submitted but the uploader isn't triggered right away. The patch adds a return value to the record function to indicate if a ping was submitted, and then in the event metric's record_sync, when that returns true, it triggers the upload.
+
+So, I need to write a test that checks whether triggering the upload happens when max_events is reached. The test should fail before the patch and pass after. 
+
+First, I need to find which function to test. The EventDatabase's record function now returns a bool. The EventMetric's record_sync calls this and if it returns true, it triggers the upload. So the test should verify that when the max_events is hit, the upload is triggered.
+
+But how to simulate hitting max_events? Maybe mock the EventDatabase to return true when record is called, and check if trigger_upload is called. However, in Rust, without mocks, perhaps we can use a spy or a test double. But since we're writing a unit test, maybe we can use a test EventDatabase that sets a flag when it returns true.
+
+In the test, create a mock Glean that tracks if upload was triggered. Then, create an EventMetric that uses this mock database. When the record is called and hits max_events, the mock should indicate that upload was triggered.
+
+The test would set up the EventDatabase to return true (simulating max_events), then call record_with_time on the EventMetric. Then assert that the upload was triggered.
+
+So, the mock for EventDatabase's record would return true. Then, in the test, we check if trigger_upload was called. Since in the patch, when record_sync returns true, the EventMetric calls trigger_upload.
+
+Looking at the code in the patch, in event.rs, the record_with_time function calls record_sync, and if it returns true, it locks the state and calls trigger_upload on the callbacks. 
+
+Therefore, the test needs to verify that trigger_upload is called when the record_sync returns true. 
+
+To do this, perhaps create a mock of the global state's callbacks. But how to do that in the test? Alternatively, perhaps we can use a test harness where we inject a mock that can be checked.
+
+But given the code, perhaps the test would need to create an EventMetric and simulate that when it records, the EventDatabase's record returns true. Then, check that the trigger_upload was called.
+
+Wait, in the patch, the EventMetric's record_sync calls the EventDatabase's record, and if that returns true, the EventMetric's code calls trigger_upload. 
+
+So, in the test, if we can make the EventDatabase's record return true, then the test can check that trigger_upload is called. 
+
+But how to make the EventDatabase's record return true? The record function returns true when the max_capacity ping is submitted, which happens when the max_events is hit. So in the test, perhaps we can set up the storage to be full. However, that might require mocking the database's internal state.
+
+Alternatively, maybe the test can simulate that the max_events is 1, then record an event that fills it. 
+
+Wait, the EventDatabase's record function has logic that checks if adding this event would reach max_events. Let me check the code:
+
+In event_database/mod.rs, in the record function, there's a line where it checks if the current count plus 1 (after adding the new event) exceeds max_events. If so, it sets submit_max_capacity_event_ping to true. Then, after inserting the event, if that flag is true, it submits the ping and returns true.
+
+So, if we can create a scenario where the EventDatabase's current count is max_events - 1, then adding another event will make it reach max_events. 
+
+So, the test would need to:
+
+1. Set up an EventDatabase instance with max_events set to a small number (like 1).
+2. Add an event that brings it to max_events.
+3. Verify that the trigger_upload is called.
+
+But how to capture that trigger_upload is called?
+
+Looking at the code, when the EventMetric's record_sync returns true, the code in record_with_time does:
+
+if sent {
+    let state = crate::global_state().lock().unwrap();
+    if let Err(e) = state.callbacks.trigger_upload() {
+        ...
+    }
+}
+
+So in the test, we need to check if this code path is executed. However, the callbacks are part of the global state, which is a Mutex<State> with a Callbacks struct. 
+
+In a test, perhaps we can inject a custom callback that counts how many times it's been called. But how?
+
+Alternatively, we can create a mock callback and set it in the global state before running the test.
+
+Wait, the global state is initialized via the STATE static variable. So, in a test, perhaps we can replace the global state with a custom one that has a callback we can monitor.
+
+But that's a bit complex. However, since this is a unit test, perhaps we can use a test helper that sets up the global state with a mock callback.
+
+Alternatively, we can create a spy that increments a counter when trigger_upload is called.
+
+So, here's a plan:
+
+- Create a mock Glean and an EventMetric with max_events set to 1.
+- In the test setup, reset the database to have 0 events (or whatever is needed to simulate reaching max_events).
+- Record an event, which should fill the database to max_events.
+- Check if trigger_upload was called.
+
+But how to simulate that the database is about to reach max_events?
+
+The EventDatabase's record function checks the current count. So, perhaps in the test, we can create an EventDatabase with max_events set to 1, then pre-insert 1 event, and then try to add another. But that might not work because the code inserts the event first. Alternatively, maybe the code checks the count before inserting. Let me check the code again.
+
+In the record function:
+
+let current_count = self.get_event_count(glean);
+if current_count + 1 > self.max_events {
+    submit_max_capacity_event_ping = true;
+}
+
+So, if the current_count is already 1, adding another (so 1+1=2) will trigger if max_events is 1. Wait, no. The code checks if current_count (say 0) + 1 exceeds max_events (say 1). So 0+1=1 which is equal, not exceeding. Hmm. So maybe the code is checking if adding the event would exceed the max_events. But in that case, if current_count is equal to max_events, adding another would make it one more. So perhaps the code is supposed to trigger the ping when the limit is hit.
+
+Wait, maybe there's a mistake in the code. Let me think: suppose max_events is 3. If I have 3 events in the database. Then, trying to add another: current_count is 3. current_count + 1 is 4, which is larger than 3. So submit_max_capacity is true. Then, the event is inserted, and the ping is submitted.
+
+So, in this case, the code would submit the ping when the event is added and the count reaches max_events + 1? That seems incorrect. Wait, perhaps there's a mistake here. But the original issue is that when the max_events is reached, the ping is submitted, but upload isn't triggered. The patch is supposed to trigger upload immediately when that ping is submitted.
+
+But regardless, the test needs to simulate that when the max_events is hit, the ping is submitted and the upload is triggered.
+
+So, to trigger the ping submission, the code needs to add an event that causes the count to exceed max_events. However, in reality, adding an event might not exceed, but reach exactly max_events. Hmm, maybe the code logic is wrong here. Wait, the code in the patch is in event_database/mod.rs's record function. Let me look:
+
+Original code:
+
+if current_count + 1 > self.max_events {
+    submit_max_capacity_event_ping = true;
+}
+
+But the max_events is the limit. So, when current_count +1 exceeds the max_events, which would mean that after inserting this event, the count would be over. But perhaps the max_events is inclusive. So, for example, if max_events is 3, then current_count is 3 (full), then adding another would make 4 > 3, so the ping is submitted. That's probably correct.
+
+But in a test, we need current_count to be 3 (max_events is 3), then trying to add an event would trigger the ping. So, in the test, we can set up the database to have max_events 1, and after inserting an event (current_count is 1), then adding another would trigger the ping.
+
+But how to simulate that in the test? The code's current_count is based on the stored events. So perhaps the test needs to record an event that fills the max_events, and then another that makes it exceed.
+
+But in a real scenario, the database can't store more than max_events. So after inserting, the ping is submitted but the event is not stored. Or perhaps the code is designed to always allow the event to be inserted but submit the ping when the limit is reached.
+
+This is getting a bit complex. Maybe for the test, we can create a mock EventDatabase that, when record is called, returns true (to simulate that the ping was submitted). Then, in the test, check if trigger_upload is called.
+
+Alternatively, create a test where after adding an event that triggers the ping, the code path that calls trigger_upload is executed.
+
+So, here's the approach for the test:
+
+1. Create an EventMetric with max_events = 1.
+2. When the first event is recorded, it's stored, and the count is 1. Adding another would trigger the ping.
+3. So, when recording the second event, the code in EventDatabase's record will check if current_count +1 (1+1=2) > max_events (1). That's true, so the ping is submitted and the record returns true. Then, in the EventMetric's code, trigger_upload is called.
+
+In the test, we need to verify that trigger_upload is called when this happens.
+
+But how to observe that? The code triggers the upload by calling state.callbacks.trigger_upload(). So, if we can replace the global_state's callbacks with a mock that we can check.
+
+The global_state() function is static, so in a test, we need to set the STATE variable to a custom State that has a callbacks struct with a trigger_upload function that can be observed.
+
+But how to do that?
+
+Alternatively, perhaps we can use a test fixture where we create a custom callback that increments a counter when called.
+
+But in the code, the callbacks are part of the State struct. The State is initialized once, so during the test setup, we can replace it with a State that has a custom Callbacks.
+
+So, in the test, we can do something like:
+
+- Create a mock counter variable (e.g., a Cell<u32>).
+- Create a Callbacks struct that when trigger_upload is called, increments the counter.
+- Replace the global_state with one that has this Callbacks.
+- Then, perform the test actions and check the counter.
+
+But how to create such a State?
+
+Looking at glean-core/src/lib.rs's code, the State struct contains a callbacks field of type Callbacks. The Callbacks struct has a trigger_upload() method.
+
+In the test, we need to create a State where the callbacks are our mock.
+
+So, perhaps in the test, we can create a struct like:
+
+struct TestCallbacks {
+    counter: std::cell::Cell<u32>,
+}
+
+impl Callbacks for TestCallbacks {
+    fn trigger_upload(&self) -> Result<(), ()> {
+        self.counter.set(self.counter.get() + 1);
+        Ok(())
+    }
+}
+
+But how to create a State with this?
+
+The State struct's definition is not in the patch, but assuming it's in the same code as glean-core. However, since the user hasn't provided the full code, perhaps it's better to see how the test can be structured using the modified code.
+
+Alternatively, maybe the test can use a mock for the callbacks.
+
+But given that the user hasn't provided the full source, I'll need to make assumptions.
+
+Assume that the global_state() is initialized with a State that includes the callbacks. During the test, we can set this to a custom state.
+
+So in the test code:
+
+// Create a custom callback counter
+let upload_called = std::cell::Cell::new(0);
+
+// Create a State with a custom Callbacks
+let state = State {
+    callbacks: Box::new(TestCallbacks { counter: upload_called }),
+    // ... other fields may need to be initialized
+};
+
+// Set the global state
+STATE.set(Mutex::new(state)).unwrap();
+
+Then, when the test runs the code that triggers the EventMetric's record_with_time, the counter should increment.
+
+But how to handle the actual EventDatabase setup?
+
+The test would need to create an EventDatabase with max_events set to 1. Then, record two events. The second event would trigger the ping, which would call trigger_upload.
+
+But the test setup would involve creating an EventMetric that uses this database. However, the EventMetric's record_sync calls into the EventDatabase's record function.
+
+So the test steps would be:
+
+1. Initialize the global_state with a custom State that has a mock callback.
+2. Create an EventDatabase with max_events = 1.
+3. Create an EventMetric that uses this database.
+4. Record an event (this will be stored, count becomes 1).
+5. Record another event. This will trigger the ping and return true, which should call trigger_upload.
+6. Assert that the mock counter has been incremented.
+
+But the EventDatabase is part of the Glean's database. So the test may need to mock the database or create a test instance with controlled values.
+
+Alternatively, in the test, we can create a mocked EventDatabase that simulates having reached max_events. However, since the EventDatabase is part of the Glean struct, which is global, this could be tricky.
+
+Alternatively, perhaps the test can use a mock for the EventDatabase. But given the code structure, perhaps the test is supposed to be in the event.rs file, given the changes there.
+
+Looking at the files modified: event_database/mod.rs and event.rs (metrics/event.rs). So the test for the event metric would probably be in event.rs's test module.
+
+Given that, perhaps the test should be written for the record_with_time function, ensuring that when record_sync returns true, the trigger_upload is called.
+
+The test can be written as follows:
+
+- Create an EventMetric instance with max_events = 1.
+- In the test, simulate that record_sync returns true.
+- Check if trigger_upload is called.
+
+But how to simulate that record_sync returns true? Normally, that happens when the ping is submitted. So perhaps in the test, we can create a scenario where the database is at max_events - 1, and adding an event causes the ping to be submitted.
+
+But to simulate this, the test may need to mock the database to return true from the record function.
+
+But in the test, perhaps the test can create a mock EventDatabase for the metric's storage. However, the EventMetric's database is obtained via glean.event_storage(), so we need to create a Glean instance with a custom event storage.
+
+This is getting complicated. Perhaps the test can use a mock that forces the EventDatabase's record to return true.
+
+But given the patch, the EventMetric's record_sync returns a bool. So, perhaps in the test, we can create an instance of EventMetric and call record_sync, but to do that, we need to set up the database in such a way that the record_sync returns true.
+
+But how?
+
+Alternatively, in the test, create a test Glean instance and EventMetric, and then record events that will cause the max_events to be hit.
+
+But how to control the database's count.
+
+Alternatively, in the test, inject a mock database where when record is called, it returns true. For example, perhaps in the test, create a database with max_events = 1, and have already stored one event. Then, when a new event is recorded, the current_count is 1, adding 1 makes 2 > 1, so submit the ping. The record function returns true, so trigger_upload is called.
+
+Wait, but inserting a new event into a database that already has max_events events would be when current_count is equal to max_events. So adding one would make current_count +1 = max_events + 1, which is > max_events, triggering the ping. So in the test:
+
+- Create a database with max_events = 1.
+- Insert an event (count is 1).
+- Insert another event. The code checks current_count (1) +1 = 2 > 1 → submit ping, return true → trigger_upload.
+
+So the test would need to:
+
+1. Initialize the global state with our mock callbacks.
+2. Create a Glean instance with an EventDatabase that allows us to insert an initial event and then trigger the second.
+3. Record an event, which is stored.
+4. Record another event, which triggers the ping and upload.
+
+But how to create the EventDatabase with max_events set?
+
+Well, in the test, we can create an EventMetric with max_events=1, then perhaps use a test helper to insert an event into the database. However, the actual implementation details might be tricky.
+
+Alternatively, the test can create a Glean instance with a mocked event database that, when record is called once, returns false, but when called again returns true. But that's a bit hacky.
+
+Alternatively, the test can create a scenario where the current_count is 1, and when record is called again, it hits max_events and returns true.
+
+But given the code, in the first record, current_count is 0, +1 → 1. So max_events could be 1. So adding the first event would not trigger the ping, because 0 +1 is equal to max_events. Wait, max_events is 1. current_count is 0. Adding one makes 1, which is not greater than max_events. So the code in the if statement (current_count +1 > max_events) is false. So no ping is submitted.
+
+Wait, that's a problem. Because according to the code, the ping is submitted only when adding the event would exceed the max_events, not reach it. So if the max_events is 1, adding the first event (current_count 0) would not trigger the ping. Adding the second event (current_count 1) would trigger the ping, because 1+1=2>1. So the max_events is reached at 1, and the second event triggers the ping.
+
+So in this scenario, the test would:
+
+- Create a metric with max_events=1.
+- Record an event → stored, no ping.
+- Record another event → triggers ping (since current_count is 1), submit ping and return true. This causes trigger_upload to be called.
+
+Thus, in the test, after two record calls, the trigger_upload should be called once.
+
+So the steps are:
+
+- Set up the global_state with a trigger_upload counter.
+- Create a Glean instance with an EventDatabase that allows this.
+- Create an EventMetric with max_events=1.
+- Record an event.
+- Record another event.
+- Check that trigger_upload was called once.
+
+So the test would look for that.
+
+But how to create the Glean instance and EventDatabase? The code may be using the actual database, which requires a real storage. To avoid dealing with the actual database, perhaps the test can mock the EventDatabase's record function to return true on the second call. But how?
+
+Alternatively, the test can create a test helper that uses a mocked EventDatabase that simulates the current count.
+
+Given the complexity, perhaps the best way is to use a mock that simulates the behavior.
+
+But since this is a unit test, perhaps the test can focus on the code path where record_sync returns true and trigger_upload is called.
+
+In the current code, the problem is that when the ping is submitted, the upload isn't triggered. The patch adds the trigger_upload call in the event.rs's record_with_time function when the record_sync returns true.
+
+Therefore, the test should verify that when record_sync returns true, trigger_upload is called.
+
+Thus, the test can be as follows:
+
+- Create a mock that tracks if trigger_upload was called.
+- Create a mock EventMetric's record_sync that returns true.
+- Call record_with_time and check if the mock was called.
+
+But how to make record_sync return true without dealing with the actual database.
+
+This seems like a unit test for event.rs's code. The record_with_time calls record_sync, and when it returns true, it calls trigger_upload.
+
+So, for a unit test of event.rs, we can create a test where the record_sync returns true, and then ensure that trigger_upload is called.
+
+To do that, the test can:
+
+- Create a mock where record_sync returns true.
+- Call record_with_time.
+- Check if trigger_upload is called.
+
+But how to mock record_sync in Rust.
+
+But in the code, record_sync is a method of EventMetric. To create a mock that returns true, perhaps create a test instance where the database is set up to return true when record is called.
+
+Alternatively, the test can use a real EventMetric and manipulate the database to reach the state where record_sync returns true.
+
+But for the purpose of this test, perhaps the test can create an EventMetric with max_events=1, record events until it reaches the point where the database's current count is 1 (after first event), then record another event which triggers the ping and returns true.
+
+But to simulate that, the test would have to deal with the actual EventDatabase.
+
+Thus, the test would require:
+
+1. Setting up the global state with a mock callback.
+2. Creating a Glean instance with an EventDatabase with max_events=1.
+3. Creating an EventMetric with this Glean instance.
+4. Recording an event, which adds it to the database.
+5. Recording another event, which triggers the ping and returns true, causing the trigger_upload to be called.
+6. Asserting that trigger_upload was called.
+
+So the Rust code for this test would involve:
+
+- Using glean-core's testing utilities to set up the Glean instance.
+- Maybe using a test harness to mock the database's behavior.
+
+But given that the user hasn't provided the full code for the EventDatabase, perhaps the test needs to rely on the existing code's behavior.
+
+Now, putting this into code.
+
+First, the test needs to create an EventMetric. Let's assume that the EventMetric can be created with max_events set to 1.
+
+But the actual parameters for creating an EventMetric might be complex. However, since the patch modifies the record_with_time function, perhaps the test can be added to the existing tests in the metrics/event.rs file.
+
+Assuming that the EventMetric can be created with a valid setup, the test can be written.
+
+But to simulate the max_events, perhaps the test uses a small value for max_events.
+
+Here's the test in code:
+
+We need to use the modules from glean-core. So the imports would include the necessary modules like the EventMetric, Glean, State, global_state, etc.
+
+But given the patch, the relevant test would be in the metrics/event.rs file.
+
+So the Filename would be "glean-core/src/metrics/event.rs".
+
+The imports would need to bring in things like Glean, EventMetric, etc. But looking at the code, the test would need to create a Glean instance and an EventMetric.
+
+But the actual code for creating an EventMetric may require some setup. For example, the EventMetric requires a CommonMetricDataInternal, which is not trivial to construct. But perhaps the test can use a test helper or create a minimal struct.
+
+Alternatively, perhaps the test can use a test EventMetric that has max_events set to 1.
+
+But to avoid complex setup, the test can use the existing code's test utilities.
+
+But without knowing the actual test setup, this is challenging. However, given the patch, we can approximate.
+
+In the test, perhaps the code can use a mocked CommonMetricDataInternal with max_events set to 1.
+
+But since the patch is about triggering upload when the ping is submitted, and the test needs to verify that trigger_upload is called.
+
+Putting it all together, the Rust test might look like this:
+
+<Filename>glean-core/src/metrics/event.rs</Filename>
+<imports>
+use super::EventMetric;
+use crate::private::Glean;
+use crate::state::Callbacks;
+use std::cell::Cell;
+use std::collections::HashMap;
+</imports>
+<Rust>
+#[test]
+fn test_upload_triggered_on_max_events() {
+    let upload_called = std::cell::Cell::new(false);
+    
+    // Mock the global_state to have a custom callback
+    let state = crate::State {
+        callbacks: Box::new(TestCallbacks {
+            counter: upload_called
+        }),
+        // Other fields need to be initialized, assuming default or omitted for brevity
+    };
+    
+    // Set the global state
+    let _guard = crate::global_state().lock().unwrap();
+    // Replace the actual state with our mock, but in practice, this would require careful setup
+    
+    // Create a Glean instance and an EventMetric with max_events = 1
+    // This part is simplified, actual setup might be more involved
+    let glean = Glean::new(false, /* no upload enabled */).unwrap();
+    
+    // Create an EventMetric with max_events = 1
+    let metric = EventMetric::new(CommonMetricDataInternal {
+        name: "test_event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["events".into()],
+        dynamic_children_send_in_pings: Vec::new(),
+        disabled: false,
+        lifetime: Lifetime::Application,
+        max_events: Some(1),
+        allowed_extra_keys: Some(vec![]),
+    });
+    
+    // Record the first event (should not trigger upload)
+    metric.record_with_time(0, HashMap::new());
+    
+    // Record the second event (should trigger upload)
+    metric.record_with_time(1, HashMap::new());
+    
+    // Assert that the upload was triggered
+    assert!(upload_called.get());
+}
+
+// Simplified TestCallbacks mock for demonstration purposes
+struct TestCallbacks {
+    counter: std::cell::Cell<bool>,
+}
+
+impl Callbacks for TestCallbacks {
+    fn trigger_upload(&self) -> Result<(), ()> {
+        self.counter.set(true);
+        Ok(())
+    }
+}
+</Rust>
+
+Wait, but the real code may have more fields in State. Also, the Glean instance's setup would need to have an event database with max_events set to 1. This example is simplified.
+
+However, the main idea is that after two record calls, the trigger_upload is called. The test would fail before the patch because the code did not call trigger_upload, and after it does.
+
+But given that this is a unit test, the setup may require mocking the callbacks and ensuring that the EventDatabase's record returns true on the second call.
+
+But given the complexity of setting up a Glean instance with the correct EventDatabase, this might be challenging. However, for the purpose of writing a regression test that confirms the fix, the test above would be a start.
+
+The final test needs to compile, so the actual code might require more proper initialization. But given the information, this is the general approach.
+</think>
+
+<Filename>glean-core/src/metrics/event.rs</Filename>
+<imports>
+use super::EventMetric;
+use crate::private::Glean;
+use crate::state::Callbacks;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceCell;
+</imports>
+<Rust>
+#[test]
+fn test_upload_triggered_on_max_events() {
+    static STATE: OnceCell<Mutex<StateMock>> = OnceCell::new();
+    
+    // Setup a mock state with a counter to track upload triggers
+    struct StateMock {
+        upload_counter: Cell<u8>,
+    }
+    
+    impl StateMock {
+        fn new() -> Self {
+            Self {
+                upload_counter: Cell::new(0),
+            }
+        }
+    }
+    
+    impl<'a> crate::State for StateMock {
+        fn callbacks(&'a self) -> &'a dyn Callbacks {
+            self
+        }
+    }
+    
+    impl Callbacks for StateMock {
+        fn trigger_upload(&self) -> Result<(), ()> {
+            self.upload_counter.set(self.upload_counter.get() + 1);
+            Ok(())
+        }
+    }
+    
+    // Initialize global state with our mock
+    STATE.set(Mutex::new(StateMock::new())).unwrap();
+    
+    // Create a Glean instance with upload enabled
+    let glean = Glean::new(true).unwrap();
+    
+    // Create a metric with max_events = 1
+    let metric = EventMetric::new(crate::private::CommonMetricDataInternal {
+        name: "test_event".into(),
+        category: "test".into(),
+        send_in_pings: vec!["events".into()],
+        dynamic_children_send_in_pings: vec![],
+        disabled: false,
+        lifetime: crate::Lifetime::Application,
+        max_events: Some(1),
+        allowed_extra_keys: None,
+    });
+    
+    // First event: should not trigger upload
+    metric.record_with_time(0, HashMap::new());
+    
+    // Second event: should trigger upload due to max_events limit
+    metric.record_with_time(1, HashMap::new());
+    
+    // Get the mock state and verify the counter
+    let state = STATE.get().unwrap().lock().unwrap();
+    assert_eq!(state.upload_counter.get(), 1);
+}
+</Rust>

@@ -1,0 +1,249 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Unblock the RLB dispatcher
+This is about the implementation of the [Unblock the RLB dispatcher](https://docs.google.com/document/d/1fc-WN5mEwgrJG9EB1ZupYTIAZchWTrm3JIGMVLcK6p4/) proposal.
+It will be split into smaller parts soon.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/lib.rs b/glean-core/ffi/src/lib.rs
+--- a/glean-core/ffi/src/lib.rs
++++ b/glean-core/ffi/src/lib.rs
+@@ -46,6 +46,10 @@ mod uuid;
+ #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
+ mod fd_logger;
+ 
++#[cfg(unix)]
++#[macro_use]
++mod weak;
++
+ use ffi_string_ext::FallibleToString;
+ use from_raw::*;
+ use handlemap_ext::HandleMapExtension;
+@@ -366,6 +370,35 @@ pub extern "C" fn glean_clear_application_lifetime_metrics() {
+     with_glean_value(|glean| glean.clear_application_lifetime_metrics());
+ }
+ 
++/// Try to unblock the RLB dispatcher to start processing queued tasks.
++///
++/// **Note**: glean-core does not have its own dispatcher at the moment.
++/// This tries to detect the RLB and, if loaded, instructs the RLB dispatcher to flush.
++/// This allows the usage of both the RLB and other language bindings (e.g. Kotlin/Swift)
++/// within the same application.
++#[no_mangle]
++pub extern "C" fn glean_flush_rlb_dispatcher() {
++    #[cfg(unix)]
++    #[allow(non_upper_case_globals)]
++    {
++        weak!(fn rlb_flush_dispatcher() -> ());
++
++        if let Some(f) = rlb_flush_dispatcher.get() {
++            // SAFETY:
++            //
++            // We did a dynamic lookup for this symbol.
++            // This is only called if we found it.
++            // We don't pass any data and don't read any return value, thus no data we directly
++            // depend on will be corruptable.
++            unsafe {
++                f();
++            }
++        } else {
++            log::info!("No RLB symbol found. Not trying to flush the RLB dispatcher.");
++        }
++    }
++}
++
+ #[no_mangle]
+ pub extern "C" fn glean_set_dirty_flag(flag: u8) {
+     with_glean_value_mut(|glean| glean.set_dirty_flag(flag != 0));
+
+diff --git a/glean-core/ffi/src/weak.rs b/glean-core/ffi/src/weak.rs
+--- a/glean-core/ffi/src/weak.rs
++++ b/glean-core/ffi/src/weak.rs
+@@ -0,0 +1,61 @@
++//! Based on `library/std/src/sys/unix/weak.rs` from the Rust libstd code base (Rust v1.49.0).
++//!
++//! Original License: MIT/Apache.
++//! <https://github.com/rust-lang/rust/blob/master/LICENSE-MIT>
++//! <https://github.com/rust-lang/rust/blob/master/LICENSE-APACHE>
++//!
++//! Support for "weak linkage" to symbols on Unix
++//!
++//! We use `dlsym` to get a symbol value at runtime.
++//! It assumes that the symbol we're looking for is linked in to our application somehow.
++//! In case of glean-ffi and the RLB this is the case if everything is built as one dynamic
++//! library.
++
++use std::ffi::CStr;
++use std::marker;
++use std::mem;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++macro_rules! weak {
++    (fn $name:ident($($t:ty),*) -> $ret:ty) => (
++        static $name: crate::weak::Weak<unsafe extern fn($($t),*) -> $ret> =
++            crate::weak::Weak::new(concat!(stringify!($name), '\0'));
++    )
++}
++
++pub struct Weak<F> {
++    name: &'static str,
++    addr: AtomicUsize,
++    _marker: marker::PhantomData<F>,
++}
++
++impl<F> Weak<F> {
++    pub const fn new(name: &'static str) -> Weak<F> {
++        Weak {
++            name,
++            addr: AtomicUsize::new(1),
++            _marker: marker::PhantomData,
++        }
++    }
++
++    pub fn get(&self) -> Option<F> {
++        assert_eq!(mem::size_of::<F>(), mem::size_of::<usize>());
++        unsafe {
++            if self.addr.load(Ordering::SeqCst) == 1 {
++                self.addr.store(fetch(self.name), Ordering::SeqCst);
++            }
++            match self.addr.load(Ordering::SeqCst) {
++                0 => None,
++                addr => Some(mem::transmute_copy::<usize, F>(&addr)),
++            }
++        }
++    }
++}
++
++unsafe fn fetch(name: &str) -> usize {
++    let name = match CStr::from_bytes_with_nul(name.as_bytes()) {
++        Ok(cstr) => cstr,
++        Err(..) => return 0,
++    };
++    ::libc::dlsym(::libc::RTLD_DEFAULT, name.as_ptr()) as usize
++}
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -347,6 +347,37 @@ pub fn shutdown() {
+     }
+ }
+ 
++/// Unblock the global dispatcher to start processing queued tasks.
++///
++/// This should _only_ be called if it is guaranteed that `initialize` will never be called.
++///
++/// **Note**: Exported as a FFI function to be used by other language bindings (e.g. Kotlin/Swift)
++/// to unblock the RLB-internal dispatcher.
++/// This allows the usage of both the RLB and other language bindings (e.g. Kotlin/Swift)
++/// within the same application.
++#[no_mangle]
++#[inline(never)]
++pub extern "C" fn rlb_flush_dispatcher() {
++    log::trace!("FLushing RLB dispatcher through the FFI");
++
++    let was_initialized = was_initialize_called();
++
++    // Panic in debug mode
++    debug_assert!(!was_initialized);
++
++    // In release do a check and bail out
++    if was_initialized {
++        log::error!(
++            "Tried to flush the dispatcher from outside, but Glean was initialized in the RLB."
++        );
++        return;
++    }
++
++    if let Err(err) = dispatcher::flush_init() {
++        log::error!("Unable to flush the preinit queue: {}", err);
++    }
++}
++
+ /// Block on the dispatcher emptying.
+ ///
+ /// This will panic if called before Glean is initialized.
+
+diff --git a/samples/multi-bindings/src/lib.rs b/samples/multi-bindings/src/lib.rs
+--- a/samples/multi-bindings/src/lib.rs
++++ b/samples/multi-bindings/src/lib.rs
+@@ -0,0 +1,29 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++pub use glean_ffi;
++
++mod test {
++    use glean::{private::CounterMetric, CommonMetricData};
++    use once_cell::sync::Lazy;
++
++    #[allow(non_upper_case_globals)]
++    pub static runs: Lazy<CounterMetric> = Lazy::new(|| {
++        CounterMetric::new(CommonMetricData {
++            category: "test".into(),
++            name: "runs".into(),
++            lifetime: glean::Lifetime::Ping,
++            send_in_pings: vec!["store1".into()],
++            disabled: false,
++            ..Default::default()
++        })
++    });
++}
++
++/// Increment the internal counter by `amount`.
++#[no_mangle]
++pub extern "C" fn increment_native_metric(amount: i32) {
++    log::info!("Incrementing native counter from the Rust side");
++    test::runs.add(amount);
++}
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn glean_clear_application_lifetime_metrics() -> ()
+
+pub fn shutdown() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

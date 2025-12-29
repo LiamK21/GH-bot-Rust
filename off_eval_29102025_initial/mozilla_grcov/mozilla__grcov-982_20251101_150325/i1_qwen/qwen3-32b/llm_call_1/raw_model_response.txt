@@ -1,0 +1,188 @@
+<think>
+Okay, I need to create a regression test for the issue where grcov doesn't create the directory path when using a sub-path in the output option. The patch changes from create_dir to create_dir_all, which should handle creating all necessary parent directories. 
+
+First, the test should check that the output directory is created properly. The problem before was that if the directory didn't exist, it wouldn't create it. So the test needs to simulate a scenario where the output path is a new directory with a subpath.
+
+I need to use the output_html function, which is the function modified by the patch. The test should pass an output_dir that includes a nested directory, like "coverage/subpath", and verify that this directory is created.
+
+The standard library's functions can be used here. I'll set up a temporary directory for testing. The test should create a unique path using std::env::temp_dir() to avoid messing up the actual directories. 
+
+The test steps would be:
+1. Create a temporary directory.
+2. Construct the output path as a nested directory (e.g., "test_output_dir/subdir").
+3. Call output_html with this output path, but since output_html requires other parameters like results, num_threads, etc., I need to provide dummy values for them.
+4. Check if the directory is actually created.
+
+But output_html takes results as a parameter. How can I create a dummy ResultTuple? Maybe just create an empty slice or a simple one. Since the function's main purpose here is directory creation, perhaps I can pass an empty results slice. The important part is that the output_html function is called with the intended output_dir.
+
+Wait, the function output_html is supposed to create the directory. So in the test, after calling output_html, I can check if the directory exists. 
+
+So in the test, I'll set up the output_dir as a path that doesn't exist. Before the patch, create_dir would fail because it only creates one directory, and if the parent doesn't exist, it errors. create_dir_all would create all necessary directories.
+
+The test should fail before the patch and pass after. Let's write the test to use a path with multiple levels and assert that after calling output_html, the path exists.
+
+Now, let's structure the test code:
+
+1. Use a temporary directory to create a unique test environment.
+2. Set output_dir to something like "coverage/subpath".
+3. Call output_html with that output_dir and other required parameters.
+4. Verify that the directory exists.
+
+But how to set up the required parameters? The function requires results, which is a slice of ResultTuple. Maybe create an empty vector of ResultTuple. The other parameters can be set to default or dummy values. For instance, num_threads can be 1, branch_enabled as false, and output_config_file can be None.
+
+Let me check the function signature again:
+
+pub fn output_html(
+    results: &[ResultTuple],
+    output_dir: Option<&Path>,
+    num_threads: usize,
+    branch_enabled: bool,
+    output_config_file: Option<&Path>) -> ();
+
+So the test needs to pass all these parameters. So in the test, I can call output_html with a dummy results slice, the output_dir as Some(output_path), num_threads as 1, branch_enabled as false, and output_config_file as None.
+
+So the test code steps:
+
+- Create a temporary directory path for the output.
+- Get its string representation and parse it as a Path.
+- Call output_html with a dummy results array, output_dir as Some(&path), and other dummy values.
+- Then check if the directory exists.
+
+But since the test is in the same crate as output_html, I can access it via use super::output_html;.
+
+So the test would look like this:
+
+- Setup a temporary directory.
+- Define a test path.
+- Call output_html with that path.
+- Check if the path was created.
+
+But the problem is that creating a temporary directory may not be necessary; perhaps just using a unique path that can be created in the test's execution and cleaned up automatically.
+
+Wait, in Rust tests, using std::fs to create directories. So in the test, I can create a unique path using something like:
+
+let test_dir = PathBuf::from("/tmp/test_output_dir"); // but on Windows it would be different. Maybe use the standard temp directory.
+
+For cross-platform compatibility, use:
+
+use std::env::temp_dir;
+
+Then:
+
+let base_dir = temp_dir();
+let output_path = base_dir.join("coverage").join("subpath");
+
+Then, before the test, check if output_path exists. If it does, delete it to start clean. Then call output_html with output_path.as_path(), and after the call, check if it exists.
+
+But the function output_html is supposed to create the directory. So the test should assert that path.exists().
+
+So putting it all together:
+
+use std::path::Path;
+use std::fs;
+use std::env;
+
+...
+
+#[test]
+fn test_output_html_creates_directory_path() {
+    let base_dir = env::temp_dir();
+    let output_path = base_dir.join("grcov_test_output");
+    let full_output_path = output_path.join("subpath");
+    // Ensure directory doesn't exist before the test
+    if fs::metadata(&full_output_path).is_ok() {
+        fs::remove_dir_all(&full_output_path).unwrap();
+    }
+    // Dummy results
+    let results: Vec<ResultTuple> = vec![];
+    // Call the function with output_dir set to Some(&full_output_path)
+    output_html(
+        &results,
+        Some(&full_output_path),
+        1,
+        false,
+        None
+    );
+    // Check if directory exists
+    assert!(fs::metadata(&full_output_path).is_ok(), "Output directory not created");
+}
+
+But since the test is in the same module as the function, we need to import super::output_html. Wait, the function is in output.rs, and if the test is in the same module, then use super::output_html.
+
+The imports would be:
+
+use std::path::Path;
+use std::fs;
+use std::env;
+use super::output_html;
+
+The test uses the output_html function with a path that includes a subdirectory. Before the patch, since create_dir is used, if the parent directory (output_path in the test's base_dir) doesn't exist, it would fail. But in the test, the full_output_path is base_dir/join("grcov_test_output")/join("subpath"), and base_dir is temp_dir. The base_dir is the OS's temp directory, so the "grcov_test_output" directory may not exist yet. Therefore, the create_dir would fail because it would try to create only "subpath" inside "grcov_test_output", assuming that the parent exists. So the test would fail before the patch because create_dir can't create "subpath" if "grcov_test_output" does not exist.
+
+After the patch, create_dir_all is used, so it would create both directories.
+
+Therefore, the test will pass after the patch and fail before.
+
+Thus, the test needs to set up a path with multiple levels that do not exist yet. The test creates that full path via the function call. The code before the patch would fail to create that path, and after it would create it.
+
+So the test is correct. Now, implementing this in code.
+
+The function is in output.rs, so the test should be in the same file. The existing code in the patch does not show a test, so the test can be added there.
+
+The test's name is important to be unique. The name here is test_output_html_creates_directory_path.
+
+Now, the test code in Rust:
+
+But the test should use the function with all parameters. The dummy results is an empty vector.
+
+So putting all together:
+
+Use the imports as shown, create the path as described, call output_html with the parameters, then assert that the directory exists.
+
+Now, the code.
+</think>
+
+<Filename> src/output.rs </Filename>
+<imports> 
+use std::fs;
+use std::path::Path;
+use std::env;
+use super::output_html;
+use std::collections::VecDeque;
+use std::sync::Arc;
+</imports>
+<Rust>
+#[test]
+fn test_output_html_creates_nested_output_dirs() {
+    // Set up a temporary test directory
+    let temp_dir = env::temp_dir();
+    let base_path = temp_dir.join("grcov_output_test");
+    let output_path = base_path.join("nested").join("subpath");
+    
+    // Clean up existing directory if present
+    if fs::metadata(&base_path).is_ok() {
+        fs::remove_dir_all(&base_path).unwrap();
+    }
+    
+    // Mock parameters
+    let results = vec![];
+    let output_dir = Some(output_path.as_path());
+    let num_threads = 1;
+    let branch_enabled = false;
+    let output_config_file = None;
+    
+    // Execute the function
+    output_html(
+        &results,
+        output_dir,
+        num_threads,
+        branch_enabled,
+        output_config_file,
+    );
+    
+    // Verify the directory structure was created
+    assert!(
+        fs::metadata(output_path.parent().unwrap()).is_ok(),
+        "Output parent directory not created"
+    );
+}
+</Rust>

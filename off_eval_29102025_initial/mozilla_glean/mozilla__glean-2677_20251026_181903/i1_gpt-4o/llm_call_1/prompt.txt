@@ -1,0 +1,276 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Instrument database loading cases
+rkv likely tells us the difference between "Tried to open the db and there wasn't one" and "Tried to open the db and it was broken" cases that result in Glean performing first run actions (generating client_id, resetting `seq` and `first_run_hour`, etc).
+
+We should consider instrumenting these cases of first run so we can help diagnose what proportions of first runs aren't actually "first"
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -381,6 +381,16 @@ impl Glean {
+                 .size
+                 .accumulate_sync(self, size.get() as i64)
+         }
++
++        if let Some(rkv_load_state) = self
++            .data_store
++            .as_ref()
++            .and_then(|database| database.rkv_load_state())
++        {
++            self.database_metrics
++                .rkv_load_error
++                .set_sync(self, rkv_load_state)
++        }
+     }
+ 
+     /// Signals that the environment is ready to submit pings.
+
+diff --git a/glean-core/src/database/mod.rs b/glean-core/src/database/mod.rs
+--- a/glean-core/src/database/mod.rs
++++ b/glean-core/src/database/mod.rs
+@@ -38,7 +38,13 @@ pub type SingleStore = rkv::SingleStore<rkv::backend::SafeModeDatabase>;
+ /// cbindgen:ignore
+ pub type Writer<'t> = rkv::Writer<rkv::backend::SafeModeRwTransaction<'t>>;
+ 
+-pub fn rkv_new(path: &Path) -> std::result::Result<Rkv, rkv::StoreError> {
++#[derive(Debug)]
++pub enum RkvLoadState {
++    Ok,
++    Err(rkv::StoreError),
++}
++
++pub fn rkv_new(path: &Path) -> std::result::Result<(Rkv, RkvLoadState), rkv::StoreError> {
+     match Rkv::new::<rkv::backend::SafeMode>(path) {
+         // An invalid file can mean:
+         // 1. An empty file.
+@@ -50,15 +56,20 @@ pub fn rkv_new(path: &Path) -> std::result::Result<Rkv, rkv::StoreError> {
+             let safebin = path.join("data.safe.bin");
+             fs::remove_file(safebin).map_err(|_| rkv::StoreError::FileInvalid)?;
+             // Now try again, we only handle that error once.
+-            Rkv::new::<rkv::backend::SafeMode>(path)
++            let rkv = Rkv::new::<rkv::backend::SafeMode>(path)?;
++            Ok((rkv, RkvLoadState::Err(rkv::StoreError::FileInvalid)))
+         }
+         Err(rkv::StoreError::DatabaseCorrupted) => {
+             let safebin = path.join("data.safe.bin");
+             fs::remove_file(safebin).map_err(|_| rkv::StoreError::DatabaseCorrupted)?;
+             // Try again, only allowing the error once.
+-            Rkv::new::<rkv::backend::SafeMode>(path)
++            let rkv = Rkv::new::<rkv::backend::SafeMode>(path)?;
++            Ok((rkv, RkvLoadState::Err(rkv::StoreError::DatabaseCorrupted)))
++        }
++        other => {
++            let rkv = other?;
++            Ok((rkv, RkvLoadState::Ok))
+         }
+-        other => other,
+     }
+ }
+ 
+@@ -173,8 +184,11 @@ pub struct Database {
+     /// so as to persist them to disk using rkv in bulk on demand.
+     ping_lifetime_data: Option<RwLock<BTreeMap<String, Metric>>>,
+ 
+-    // Initial file size when opening the database.
++    /// Initial file size when opening the database.
+     file_size: Option<NonZeroU64>,
++
++    /// RKV load state
++    rkv_load_state: RkvLoadState,
+ }
+ 
+ impl std::fmt::Debug for Database {
+@@ -232,7 +246,7 @@ impl Database {
+         log::debug!("Database path: {:?}", path.display());
+         let file_size = database_size(&path);
+ 
+-        let rkv = Self::open_rkv(&path)?;
++        let (rkv, rkv_load_state) = Self::open_rkv(&path)?;
+         let user_store = rkv.open_single(Lifetime::User.as_str(), StoreOptions::create())?;
+         let ping_store = rkv.open_single(Lifetime::Ping.as_str(), StoreOptions::create())?;
+         let application_store =
+@@ -250,6 +264,7 @@ impl Database {
+             application_store,
+             ping_lifetime_data,
+             file_size,
++            rkv_load_state,
+         };
+ 
+         db.load_ping_lifetime_data();
+@@ -262,6 +277,15 @@ impl Database {
+         self.file_size
+     }
+ 
++    /// Get the rkv load state.
++    pub fn rkv_load_state(&self) -> Option<String> {
++        if let RkvLoadState::Err(e) = &self.rkv_load_state {
++            Some(e.to_string())
++        } else {
++            None
++        }
++    }
++
+     fn get_store(&self, lifetime: Lifetime) -> &SingleStore {
+         match lifetime {
+             Lifetime::User => &self.user_store,
+@@ -271,14 +295,14 @@ impl Database {
+     }
+ 
+     /// Creates the storage directories and inits rkv.
+-    fn open_rkv(path: &Path) -> Result<Rkv> {
++    fn open_rkv(path: &Path) -> Result<(Rkv, RkvLoadState)> {
+         fs::create_dir_all(path)?;
+ 
+-        let rkv = rkv_new(path)?;
++        let (rkv, load_state) = rkv_new(path)?;
+         migrate(path, &rkv);
+ 
+         log::info!("Database initialized");
+-        Ok(rkv)
++        Ok((rkv, load_state))
+     }
+ 
+     /// Build the key of the final location of the data in the database.
+@@ -1484,9 +1508,13 @@ mod test {
+             let f = File::create(safebin).expect("create database file");
+             drop(f);
+ 
+-            Database::new(dir.path(), false).unwrap();
++            let db = Database::new(dir.path(), false).unwrap();
+ 
+             assert!(dir.path().exists());
++            assert!(
++                matches!(db.rkv_load_state, RkvLoadState::Err(_)),
++                "Load error recorded"
++            );
+         }
+ 
+         #[test]
+@@ -1501,9 +1529,13 @@ mod test {
+             let safebin = database_dir.join("data.safe.bin");
+             fs::write(safebin, "<broken>").expect("write to database file");
+ 
+-            Database::new(dir.path(), false).unwrap();
++            let db = Database::new(dir.path(), false).unwrap();
+ 
+             assert!(dir.path().exists());
++            assert!(
++                matches!(db.rkv_load_state, RkvLoadState::Err(_)),
++                "Load error recorded"
++            );
+         }
+ 
+         #[test]
+
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -261,6 +261,9 @@ impl UploadMetrics {
+ #[derive(Debug)]
+ pub struct DatabaseMetrics {
+     pub size: MemoryDistributionMetric,
++
++    /// RKV's load result, indicating success or relaying the detected error.
++    pub rkv_load_error: StringMetric,
+ }
+ 
+ impl DatabaseMetrics {
+@@ -277,6 +280,15 @@ impl DatabaseMetrics {
+                 },
+                 MemoryUnit::Byte,
+             ),
++
++            rkv_load_error: StringMetric::new(CommonMetricData {
++                name: "rkv_load_error".into(),
++                category: "glean.error".into(),
++                send_in_pings: vec!["metrics".into()],
++                lifetime: Lifetime::Ping,
++                disabled: false,
++                dynamic_label: None,
++            }),
+         }
+     }
+ }
+
+diff --git a/glean-core/src/lib_unit_tests.rs b/glean-core/src/lib_unit_tests.rs
+--- a/glean-core/src/lib_unit_tests.rs
++++ b/glean-core/src/lib_unit_tests.rs
+@@ -1077,11 +1077,13 @@ fn records_database_file_size() {
+     let dir = tempfile::tempdir().unwrap();
+     let tmpname = dir.path().display().to_string();
+ 
+-    // Initialize Glean once to ensure we create the database.
++    // Initialize Glean once to ensure we create the database and did not error.
+     let glean = Glean::with_options(&tmpname, GLOBAL_APPLICATION_ID, true);
+     let database_size = &glean.database_metrics.size;
+     let data = database_size.get_value(&glean, "metrics");
++
+     assert!(data.is_none());
++
+     drop(glean);
+ 
+     // Initialize Glean again to record file size.
+@@ -1094,6 +1096,11 @@ fn records_database_file_size() {
+ 
+     // We should see the database containing some data.
+     assert!(data.sum > 0);
++
++    let rkv_load_state = &glean.database_metrics.rkv_load_error;
++    let rkv_load_error = rkv_load_state.get_value(&glean, "metrics");
++
++    assert_eq!(rkv_load_error, None);
+ }
+ 
+ #[cfg(not(target_os = "windows"))]
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn rkv_new(path: &Path) -> std::result::Result<(Rkv, RkvLoadState), rkv::StoreError>
+
+fn records_database_file_size() -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

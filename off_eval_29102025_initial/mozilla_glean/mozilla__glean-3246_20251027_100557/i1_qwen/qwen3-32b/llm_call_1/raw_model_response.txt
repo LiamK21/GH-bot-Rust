@@ -1,0 +1,377 @@
+<think>
+Okay, let's see. The user wants me to create a regression test for the patch provided. The issue is about removing infill 0 buckets from custom distributions. The patch modifies the snapshot_values function in the Histogram struct. 
+
+First, I need to understand what the patch does. The original code for snapshot_values fills in missing buckets up to the max filled bucket. The patch removes that logic and just returns the cloned values. So, before the patch, if there were missing buckets (with 0 counts), they got filled. After the patch, those buckets are not included unless they exist in the values.
+
+So the test should check that after the patch, the snapshot_values does not include the infill 0 buckets. 
+
+Let me think about how to set this up. I need to create a Histogram with some PrecomputedLinear or Exponential, then add some values, and check the output of snapshot_values.
+
+Wait, in the patch, the Precomputed structures (Exponential and Linear) have their PartialEq implementations added. Maybe the test needs to compare two histograms. But the main change is in snapshot_values.
+
+So the test steps would be: 
+
+1. Create a histogram with a specific bucketing (linear or exponential) that has certain ranges.
+2. Add some data to the histogram such that there are gaps between the buckets.
+3. Call snapshot_values.
+4. Check that the returned HashMap does not contain the missing buckets (0 counts) that were filled in before.
+
+Let's pick linear for simplicity. Let's say we create a histogram with ranges 10, 20, 30. Then add a value of 15 (which falls into the first bucket, but maybe the next buckets are 20, 30, etc. Wait, the linear range is generated with min, max, count. For example, if I use linear_range(10, 30, 3), the steps would be 10, 20, 30. So the buckets are [10, 20), [20,30), [30, ...). Wait, no, the linear range might generate 10, 20, 30 as the bucket edges. So the sample 15 would go into the first bucket (counting as 1), sample 25 into the second, etc.
+
+Now, suppose we create a histogram with these ranges. Then, add a sample of 15 (counts in first bucket) and 25 (counts in second). The snapshot_values before the patch would include all three buckets (with 0 in the third if not added). After the patch, only the first two buckets are present.
+
+Wait, the original code had a loop to fill in missing entries up to max_bucket. So if the max bucket in the values is 20 (i.e., the second bucket), then the loop would go through all the min_buckets (from the ranges) up to that max. But in this case, the ranges would be 10, 20, 30. So if the max_bucket is 20 (the second bucket's min?), then the loop would process up to that.
+
+Wait, perhaps the original code added the min_bucket entries, even if they were beyond the max filled bucket. Wait, in the original code, the loop iterates through all the ranges in the bucketing. For each, it inserts into res if it's not present. But then breaks when min_bucket is greater than max_bucket (the max filled bucket).
+
+Wait, max_bucket is the max key in the current values. So if there's no values, it's 0. The loop goes through each min_bucket (from the ranges). For each, it inserts 0 if not present. Then breaks if the min_bucket is larger than the max_bucket.
+
+So if the max_bucket is, say, 20, and the next min_bucket is 20 (the second bucket's min?), maybe that's where the loop stops. Not sure. But the point is, the original code filled in all buckets up to the max filled, whereas the new code removes that.
+
+So to test this, the test should create a histogram with precomputed buckets that have gaps in the sample data. For example, create a histogram with buckets at 10, 20, 30. Add samples to the first and third buckets. Before the patch, snapshot_values would include 10, 20, 30, with 0 in 20. After the patch, only the 10 and 30 would be present in the values.
+
+Wait, but in the code, the 'max_bucket' is the maximum key in the current values. Suppose after adding a sample to 10 (bucket 10?), but not to 20. Then the original code would add 10, 20, and 30 buckets (with 0s for 20 and 30?), but the new code would only return the existing keys.
+
+Hmm, perhaps the test case is to create a histogram with precomputed linear buckets (say, 10, 20, 30), add a sample to 10 (which is in the first bucket?), and check that the snapshot_values does not include the 20 and 30 buckets as 0s. Because before the patch, those would be filled. After the patch, they are not.
+
+But how to add samples to the histogram? The Histogram struct's methods need to be used. For example, maybe there's a record method.
+
+So the steps in the test:
+
+1. Create a PrecomputedLinear with min=10, max=30, count=3 (buckets 10, 20, 30).
+
+2. Create a Histogram using this PrecomputedLinear.
+
+3. Record a value of 15 (which would fall into the first bucket) and a value of 35 (which would be in overflow or maybe the third bucket? Wait, linear_range(10, 30, 3) would generate 10, 20, 30. The buckets are [10,20), [20,30), [30, ...). Wait, the bucketing is such that each bucket is [previous max, new max). So for linear, the ranges are 10, 20, 30. The first bucket is 10 to 20, the second is 20 to 30, the third is 40. Wait, no. The linear_range function for min 10, max 30, count 3 would create steps of (30-10)/3 = 6.666? Wait, linear_range adds min + i * step. Wait, the actual code may vary. Let's think: the linear_range function is supposed to generate a vector of bucket edges. For example, for count=3, min=10, max=40, count=3 would generate 10, 20, 30, 40? Or 10, 20, 30. Maybe the code for linear_range is min is the first, then each step is (max - min) / (count as f64) ?
+
+But perhaps for our test, the exact range is not critical as long as there are multiple buckets. So I can create a PrecomputedLinear with min 10, max 30, and 3 buckets. Then, the range would be 10, 20, 30. So the buckets are [10,20), [20,30), and then [30, ...). But the sample 30 would go into the third bucket. Wait, the PrecomputedLinear's ranges would be 10,20,30. So the bucket ranges would be from 10 to 20, then 20 to 30, then 30 and above. So, when you call the record method for a value like 15, it's in the first bucket. A value of 25 is in the second. A value of 35 is in the third (overflow bucket?), but that depends on how the PrecomputedLinear's bucketing is implemented.
+
+In any case, the idea is to have a histogram where there are some buckets with data and others not. The test should create a scenario where the snapshot_values before had filled in the empty buckets as zero, and after the patch, they are not included.
+
+So the test would:
+
+- Create a PrecomputedLinear with 3 buckets (10,20,30).
+- Create a Histogram using this.
+- Record a value (15) which lands in the first bucket.
+- Call snapshot_values and check that the second and third buckets (20 and 30) are not present in the hash map.
+
+Before the patch, the snapshot_values would include them with zero counts. After the patch, only the first bucket is present.
+
+Therefore, the test case would be to check that those buckets are not present after the patch. Thus, the test would create a histogram with some data, then check that the snapshot doesn't have the zero-infilled buckets.
+
+Now, how to implement this in Rust code.
+
+First, the imports. The PrecomputedLinear is in glean-core/src/histogram/linear.rs, but the test would be in that same file's test module. The Histogram struct is in glean-core/src/histogram/mod.rs. So in the test, I need to use these structs.
+
+Wait, the test is in the same file as the PrecomputedLinear and Histogram, or is it in a separate file? The user's instruction says to return the filename where the test should be added. The patch modifies the linear.rs, exponential.rs, and mod.rs. The snapshot_values is in the Histogram's implementation in mod.rs. So the test should be in the mod.rs's tests or another file.
+
+Looking at the patch, there's no existing test in the mod.rs's mod tests. So the new test should be added there.
+
+But the user's example shows that if there's an existing test in the patch, the new test name must be unique. Let's assume that the test is added to the same file (glean-core/src/histogram/mod.rs) in a tests module.
+
+But according to the user's instructions, the test should be written as a single #[test] function. So the code should include the necessary imports and functions.
+
+So, in the test, we need to:
+
+- Use PrecomputedLinear (from linear.rs)
+- Use Histogram (from mod.rs)
+- Create a PrecomputedLinear instance with min=10, max=30, count=3.
+- Create a Histogram with that PrecomputedLinear.
+- Record some values into the first bucket.
+- Call snapshot_values and check that certain buckets are not present.
+
+Wait, the PrecomputedLinear is a separate module, but in the code, the Histogram struct is in the mod.rs. So the test might need to import PrecomputedLinear from the linear module. How to handle that? In the test, perhaps the PrecomputedLinear is accessible via a relative path, like super::PrecomputedLinear, but I need to make sure the code is correct.
+
+So the imports would need to include the PrecomputedLinear from the linear module.
+
+The code structure is something like:
+
+mod linear {
+    pub struct PrecomputedLinear { ... }
+}
+
+mod mod.rs {
+    use super::linear::PrecomputedLinear;
+    impl Histogram { ... }
+}
+
+So in the test written in mod.rs, to use PrecomputedLinear, it would need to import it via 'use super::linear::PrecomputedLinear;' ?
+
+But the user's instruction says to use 'use super::<function name> for the function under test. So perhaps the test code will need to import the PrecomputedLinear from the linear module.
+
+So in the imports section, we need to include:
+
+use super::linear::PrecomputedLinear;
+use super::Histogram;
+
+But also, perhaps the test needs to create a Histogram, which is in the same module. So the imports are:
+
+The test is written in the same file as the Histogram, so using the structs directly.
+
+Now, the code.
+
+The test would be:
+
+Create a PrecomputedLinear with min=10, max=30, count=3. The linear_range function is in the linear module. So in the test, to create the PrecomputedLinear instance, we can call PrecomputedLinear::new or whatever constructor it has. Wait, looking at the code, the PrecomputedLinear struct has min, max, and bucket_count. The PrecomputedLinear struct's ranges are computed on first access. So maybe the PrecomputedLinear is constructed with some function. Wait, in the code, the PrecomputedLinear is initialized by the linear_range function, but that function returns a Vec<u64>. The PrecomputedLinear struct's fields are min, max, bucket_count. So perhaps there's a function to create a PrecomputedLinear instance.
+
+Alternatively, perhaps the test can directly instantiate the PrecomputedLinear with min, max, bucket_count. Let's check the struct definition:
+
+In linear.rs:
+
+pub struct PrecomputedLinear {
+    min: u64,
+    max: u64,
+    bucket_count: usize,
+}
+
+So, perhaps the test can create an instance by setting these values. But since they are pub, maybe not. Wait, the fields are pub(crate). So in the test, if the test is in the same crate, can we create the struct directly?
+
+The PrecomputedLinear fields are:
+
+pub struct PrecomputedLinear {
+    min: u64,
+    max: u64,
+    bucket_count: usize,
+}
+
+Wait, in the code, the fields are 'pub(crate)'. So for a test within the same crate (glean-core), the test can access them.
+
+Wait, in the code: the fields in PrecomputedLinear are 'pub(crate) min: u64, ...', which means they are public only within the crate. So in a test, if the test is in the same module or another module of the same crate, the test can access them. However, creating a PrecomputedLinear instance requires setting those fields, but since the PrecomputedLinear struct is public, but the fields are pub(crate), the test can create the instance by providing the fields via the struct constructor?
+
+Wait, perhaps not. Because the PrecomputedLinear's fields are pub(crate), they are not public in other modules. So unless there's a constructor function, the test cannot create an instance of PrecomputedLinear.
+
+But in the code, the PrecomputedLinear is supposed to be constructed via the linear_range function. Wait, no. The linear_range function returns a Vec<u64>, which is the list of bucket edges. The PrecomputedLinear struct is separate. Hmm. Maybe there's a way to create a PrecomputedLinear instance. Let me check the code again.
+
+The PrecomputedLinear struct is used as a Bucketing implementation. The Bucketing trait likely has a method to compute the bucket for a sample, etc. But for the test, perhaps the test can create a PrecomputedLinear struct with the given parameters.
+
+Alternatively, maybe the test can create a PrecomputedLinear via a method that creates it from the min, max, and count. For example, the linear_range function returns the bucket edges, but the PrecomputedLinear is initialized with min, max, and bucket_count. So perhaps to create a PrecomputedLinear, the test can call some constructor.
+
+Wait, looking at the linear.rs code:
+
+The PrecomputedLinear is defined as:
+
+pub struct PrecomputedLinear {
+    pub(crate) min: u64,
+    pub(crate) max: u64,
+    pub(crate) bucket_count: usize,
+}
+
+Since the fields are pub(crate), and the struct is public, perhaps the test can create an instance directly, but that's possible only if the test is in the same module. But if the test is in the mod.rs (the histogram module), accessing the PrecomputedLinear from the linear module may not be possible unless there's a public constructor.
+
+Alternatively, maybe the code has a public function that returns a PrecomputedLinear. If not, perhaps we need to create a PrecomputedLinear by using the linear_range function and then creating it from that. But the PrecomputedLinear's fields are min, max, bucket_count. For example, if we call linear_range(10, 30, 3), which would create a Vec of [10, 20, 30]. Then, the PrecomputedLinear's min is 10, max 30, bucket_count 3. So the test can create a PrecomputedLinear with those values.
+
+But how to create it? Since the struct is public, and the fields are pub(crate), maybe the test can create it directly. For example, in the test code:
+
+let bucket_config = PrecomputedLinear {
+    min: 10,
+    max: 30,
+    bucket_count: 3,
+};
+
+But how to access PrecomputedLinear from the test code? The struct is in the linear module. So in the test code in mod.rs (histogram/mod.rs), the code would need to import it from the linear module.
+
+So the imports would include:
+
+use super::Histogram;
+use super::linear::PrecomputedLinear;
+
+Wait, but if the test is in mod.rs, the linear module is part of the same crate. Assuming that the mod.rs has access to the linear module, the test can import super::linear::PrecomputedLinear.
+
+But in the code, the PrecomputedLinear struct is in the histogram::linear module. So the correct path would be use crate::histogram::linear::PrecomputedLinear; but perhaps the test is in the same crate, and the imports can be via super.
+
+Alternatively, perhaps the test is part of the same module hierarchy. Assuming that the test is written in the histogram::mod.rs, and the PrecomputedLinear is in histogram::linear. So the imports would be:
+
+use super::linear::PrecomputedLinear;
+
+But no, in mod.rs, the super would refer to the parent module. If the test is in histogram::mod.rs, which is part of the histogram crate, then perhaps it's:
+
+use crate::histogram::linear::PrecomputedLinear;
+
+But since the test is in the same crate, this is possible. However, the user's instructions require that the test is self-contained and uses 'use super::' for functions under test.
+
+But given the code structure, perhaps the correct way is to import the PrecomputedLinear as super::linear::PrecomputedLinear, but that depends on the actual module hierarchy.
+
+Assuming that the test is written in the same mod.rs where the code exists, perhaps the test can use use super::linear::PrecomputedLinear;. But if the test is in the histogram::mod.rs, and the linear module is a sibling to mod.rs, then the correct import path may be crate::linear::PrecomputedLinear.
+
+But without knowing the exact module structure, perhaps the correct way is to assume that the PrecomputedLinear is accessible via the linear module in the same crate.
+
+Alternatively, perhaps the test can create a PrecomputedLinear by using the linear_range function. Wait, the linear_range function returns a Vec<u64> which is the list of ranges. The PrecomputedLinear is a struct that uses min, max, and bucket_count to compute the bucket ranges on demand. So for the test, to create a PrecomputedLinear, the min, max, and bucket_count need to be set correctly.
+
+So in the test, create a PrecomputedLinear with min=10, max=30, bucket_count=3. Then, create a Histogram with this PrecomputedLinear, then add some samples.
+
+But to add samples, the Histogram has a record method. Let's check the code. The Histogram struct's implementation may have a method to record a value. For example:
+
+impl<B> Histogram<B> {
+    pub fn record(&self, sample: B::Value);
+}
+
+But again, the actual code may vary. Assuming that the Histogram has a record method that takes a value and adds it to the histogram.
+
+Once the samples are added, the test calls snapshot_values and checks the keys present.
+
+So the test code would look like:
+
+use super::Histogram;
+use super::linear::PrecomputedLinear;
+
+#[test]
+fn test_snapshot_values_no_infill() {
+    let bucket_config = PrecomputedLinear {
+        min: 10,
+        max: 30,
+        bucket_count: 3,
+    };
+    let histogram = Histogram::new(bucket_config);
+    histogram.record(15); // lands in first bucket
+    histogram.record(35); // maybe lands in the third bucket?
+
+    let snapshot = histogram.snapshot_values();
+    assert!(!snapshot.contains_key(&20));
+    assert!(!snapshot.contains_key(&30));
+}
+
+But wait, the first bucket's key is 10. The second is 20, third is 30. But how does the Histogram's bucketing work? The PrecomputedLinear's bucketing would assign the sample to a bucket based on the sample's value. When snapshot_values is called, the original code would include 10, 20, 30 keys if those buckets were filled. But in our case, after adding 15 (bucket 10) and 35 (which may land in the third bucket, say 30?), the max_bucket is 30. Before the patch, the loop would go through the ranges (10, 20, 30), add entries for 10, 20, 30. After the patch, the snapshot is the cloned self.values. If the code only inserts the actual keys that have counts (i.e., 10 and 30), then the test would pass.
+
+But in this case, the test is checking that 20 and 30 are not present.
+
+But how to make sure that the 20 bucket is not present. So in the test, after adding the two samples (15 and 35), the values map would have entries for 10 and 30. Then snapshot_values would return those entries. The test checks that the keys 20 and 30 are not present. Wait, 30 is the max_bucket. If the new code returns the self.values, which includes the keys that were added (which would be 10 and 30). Wait, no. The Histogram's values are stored as a HashMap where the key is the bucket's minimum value. When a sample is recorded, it is mapped to a bucket's min value. So for sample 15, it's in the first bucket (10), so the key is 10, count is 1. For sample 35, it's in the third bucket (30), so key is 30, count is 1. The 'values' HashMap would have entries for 10 and 30. The snapshot_values after the patch is just the clone of self.values, which includes 10 and 30. But the code loops through the ranges (the PrecomputedLinear's bucketing.ranges() would give the ranges as [10, 20, 30]. But in the precomputed case, the ranges are computed on first access. Hmm, but the PrecomputedLinear's ranges are generated by the linear_range function. For the example, the linear_range(10, 30, 3) would be [10, 20, 30]. The PrecomputedLinear's ranges() method would return this. The bucketing for the histogram uses this.
+
+But for the test, the sample is recorded via the Histogram's record method, which uses the bucketing's get_bucket method. So the sample 15 would be in the first bucket (10), and the sample 35 would be in the third bucket (30). Thus, the values HashMap would have keys 10 and 30. The snapshot_values would then return that HashMap, which does not contain the key 20. Thus, the test can check that 20 is not present.
+
+So, in the test, after recording samples, call snapshot_values and assert that the keys 20 and others are not present.
+
+So the test code would be:
+
+Create a PrecomputedLinear with min=10, max=30, bucket_count=3.
+
+Create a Histogram with that.
+
+Record a sample that lands in the first bucket (15) and a sample in the third (35). Then check that the snapshot doesn't have the second bucket (20) with zero count.
+
+Thus, the test would be:
+
+#[test]
+fn test_snapshot_values_does_not_infill_zeros() {
+    let bucket_config = PrecomputedLinear {
+        min: 10,
+        max: 30,
+        bucket_count: 3,
+    };
+    let hist = Histogram::new(bucket_config);
+    hist.record(15); // lands in 10 bucket
+    hist.record(35); // lands in 30 bucket
+
+    let snapshot = hist.snapshot_values();
+    assert_eq!(snapshot.len(), 2); // Only 10 and 30
+    assert!(snapshot.contains_key(&10));
+    assert!(snapshot.contains_key(&30));
+    assert!(!snapshot.contains_key(&20));
+}
+
+But how to create the Histogram? The Histogram's new function would take the PrecomputedLinear and create a new instance. Assuming that Histogram has a new function that takes B: Bucketing and returns Histogram<B>, which is the case given the code.
+
+So, the code for the test would be as above.
+
+Now, the imports would need to include Histogram and PrecomputedLinear.
+
+But for the PrecomputedLinear, the test is in the same crate and the struct is public, so the import is possible.
+
+But the PrecomputedLinear is in the linear module, so in the test, the code would need to import it.
+
+So, the imports would be:
+
+use super::Histogram;
+use crate::histogram::linear::PrecomputedLinear;
+
+But according to the user's instructions, the use statements must be in the imports block and must not use group imports.
+
+So the imports would be:
+
+<imports>
+use super::Histogram;
+use crate::histogram::linear::PrecomputedLinear;
+</imports>
+
+But the user's example shows that in the patch, the files modified are histogram/exponential.rs, histogram/linear.rs, and histogram/mod.rs. The test is being written in mod.rs, so the 'super' for Histogram is correct.
+
+But the user's instruction says to only use 'use super::' for functions under test. For PrecomputedLinear, since it's in the linear module, perhaps it's accessed via crate::histogram::linear::PrecomputedLinear.
+
+However, depending on the actual crate structure, it might be necessary to adjust the import path. However, given the user's instructions, perhaps the correct import is:
+
+use crate::histogram::linear::PrecomputedLinear;
+
+But the user's instruction requires that if the test is in the same file as the function under test, use super::. So, since the test is in mod.rs (histogram/mod.rs), the Histogram is in the same module, so 'use super::Histogram' is correct. For PrecomputedLinear in linear.rs, which is part of the histogram module, perhaps the correct path is 'use crate::histogram::linear::PrecomputedLinear;'.
+
+But the user's instruction says to avoid group imports and to use only necessary imports.
+
+Assuming that the test is written in the same crate and the PrecomputedLinear is accessible via the correct path, the imports would be:
+
+use crate::histogram::linear::PrecomputedLinear;
+use crate::histogram::Histogram;
+
+But since the code is in the same file where Histogram is defined, the super might work. However, the PrecomputedLinear is in a different module. So in the test case, the code would need to use super::linear::PrecomputedLinear.
+
+But if the test is in the mod.rs (histogram::mod.rs), and the linear module is part of the histogram crate, then the correct path would be:
+
+use super::linear::PrecomputedLinear;
+
+Wait, no. The mod.rs is the parent module, and the linear module is a sibling. So to import PrecomputedLinear from the linear module, which is a module in the same crate, perhaps the correct path is:
+
+use crate::histogram::linear::PrecomputedLinear;
+
+But the user's instruction says to use 'use super::...' for functions under test. Since the PrecomputedLinear is not a function but a struct, perhaps the user's instruction allows to use the correct path.
+
+In any case, the code needs to be written in such a way that the test compiles and runs.
+
+Given the possible confusion, perhaps the test code would be:
+
+use super::Histogram;
+use crate::histogram::linear::PrecomputedLinear;
+
+#[test]
+fn test_snapshot_values_does_not_infill_zeros() {
+    let config = PrecomputedLinear {
+        min: 10,
+        max: 30,
+        bucket_count: 3,
+    };
+    let mut histogram = Histogram::new(config);
+    histogram.record(15); // lands in 10 bucket
+    histogram.record(35); // lands in 30 bucket
+
+    let snapshot = histogram.snapshot_values();
+    assert_eq!(snapshot.len(), 2);
+    assert!(snapshot.contains_key(&10));
+    assert!(snapshot.contains_key(&30));
+    assert!(!snapshot.contains_key(&20));
+}
+
+But the user's instruction says to return the filename as it is in the patch. The patch modifies mod.rs, so the filename is glean-core/src/histogram/mod.rs.
+
+Thus, the final answer would be the Filename, the imports, and the test code.
+</think>
+
+<Filename>glean-core/src/histogram/mod.rs</Filename>
+<imports>
+use super::Histogram;
+use crate::histogram::linear::PrecomputedLinear;
+</imports>
+<Rust>
+#[test]
+fn test_snapshot_values_does_not_infill_zeros() {
+    let bucket_config = PrecomputedLinear {
+        min: 10,
+        max: 30,
+        bucket_count: 3,
+    };
+    let mut hist = Histogram::new(bucket_config);
+    hist.record(15); // Falls into the first bucket [10,20)
+    hist.record(35); // Falls into the third bucket [30, ...)
+
+    let snapshot = hist.snapshot_values();
+    assert_eq!(snapshot.len(), 2); // Only 10 and 30 buckets are populated
+    assert!(snapshot.contains_key(&10));
+    assert!(snapshot.contains_key(&30));
+    assert!(!snapshot.contains_key(&20));
+}
+</Rust>

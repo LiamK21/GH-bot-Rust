@@ -1,0 +1,536 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Refactor `dispatcher::launch(.... with_glean(|..|...))` to a single function (RLB)
+As Jan-Erik rightfully pointed out on [github](https://github.com/mozilla/glean/pull/1323#discussion_r524058031), code such as:
+
+`dispatcher::launch(move || crate::with_glean(|glean| metric.add(glean, amount)));`
+
+in the rust language bindings could be refactored to a single function like:
+
+`launch_with_glean(|glean| ...)`
+
+which would internally call the dispatcher and acquire the Glean instance.
+
+This is a potentially good next bug.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -151,6 +151,17 @@ where
+     f(&mut lock)
+ }
+ 
++/// Launches a new task on the global dispatch queue with a reference to the Glean singleton.
++fn launch_with_glean(callback: impl FnOnce(&Glean) + Send + 'static) {
++    dispatcher::launch(|| crate::with_glean(callback));
++}
++
++/// Launches a new task on the global dispatch queue with a mutable reference to the
++/// Glean singleton.
++fn launch_with_glean_mut(callback: impl FnOnce(&mut Glean) + Send + 'static) {
++    dispatcher::launch(|| crate::with_glean_mut(callback));
++}
++
+ /// Creates and initializes a new Glean object.
+ ///
+ /// See [`glean_core::Glean::new`] for more information.
+@@ -352,10 +363,8 @@ pub fn shutdown() {
+         return;
+     }
+ 
+-    dispatcher::launch(move || {
+-        with_glean_mut(|glean| {
+-            glean.set_dirty_flag(false);
+-        })
++    crate::launch_with_glean_mut(|glean| {
++        glean.set_dirty_flag(false);
+     });
+ 
+     if let Err(e) = dispatcher::shutdown() {
+@@ -450,27 +459,25 @@ pub fn set_upload_enabled(enabled: bool) {
+     //
+     // Because the dispatch queue is halted until Glean is fully initialized
+     // we can safely enqueue here and it will execute after initialization.
+-    dispatcher::launch(move || {
+-        with_glean_mut(|glean| {
+-            let state = global_state().lock().unwrap();
+-            let old_enabled = glean.is_upload_enabled();
+-            glean.set_upload_enabled(enabled);
+-
+-            // TODO: Cancel upload and any outstanding metrics ping scheduler
+-            // task. Will happen on bug 1672951.
+-
+-            if !old_enabled && enabled {
+-                // If uploading is being re-enabled, we have to restore the
+-                // application-lifetime metrics.
+-                initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
+-            }
++    crate::launch_with_glean_mut(move |glean| {
++        let state = global_state().lock().unwrap();
++        let old_enabled = glean.is_upload_enabled();
++        glean.set_upload_enabled(enabled);
+ 
+-            if old_enabled && !enabled {
+-                // If uploading is disabled, we need to send the deletion-request ping:
+-                // note that glean-core takes care of generating it.
+-                state.upload_manager.trigger_upload();
+-            }
+-        });
++        // TODO: Cancel upload and any outstanding metrics ping scheduler
++        // task. Will happen on bug 1672951.
++
++        if !old_enabled && enabled {
++            // If uploading is being re-enabled, we have to restore the
++            // application-lifetime metrics.
++            initialize_core_metrics(&glean, &state.client_info, state.channel.clone());
++        }
++
++        if old_enabled && !enabled {
++            // If uploading is disabled, we need to send the deletion-request ping:
++            // note that glean-core takes care of generating it.
++            state.upload_manager.trigger_upload();
++        }
+     });
+ }
+ 
+@@ -482,10 +489,8 @@ pub fn register_ping_type(ping: &private::PingType) {
+     // Submission itself is also dispatched, so it will always come after the registration.
+     if was_initialize_called() {
+         let ping = ping.clone();
+-        dispatcher::launch(move || {
+-            with_glean_mut(|glean| {
+-                glean.register_ping_type(&ping.ping_type);
+-            })
++        crate::launch_with_glean_mut(move |glean| {
++            glean.register_ping_type(&ping.ping_type);
+         })
+     } else {
+         // We need to keep track of pings, so they get re-registered after a reset or
+@@ -570,14 +575,8 @@ pub fn set_experiment_active(
+     branch: String,
+     extra: Option<HashMap<String, String>>,
+ ) {
+-    dispatcher::launch(move || {
+-        with_glean(|glean| {
+-            glean.set_experiment_active(
+-                experiment_id.to_owned(),
+-                branch.to_owned(),
+-                extra.to_owned(),
+-            )
+-        });
++    crate::launch_with_glean(move |glean| {
++        glean.set_experiment_active(experiment_id.to_owned(), branch.to_owned(), extra)
+     })
+ }
+ 
+@@ -585,9 +584,7 @@ pub fn set_experiment_active(
+ ///
+ /// See [`glean_core::Glean::set_experiment_inactive`].
+ pub fn set_experiment_inactive(experiment_id: String) {
+-    dispatcher::launch(move || {
+-        with_glean(|glean| glean.set_experiment_inactive(experiment_id.to_owned()))
+-    })
++    crate::launch_with_glean(move |glean| glean.set_experiment_inactive(experiment_id))
+ }
+ 
+ /// Performs the collection/cleanup operations required by becoming active.
+@@ -597,16 +594,14 @@ pub fn set_experiment_inactive(experiment_id: String) {
+ /// This should be called whenever the consuming product becomes active (e.g.
+ /// getting to foreground).
+ pub fn handle_client_active() {
+-    dispatcher::launch(move || {
+-        with_glean_mut(|glean| {
+-            glean.handle_client_active();
++    crate::launch_with_glean_mut(|glean| {
++        glean.handle_client_active();
+ 
+-            // The above call may generate pings, so we need to trigger
+-            // the uploader. It's fine to trigger it if no ping was generated:
+-            // it will bail out.
+-            let state = global_state().lock().unwrap();
+-            state.upload_manager.trigger_upload();
+-        })
++        // The above call may generate pings, so we need to trigger
++        // the uploader. It's fine to trigger it if no ping was generated:
++        // it will bail out.
++        let state = global_state().lock().unwrap();
++        state.upload_manager.trigger_upload();
+     });
+ 
+     // The previous block of code may send a ping containing the `duration` metric,
+@@ -628,16 +623,14 @@ pub fn handle_client_inactive() {
+     // by the next call.
+     core_metrics::internal_metrics::baseline_duration.stop();
+ 
+-    dispatcher::launch(move || {
+-        with_glean_mut(|glean| {
+-            glean.handle_client_inactive();
++    crate::launch_with_glean_mut(|glean| {
++        glean.handle_client_inactive();
+ 
+-            // The above call may generate pings, so we need to trigger
+-            // the uploader. It's fine to trigger it if no ping was generated:
+-            // it will bail out.
+-            let state = global_state().lock().unwrap();
+-            state.upload_manager.trigger_upload();
+-        })
++        // The above call may generate pings, so we need to trigger
++        // the uploader. It's fine to trigger it if no ping was generated:
++        // it will bail out.
++        let state = global_state().lock().unwrap();
++        state.upload_manager.trigger_upload();
+     })
+ }
+
+diff --git a/glean-core/rlb/src/private/boolean.rs b/glean-core/rlb/src/private/boolean.rs
+--- a/glean-core/rlb/src/private/boolean.rs
++++ b/glean-core/rlb/src/private/boolean.rs
+@@ -7,8 +7,6 @@ use std::sync::Arc;
+ 
+ use glean_core::metrics::MetricType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -33,7 +31,7 @@ impl BooleanMetric {
+ impl glean_core::traits::Boolean for BooleanMetric {
+     fn set(&self, value: bool) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, value));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<bool> {
+
+diff --git a/glean-core/rlb/src/private/counter.rs b/glean-core/rlb/src/private/counter.rs
+--- a/glean-core/rlb/src/private/counter.rs
++++ b/glean-core/rlb/src/private/counter.rs
+@@ -9,8 +9,6 @@ use std::sync::Arc;
+ use glean_core::metrics::MetricType;
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -40,7 +38,7 @@ impl CounterMetric {
+ impl glean_core::traits::Counter for CounterMetric {
+     fn add(&self, amount: i32) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.add(glean, amount)));
++        crate::launch_with_glean(move |glean| metric.add(glean, amount));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<i32> {
+
+diff --git a/glean-core/rlb/src/private/custom_distribution.rs b/glean-core/rlb/src/private/custom_distribution.rs
+--- a/glean-core/rlb/src/private/custom_distribution.rs
++++ b/glean-core/rlb/src/private/custom_distribution.rs
+@@ -8,8 +8,6 @@ use std::sync::Arc;
+ use glean_core::metrics::{DistributionData, MetricType};
+ use glean_core::{CommonMetricData, ErrorType, HistogramType};
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -48,9 +46,7 @@ impl CustomDistributionMetric {
+ impl glean_core::traits::CustomDistribution for CustomDistributionMetric {
+     fn accumulate_samples_signed(&self, samples: Vec<i64>) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || {
+-            crate::with_glean(|glean| metric.accumulate_samples_signed(glean, samples))
+-        });
++        crate::launch_with_glean(move |glean| metric.accumulate_samples_signed(glean, samples));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(
+
+diff --git a/glean-core/rlb/src/private/datetime.rs b/glean-core/rlb/src/private/datetime.rs
+--- a/glean-core/rlb/src/private/datetime.rs
++++ b/glean-core/rlb/src/private/datetime.rs
+@@ -9,8 +9,6 @@ use glean_core::metrics::MetricType;
+ pub use glean_core::metrics::{Datetime, TimeUnit};
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -37,7 +35,7 @@ impl DatetimeMetric {
+ impl glean_core::traits::Datetime for DatetimeMetric {
+     fn set(&self, value: Option<Datetime>) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, value));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<Datetime> {
+
+diff --git a/glean-core/rlb/src/private/event.rs b/glean-core/rlb/src/private/event.rs
+--- a/glean-core/rlb/src/private/event.rs
++++ b/glean-core/rlb/src/private/event.rs
+@@ -8,7 +8,7 @@ use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+ use glean_core::metrics::MetricType;
+ use glean_core::traits;
+ 
+-use crate::{dispatcher, ErrorType, RecordedEvent};
++use crate::{ErrorType, RecordedEvent};
+ 
+ pub use glean_core::traits::NoExtraKeys;
+ 
+@@ -56,7 +56,7 @@ impl<K: traits::ExtraKeys> traits::Event for EventMetric<K> {
+             .into()
+             .map(|h| h.into_iter().map(|(k, v)| (k.index(), v)).collect());
+         let metric = Arc::clone(&self.inner);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.record(glean, now, extra)));
++        crate::launch_with_glean(move |glean| metric.record(glean, now, extra));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(
+
+diff --git a/glean-core/rlb/src/private/memory_distribution.rs b/glean-core/rlb/src/private/memory_distribution.rs
+--- a/glean-core/rlb/src/private/memory_distribution.rs
++++ b/glean-core/rlb/src/private/memory_distribution.rs
+@@ -8,8 +8,6 @@ use std::sync::Arc;
+ use glean_core::metrics::{DistributionData, MemoryUnit, MetricType};
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -36,7 +34,7 @@ impl MemoryDistributionMetric {
+ impl glean_core::traits::MemoryDistribution for MemoryDistributionMetric {
+     fn accumulate(&self, sample: u64) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.accumulate(glean, sample)));
++        crate::launch_with_glean(move |glean| metric.accumulate(glean, sample));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(
+
+diff --git a/glean-core/rlb/src/private/quantity.rs b/glean-core/rlb/src/private/quantity.rs
+--- a/glean-core/rlb/src/private/quantity.rs
++++ b/glean-core/rlb/src/private/quantity.rs
+@@ -8,8 +8,6 @@ use std::sync::Arc;
+ use glean_core::metrics::MetricType;
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type, otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -34,7 +32,7 @@ impl QuantityMetric {
+ impl glean_core::traits::Quantity for QuantityMetric {
+     fn set(&self, value: i64) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, value));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<i64> {
+
+diff --git a/glean-core/rlb/src/private/string.rs b/glean-core/rlb/src/private/string.rs
+--- a/glean-core/rlb/src/private/string.rs
++++ b/glean-core/rlb/src/private/string.rs
+@@ -9,8 +9,6 @@ use std::sync::Arc;
+ use glean_core::metrics::MetricType;
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type, otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -41,7 +39,7 @@ impl glean_core::traits::String for StringMetric {
+     fn set<S: Into<std::string::String>>(&self, value: S) {
+         let metric = Arc::clone(&self.0);
+         let new_value = value.into();
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, new_value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, new_value));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(
+
+diff --git a/glean-core/rlb/src/private/string_list.rs b/glean-core/rlb/src/private/string_list.rs
+--- a/glean-core/rlb/src/private/string_list.rs
++++ b/glean-core/rlb/src/private/string_list.rs
+@@ -8,8 +8,6 @@ use std::sync::Arc;
+ use glean_core::metrics::MetricType;
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -35,12 +33,12 @@ impl glean_core::traits::StringList for StringListMetric {
+     fn add<S: Into<String>>(&self, value: S) {
+         let metric = Arc::clone(&self.0);
+         let new_value = value.into();
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.add(glean, new_value)));
++        crate::launch_with_glean(move |glean| metric.add(glean, new_value));
+     }
+ 
+     fn set(&self, value: Vec<String>) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, value));
+     }
+ 
+     fn test_get_value<'a, S: Into<Option<&'a str>>>(&self, ping_name: S) -> Option<Vec<String>> {
+
+diff --git a/glean-core/rlb/src/private/timespan.rs b/glean-core/rlb/src/private/timespan.rs
+--- a/glean-core/rlb/src/private/timespan.rs
++++ b/glean-core/rlb/src/private/timespan.rs
+@@ -38,13 +38,11 @@ impl glean_core::traits::Timespan for TimespanMetric {
+         let start_time = time::precise_time_ns();
+ 
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || {
+-            crate::with_glean(|glean| {
+-                let mut lock = metric
+-                    .write()
+-                    .expect("Lock poisoned for timespan metric on start.");
+-                lock.set_start(glean, start_time)
+-            })
++        crate::launch_with_glean(move |glean| {
++            let mut lock = metric
++                .write()
++                .expect("Lock poisoned for timespan metric on start.");
++            lock.set_start(glean, start_time)
+         });
+     }
+ 
+@@ -52,13 +50,11 @@ impl glean_core::traits::Timespan for TimespanMetric {
+         let stop_time = time::precise_time_ns();
+ 
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || {
+-            crate::with_glean(|glean| {
+-                let mut lock = metric
+-                    .write()
+-                    .expect("Lock poisoned for timespan metric on stop.");
+-                lock.set_stop(glean, stop_time)
+-            })
++        crate::launch_with_glean(move |glean| {
++            let mut lock = metric
++                .write()
++                .expect("Lock poisoned for timespan metric on stop.");
++            lock.set_stop(glean, stop_time)
+         });
+     }
+
+diff --git a/glean-core/rlb/src/private/timing_distribution.rs b/glean-core/rlb/src/private/timing_distribution.rs
+--- a/glean-core/rlb/src/private/timing_distribution.rs
++++ b/glean-core/rlb/src/private/timing_distribution.rs
+@@ -44,13 +44,11 @@ impl glean_core::traits::TimingDistribution for TimingDistributionMetric {
+     fn stop_and_accumulate(&self, id: TimerId) {
+         let stop_time = time::precise_time_ns();
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || {
+-            crate::with_glean(|glean| {
+-                metric
+-                    .write()
+-                    .unwrap()
+-                    .set_stop_and_accumulate(glean, id, stop_time)
+-            })
++        crate::launch_with_glean(move |glean| {
++            metric
++                .write()
++                .unwrap()
++                .set_stop_and_accumulate(glean, id, stop_time)
+         });
+     }
+
+diff --git a/glean-core/rlb/src/private/uuid.rs b/glean-core/rlb/src/private/uuid.rs
+--- a/glean-core/rlb/src/private/uuid.rs
++++ b/glean-core/rlb/src/private/uuid.rs
+@@ -8,8 +8,6 @@ use std::sync::Arc;
+ use glean_core::metrics::MetricType;
+ use glean_core::ErrorType;
+ 
+-use crate::dispatcher;
+-
+ // We need to wrap the glean-core type, otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+ // only traits defined in the current crate can be implemented for arbitrary
+@@ -34,7 +32,7 @@ impl UuidMetric {
+ impl glean_core::traits::Uuid for UuidMetric {
+     fn set(&self, value: uuid::Uuid) {
+         let metric = Arc::clone(&self.0);
+-        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
++        crate::launch_with_glean(move |glean| metric.set(glean, value));
+     }
+ 
+     fn generate_and_set(&self) -> uuid::Uuid {
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn register_ping_type(ping: &private::PingType) -> ()
+
+pub fn set_upload_enabled(enabled: bool) -> ()
+
+pub fn handle_client_inactive() -> ()
+
+pub fn shutdown() -> ()
+
+pub fn set_experiment_inactive(experiment_id: String) -> ()
+
+pub fn set_experiment_active(
+experiment_id: String,
+branch: String,
+extra: Option<HashMap<String, String>>) -> ()
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

@@ -1,0 +1,427 @@
+<think>
+Okay, I need to create a regression test for the patch that enforces disk quota on pending pings. Let me start by understanding what the patch does.
+
+The patch introduces a new method `enqueue_cached_pings` in the `PingUploadManager` which checks the size of the pending pings directory. If the size exceeds the quota (10 MB), the oldest pings are deleted until the quota is under. There's also a new test in the patch's `test_quota_is_enforced_when_enqueueing_cached_pings` which checks that when the quota is hit, all but the newest ping are deleted, and the count of deleted pings is recorded correctly.
+
+But the user is asking for a unit test that verifies the fix. The existing test seems to cover part of the functionality, but maybe there's another scenario to test. Wait, the existing test checks when the quota is exceeded, and ensures that all except the newest ping are deleted. However, the function `enqueue_cached_pings` is supposed to measure the size of the pending directory and accumulate that into the `pending_pings_directory_size` metric. The existing test doesn't check whether that metric is recorded correctly, which is part of the issue.
+
+So the test should verify that the pending_pings_directory_size is recorded. Let me think: when the pings are processed, the size is calculated and then reported to the telemetry metric. So in a test scenario where multiple pings are created, the total size of the pending pings directory should be the sum of their sizes, and then recorded into the `pending_pings_directory_size` metric.
+
+Wait, the patch adds the `pending_pings_directory_size` metric which is a memory distribution. The existing test checks for the number of deleted pings, but not the size metric. So I need a test that ensures that this metric is being recorded correctly.
+
+But how to set up that test? The existing directory manager's `process_dir` method now collects each file's size. The `enqueue_cached_pings` method adds the sizes and then records the sum into the metric.
+
+So, the test would need to create multiple pings with known sizes, process them, and then check the metric's value. However, since in the test environment, the pings are in the file system, perhaps I need to mock or create dummy pings with specific sizes. But since we can't create real files easily in tests, maybe the existing code uses a temporary directory for tests. The test could create mock pings with known sizes, process them, and then check the metric.
+
+Ah, in the existing test `quota_is_enforced_when_enqueueing_cached_pings`, they create multiple pings by submitting the same ping multiple times. Each ping's size is roughly the same (empty pings). But in reality, each ping's size might vary. However, for the test, if I have two pings with known sizes, say 100 and 200 bytes, the total size would be 300, and the metric should accumulate that.
+
+But the existing code in `enqueue_cached_pings` sums the file sizes. So a test case could be to create two pings with known sizes and verify that the metric is updated correctly.
+
+Wait, the `process_dir` method in the patch returns a vector of (u64, PingPayload). So the u64 is the file size. Then, during `enqueue_cached_pings`, the code sums these sizes, records the total into the metric, and then processes the pings.
+
+So to create a test where the metric is recorded correctly, I can set up a scenario where the pending pings have specific sizes. However, how to simulate this in the test without touching the filesystem?
+
+Hmm, perhaps in the test, we can create a mock PingPayloadsByDirectory with specific sizes and then check that the metric is recorded. But the existing code processes the directory and reads the actual sizes from the file system. So to test the metric, the test would need to create real files with known sizes and then verify the metric.
+
+But given that the existing test uses a temporary directory and creates files, perhaps we can leverage that. Let me check the existing code. In the test, they use `tmpdir` to simulate the data path. For the test, I can generate multiple pings, each with a specific size on disk, then process them and check the metric.
+
+Wait, the `enqueue_cached_pings` method is part of the `PingUploadManager`, so in the test, we need to create an instance of `PingUploadManager`, trigger the enqueueing, and then check the metric's value.
+
+Let me outline the steps for the test:
+
+1. Create a temporary directory.
+2. Submit a few pings to create pending files with known sizes. For example, create a test ping whose content is adjusted to have a specific size.
+3. Create the `PingUploadManager` pointing to this directory.
+4. Call `enqueue_cached_pings` with a quota larger than the total size to avoid actual deletion.
+5. Check that the `pending_pings_directory_size` metric has the correct value recorded.
+
+But how to create pings with specific sizes? The `submit_ping` method creates a file. Maybe the test can create a ping with a specific body size. Alternatively, the test can modify the ping's content to adjust the size.
+
+Alternatively, in the test, after submitting the pings, we can manually adjust the file sizes (but that would require modifying the actual files, which might be complicated in tests). Alternatively, perhaps the test can simulate the size in the `process_dir` method by mocking the file size. However, without mocks, that's challenging. Since the existing tests use actual files, perhaps the test can generate multiple pings with varying sizes and then check the metric.
+
+For example:
+
+- Create two pings, one with a body of 100 bytes, another with 200 bytes. The total size would be 300 bytes.
+- Call `enqueue_cached_pings` with a quota of a large enough size (so they are not deleted).
+- Check that the metric `pending_pings_directory_size` has recorded the total size of 300 KiB (or whatever the unit is). Wait, the `MemoryDistributionMetric` uses `MemoryUnit::Kilobyte`, so the recorded value is in KB. So if the total is 300 bytes, that's 0.3 KB. But the metric's accumulate function would take the value as an u64 (300 bytes = 0.3KB, but stored as integer). Wait, the code in `enqueue_cached_pings` does this:
+
+self.upload_metrics.pending_pings_directory_size.accumulate(glean, pending_pings_directory_size as u64);
+
+But `pending_pings_directory_size` is in bytes. Then the metric is of type `MemoryDistributionMetric`, which when accumulated with `MemoryUnit::Kilobyte`, would convert the bytes to KiB. However, the `accumulate` method here passes the raw bytes, which might not be correct. Wait, looking at the code for `MemoryDistributionMetric::accumulate`:
+
+In the `MemoryDistributionMetric::accumulate` function, there's a parameter `unit` which is used to convert the value. For example, when you call it with `MemoryUnit::Kilobyte`, it divides the input by 1024. So if the code is using `MemoryUnit::Kilobyte` as the unit, and the `accumulate` function is passed the byte count, then the metric would record the value in KiB.
+
+Wait, the `MemoryDistributionMetric` is constructed with `MemoryUnit::Kilobyte`, which tells the accumulate function to convert the value into KiB before storing it. So when you do:
+
+upload_metrics.pending_pings_directory_size.accumulate(glean, 300);
+
+And the metric's unit is `MemoryUnit::Kilobyte`, the actual value stored is 300 / 1024 = 0.293 KiB. But since it's a distribution, it's stored as an integer? Or perhaps the code multiplies to the next integer. Hmm, but the metric uses `u64`, so division would lose precision. But the test would have to account for that.
+
+But perhaps for the purpose of the test, we can create pings with sizes that are exact multiples of 1024 to avoid floating point issues. For example, create a ping with a size of 1024 bytes (exactly 1 KiB) and another with 2048 bytes (2 KiB). Then the sum is 3072 bytes, which equals 3 KiB. Then the metric should have a sample of 3 KiB.
+
+So the test steps would be:
+
+1. Set up a Glean instance with a temporary directory.
+2. Register a test ping type.
+3. Submit multiple pings, ensuring each has a known size (e.g., by creating custom content).
+4. Create the `PingUploadManager` that uses the same data path.
+5. Call `enqueue_cached_pings` with a quota larger than the total size so no deletions happen.
+6. Check that the `pending_pings_directory_size` metric records the correct value.
+
+But how to control the size of the pings? When you submit a ping, the body is generated, but the size may vary. To create a specific size, perhaps in the test, after submitting the ping, we can modify the file's content to have a specific size. However, that's complicated in Rust. Alternatively, create a custom payload with a known size.
+
+Another approach: since the `process_dir` function collects the file size from the filesystem, perhaps in the test, create multiple pings (submit them), and then modify the files to have the desired sizes. For example, after submitting a ping, append some dummy data to the file to reach a specific size.
+
+So for the test:
+
+- Submit two pings.
+- After submission, for each ping's file, append extra data to reach 1 KiB and 2 KiB.
+- Then, the `pending_pings_directory_size` should be 3 KiB.
+
+Then, check if the metric records 3 KiB.
+
+This test would ensure that the code correctly accumulates the total size of the pending pings directory.
+
+So the test would need to:
+
+1. Submit pings.
+2. Modify their file sizes.
+3. Process the directory.
+4. Check the metric.
+
+But how to modify the file sizes? For example, after creating the file, open it in append mode and write some dummy data to reach the desired size.
+
+Yes. For example, in code:
+
+In the test:
+
+let path = directory_manager.get_file_path("document_id").unwrap();
+
+let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+
+let data = "0123456789".repeat(103); // 103 * 10 = 1030 bytes. Close to 1 KiB (1024).
+
+file.write_all(data.as_bytes()).unwrap();
+
+This would add 1030 bytes to the file, making it 1024 + 1030 = 2054? Wait, no. The original ping file may already be some size. The test would need to measure the current size and append the difference to reach a specific target.
+
+Alternatively, overwrite the file with a specific content of known size.
+
+But this might be necessary. So the test steps would involve:
+
+- Create a temporary directory.
+- Submit a ping to create a file.
+- Modify the file's content to have a specific size.
+- Submit another ping and repeat.
+
+Once the files are of known sizes, call `enqueue_cached_pings` and then check the metric.
+
+The test would then verify that the sum of the file sizes (converted to KiB) is recorded into the metric.
+
+Now, to implement this in Rust. The test would need to use the `tempdir` crate to create a temporary directory. But the existing test in the patch uses `tmpdir`, which is part of the `tempdir` or `tempfile` crate. However, in the code, the test uses `new_glean` which returns a tmpdir. So in our test, we can use similar code.
+
+But for the test code, we need to create a directory, submit pings, modify the file sizes, then process them.
+
+Putting this all together, the rust test would look like this:
+
+1. Create a directory with pings.
+2. Submit a ping, then modify the file to be of 1 KiB.
+3. Submit another ping, modify to 2 KiB.
+4. The manager processes the directory.
+5. Check that the metric has a sample of 3 KiB.
+
+But in code, the test would have to:
+
+- Use `create_file` or similar to write specific content.
+
+Wait, in Rust, to write a file's content, perhaps after submitting the ping, we can read the file's path, then open it and write a specific amount of data.
+
+But first, the test would need to:
+
+let dir = tempdir::TempDir::new("glean-test").unwrap();
+let upload_manager = PingUploadManager::new(&dir, ...);
+
+Then, create a ping type, submit it, then modify the file's content.
+
+But how to find the file's path? The `PingDirectoryManager` can be used to process the directory and get the paths. Alternatively, after submitting the ping, the document ID is known, so the path can be constructed.
+
+Assuming that the `new_glean` function in the existing tests returns a Glean instance and a tmpdir, perhaps we can use similar code.
+
+In any case, the test would need to:
+
+- Submit two pings.
+
+For each ping, get their respective file paths and modify their contents.
+
+In code:
+
+After submitting the first ping, get the document_id, then the path is `dir.path().join("PENDING_PINGS_DIRECTORY").join(document_id)`.
+
+Then open the file, write some data to it to reach the desired size.
+
+Then, create a PingUploadManager and enqueue_cached_pings.
+
+Then, check the metric.
+
+But how to check the metric's value? The `pending_pings_directory_size` is a distribution metric. To check it, the test would use `test_get_value` as in the existing test.
+
+In the existing test, `upload_manager.upload_metrics.pending_pings_directory_size.test_get_value(&glean, "metrics")` is used to retrieve the value.
+
+But in the test, we can check that the distribution metric has the correct value.
+
+So putting it all together, the test code would:
+
+1. Create a Glean instance with a tmpdir.
+2. Register a ping and submit it twice.
+3. Modify the two pending ping files to have 1 KiB and 2 KiB respectively.
+4. Create a PingUploadManager with the tmpdir.
+5. Call enqueue_cached_pings with a quota larger than the total size (3 KiB, which is 3072 bytes).
+6. Check that the metric has a sample of 3 KiB (3072 bytes = 3 KiB, since 1024 * 3 = 3072).
+
+But converting the 3072 bytes to KiB using the metric's unit. Since the metric is using `MemoryUnit::Kilobyte`, the accumulate function will divide the byte value by 1024. So 3072 bytes is 3 KiB. So the test should expect the metric to have a sample of 3.
+
+So the code would be:
+
+After setting up the two files of 1 and 2 KiB each:
+
+upload_manager.enqueue_cached_pings(&glean, 4096); // quota of 4KiB (4096 bytes)
+
+Then, check if the metric has a sample of 3 (3 KiB).
+
+The test would then check that the value is 3.
+
+So the Rust code for the test would involve:
+
+use std::fs::File;
+use std::io::Write;
+use glean::Glean;
+use glean::core::upload::PingUploadManager;
+use glean::core::upload::directory::PingDirectoryManager;
+use glean::private::test::new_glean;
+
+#[test]
+fn test_pending_pings_directory_size_metric() {
+    let (mut glean, tmpdir) = new_glean(None);
+    let ping_type = PingType::new("test", true, true, vec![]);
+    glean.register_ping_type(&ping_type);
+    
+    // Submit two pings
+    glean.submit_ping(&ping_type, None).unwrap();
+    let doc_id1 = "test-uuid-1"; // Need to find the actual document ID generated
+    // Wait, actually, Glean generates a UUID for the document_id. So the test would need to track the actual IDs. Hmm, this complicates the test.
+
+    // Alternatively, the test could submit the ping multiple times and capture the document IDs.
+
+    // Alternatively, the test could use the PingDirectoryManager to get the list of pending pings after submission.
+
+    // Maybe a better approach: after submitting, process the directory to get the list of pending pings.
+
+    // Create a PingDirectoryManager to process the directory and get the paths.
+    let manager = PingDirectoryManager::new(tmpdir.path());
+    let data = manager.process_dirs().pending_pings;
+    assert_eq!(data.len(), 1); // First ping. Hmm, but we submitted only once?
+
+    Wait, in the existing test `fills_up_queue_successfully_from_disk`, they submit a ping once, then check for one entry. Maybe the first submission creates one ping file. But if we submit twice, we get two pings.
+
+So maybe the test should submit the ping multiple times, then process the directory to get the list of pings, then modify each file's size.
+
+Revised plan:
+
+1. Submit the ping twice to create two entries.
+2. Use the PingDirectoryManager to process the directory and get the list of (size, PingPayload) pairs.
+3. For each PingPayload's document_id, get the file path.
+4. Modify the file's content to have a specific size.
+5. Then, create the upload manager and call enqueue_cached_pings.
+6. Check the metric's value.
+
+But in code, to get the document IDs, perhaps after submission, the PingDirectoryManager can be used to get the files.
+
+Wait, in the existing code's test_quota_is_enforced..., they submit once, process the directory, and capture the document_id. So in this test:
+
+After submitting twice, the pending_pings would be two entries. Then, for each entry, get their document_ids, and then modify the file for each.
+
+But how to find the actual file paths?
+
+In the code:
+
+let manager = PingDirectoryManager::new(tmpdir.path());
+let pings = manager.process_dirs().pending_pings;
+assert_eq!(pings.len(), 2); // Assuming two submissions
+
+Then, for each (size, (doc_id, path, ..., ...)) in pings, we can modify the file at path.
+
+Wait, but the path is part of the PingPayload. But in the current code, the PingPayload is a tuple (document_id, path, body, headers). So for each entry in pings, we can get the path, and then append data to reach the desired size.
+
+So in code:
+
+for (file_size, (document_id, path_str, _, _)) in pings {
+    let path = PathBuf::from(path_str);
+    // Check if the current size is 0 (empty ping), then append data to reach 1 KiB (1024 bytes).
+    let desired_size = 1024;
+    let current_size = std::path::PathBuf::new(&path).metadata().unwrap().len();
+    if current_size < desired_size {
+        let mut file = File::options().append(true).open(&path).unwrap();
+        let bytes_to_write = desired_size - current_size;
+        let data = std::iter::repeat("a".as_bytes()[0])
+            .take(bytes_to_write as usize)
+            .collect::<Vec<u8>>();
+        file.write_all(&data).unwrap();
+    }
+}
+
+But for two files, perhaps adjust the first to 1024 and the second to 2048 bytes.
+
+But this requires knowing which ping is which. The code could modify the first ping to 1024 and the second to 2048.
+
+Once the files are modified, the total size is 3072 bytes (3 KiB). Then, when enqueue_cached_pings is called, the code sums the sizes and records 3 KiB.
+
+Then, the test can check that the `pending_pings_directory_size` metric has a sample of 3.
+
+So the test code would look like:
+
+fn test_pending_pings_directory_size_metric() {
+    let (mut glean, tmpdir) = new_glean(None);
+    let ping_type = PingType::new("test", true, true, vec![]);
+    glean.register_ping_type(&ping_type);
+    glean.submit_ping(&ping_type, None).unwrap();
+    glean.submit_ping(&ping_type, None).unwrap();
+
+    // Need to process the directory to get the list of pending pings
+    let manager = PingDirectoryManager::new(tmpdir.path());
+    let pings = manager.process_dirs().pending_pings;
+    assert_eq!(pings.len(), 2);
+
+    // Modify the first file to 1024 bytes, second to 2048 bytes
+    let mut i = 0;
+    for (file_size, (document_id, path_str, _, _)) in pings {
+        let path = Path::new(&tmpdir.path()).join(PENDING_PINGS_DIRECTORY).join(document_id);
+        let desired_size = if i == 0 { 1024 } else { 2048 } as u64;
+        let metadata = fs::metadata(&path).unwrap();
+        let current_size = metadata.len();
+        let bytes_to_add = desired_size - current_size;
+        if bytes_to_add > 0 {
+            let mut file = File::create(&path).unwrap(); // Truncate and create new file
+            let data = vec![b'0'; bytes_to_add as usize];
+            file.write_all(&data).unwrap();
+        }
+        i += 1;
+    }
+
+    let upload_manager = PingUploadManager::new(tmpdir.path(), "test", true);
+    upload_manager.enqueue_cached_pings(&glean, PENDING_PINGS_DIRECTORY_QUOTA + 1); // Ensure quota not exceeded
+
+    // Check the metric
+    let value = upload_manager.upload_metrics.pending_pings_directory_size.test_get_value(&glean, "metrics").unwrap();
+    assert_eq!(value, 3); // Total 3 KiB
+}
+
+Wait, the `test_get_value` for a distribution metric would return the sum or the samples? The `test_get_value` for a `MemoryDistributionMetric` would return the accumulated distribution as a JSON string, but in the existing test, it's using `test_get_value` which returns a u64 for the counter.
+
+Wait, no. Looking at the existing code in the patch's test:
+
+The `deleted_pings_after_quota_hit` is a counter, and the test uses:
+
+n - 1, upload_manager.upload_metrics.deleted_pings_after_quota_hit.test_get_value(...).unwrap()
+
+So `test_get_value` returns a u64 for a counter metric. For a distribution metric, `test_get_value` would return a JSON string representing the distribution samples.
+
+Ah, right. The `pending_pings_directory_size` is a `MemoryDistributionMetric`, which is a distribution metric. So the `test_get_value` returns a JSON string like "[{ \"sum\": 3 }]" if there's one sample of 3.
+
+So the test would need to parse this JSON and check that the sum is 3.
+
+But in the existing test, `deleted_pings_after_quota_hit` is a counter metric, which is different.
+
+Therefore, in our test, after calling `enqueue_cached_pings`, we need to check the distribution metric.
+
+So for the `pending_pings_directory_size` metric, after processing the pings, the `test_get_value` function would return a JSON string like "[{'count': 1, 'sum': 3000, ...}]", but the exact format depends on how the distribution metric is implemented.
+
+But perhaps the code can use the `test_get_num_recorded_errors` or `test_get_value` in a way that the test can verify the recorded sum.
+
+Alternatively, the test could check that the metric contains at least one sample with the expected value.
+
+But since distribution metrics are more complex, maybe the test should use the `test_get_value` and then check that the recorded sum is correct.
+
+Given that, the test would look like:
+
+let value = upload_manager.upload_metrics.pending_pings_directory_size.test_get_value(&glean, "test_get_value_category").unwrap();
+assert!(value.contains("3"));
+
+But since the format is JSON, maybe the code can parse it.
+
+Alternatively, perhaps the `test_get_value` returns a string representation that we can parse.
+
+But given that this depends on the internal structure of the distribution metric, which might vary, the test could be more straightforward by using a helper function.
+
+However, in the existing code, the `test_get_value` for a distribution metric might return a string like "[{ "min": 3, ... }]".
+
+Alternatively, since the metric is added with `accumulate`, and we know that the sum of the sizes is 3072 bytes (3 KiB), the metric would have a sample of 3 KiB.
+
+Thus, the test would need to check that the sum recorded is 3.
+
+Therefore, the code in the test would:
+
+let value = upload_manager.upload_metrics.pending_pings_directory_size.test_get_value(&glean, "metrics").unwrap();
+assert_eq!(value, "{\"sum\":3}");
+
+But the actual JSON might have more fields. However, the test can verify that the JSON contains "sum":3.
+
+Thus, the final test code would involve setting up the files with specific sizes, and then checking that the metric's sum is correct.
+
+So putting all this together into the Rust test function.
+</think>
+
+<Filename>glean-core/src/upload/mod.rs</Filename>
+<imports>
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::tempdir;
+use glean::core::upload::{PingUploadManager, PingUploadTask, PingType};
+use glean::core::upload::directory::PingDirectoryManager;
+use glean::core::Glean;
+use glean::private::test::new_glean;
+use glean::internal_metrics::UploadMetrics;
+use glean::core::upload::{PingDirectoryManager, PingPayloadsByDirectory};
+</imports>
+<Rust>
+#[test]
+fn test_pending_pings_directory_size_is_recorded() {
+    let (mut glean, tmpdir) = new_glean(None);
+    let ping_type = PingType::new("test", true, /* send_if_empty */ true, vec![]);
+    glean.register_ping_type(&ping_type);
+
+    // Submit the ping twice
+    for _ in 0..2 {
+        glean.submit_ping(&ping_type, None).unwrap();
+    }
+
+    // Get the ping file paths and adjust sizes
+    let manager = PingDirectoryManager::new(tmpdir.path());
+    let pings = manager.process_dirs().pending_pings;
+    assert_eq!(pings.len(), 2);
+
+    // Adjust file sizes to exactly 1 KiB and 2 KiB
+    for (i, (_, (doc_id, path_str, _, _))) in pings.iter().enumerate() {
+        let path = Path::new(path_str);
+        let mut file = fs::File::create(path).unwrap();
+        let size_bytes = if i == 0 { 1024 } else { 2048 };
+        let bytes = vec![b'a'; size_bytes as usize];
+        file.write_all(&bytes).unwrap();
+    }
+
+    // Create the upload manager
+    let upload_manager = PingUploadManager::new(tmpdir.path(), "Rust", true);
+    // Use a quota larger than the total size to avoid deletions
+    upload_manager.enqueue_cached_pings(&glean, 10_000_000); // 10 MiB
+
+    // Check the metric recorded the correct size (3 KiB)
+    let metric_value = upload_manager.upload_metrics
+        .pending_pings_directory_size
+        .test_get_value(&glean, "metrics")
+        .unwrap();
+
+    // The sample should be 3 KiB (3072 bytes)
+    assert_eq!(metric_value, "{\"sum\":3}");
+}
+</Rust>

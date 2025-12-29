@@ -1,0 +1,66 @@
+<Filename> glean-core/rlb/src/test.rs </Filename>
+<imports> 
+use super::set_source_tags;
+use super::was_initialize_called;
+use super::destroy_glean;
+use super::new_glean;
+use super::submit_ping_by_name;
+use super::block_on_dispatcher;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use crossbeam_channel::bounded;
+use tempfile::tempdir;
+use glean_core::net;
+use glean_core::Configuration;
+use glean_core::GLOBAL_APPLICATION_ID;
+</imports>
+<Rust>
+#[test]
+fn test_setting_source_tags_after_initialization() {
+  let _lock = std::sync::Mutex::new(());
+  let _ = std::sync::Mutex::lock(_lock);
+  destroy_glean(true);
+  assert!(!was_initialize_called());
+  let (s, r) = bounded::<Vec<(String, String)>>(1);
+  let dir = tempdir().unwrap();
+  let tmpname = dir.path().to_path_buf();
+  let cfg = Configuration {
+    data_path: tmpname,
+    application_id: GLOBAL_APPLICATION_ID.into(),
+    upload_enabled: true,
+    max_events: None,
+    delay_ping_lifetime_io: false,
+    channel: Some("testing".into()),
+    server_endpoint: Some("invalid-test-host".into()),
+    uploader: Some(Box::new(FakeUploader { sender: s })),
+  };
+  let _t = new_glean(Some(cfg), true);
+  assert!(was_initialize_called());
+  set_source_tags(vec!["valid-tag1".to_string(), "valid-tag2".to_string()]);
+  block_on_dispatcher();
+  submit_ping_by_name("baseline", Some("background"));
+  let headers = r.recv().unwrap();
+  assert_eq!(
+    "valid-tag1,valid-tag2",
+    headers
+      .iter()
+      .find(|&kv| kv.0 == "X-Source-Tags")
+      .unwrap()
+      .1
+  );
+}
+struct FakeUploader {
+  sender: crossbeam_channel::Sender<Vec<(String, String)>>,
+}
+impl net::PingUploader for FakeUploader {
+  fn upload(
+    &self,
+    _url: String,
+    _body: Vec<u8>,
+    headers: Vec<(String, String)>,
+  ) -> net::UploadResult {
+    self.sender.send(headers).unwrap();
+    net::UploadResult::HttpStatus(200)
+  }
+}
+</Rust>

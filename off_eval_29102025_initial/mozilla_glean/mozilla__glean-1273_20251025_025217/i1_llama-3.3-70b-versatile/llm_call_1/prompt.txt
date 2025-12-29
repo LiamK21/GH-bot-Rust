@@ -1,0 +1,752 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Copy the dispatcher from m-c to the RLB
+This is required in order for the bindings to properly dispatch things off the main thread.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/dispatcher/global.rs b/glean-core/rlb/src/dispatcher/global.rs
+--- a/glean-core/rlb/src/dispatcher/global.rs
++++ b/glean-core/rlb/src/dispatcher/global.rs
+@@ -0,0 +1,119 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++use once_cell::sync::{Lazy, OnceCell};
++use std::sync::RwLock;
++
++use super::{DispatchError, DispatchGuard, Dispatcher};
++
++const GLOBAL_DISPATCHER_LIMIT: usize = 100;
++static GLOBAL_DISPATCHER: Lazy<RwLock<Option<Dispatcher>>> =
++    Lazy::new(|| RwLock::new(Some(Dispatcher::new(GLOBAL_DISPATCHER_LIMIT))));
++
++fn guard() -> &'static DispatchGuard {
++    static GLOBAL_GUARD: OnceCell<DispatchGuard> = OnceCell::new();
++
++    GLOBAL_GUARD.get_or_init(|| {
++        let lock = GLOBAL_DISPATCHER.read().unwrap();
++        lock.as_ref().unwrap().guard()
++    })
++}
++
++/// Launches a new task on the global dispatch queue.
++///
++/// The new task will be enqueued immediately.
++/// If the pre-init queue was already flushed,
++/// the background thread will process tasks in the queue (see [`flush_init`]).
++///
++/// This will not block.
++///
++/// [`flush_init`]: fn.flush_init.html
++pub fn launch(task: impl FnOnce() + Send + 'static) {
++    match guard().launch(task) {
++        Ok(_) => {}
++        Err(DispatchError::QueueFull) => {
++            log::info!("Exceeded maximum queue size, discarding task");
++            // TODO: Record this as an error.
++        }
++        Err(_) => {
++            log::info!("Failed to launch a task on the queue. Discarding task.");
++        }
++    }
++}
++
++/// Block until all tasks prior to this call are processed.
++pub fn block_on_queue() {
++    GLOBAL_DISPATCHER
++        .write()
++        .unwrap()
++        .as_mut()
++        .map(|dispatcher| dispatcher.block_on_queue())
++        .unwrap()
++}
++
++/// Starts processing queued tasks in the global dispatch queue.
++///
++/// This function blocks until queued tasks prior to this call are finished.
++/// Once the initial queue is empty the dispatcher will wait for new tasks to be launched.
++pub fn flush_init() -> Result<(), DispatchError> {
++    GLOBAL_DISPATCHER
++        .write()
++        .unwrap()
++        .as_mut()
++        .map(|dispatcher| dispatcher.flush_init())
++        .unwrap()
++}
++
++/// Shuts down the dispatch queue.
++///
++/// This will initiate a shutdown of the worker thread
++/// and no new tasks will be processed after this.
++/// It will not block on the worker thread.
++pub fn try_shutdown() -> Result<(), DispatchError> {
++    guard().shutdown()
++}
++
++#[cfg(test)]
++mod test {
++    use std::sync::{Arc, Mutex};
++
++    use super::*;
++
++    // We can only test this once, as it is a global resource which we can't reset.
++    #[test]
++    fn global_fills_up_in_order_and_works() {
++        let _ = env_logger::builder().is_test(true).try_init();
++
++        let result = Arc::new(Mutex::new(vec![]));
++
++        for i in 1..=GLOBAL_DISPATCHER_LIMIT {
++            let result = Arc::clone(&result);
++            launch(move || {
++                result.lock().unwrap().push(i);
++            });
++        }
++
++        {
++            let result = Arc::clone(&result);
++            launch(move || {
++                result.lock().unwrap().push(150);
++            });
++        }
++
++        flush_init().unwrap();
++
++        {
++            let result = Arc::clone(&result);
++            launch(move || {
++                result.lock().unwrap().push(200);
++            });
++        }
++
++        block_on_queue();
++
++        let mut expected = (1..=GLOBAL_DISPATCHER_LIMIT).collect::<Vec<_>>();
++        expected.push(200);
++        assert_eq!(&*result.lock().unwrap(), &expected);
++    }
++}
+
+diff --git a/glean-core/rlb/src/dispatcher/mod.rs b/glean-core/rlb/src/dispatcher/mod.rs
+--- a/glean-core/rlb/src/dispatcher/mod.rs
++++ b/glean-core/rlb/src/dispatcher/mod.rs
+@@ -0,0 +1,506 @@
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this
++// file, You can obtain one at https://mozilla.org/MPL/2.0/.
++
++//! A global dispatcher queue.
++//!
++//! # Example - Global Dispatch queue
++//!
++//! The global dispatch queue is pre-configured with a maximum queue size of 100 tasks.
++//!
++//! ```rust,ignore
++//! // Ensure the dispatcher queue is being worked on.
++//! dispatcher::flush_init();
++//!
++//! dispatcher::launch(|| {
++//!     println!("Executing expensive task");
++//!     // Run your expensive task in a separate thread.
++//! });
++//!
++//! dispatcher::launch(|| {
++//!     println!("A second task that's executed sequentially, but off the main thread.");
++//! });
++//! ```
++
++// TODO: remove this once bug 1672440 is merged and the code below
++// will actually be used somewhere.
++#![allow(dead_code)]
++
++use std::{
++    mem,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc,
++    },
++    thread::{self, JoinHandle},
++};
++
++use crossbeam_channel::{bounded, unbounded, SendError, Sender, TrySendError};
++use thiserror::Error;
++
++pub use global::*;
++
++mod global;
++
++/// The command a worker should execute.
++enum Command {
++    /// A task is a user-defined function to run.
++    Task(Box<dyn FnOnce() + Send>),
++
++    /// Swap the channel
++    Swap(Sender<()>),
++
++    /// Signal the worker to finish work and shut down.
++    Shutdown,
++}
++
++/// The error returned from operations on the dispatcher
++#[derive(Error, Debug, PartialEq)]
++pub enum DispatchError {
++    #[error("The worker panicked while running a task")]
++    WorkerPanic,
++
++    #[error("Maximum queue size reached")]
++    QueueFull,
++
++    #[error("Pre-init buffer was already flushed")]
++    AlreadyFlushed,
++
++    #[error("Failed to send command to worker thread")]
++    SendError,
++
++    #[error("Failed to receive from channel")]
++    RecvError(#[from] crossbeam_channel::RecvError),
++}
++
++impl From<TrySendError<Command>> for DispatchError {
++    fn from(err: TrySendError<Command>) -> Self {
++        match err {
++            TrySendError::Full(_) => DispatchError::QueueFull,
++            _ => DispatchError::SendError,
++        }
++    }
++}
++
++impl<T> From<SendError<T>> for DispatchError {
++    fn from(_: SendError<T>) -> Self {
++        DispatchError::SendError
++    }
++}
++
++/// A clonable guard for a dispatch queue.
++#[derive(Clone)]
++struct DispatchGuard {
++    queue_preinit: Arc<AtomicBool>,
++    preinit: Sender<Command>,
++    queue: Sender<Command>,
++}
++
++impl DispatchGuard {
++    pub fn launch(&self, task: impl FnOnce() + Send + 'static) -> Result<(), DispatchError> {
++        let task = Command::Task(Box::new(task));
++        self.send(task)
++    }
++
++    pub fn shutdown(&self) -> Result<(), DispatchError> {
++        self.send(Command::Shutdown)
++    }
++
++    fn send(&self, task: Command) -> Result<(), DispatchError> {
++        if self.queue_preinit.load(Ordering::SeqCst) {
++            match self.preinit.try_send(task) {
++                Ok(()) => Ok(()),
++                Err(TrySendError::Full(_)) => Err(DispatchError::QueueFull),
++                Err(TrySendError::Disconnected(_)) => Err(DispatchError::SendError),
++            }
++        } else {
++            self.queue.send(task)?;
++            Ok(())
++        }
++    }
++}
++
++/// A dispatcher.
++///
++/// Run expensive processing tasks sequentially off the main thread.
++/// Tasks are processed in a single separate thread in the order they are submitted.
++/// The dispatch queue will enqueue tasks while not flushed, up to the maximum queue size.
++/// Processing will start after flushing once, processing already enqueued tasks first, then
++/// waiting for further tasks to be enqueued.
++pub struct Dispatcher {
++    /// Whether to queue on the preinit buffer or on the unbounded queue
++    queue_preinit: Arc<AtomicBool>,
++
++    /// Used to unblock the worker thread initially.
++    block_sender: Sender<()>,
++
++    /// Sender for the preinit queue.
++    preinit_sender: Sender<Command>,
++
++    /// Sender for the unbounded queue.
++    sender: Sender<Command>,
++
++    /// Handle to the worker thread, allows to wait for it to finish.
++    worker: Option<JoinHandle<()>>,
++}
++
++impl Dispatcher {
++    /// Creates a new dispatcher with a maximum queue size.
++    ///
++    /// Launched tasks won't run until [`flush_init`] is called.
++    ///
++    /// [`flush_init`]: #method.flush_init
++    pub fn new(max_queue_size: usize) -> Self {
++        let (block_sender, block_receiver) = bounded(0);
++        let (preinit_sender, preinit_receiver) = bounded(max_queue_size);
++        let (sender, mut unbounded_receiver) = unbounded();
++
++        let queue_preinit = Arc::new(AtomicBool::new(true));
++
++        let worker = thread::spawn(move || {
++            if block_receiver.recv().is_err() {
++                // The other side was disconnected.
++                // There's nothing the worker thread can do.
++                log::error!("The task producer was disconnected. Worker thread will exit.");
++                return;
++            }
++
++            let mut receiver = preinit_receiver;
++            loop {
++                use Command::*;
++
++                match receiver.recv() {
++                    Ok(Shutdown) => {
++                        break;
++                    }
++
++                    Ok(Task(f)) => {
++                        (f)();
++                    }
++
++                    Ok(Swap(swap_done)) => {
++                        // A swap should only occur exactly once.
++                        // This is upheld by `flush_init`, which errors out if the preinit buffer
++                        // was already flushed.
++
++                        // We swap the channels we listen on for new tasks.
++                        // The next iteration will continue with the unbounded queue.
++                        mem::swap(&mut receiver, &mut unbounded_receiver);
++
++                        // The swap command MUST be the last one received on the preinit buffer,
++                        // so by the time we run this we know all preinit tasks were processed.
++                        // We can notify the other side.
++                        swap_done
++                            .send(())
++                            .expect("The caller of `flush_init` has gone missing");
++                    }
++
++                    // Other side was disconnected.
++                    Err(_) => {
++                        log::error!("The task producer was disconnected. Worker thread will exit.");
++                        return;
++                    }
++                }
++            }
++        });
++
++        Dispatcher {
++            queue_preinit,
++            block_sender,
++            preinit_sender,
++            sender,
++            worker: Some(worker),
++        }
++    }
++
++    fn guard(&self) -> DispatchGuard {
++        DispatchGuard {
++            queue_preinit: Arc::clone(&self.queue_preinit),
++            preinit: self.preinit_sender.clone(),
++            queue: self.sender.clone(),
++        }
++    }
++
++    fn block_on_queue(&self) {
++        let (tx, rx) = crossbeam_channel::bounded(0);
++        self.guard()
++            .launch(move || {
++                tx.send(())
++                    .expect("(worker) Can't send message on single-use channel")
++            })
++            .expect("Failed to launch the blocking task");
++        rx.recv()
++            .expect("Failed to receive message on single-use channel");
++    }
++
++    /// Waits for the worker thread to finish and finishes the dispatch queue.
++    ///
++    /// You need to call `try_shutdown` to initiate a shutdown of the queue.
++    fn join(mut self) -> Result<(), DispatchError> {
++        if let Some(worker) = self.worker.take() {
++            worker.join().map_err(|_| DispatchError::WorkerPanic)?;
++        }
++        Ok(())
++    }
++
++    /// Flushes the pre-init buffer.
++    ///
++    /// This function blocks until tasks queued prior to this call are finished.
++    /// Once the initial queue is empty the dispatcher will wait for new tasks to be launched.
++    ///
++    /// Returns an error if called multiple times.
++    pub fn flush_init(&mut self) -> Result<(), DispatchError> {
++        // We immediately stop queueing in the pre-init buffer.
++        let old_val = self.queue_preinit.swap(false, Ordering::SeqCst);
++        if !old_val {
++            return Err(DispatchError::AlreadyFlushed);
++        }
++
++        // Unblock the worker thread exactly once.
++        self.block_sender.send(())?;
++
++        // Single-use channel to communicate with the worker thread.
++        let (swap_sender, swap_receiver) = bounded(0);
++
++        // Send final command and block until it is sent.
++        self.preinit_sender
++            .send(Command::Swap(swap_sender))
++            .map_err(|_| DispatchError::SendError)?;
++
++        // Now wait for the worker thread to do the swap and inform us.
++        // This blocks until all tasks in the preinit buffer have been processed.
++        swap_receiver.recv()?;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use super::*;
++    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++    use std::sync::{Arc, Mutex};
++    use std::{thread, time::Duration};
++
++    fn enable_test_logging() {
++        // When testing we want all logs to go to stdout/stderr by default,
++        // without requiring each individual test to activate it.
++        let _ = env_logger::builder().is_test(true).try_init();
++    }
++
++    #[test]
++    fn tasks_run_off_the_main_thread() {
++        enable_test_logging();
++
++        let main_thread_id = thread::current().id();
++        let thread_canary = Arc::new(AtomicBool::new(false));
++
++        let mut dispatcher = Dispatcher::new(100);
++
++        // Force the Dispatcher out of the pre-init queue mode.
++        dispatcher
++            .flush_init()
++            .expect("Failed to get out of preinit queue mode");
++
++        let canary_clone = thread_canary.clone();
++        dispatcher
++            .guard()
++            .launch(move || {
++                assert!(thread::current().id() != main_thread_id);
++                // Use the canary bool to make sure this is getting called before
++                // the test completes.
++                assert_eq!(false, canary_clone.load(Ordering::SeqCst));
++                canary_clone.store(true, Ordering::SeqCst);
++            })
++            .expect("Failed to dispatch the test task");
++
++        dispatcher.block_on_queue();
++        assert_eq!(true, thread_canary.load(Ordering::SeqCst));
++        assert_eq!(main_thread_id, thread::current().id());
++    }
++
++    #[test]
++    fn launch_correctly_adds_tasks_to_preinit_queue() {
++        enable_test_logging();
++
++        let main_thread_id = thread::current().id();
++        let thread_canary = Arc::new(AtomicU8::new(0));
++
++        let mut dispatcher = Dispatcher::new(100);
++
++        // Add 3 tasks to queue each one increasing thread_canary by 1 to
++        // signal that the tasks ran.
++        for _ in 0..3 {
++            let canary_clone = thread_canary.clone();
++            dispatcher
++                .guard()
++                .launch(move || {
++                    // Make sure the task is flushed off-the-main thread.
++                    assert!(thread::current().id() != main_thread_id);
++                    canary_clone.fetch_add(1, Ordering::SeqCst);
++                })
++                .expect("Failed to dispatch the test task");
++        }
++
++        // Ensure that no task ran.
++        assert_eq!(0, thread_canary.load(Ordering::SeqCst));
++
++        // Flush the queue and wait for the tasks to complete.
++        dispatcher
++            .flush_init()
++            .expect("Failed to get out of preinit queue mode");
++        // Validate that we have the expected canary value.
++        assert_eq!(3, thread_canary.load(Ordering::SeqCst));
++    }
++
++    #[test]
++    fn preinit_tasks_are_processed_after_flush() {
++        enable_test_logging();
++
++        let mut dispatcher = Dispatcher::new(10);
++
++        let result = Arc::new(Mutex::new(vec![]));
++        for i in 1..=5 {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(i);
++                })
++                .unwrap();
++        }
++
++        result.lock().unwrap().push(0);
++        dispatcher.flush_init().unwrap();
++        for i in 6..=10 {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(i);
++                })
++                .unwrap();
++        }
++
++        dispatcher.block_on_queue();
++
++        // This additionally checks that tasks were executed in order.
++        assert_eq!(
++            &*result.lock().unwrap(),
++            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
++        );
++    }
++
++    #[test]
++    fn tasks_after_shutdown_are_not_processed() {
++        enable_test_logging();
++
++        let mut dispatcher = Dispatcher::new(10);
++
++        let result = Arc::new(Mutex::new(vec![]));
++
++        dispatcher.flush_init().unwrap();
++
++        dispatcher.guard().shutdown().unwrap();
++        {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(0);
++                })
++                .unwrap();
++        }
++
++        dispatcher.join().unwrap();
++
++        assert!(result.lock().unwrap().is_empty());
++    }
++
++    #[test]
++    fn preinit_buffer_fills_up() {
++        enable_test_logging();
++
++        let mut dispatcher = Dispatcher::new(5);
++
++        let result = Arc::new(Mutex::new(vec![]));
++
++        for i in 1..=5 {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(i);
++                })
++                .unwrap();
++        }
++
++        {
++            let result = Arc::clone(&result);
++            let err = dispatcher.guard().launch(move || {
++                result.lock().unwrap().push(10);
++            });
++            assert_eq!(Err(DispatchError::QueueFull), err);
++        }
++
++        dispatcher.flush_init().unwrap();
++
++        {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(20);
++                })
++                .unwrap();
++        }
++
++        dispatcher.block_on_queue();
++
++        assert_eq!(&*result.lock().unwrap(), &[1, 2, 3, 4, 5, 20]);
++    }
++
++    #[test]
++    fn normal_queue_is_unbounded() {
++        enable_test_logging();
++
++        // Note: We can't actually test that it's fully unbounded,
++        // but we can quickly queue more slow tasks than the pre-init buffer holds
++        // and then guarantuee they all run.
++
++        let mut dispatcher = Dispatcher::new(5);
++
++        let result = Arc::new(Mutex::new(vec![]));
++
++        for i in 1..=5 {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    result.lock().unwrap().push(i);
++                })
++                .unwrap();
++        }
++
++        dispatcher.flush_init().unwrap();
++
++        // Queue more than 5 tasks,
++        // Each one is slow to process, so we should be faster in queueing
++        // them up than they are processed.
++        for i in 6..=20 {
++            let result = Arc::clone(&result);
++            dispatcher
++                .guard()
++                .launch(move || {
++                    thread::sleep(Duration::from_millis(50));
++                    result.lock().unwrap().push(i);
++                })
++                .unwrap();
++        }
++
++        dispatcher.guard().shutdown().unwrap();
++        dispatcher.join().unwrap();
++
++        let expected = (1..=20).collect::<Vec<_>>();
++        assert_eq!(&*result.lock().unwrap(), &expected);
++    }
++}
+
+diff --git a/glean-core/rlb/src/lib.rs b/glean-core/rlb/src/lib.rs
+--- a/glean-core/rlb/src/lib.rs
++++ b/glean-core/rlb/src/lib.rs
+@@ -47,6 +47,7 @@ pub use glean_core::{global_glean, setup_glean, CommonMetricData, Error, Glean,
+ 
+ mod configuration;
+ mod core_metrics;
++mod dispatcher;
+ pub mod private;
+ mod system;
+
+diff --git a/glean-core/rlb/src/private/boolean.rs b/glean-core/rlb/src/private/boolean.rs
+--- a/glean-core/rlb/src/private/boolean.rs
++++ b/glean-core/rlb/src/private/boolean.rs
+@@ -3,6 +3,9 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use inherent::inherent;
++use std::sync::Arc;
++
++use crate::dispatcher;
+ 
+ // We need to wrap the glean-core type: otherwise if we try to implement
+ // the trait for the metric in `glean_core::metrics` we hit error[E0117]:
+@@ -14,12 +17,13 @@ use inherent::inherent;
+ /// Instances of this class type are automatically generated by the parsers
+ /// at build time, allowing developers to record values that were previously
+ /// registered in the metrics.yaml file.
+-pub struct BooleanMetric(pub(crate) glean_core::metrics::BooleanMetric);
++#[derive(Clone)]
++pub struct BooleanMetric(pub(crate) Arc<glean_core::metrics::BooleanMetric>);
+ 
+ impl BooleanMetric {
+     /// The public constructor used by automatically generated metrics.
+     pub fn new(meta: glean_core::CommonMetricData) -> Self {
+-        Self(glean_core::metrics::BooleanMetric::new(meta))
++        Self(Arc::new(glean_core::metrics::BooleanMetric::new(meta)))
+     }
+ }
+ 
+@@ -31,11 +35,8 @@ impl glean_core::traits::Boolean for BooleanMetric {
+     ///
+     /// * `value` - the value to set.
+     fn set(&self, value: bool) {
+-        crate::with_glean(|glean| {
+-            // Important note: this will need to use the
+-            // Dispatcher to call off the main thread.
+-            self.0.set(glean, value)
+-        })
++        let metric = Arc::clone(&self.0);
++        dispatcher::launch(move || crate::with_glean(|glean| metric.set(glean, value)));
+     }
+ 
+     /// **Exported for test purposes.**
+@@ -44,6 +45,8 @@ impl glean_core::traits::Boolean for BooleanMetric {
+     ///
+     /// This doesn't clear the stored value.
+     fn test_get_value(&self, storage_name: &str) -> Option<bool> {
++        dispatcher::block_on_queue();
++
+         crate::with_glean(|glean| self.0.test_get_value(glean, storage_name))
+     }
+ }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

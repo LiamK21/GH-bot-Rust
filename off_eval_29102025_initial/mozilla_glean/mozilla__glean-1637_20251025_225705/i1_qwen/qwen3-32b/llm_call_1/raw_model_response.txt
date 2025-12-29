@@ -1,0 +1,81 @@
+<think>
+Okay, I need to create a regression test for the provided patch. The issue was a lock-order-inversion leading to a potential deadlock. The patch modifies the `start_scheduler` function in `scheduler.rs` to avoid holding a lock while calling `submit_metrics_ping`, which likely prevents the deadlock by releasing the lock before accessing other mutexes.
+
+First, I should understand the function's behavior. The original problem occurs when two mutexes are acquired in different orders by different threads. The patch moves the lock release before submitting the metrics ping. So, the test should simulate a scenario where the scheduling thread and another thread access shared resources in a way that could cause a deadlock if the lock order is inverted.
+
+The test needs to check that the patch prevents the deadlock. Since the issue is related to concurrency and lock ordering, I can create a test that spawns multiple threads to access the scheduler and another resource under lock, verifying that no deadlock occurs.
+
+I'll create a mock `submitter` that locks another mutex. The test will run the scheduler in one thread and have another thread also acquire locks in a different order if the patch isn't applied. With the patch, the lock is released before submitting, so the order is consistent.
+
+So, the test should:
+
+1. Use a mock submitter that locks a mutex.
+2. Start the scheduler thread.
+3. In another thread, attempt to lock the same mutex in a different order to simulate the scenario.
+4. Check that the test completes without deadlocking.
+
+I'll need to use `Mutex`, `Condvar`, and threading from std. The mock submitter will lock a mutex, and the test will join the threads to ensure they finish without deadlock.
+
+Now, structure the test. The function under test is `start_scheduler`, which takes a submitter, now, and when. The mock submitter can be a closure that locks a mutex. The test will verify that the threads can run without deadlocking.
+
+In the test, I'll have two mutexes: one in the scheduler's lock and another in the submitter's lock. Without the patch, acquiring them in different orders could deadlock. The patch ensures that the scheduler releases its lock before the submitter acquires its own.
+
+I'll simulate this by having one thread (scheduler) holdMutexA and then call the submitter which tries to lockMutexB. Another thread holdsMutexB and tries to lockMutexA. Without the patch, this would cause a deadlock. With the patch, the scheduler releases MutexA before calling the submitter, allowing the other thread to proceed.
+
+Thus, the test should pass if the deadlock is avoided, ensuring the patch's correctness.
+</think>
+
+<Filename>glean-core/src/scheduler.rs</Filename>
+<imports>
+use std::sync::{Arc, Mutex, Condvar, MutexGuard};
+use std::thread;
+use std::time::{Duration, SystemTime};
+</imports>
+<Rust>
+#[test]
+fn test_scheduler_avoids_lock_order_inversion() {
+    let mutex1 = Arc::new(Mutex::new(()));
+    let mutex2 = Arc::new(Mutex::new(()));
+    
+    let (cancel_sender, cancel_receiver) = std::sync::mpsc::channel();
+    
+    // Mock submitter that holds mutex2 while accessing shared state
+    let submitter = Arc::new(move |_: &dyn std::any::Any, _reason: Option<&str>, _now: SystemTime| {
+        let _guard = mutex2.lock().unwrap();
+        // Simulate some processing
+        std::thread::sleep(Duration::from_millis(10));
+    });
+    
+    let now = SystemTime::now();
+    let when = When::Reschedule;
+    
+    let scheduler_handle = thread::spawn(move || {
+        let canceller = Arc::new((Mutex::new(false), Condvar::new()));
+        let (cancelled, condvar) = &*canceller;
+        
+        start_scheduler(submitter, now, when, canceller);
+    });
+    
+    // Simulate another thread that would deadlock without the patch
+    let mutex1_clone = Arc::clone(&mutex1);
+    let mutex2_clone = Arc::clone(&mutex2);
+    let test_thread = thread::spawn(move || {
+        // Acquire the locks in reverse order
+        let _guard2 = mutex2_clone.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(50)); // Ensure lock ordering race
+        let _guard1 = mutex1_clone.lock().unwrap();
+    });
+    
+    // Let threads execute
+    std::thread::sleep(Duration::from_millis(200));
+    
+    // Clean up
+    cancel_sender.send(()).unwrap();
+    scheduler_handle.join().unwrap();
+    test_thread.join().unwrap();
+}
+
+enum When {
+    Reschedule,
+}
+</Rust>

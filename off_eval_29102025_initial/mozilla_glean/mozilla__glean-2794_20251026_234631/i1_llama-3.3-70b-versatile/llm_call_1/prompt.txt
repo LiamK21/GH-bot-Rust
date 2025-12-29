@@ -1,0 +1,1020 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Consider if, and if so how to best, report Glean SDK memory use in Firefox Desktop
+As mentioned in bug 1804420 comment 5, Glean SDK memory's ending up in the "heap unclassified" bucket. We ought to be able to do better than this and report where all the memory's going.
+
+That is, if this makes sense to the SDK at large. Webrender apparently has a good model to follow, and there are empty crates.io impls for `malloc_size_of/malloc_size_of_derive` which ought to assist. But I've not looked into it.
+
+Also: it may make the most sense for FOG to be the only part that records memory, but I'm not sure how much memory is used internal to the SDK vs at a layer where FOG would be able to report it. Unsure, so I'm filing this as an SDK bug first.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/rlb/src/private/event.rs b/glean-core/rlb/src/private/event.rs
+--- a/glean-core/rlb/src/private/event.rs
++++ b/glean-core/rlb/src/private/event.rs
+@@ -5,6 +5,8 @@
+ use inherent::inherent;
+ use std::{collections::HashMap, marker::PhantomData};
+ 
++use malloc_size_of::MallocSizeOf;
++
+ use glean_core::{metrics::MetricIdentifier, traits};
+ 
+ use crate::{ErrorType, RecordedEvent};
+@@ -25,6 +27,12 @@ pub struct EventMetric<K> {
+     extra_keys: PhantomData<K>,
+ }
+ 
++impl<K> MallocSizeOf for EventMetric<K> {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        self.inner.size_of(ops)
++    }
++}
++
+ impl<'a, K> MetricIdentifier<'a> for EventMetric<K> {
+     fn get_identifiers(&'a self) -> (&'a str, &'a str, Option<&'a str>) {
+         self.inner.get_identifiers()
+
+diff --git a/glean-core/rlb/src/private/object.rs b/glean-core/rlb/src/private/object.rs
+--- a/glean-core/rlb/src/private/object.rs
++++ b/glean-core/rlb/src/private/object.rs
+@@ -4,6 +4,8 @@
+ 
+ use std::marker::PhantomData;
+ 
++use malloc_size_of::MallocSizeOf;
++
+ use glean_core::metrics::{JsonValue, MetricIdentifier};
+ use glean_core::traits;
+ 
+@@ -25,6 +27,12 @@ pub struct ObjectMetric<K> {
+     object_type: PhantomData<K>,
+ }
+ 
++impl<K> MallocSizeOf for ObjectMetric<K> {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        self.inner.size_of(ops)
++    }
++}
++
+ impl<'a, K> MetricIdentifier<'a> for ObjectMetric<K> {
+     fn get_identifiers(&'a self) -> (&'a str, &'a str, Option<&'a str>) {
+         self.inner.get_identifiers()
+
+diff --git a/glean-core/rlb/src/private/ping.rs b/glean-core/rlb/src/private/ping.rs
+--- a/glean-core/rlb/src/private/ping.rs
++++ b/glean-core/rlb/src/private/ping.rs
+@@ -2,7 +2,12 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use std::sync::{Arc, Mutex};
++use std::{
++    mem,
++    sync::{Arc, Mutex},
++};
++
++use malloc_size_of::MallocSizeOf;
+ 
+ type BoxedCallback = Box<dyn FnOnce(Option<&str>) + Send + 'static>;
+ 
+@@ -19,6 +24,19 @@ pub struct PingType {
+     test_callback: Arc<Mutex<Option<BoxedCallback>>>,
+ }
+ 
++impl MallocSizeOf for PingType {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        self.inner.size_of(ops)
++            + self
++                .test_callback
++                .lock()
++                .unwrap()
++                .as_ref()
++                .map(|cb| mem::size_of_val(cb))
++                .unwrap_or(0)
++    }
++}
++
+ impl PingType {
+     /// Creates a new ping type.
+     ///
+
+diff --git a/glean-core/src/common_metric_data.rs b/glean-core/src/common_metric_data.rs
+--- a/glean-core/src/common_metric_data.rs
++++ b/glean-core/src/common_metric_data.rs
+@@ -4,6 +4,8 @@
+ 
+ use std::sync::atomic::{AtomicU8, Ordering};
+ 
++use malloc_size_of_derive::MallocSizeOf;
++
+ use crate::error::{Error, ErrorKind};
+ use crate::metrics::labeled::validate_dynamic_label;
+ use crate::Glean;
+@@ -12,7 +14,7 @@ use serde::{Deserialize, Serialize};
+ /// The supported metrics' lifetimes.
+ ///
+ /// A metric's lifetime determines when its stored data gets reset.
+-#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default, MallocSizeOf)]
+ #[repr(i32)] // Use i32 to be compatible with our JNA definition
+ #[serde(rename_all = "lowercase")]
+ pub enum Lifetime {
+@@ -50,7 +52,7 @@ impl TryFrom<i32> for Lifetime {
+ }
+ 
+ /// The common set of data shared across all different metric types.
+-#[derive(Default, Debug, Clone, Deserialize, Serialize)]
++#[derive(Default, Debug, Clone, Deserialize, Serialize, MallocSizeOf)]
+ pub struct CommonMetricData {
+     /// The metric's name.
+     pub name: String,
+@@ -73,9 +75,10 @@ pub struct CommonMetricData {
+     pub dynamic_label: Option<String>,
+ }
+ 
+-#[derive(Default, Debug)]
++#[derive(Default, Debug, MallocSizeOf)]
+ pub struct CommonMetricDataInternal {
+     pub inner: CommonMetricData,
++    #[ignore_malloc_size_of = "atomic integers never allocate (bug 1960589)"]
+     pub disabled: AtomicU8,
+ }
+
+diff --git a/glean-core/src/core/mod.rs b/glean-core/src/core/mod.rs
+--- a/glean-core/src/core/mod.rs
++++ b/glean-core/src/core/mod.rs
+@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, FixedOffset};
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::OnceCell;
+ 
+ use crate::database::Database;
+@@ -147,7 +148,7 @@ where
+ ///
+ /// In specific language bindings, this is usually wrapped in a singleton and all metric recording goes to a single instance of this object.
+ /// In the Rust core, it is possible to create multiple instances, which is used in testing.
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct Glean {
+     upload_enabled: bool,
+     pub(crate) data_store: Option<Database>,
+@@ -159,6 +160,7 @@ pub struct Glean {
+     data_path: PathBuf,
+     application_id: String,
+     ping_registry: HashMap<String, PingType>,
++    #[ignore_malloc_size_of = "external non-allocating type"]
+     start_time: DateTime<FixedOffset>,
+     max_events: u32,
+     is_first_run: bool,
+@@ -166,7 +168,9 @@ pub struct Glean {
+     debug: DebugOptions,
+     pub(crate) app_build: String,
+     pub(crate) schedule_metrics_pings: bool,
++    #[ignore_malloc_size_of = "atomic integers never allocate (bug 1960589)"]
+     pub(crate) remote_settings_epoch: AtomicU8,
++    #[ignore_malloc_size_of = "TODO: Expose Glean's inner memory allocations (bug 1960592)"]
+     pub(crate) remote_settings_config: Arc<Mutex<RemoteSettingsConfig>>,
+     pub(crate) with_timestamps: bool,
+     pub(crate) ping_schedule: HashMap<String, Vec<String>>,
+
+diff --git a/glean-core/src/core_metrics.rs b/glean-core/src/core_metrics.rs
+--- a/glean-core/src/core_metrics.rs
++++ b/glean-core/src/core_metrics.rs
+@@ -7,10 +7,11 @@ use crate::metrics::{
+ };
+ use crate::{CommonMetricData, Lifetime};
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::Lazy;
+ 
+ /// Metrics included in every ping as `client_info`.
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, MallocSizeOf)]
+ pub struct ClientInfoMetrics {
+     /// The build identifier generated by the CI system (e.g. "1234/A").
+     pub app_build: String,
+
+diff --git a/glean-core/src/database/mod.rs b/glean-core/src/database/mod.rs
+--- a/glean-core/src/database/mod.rs
++++ b/glean-core/src/database/mod.rs
+@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
+ 
+ use crate::ErrorKind;
+ 
++use malloc_size_of::MallocSizeOf;
+ use rkv::{StoreError, StoreOptions};
+ 
+ /// Unwrap a `Result`s `Ok` value or do the specified action.
+@@ -143,6 +144,34 @@ pub struct Database {
+     pub(crate) write_timings: RefCell<Vec<i64>>,
+ }
+ 
++impl MallocSizeOf for Database {
++    fn size_of(&self, _ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        // TODO(bug 1960592): Fill in gaps.
++
++        /*
++        let mut n = 0;
++
++        n += 0; // self.rkv.size_of(ops) -- not implemented.
++        n += 0; // self.user_store.size_of(ops) -- not implemented.
++
++        n += self
++            .ping_lifetime_data
++            .as_ref()
++            .map(|_data| {
++                // TODO(bug 1960592): servo's malloc_size_of implements it for BTreeMap.
++                //let lock = data.read().unwrap();
++                //(*lock).size_of(ops)
++                0
++            })
++            .unwrap_or(0);
++
++        n
++        */
++
++        0
++    }
++}
++
+ impl std::fmt::Debug for Database {
+     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+         fmt.debug_struct("Database")
+
+diff --git a/glean-core/src/debug.rs b/glean-core/src/debug.rs
+--- a/glean-core/src/debug.rs
++++ b/glean-core/src/debug.rs
+@@ -27,12 +27,16 @@
+ 
+ use std::env;
+ 
++use malloc_size_of::MallocSizeOf;
++use malloc_size_of_derive::MallocSizeOf;
++
+ const GLEAN_LOG_PINGS: &str = "GLEAN_LOG_PINGS";
+ const GLEAN_DEBUG_VIEW_TAG: &str = "GLEAN_DEBUG_VIEW_TAG";
+ const GLEAN_SOURCE_TAGS: &str = "GLEAN_SOURCE_TAGS";
+ const GLEAN_MAX_SOURCE_TAGS: usize = 5;
+ 
+ /// A representation of all of Glean's debug options.
++#[derive(MallocSizeOf)]
+ pub struct DebugOptions {
+     /// Option to log the payload of pings that are successfully assembled into a ping request.
+     pub log_pings: DebugOption<bool>,
+@@ -83,6 +87,15 @@ pub struct DebugOption<T, E = fn(String) -> Option<T>, V = fn(&T) -> bool> {
+     validation: Option<V>,
+ }
+ 
++impl<T, E, V> MallocSizeOf for DebugOption<T, E, V>
++where
++    T: MallocSizeOf,
++{
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        self.env.size_of(ops) + self.value.size_of(ops)
++    }
++}
++
+ impl<T, E, V> DebugOption<T, E, V>
+ where
+     T: Clone,
+
+diff --git a/glean-core/src/event_database/mod.rs b/glean-core/src/event_database/mod.rs
+--- a/glean-core/src/event_database/mod.rs
++++ b/glean-core/src/event_database/mod.rs
+@@ -14,6 +14,8 @@ use std::sync::{Mutex, RwLock};
+ 
+ use chrono::{DateTime, FixedOffset, Utc};
+ 
++use malloc_size_of::MallocSizeOf;
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Value as JsonValue};
+ 
+@@ -28,7 +30,7 @@ use crate::Result;
+ use crate::{CommonMetricData, CounterMetric, Lifetime};
+ 
+ /// Represents the recorded data for a single event.
+-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, MallocSizeOf)]
+ #[cfg_attr(test, derive(Default))]
+ pub struct RecordedEvent {
+     /// The timestamp of when the event was recorded.
+@@ -54,7 +56,9 @@ pub struct RecordedEvent {
+ }
+ 
+ /// Represents the stored data for a single event.
+-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
++#[derive(
++    Debug, Clone, Deserialize, Serialize, PartialEq, Eq, malloc_size_of_derive::MallocSizeOf,
++)]
+ struct StoredEvent {
+     #[serde(flatten)]
+     event: RecordedEvent,
+@@ -99,6 +103,12 @@ pub struct EventDatabase {
+     file_lock: Mutex<()>,
+ }
+ 
++impl MallocSizeOf for EventDatabase {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        self.event_stores.read().unwrap().size_of(ops)
++    }
++}
++
+ impl EventDatabase {
+     /// Creates a new event database.
+     ///
+
+diff --git a/glean-core/src/histogram/exponential.rs b/glean-core/src/histogram/exponential.rs
+--- a/glean-core/src/histogram/exponential.rs
++++ b/glean-core/src/histogram/exponential.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::OnceCell;
+ use serde::{Deserialize, Serialize};
+ 
+@@ -56,7 +57,7 @@ fn exponential_range(min: u64, max: u64, bucket_count: usize) -> Vec<u64> {
+ ///
+ /// Buckets are pre-computed at instantiation with an exponential distribution from `min` to `max`
+ /// and `bucket_count` buckets.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, MallocSizeOf)]
+ pub struct PrecomputedExponential {
+     // Don't serialize the (potentially large) array of ranges, instead compute them on first
+     // access.
+
+diff --git a/glean-core/src/histogram/functional.rs b/glean-core/src/histogram/functional.rs
+--- a/glean-core/src/histogram/functional.rs
++++ b/glean-core/src/histogram/functional.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ 
+ use super::{Bucketing, Histogram};
+@@ -18,7 +19,7 @@ use crate::util::floating_point_context::FloatingPointContext;
+ /// i = ⌊n log<sub>base</sub>(𝑥)⌋
+ ///
+ /// In other words, there are n buckets for each power of `base` magnitude.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, MallocSizeOf)]
+ pub struct Functional {
+     exponent: f64,
+ }
+
+diff --git a/glean-core/src/histogram/linear.rs b/glean-core/src/histogram/linear.rs
+--- a/glean-core/src/histogram/linear.rs
++++ b/glean-core/src/histogram/linear.rs
+@@ -5,6 +5,7 @@
+ use std::cmp;
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::OnceCell;
+ use serde::{Deserialize, Serialize};
+ 
+@@ -36,7 +37,7 @@ fn linear_range(min: u64, max: u64, count: usize) -> Vec<u64> {
+ ///
+ /// Buckets are pre-computed at instantiation with a linear  distribution from `min` to `max`
+ /// and `bucket_count` buckets.
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, MallocSizeOf)]
+ pub struct PrecomputedLinear {
+     // Don't serialize the (potentially large) array of ranges, instead compute them on first
+     // access.
+
+diff --git a/glean-core/src/histogram/mod.rs b/glean-core/src/histogram/mod.rs
+--- a/glean-core/src/histogram/mod.rs
++++ b/glean-core/src/histogram/mod.rs
+@@ -7,6 +7,7 @@
+ use std::any::TypeId;
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::OnceCell;
+ use serde::{Deserialize, Serialize};
+ 
+@@ -21,7 +22,7 @@ mod functional;
+ mod linear;
+ 
+ /// Different kinds of histograms.
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
++#[derive(Debug, Clone, Copy, Serialize, Deserialize, MallocSizeOf)]
+ #[serde(rename_all = "lowercase")]
+ pub enum HistogramType {
+     /// A histogram with linear distributed buckets.
+@@ -59,7 +60,7 @@ impl TryFrom<i32> for HistogramType {
+ /// assert_eq!(10, hist.count());
+ /// assert_eq!(55, hist.sum());
+ /// ```
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, MallocSizeOf)]
+ pub struct Histogram<B> {
+     /// Mapping bucket's minimum to sample count.
+     values: HashMap<u64, u64>,
+
+diff --git a/glean-core/src/internal_metrics.rs b/glean-core/src/internal_metrics.rs
+--- a/glean-core/src/internal_metrics.rs
++++ b/glean-core/src/internal_metrics.rs
+@@ -4,9 +4,11 @@
+ 
+ use std::borrow::Cow;
+ 
++use malloc_size_of_derive::MallocSizeOf;
++
+ use super::{metrics::*, CommonMetricData, LabeledMetricData, Lifetime};
+ 
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct CoreMetrics {
+     pub client_id: UuidMetric,
+     pub first_run_date: DatetimeMetric,
+@@ -19,7 +21,7 @@ pub struct CoreMetrics {
+     pub distribution_name: StringMetric,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct AdditionalMetrics {
+     /// The number of times we encountered an IO error
+     /// when writing a pending ping to disk.
+@@ -199,7 +201,7 @@ impl AdditionalMetrics {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct UploadMetrics {
+     pub ping_upload_failure: LabeledMetric<CounterMetric>,
+     pub discarded_exceeding_pings_size: MemoryDistributionMetric,
+@@ -323,7 +325,7 @@ impl UploadMetrics {
+     }
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct DatabaseMetrics {
+     pub size: MemoryDistributionMetric,
+
+diff --git a/glean-core/src/internal_pings.rs b/glean-core/src/internal_pings.rs
+--- a/glean-core/src/internal_pings.rs
++++ b/glean-core/src/internal_pings.rs
+@@ -2,6 +2,8 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
++use malloc_size_of_derive::MallocSizeOf;
++
+ use crate::metrics::PingType;
+ 
+ /// Glean-provided pings, all enabled by default.
+@@ -10,7 +12,7 @@ use crate::metrics::PingType;
+ /// This might get auto-generated when the Rust API lands ([Bug 1579146](https://bugzilla.mozilla.org/show_bug.cgi?id=1579146)).
+ ///
+ /// They are parsed and registered by the platform-specific wrappers, but might be used Glean-internal directly.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, MallocSizeOf)]
+ pub struct InternalPings {
+     pub baseline: PingType,
+     pub metrics: PingType,
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -26,6 +26,7 @@ use std::time::Duration;
+ 
+ use crossbeam_channel::unbounded;
+ use log::LevelFilter;
++use malloc_size_of_derive::MallocSizeOf;
+ use once_cell::sync::{Lazy, OnceCell};
+ use uuid::Uuid;
+ 
+@@ -113,7 +114,7 @@ static INIT_HANDLES: Lazy<Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>> =
+     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+ 
+ /// Configuration for Glean
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, MallocSizeOf)]
+ pub struct InternalConfiguration {
+     /// Whether upload should be enabled.
+     pub upload_enabled: bool,
+@@ -135,6 +136,8 @@ pub struct InternalConfiguration {
+     /// Whether Glean should, on init, trim its event storage to only the registered pings.
+     pub trim_data_to_registered_pings: bool,
+     /// The internal logging level.
++    /// ignore
++    #[ignore_malloc_size_of = "external non-allocating type"]
+     pub log_level: Option<LevelFilter>,
+     /// The rate at which pings may be uploaded before they are throttled.
+     pub rate_limit: Option<PingRateLimit>,
+@@ -158,7 +161,7 @@ pub struct InternalConfiguration {
+ }
+ 
+ /// How to specify the rate at which pings may be uploaded before they are throttled.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, MallocSizeOf)]
+ pub struct PingRateLimit {
+     /// Length of time in seconds of a ping uploading interval.
+     pub seconds_per_interval: u64,
+
+diff --git a/glean-core/src/metrics/datetime.rs b/glean-core/src/metrics/datetime.rs
+--- a/glean-core/src/metrics/datetime.rs
++++ b/glean-core/src/metrics/datetime.rs
+@@ -16,6 +16,7 @@ use crate::CommonMetricData;
+ use crate::Glean;
+ 
+ use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike};
++use malloc_size_of_derive::MallocSizeOf;
+ 
+ /// A datetime type.
+ ///
+@@ -23,7 +24,7 @@ use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Timelike};
+ pub type ChronoDatetime = DateTime<FixedOffset>;
+ 
+ /// Representation of a date, time and timezone.
+-#[derive(Clone, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq, MallocSizeOf)]
+ pub struct Datetime {
+     /// The year, e.g. 2021.
+     pub year: i32,
+
+diff --git a/glean-core/src/metrics/labeled.rs b/glean-core/src/metrics/labeled.rs
+--- a/glean-core/src/metrics/labeled.rs
++++ b/glean-core/src/metrics/labeled.rs
+@@ -4,8 +4,11 @@
+ 
+ use std::borrow::Cow;
+ use std::collections::{hash_map::Entry, HashMap};
++use std::mem;
+ use std::sync::{Arc, Mutex};
+ 
++use malloc_size_of::MallocSizeOf;
++
+ use crate::common_metric_data::{CommonMetricData, CommonMetricDataInternal};
+ use crate::error_recording::{record_error, test_get_num_recorded_errors, ErrorType};
+ use crate::histogram::HistogramType;
+@@ -86,6 +89,32 @@ pub struct LabeledMetric<T> {
+     label_map: Mutex<HashMap<String, Arc<T>>>,
+ }
+ 
++impl<T: MallocSizeOf> ::malloc_size_of::MallocSizeOf for LabeledMetric<T> {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        let map = self.label_map.lock().unwrap();
++
++        // Copy of `MallocShallowSizeOf` implementation for `HashMap<K, V>` in `wr_malloc_size_of`.
++        // Note: An instantiated submetric is behind an `Arc`.
++        // `size_of` should only be called from a single thread to avoid double-counting.
++        let shallow_size = if ops.has_malloc_enclosing_size_of() {
++            map.values()
++                .next()
++                .map_or(0, |v| unsafe { ops.malloc_enclosing_size_of(v) })
++        } else {
++            map.capacity()
++                * (mem::size_of::<String>() + mem::size_of::<T>() + mem::size_of::<usize>())
++        };
++
++        let mut map_size = shallow_size;
++        for (k, v) in map.iter() {
++            map_size += k.size_of(ops);
++            map_size += v.size_of(ops);
++        }
++
++        self.labels.size_of(ops) + self.submetric.size_of(ops) + map_size
++    }
++}
++
+ /// Sealed traits protect against downstream implementations.
+ ///
+ /// We wrap it in a private module that is inaccessible outside of this module.
+
+diff --git a/glean-core/src/metrics/mod.rs b/glean-core/src/metrics/mod.rs
+--- a/glean-core/src/metrics/mod.rs
++++ b/glean-core/src/metrics/mod.rs
+@@ -8,6 +8,7 @@ use std::collections::HashMap;
+ use std::sync::atomic::Ordering;
+ 
+ use chrono::{DateTime, FixedOffset};
++use malloc_size_of::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ use serde_json::json;
+ pub use serde_json::Value as JsonValue;
+@@ -152,6 +153,32 @@ pub enum Metric {
+     Object(String),
+ }
+ 
++impl MallocSizeOf for Metric {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        match self {
++            Metric::Boolean(m) => m.size_of(ops),
++            Metric::Counter(m) => m.size_of(ops),
++            // Custom distributions are in the same section, no matter what bucketing.
++            Metric::CustomDistributionExponential(m) => m.size_of(ops),
++            Metric::CustomDistributionLinear(m) => m.size_of(ops),
++            Metric::Datetime(_a, b) => b.size_of(ops),
++            Metric::Experiment(m) => m.size_of(ops),
++            Metric::Quantity(m) => m.size_of(ops),
++            Metric::Rate(a, b) => a.size_of(ops) + b.size_of(ops),
++            Metric::String(m) => m.size_of(ops),
++            Metric::StringList(m) => m.size_of(ops),
++            Metric::Timespan(a, b) => a.size_of(ops) + b.size_of(ops),
++            Metric::TimingDistribution(m) => m.size_of(ops),
++            Metric::Url(m) => m.size_of(ops),
++            Metric::Uuid(m) => m.size_of(ops),
++            Metric::MemoryDistribution(m) => m.size_of(ops),
++            Metric::Jwe(m) => m.size_of(ops),
++            Metric::Text(m) => m.size_of(ops),
++            Metric::Object(m) => m.size_of(ops),
++        }
++    }
++}
++
+ /// A [`MetricType`] describes common behavior across all metrics.
+ pub trait MetricType {
+     /// Access the stored metadata
+@@ -312,3 +339,34 @@ impl Metric {
+         }
+     }
+ }
++
++macro_rules! impl_malloc_size_of_for_metric {
++    ($ty:ident) => {
++        impl ::malloc_size_of::MallocSizeOf for $ty {
++            fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++                // Note: `meta` is likely s behind an `Arc`.
++                // `size_of` should only be called from a single thread to avoid double-counting.
++                self.meta().size_of(ops)
++            }
++        }
++    };
++}
++
++impl_malloc_size_of_for_metric!(BooleanMetric);
++impl_malloc_size_of_for_metric!(CounterMetric);
++impl_malloc_size_of_for_metric!(CustomDistributionMetric);
++impl_malloc_size_of_for_metric!(DatetimeMetric);
++impl_malloc_size_of_for_metric!(DenominatorMetric);
++impl_malloc_size_of_for_metric!(EventMetric);
++impl_malloc_size_of_for_metric!(ExperimentMetric);
++impl_malloc_size_of_for_metric!(MemoryDistributionMetric);
++impl_malloc_size_of_for_metric!(NumeratorMetric);
++impl_malloc_size_of_for_metric!(ObjectMetric);
++impl_malloc_size_of_for_metric!(QuantityMetric);
++impl_malloc_size_of_for_metric!(RateMetric);
++impl_malloc_size_of_for_metric!(StringMetric);
++impl_malloc_size_of_for_metric!(StringListMetric);
++impl_malloc_size_of_for_metric!(TextMetric);
++impl_malloc_size_of_for_metric!(TimespanMetric);
++impl_malloc_size_of_for_metric!(UrlMetric);
++impl_malloc_size_of_for_metric!(UuidMetric);
+
+diff --git a/glean-core/src/metrics/ping.rs b/glean-core/src/metrics/ping.rs
+--- a/glean-core/src/metrics/ping.rs
++++ b/glean-core/src/metrics/ping.rs
+@@ -10,6 +10,7 @@ use crate::ping::PingMaker;
+ use crate::upload::PingPayload;
+ use crate::Glean;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use uuid::Uuid;
+ 
+ /// Stores information about a ping.
+@@ -19,6 +20,7 @@ use uuid::Uuid;
+ #[derive(Clone)]
+ pub struct PingType(Arc<InnerPing>);
+ 
++#[derive(MallocSizeOf)]
+ struct InnerPing {
+     /// The name of the ping.
+     pub name: String,
+@@ -65,6 +67,14 @@ impl fmt::Debug for PingType {
+     }
+ }
+ 
++impl ::malloc_size_of::MallocSizeOf for PingType {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        // Note: This is behind an `Arc`.
++        // `size_of` should only be called from a single thread to avoid double-counting.
++        self.0.size_of(ops)
++    }
++}
++
+ // IMPORTANT:
+ //
+ // When changing this implementation, make sure all the operations are
+
+diff --git a/glean-core/src/metrics/recorded_experiment.rs b/glean-core/src/metrics/recorded_experiment.rs
+--- a/glean-core/src/metrics/recorded_experiment.rs
++++ b/glean-core/src/metrics/recorded_experiment.rs
+@@ -4,11 +4,12 @@
+ 
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ use serde_json::{json, Map as JsonMap, Value as JsonValue};
+ 
+ /// Deserialized experiment data.
+-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
++#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, MallocSizeOf)]
+ pub struct RecordedExperiment {
+     /// The experiment's branch as set through [`set_experiment_active`](crate::glean_set_experiment_active).
+     pub branch: String,
+
+diff --git a/glean-core/src/metrics/remote_settings_config.rs b/glean-core/src/metrics/remote_settings_config.rs
+--- a/glean-core/src/metrics/remote_settings_config.rs
++++ b/glean-core/src/metrics/remote_settings_config.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::collections::HashMap;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ 
+ /// Represents a list of metrics and an associated boolean property
+@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
+ ///     "category.metric_name": true
+ /// }
+ /// ```
+-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
++#[derive(Serialize, Deserialize, Debug, Clone, Default, MallocSizeOf)]
+ pub struct RemoteSettingsConfig {
+     /// This is a `HashMap` consisting of base_identifiers as keys
+     /// and bool values representing an override for the `disabled`
+
+diff --git a/glean-core/src/metrics/time_unit.rs b/glean-core/src/metrics/time_unit.rs
+--- a/glean-core/src/metrics/time_unit.rs
++++ b/glean-core/src/metrics/time_unit.rs
+@@ -4,13 +4,14 @@
+ 
+ use std::time::Duration;
+ 
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::error::{Error, ErrorKind};
+ 
+ /// Different resolutions supported by the time related
+ /// metric types (e.g. DatetimeMetric).
+-#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
++#[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, MallocSizeOf)]
+ #[serde(rename_all = "lowercase")]
+ #[repr(i32)] // use i32 to be compatible with our JNA definition
+ pub enum TimeUnit {
+
+diff --git a/glean-core/src/metrics/timing_distribution.rs b/glean-core/src/metrics/timing_distribution.rs
+--- a/glean-core/src/metrics/timing_distribution.rs
++++ b/glean-core/src/metrics/timing_distribution.rs
+@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++use malloc_size_of_derive::MallocSizeOf;
++
+ use crate::common_metric_data::CommonMetricDataInternal;
+ use crate::error_recording::{record_error, test_get_num_recorded_errors, ErrorType};
+ use crate::histogram::{Functional, Histogram};
+@@ -36,7 +38,7 @@ const MAX_SAMPLE_TIME: u64 = 1000 * 1000 * 1000 * 60 * 10;
+ ///
+ /// Its internals are considered private,
+ /// but due to UniFFI's behavior we expose its field for now.
+-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
++#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, MallocSizeOf)]
+ pub struct TimerId {
+     /// This timer's id.
+     pub id: u64,
+@@ -65,6 +67,17 @@ pub struct TimingDistributionMetric {
+     start_times: Arc<Mutex<HashMap<TimerId, u64>>>,
+ }
+ 
++impl ::malloc_size_of::MallocSizeOf for TimingDistributionMetric {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        // Note: This is behind an `Arc`.
++        // `size_of` should only be called on the main thread to avoid double-counting.
++        self.meta.size_of(ops)
++            + self.time_unit.size_of(ops)
++            + self.next_id.size_of(ops)
++            + self.start_times.lock().unwrap().size_of(ops)
++    }
++}
++
+ /// Create a snapshot of the histogram with a time unit.
+ ///
+ /// The snapshot can be serialized into the payload format.
+
+diff --git a/glean-core/src/upload/directory.rs b/glean-core/src/upload/directory.rs
+--- a/glean-core/src/upload/directory.rs
++++ b/glean-core/src/upload/directory.rs
+@@ -9,6 +9,8 @@ use std::fs::{self, File};
+ use std::io::{BufRead, BufReader};
+ use std::path::{Path, PathBuf};
+ 
++use malloc_size_of::MallocSizeOf;
++use malloc_size_of_derive::MallocSizeOf;
+ use serde::{Deserialize, Serialize};
+ use uuid::Uuid;
+ 
+@@ -16,7 +18,7 @@ use super::request::HeaderMap;
+ use crate::{DELETION_REQUEST_PINGS_DIRECTORY, PENDING_PINGS_DIRECTORY};
+ 
+ /// A representation of the data extracted from a ping file,
+-#[derive(Clone, Debug, Default)]
++#[derive(Clone, Debug, Default, MallocSizeOf)]
+ pub struct PingPayload {
+     /// The ping's doc_id.
+     pub document_id: String,
+@@ -41,6 +43,28 @@ pub struct PingPayloadsByDirectory {
+     pub deletion_request_pings: Vec<(u64, PingPayload)>,
+ }
+ 
++impl MallocSizeOf for PingPayloadsByDirectory {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        // SAFETY: We own the referenced `Vec`s and can hand out pointers to them
++        // to an external function.
++        let shallow_size = unsafe {
++            ops.malloc_size_of(self.pending_pings.as_ptr())
++                + ops.malloc_size_of(self.deletion_request_pings.as_ptr())
++        };
++
++        let mut n = shallow_size;
++        for elem in self.pending_pings.iter() {
++            n += elem.0.size_of(ops);
++            n += elem.1.size_of(ops);
++        }
++        for elem in self.deletion_request_pings.iter() {
++            n += elem.0.size_of(ops);
++            n += elem.1.size_of(ops);
++        }
++        n
++    }
++}
++
+ impl PingPayloadsByDirectory {
+     /// Extends the data of this instance of PingPayloadsByDirectory
+     /// with the data from another instance of PingPayloadsByDirectory.
+@@ -108,7 +132,7 @@ pub fn process_metadata(path: &str, metadata: &str) -> Option<PingMetadata> {
+ }
+ 
+ /// Manages the pings directories.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, MallocSizeOf)]
+ pub struct PingDirectoryManager {
+     /// Path to the pending pings directory.
+     pending_pings_dir: PathBuf,
+
+diff --git a/glean-core/src/upload/mod.rs b/glean-core/src/upload/mod.rs
+--- a/glean-core/src/upload/mod.rs
++++ b/glean-core/src/upload/mod.rs
+@@ -14,6 +14,7 @@
+ 
+ use std::collections::HashMap;
+ use std::collections::VecDeque;
++use std::mem;
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::sync::{Arc, RwLock, RwLockWriteGuard};
+@@ -21,6 +22,8 @@ use std::thread;
+ use std::time::{Duration, Instant};
+ 
+ use chrono::Utc;
++use malloc_size_of::MallocSizeOf;
++use malloc_size_of_derive::MallocSizeOf;
+ 
+ use crate::error::ErrorKind;
+ use crate::TimerId;
+@@ -41,7 +44,7 @@ mod result;
+ 
+ const WAIT_TIME_FOR_PING_PROCESSING: u64 = 1000; // in milliseconds
+ 
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ struct RateLimiter {
+     /// The instant the current interval has started.
+     started: Option<Instant>,
+@@ -216,6 +219,47 @@ pub struct PingUploadManager {
+     in_flight: RwLock<HashMap<String, (TimerId, TimerId)>>,
+ }
+ 
++impl MallocSizeOf for PingUploadManager {
++    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
++        let shallow_size = {
++            let queue = self.queue.read().unwrap();
++            if ops.has_malloc_enclosing_size_of() {
++                if let Some(front) = queue.front() {
++                    // SAFETY: The front element is a valid interior pointer and thus valid to pass
++                    // to an external function.
++                    unsafe { ops.malloc_enclosing_size_of(front) }
++                } else {
++                    // This assumes that no memory is allocated when the VecDeque is empty.
++                    0
++                }
++            } else {
++                // If `ops` can't estimate the size of a pointer,
++                // we can estimate the allocation size by the size of each element and the
++                // allocated capacity.
++                queue.capacity() * mem::size_of::<PingRequest>()
++            }
++        };
++
++        let mut n = shallow_size
++            + self.directory_manager.size_of(ops)
++            // SAFETY: We own this arc and can pass a pointer to it to an external function.
++            + unsafe { ops.malloc_size_of(self.processed_pending_pings.as_ptr()) }
++            + self.cached_pings.read().unwrap().size_of(ops)
++            + self.rate_limiter.as_ref().map(|rl| {
++                let lock = rl.read().unwrap();
++                (*lock).size_of(ops)
++            }).unwrap_or(0)
++            + self.language_binding_name.size_of(ops)
++            + self.upload_metrics.size_of(ops)
++            + self.policy.size_of(ops);
++
++        let in_flight = self.in_flight.read().unwrap();
++        n += in_flight.size_of(ops);
++
++        n
++    }
++}
++
+ impl PingUploadManager {
+     /// Creates a new PingUploadManager.
+     ///
+
+diff --git a/glean-core/src/upload/policy.rs b/glean-core/src/upload/policy.rs
+--- a/glean-core/src/upload/policy.rs
++++ b/glean-core/src/upload/policy.rs
+@@ -4,6 +4,8 @@
+ 
+ //! Policies for ping storage, uploading and requests.
+ 
++use malloc_size_of_derive::MallocSizeOf;
++
+ const MAX_RECOVERABLE_FAILURES: u32 = 3;
+ const MAX_WAIT_ATTEMPTS: u32 = 3;
+ const MAX_PING_BODY_SIZE: usize = 1024 * 1024; // 1 MB
+@@ -18,7 +20,7 @@ const MAX_PENDING_PINGS_DIRECTORY_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+ const MAX_PENDING_PINGS_COUNT: u64 = 250;
+ 
+ /// A struct holding the values for all the policies related to ping storage, uploading and requests.
+-#[derive(Debug)]
++#[derive(Debug, MallocSizeOf)]
+ pub struct Policy {
+     /// The maximum recoverable failures allowed per uploading window.
+     ///
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn exponential_range(min: u64, max: u64, bucket_count: usize) -> Vec<u64>
+
+fn linear_range(min: u64, max: u64, count: usize) -> Vec<u64>
+
+pub fn process_metadata(path: &str, metadata: &str) -> Option<PingMetadata>
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

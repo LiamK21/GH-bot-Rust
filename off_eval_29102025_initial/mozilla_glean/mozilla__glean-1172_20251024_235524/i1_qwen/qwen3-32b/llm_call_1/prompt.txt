@@ -1,0 +1,338 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Distribuitons `accumulate_samples_signed` functions don't check if we should record before recording
+See [1](https://github.com/mozilla/glean/blob/main/glean-core/src/metrics/custom_distribution.rs#L77), [2](https://github.com/mozilla/glean/blob/main/glean-core/src/metrics/memory_distribution.rs#L122), [3](https://github.com/mozilla/glean/blob/main/glean-core/src/metrics/timing_distribution.rs#L244).
+
+We can probably move the `should_record` check to the `record` and `record_with` functions.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/src/database/mod.rs b/glean-core/src/database/mod.rs
+--- a/glean-core/src/database/mod.rs
++++ b/glean-core/src/database/mod.rs
+@@ -263,7 +263,7 @@ impl Database {
+     /// # Panics
+     ///
+     /// * This function will **not** panic on database errors.
+-    pub fn write_with_store<F>(&self, store_name: Lifetime, mut transaction_fn: F) -> Result<()>
++    fn write_with_store<F>(&self, store_name: Lifetime, mut transaction_fn: F) -> Result<()>
+     where
+         F: FnMut(rkv::Writer, &SingleStore) -> Result<()>,
+     {
+@@ -274,6 +274,11 @@ impl Database {
+ 
+     /// Records a metric in the underlying storage system.
+     pub fn record(&self, glean: &Glean, data: &CommonMetricData, value: &Metric) {
++        // If upload is disabled we don't want to record.
++        if !glean.is_upload_enabled() {
++            return;
++        }
++
+         let name = data.identifier(glean);
+ 
+         for ping_name in data.storage_names() {
+@@ -331,6 +336,11 @@ impl Database {
+     where
+         F: FnMut(Option<Metric>) -> Metric,
+     {
++        // If upload is disabled we don't want to record.
++        if !glean.is_upload_enabled() {
++            return;
++        }
++
+         let name = data.identifier(glean);
+         for ping_name in data.storage_names() {
+             if let Err(e) =
+@@ -353,7 +363,7 @@ impl Database {
+     /// # Panics
+     ///
+     /// This function will **not** panic on database errors.
+-    pub fn record_per_lifetime_with<F>(
++    fn record_per_lifetime_with<F>(
+         &self,
+         lifetime: Lifetime,
+         storage_name: &str,
+@@ -580,6 +590,8 @@ impl Database {
+ #[cfg(test)]
+ mod test {
+     use super::*;
++    use crate::tests::new_glean;
++    use crate::CommonMetricData;
+     use std::collections::HashMap;
+     use tempfile::tempdir;
+ 
+@@ -1026,4 +1038,95 @@ mod test {
+                 .is_some());
+         }
+     }
++
++    #[test]
++    fn doesnt_record_when_upload_is_disabled() {
++        let (mut glean, dir) = new_glean(None);
++
++        // Init the database in a temporary directory.
++        let str_dir = dir.path().display().to_string();
++
++        let test_storage = "test-storage";
++        let test_data = CommonMetricData::new("category", "name", test_storage);
++        let test_metric_id = test_data.identifier(&glean);
++
++        // Attempt to record metric with the record and record_with functions,
++        // this should work since upload is enabled.
++        let db = Database::new(&str_dir, true).unwrap();
++        db.record(&glean, &test_data, &Metric::String("record".to_owned()));
++        db.iter_store_from(
++            Lifetime::Ping,
++            test_storage,
++            None,
++            &mut |metric_id: &[u8], metric: &Metric| {
++                assert_eq!(
++                    String::from_utf8_lossy(metric_id).into_owned(),
++                    test_metric_id
++                );
++                match metric {
++                    Metric::String(v) => assert_eq!("record", *v),
++                    _ => panic!("Unexpected data found"),
++                }
++            },
++        );
++
++        db.record_with(&glean, &test_data, |_| {
++            Metric::String("record_with".to_owned())
++        });
++        db.iter_store_from(
++            Lifetime::Ping,
++            test_storage,
++            None,
++            &mut |metric_id: &[u8], metric: &Metric| {
++                assert_eq!(
++                    String::from_utf8_lossy(metric_id).into_owned(),
++                    test_metric_id
++                );
++                match metric {
++                    Metric::String(v) => assert_eq!("record_with", *v),
++                    _ => panic!("Unexpected data found"),
++                }
++            },
++        );
++
++        // Disable upload
++        glean.set_upload_enabled(false);
++
++        // Attempt to record metric with the record and record_with functions,
++        // this should work since upload is now **disabled**.
++        db.record(&glean, &test_data, &Metric::String("record_nop".to_owned()));
++        db.iter_store_from(
++            Lifetime::Ping,
++            test_storage,
++            None,
++            &mut |metric_id: &[u8], metric: &Metric| {
++                assert_eq!(
++                    String::from_utf8_lossy(metric_id).into_owned(),
++                    test_metric_id
++                );
++                match metric {
++                    Metric::String(v) => assert_eq!("record_with", *v),
++                    _ => panic!("Unexpected data found"),
++                }
++            },
++        );
++        db.record_with(&glean, &test_data, |_| {
++            Metric::String("record_with_nop".to_owned())
++        });
++        db.iter_store_from(
++            Lifetime::Ping,
++            test_storage,
++            None,
++            &mut |metric_id: &[u8], metric: &Metric| {
++                assert_eq!(
++                    String::from_utf8_lossy(metric_id).into_owned(),
++                    test_metric_id
++                );
++                match metric {
++                    Metric::String(v) => assert_eq!("record_with", *v),
++                    _ => panic!("Unexpected data found"),
++                }
++            },
++        );
++    }
+ }
+
+diff --git a/glean-core/src/event_database/mod.rs b/glean-core/src/event_database/mod.rs
+--- a/glean-core/src/event_database/mod.rs
++++ b/glean-core/src/event_database/mod.rs
+@@ -187,6 +187,11 @@ impl EventDatabase {
+         timestamp: u64,
+         extra: Option<HashMap<String, String>>,
+     ) {
++        // If upload is disabled we don't want to record.
++        if !glean.is_upload_enabled() {
++            return;
++        }
++
+         // Create RecordedEvent object, and its JSON form for serialization
+         // on disk.
+         let event = RecordedEvent {
+@@ -357,6 +362,8 @@ impl EventDatabase {
+ #[cfg(test)]
+ mod test {
+     use super::*;
++    use crate::tests::new_glean;
++    use crate::CommonMetricData;
+ 
+     #[test]
+     fn handle_truncated_events_on_disk() {
+@@ -451,4 +458,40 @@ mod test {
+         );
+         assert_eq!(event_data, serde_json::from_str(&event_data_json).unwrap());
+     }
++
++    #[test]
++    fn doesnt_record_when_upload_is_disabled() {
++        let (mut glean, dir) = new_glean(None);
++        let db = EventDatabase::new(dir.path().to_str().unwrap()).unwrap();
++
++        let test_storage = "test-storage";
++        let test_category = "category";
++        let test_name = "name";
++        let test_timestamp = 2;
++        let test_meta = CommonMetricData::new(test_category, test_name, test_storage);
++        let event_data = RecordedEvent {
++            timestamp: test_timestamp,
++            category: test_category.to_string(),
++            name: test_name.to_string(),
++            extra: None,
++        };
++
++        // Upload is not yet disabled,
++        // so let's check that everything is getting recorded as expected.
++        db.record(&glean, &test_meta, 2, None);
++        {
++            let event_stores = db.event_stores.read().unwrap();
++            assert_eq!(&event_data, &event_stores.get(test_storage).unwrap()[0]);
++            assert_eq!(event_stores.get(test_storage).unwrap().len(), 1);
++        }
++
++        glean.set_upload_enabled(false);
++
++        // Now that upload is disabled, let's check nothing is recorded.
++        db.record(&glean, &test_meta, 2, None);
++        {
++            let event_stores = db.event_stores.read().unwrap();
++            assert_eq!(event_stores.get(test_storage).unwrap().len(), 1);
++        }
++    }
+ }
+
+diff --git a/glean-core/src/metrics/custom_distribution.rs b/glean-core/src/metrics/custom_distribution.rs
+--- a/glean-core/src/metrics/custom_distribution.rs
++++ b/glean-core/src/metrics/custom_distribution.rs
+@@ -75,6 +75,10 @@ impl CustomDistributionMetric {
+     /// Discards any negative value in `samples` and report an `ErrorType::InvalidValue`
+     /// for each of them.
+     pub fn accumulate_samples_signed(&self, glean: &Glean, samples: Vec<i64>) {
++        if !self.should_record(glean) {
++            return;
++        }
++
+         let mut num_negative_samples = 0;
+ 
+         // Generic accumulation function to handle the different histogram types and count negative
+
+diff --git a/glean-core/src/metrics/datetime.rs b/glean-core/src/metrics/datetime.rs
+--- a/glean-core/src/metrics/datetime.rs
++++ b/glean-core/src/metrics/datetime.rs
+@@ -72,6 +72,10 @@ impl DatetimeMetric {
+         nano: u32,
+         offset_seconds: i32,
+     ) {
++        if !self.should_record(glean) {
++            return;
++        }
++
+         let timezone_offset = FixedOffset::east_opt(offset_seconds);
+         if timezone_offset.is_none() {
+             let msg = format!("Invalid timezone offset {}. Not recording.", offset_seconds);
+
+diff --git a/glean-core/src/metrics/memory_distribution.rs b/glean-core/src/metrics/memory_distribution.rs
+--- a/glean-core/src/metrics/memory_distribution.rs
++++ b/glean-core/src/metrics/memory_distribution.rs
+@@ -120,6 +120,10 @@ impl MemoryDistributionMetric {
+     /// Values bigger than 1 Terabyte (2<sup>40</sup> bytes) are truncated
+     /// and an `ErrorType::InvalidValue` error is recorded.
+     pub fn accumulate_samples_signed(&self, glean: &Glean, samples: Vec<i64>) {
++        if !self.should_record(glean) {
++            return;
++        }
++
+         let mut num_negative_samples = 0;
+         let mut num_too_log_samples = 0;
+
+diff --git a/glean-core/src/metrics/timing_distribution.rs b/glean-core/src/metrics/timing_distribution.rs
+--- a/glean-core/src/metrics/timing_distribution.rs
++++ b/glean-core/src/metrics/timing_distribution.rs
+@@ -242,6 +242,10 @@ impl TimingDistributionMetric {
+     /// for each of them. Reports an `ErrorType::InvalidOverflow` error for samples that
+     /// are longer than `MAX_SAMPLE_TIME`.
+     pub fn accumulate_samples_signed(&mut self, glean: &Glean, samples: Vec<i64>) {
++        if !self.should_record(glean) {
++            return;
++        }
++
+         let mut num_negative_samples = 0;
+         let mut num_too_long_samples = 0;
+         let max_sample_time = self.time_unit.as_nanos(MAX_SAMPLE_TIME);
+@@ -273,6 +277,7 @@ impl TimingDistributionMetric {
+                     hist.accumulate(sample);
+                 }
+             }
++
+             Metric::TimingDistribution(hist)
+         });
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

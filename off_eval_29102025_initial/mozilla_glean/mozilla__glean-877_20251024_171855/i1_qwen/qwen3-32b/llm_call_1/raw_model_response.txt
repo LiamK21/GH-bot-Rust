@@ -1,0 +1,209 @@
+<think>
+Okay, let me try to figure out what regression test to write for this patch. The issue is about enabling uploading gzipped ping payloads on iOS. The patch shows that in the FfiPingUploadTask struct, the 'body' field was changed from a *mut c_char to a ByteBuffer. The conversion in the From implementation now uses ByteBuffer::from_vec instead of converting to a CString.
+
+So the old code would serialize the body to a JSON string, wrap it in a CString, and then take the raw pointer. The new code uses ByteBuffer::from_vec directly on the request.body, which is probably a Vec<u8> or similar. This suggests that the body is now handled as binary data (since ByteBuffer is for binary) instead of a JSON string. That makes sense for gzipped data because binary data isn't a valid JSON string.
+
+The test needs to verify that the body is correctly handled as binary data, not a JSON string. Before the patch, if the body was binary (like gzipped data), converting to a JSON string would escape it, making it invalid when sent. The test should check that the 'body' field in the ffi is properly wrapped in a ByteBuffer, which should not modify the data.
+
+Looking at the modified functions: the From implementation for FfiPingUploadTask. So the test should create a PingUploadTask with some binary data, convert it to the Ffi variant, and then check that the body is correctly captured in a ByteBuffer.
+
+Wait, but in the From implementation, the body is now ByteBuffer::from_vec(request.body). So the request.body must be a Vec<u8>, perhaps. So the test would need to create a PingUploadTask with some binary data, then check that the FfiPingUploadTask's Upload variant's body is correctly set as a ByteBuffer containing that data.
+
+But how can we test that? Because the ByteBuffer is an internal struct. Maybe the test would simulate creating a body and then check that when the FfiPingUploadTask is created, the body is correctly handled. Alternatively, since the patch changes the Drop implementation to use ByteBuffer's destroy, maybe the test ensures that the body is dropped correctly, but that's more about memory handling.
+
+But the main issue is the conversion from the body data. The test needs to ensure that the body is properly converted into a ByteBuffer without being JSON-encoded. So the test could use a mock or a sample Upload task and verify that the FfiPingUploadTask's body is constructed correctly.
+
+Let me think about the code structure. The FfiPingUploadTask is generated from PingUploadTask. So the test would need to create a PingUploadTask::Upload with a specific body, then convert it to FfiPingUploadTask, and check that the body is as expected.
+
+But since FfiPingUploadTask's Upload variant holds a ByteBuffer, and ByteBuffer's from_vec is called, maybe the test can create a body with some expected data, and then after conversion, check the ByteBuffer's contents.
+
+However, ByteBuffer may not be publicly accessible, so maybe there's no way to directly test the content. Alternatively, maybe we can check that the correct method is called. But without internal access, perhaps a different approach is needed.
+
+Alternatively, consider the Drop implementation. The old code had a 'glean_str_free' for the body, which was a pointer from theCString. The new code uses ByteBuffer's destroy. If the test can check that the Drop method now correctly calls body.destroy(), but that's part of the Drop, perhaps via memory tracking.
+
+Another angle: the problem before was that the body was a JSON string, which would not handle binary data correctly. The patch changes it to ByteBuffer, which is suitable for binary. So a test could have a body with non-text data (like some binary content), convert to FfiPingUploadTask, and then ensure that the conversion doesn't mangle the data. But since we can't access ByteBuffer's data directly, perhaps the test needs to create a body with known data, convert to FfiPingUploadTask, then when dropped, check that the ByteBuffer is properly handled. But that's tricky.
+
+Alternatively, maybe the test can create a PingUploadTask with some binary data, then convert it to the Ffi variant, and check that the body's bytes are preserved. But without exposing ByteBuffer's internals, perhaps that's not possible.
+
+Wait, the From implementation for FfiPingUploadTask from PingUploadTask now does byte_buffer.from_vec(request.body). So if the request.body is a Vec<u8>, then ByteBuffer is constructed from that. If the body was a JSON string before, then perhaps the test can show that for a binary payload, the old conversion would have failed, but the new one works.
+
+For example, if the body contains a 0 byte, which is valid in binary but invalid in JSON strings. Converting a Vec<u8> with a 0 to a CString would fail because CString::new() can't handle nul bytes. But in the old code, the body was converted to JSON (which would serialize it as a string?), then to CString. Wait, the old code in the From implementation had:
+
+let body = CString::new(serde_json::to_string(&request.body).unwrap()).unwrap();
+
+But request.body is the original body. So if the body was a Vec<u8>, then serde_json::to_string would serialize it as a JSON array or base64? Or maybe the request.body is a Value (JSON value). Wait, the comment says "request.body is a JsonValue" in the original code.
+
+So in the old code, request.body is a JsonValue. So if the body is binary, perhaps it's stored as base64 or as a JSON array. But when they converted it to a string (serde_json::to_string), that would create a JSON-encoded string, then passed to CString::new(). But if the body is binary, that JSON string would escape any problematic characters, which is not correct for binary data.
+
+So the test needs to show that when the body contains binary data (e.g., 0 bytes or invalid UTF-8), the FfiPingUploadTask is created without errors and the body is preserved as binary.
+
+In the old code, if the JSON string contains non-UTF-8, that's impossible because JSON is UTF-8 encoded, but when you have binary data, representing it as a JSON string via base64 is correct. But when converting that JSON string into a CString (which is UTF-8), that would fail for non-UTF-8 data. Wait, no: the old code uses CString::new(...), which takes a &str (since serde_json::to_string returns a string in Rust, which is UTF-8). So if the original body is a binary slice, perhaps it's base64 encoded and then stored as a JSON value. But in the old code, the body is serialized to a JSON string, which would be a UTF-8 encoded base64 string, then CString::new() would work. Hmm, perhaps that's not the right approach.
+
+But the problem here is that the body is being treated as text when it should be binary. The patch changes this to use ByteBuffer, which can hold binary data.
+
+So maybe the test could create a PingUploadTask with a body that contains binary data (like some invalid UTF-8), then convert it to FfiPingUploadTask. In the old code, this would have failed when creating the CString, but in the new code, it's handled as a ByteBuffer.
+
+Wait, but the body in the PingUploadTask's request is a JsonValue. How does that work? Maybe the body is a JSON object, but if they want to send binary data, it's stored as base64 in a JSON string. However, when the patch changes to use ByteBuffer::from_vec, the request.body must be a Vec<u8> instead of a JSON value. Wait, maybe the PingUploadTask's body is actually a Vec<u8> type, but the code is using serde_json to serialize it? That seems conflicting.
+
+Wait, the comment says "1. CString::new(serde_json::to_string(&request.body).unwrap()).unwrap()" and that should not fail because request.body is a JsonValue. But if the body is supposed to be binary data, perhaps that's stored in a way that's not compatible with JSON. So the patch is now changing this so that the request.body is directly a Vec<u8>, which is passed to ByteBuffer::from_vec.
+
+Therefore, the test should create a request.body that is a Vec<u8> (binary data), then convert it into the FfiPingUploadTask, and check that the body is correctly wrapped in a ByteBuffer.
+
+But how to test this? The problem is that ByteBuffer is an internal type, so the test can't directly access its contents. But the Drop implementation for FfiPingUploadTask now uses ByteBuffer's destroy. So perhaps the test can verify that the body is correctly set in the Upload variant.
+
+Alternatively, the test can create an Upload task with a known body, then check that the Drop implementation calls the necessary methods. But that's more about the Drop logic.
+
+Alternatively, the test could check that the FfiPingUploadTask::Upload's body is not a CString (as before) but a ByteBuffer, but in code, that's type-checked.
+
+Hmm. Maybe the best way is to create a PingUploadTask with a body that contains binary data that would cause issues when converted via the old method (like a zero byte), then ensure that when converting to FfiPingUploadTask, the new method doesn't fail, while the old code would have failed.
+
+But since the test is in the same crate, perhaps the test can create a PingUploadTask, then create the FfiPingUploadTask from it. Wait, but the FfiPingUploadTask is part of the upload module. So the test would need to have access to the necessary types.
+
+Let me look at the code again. The From implementation for FfiPingUploadTask is part of the upload module. So the test would need to import that module. The test would need to create a PingUploadTask with an Upload variant that has a specific body.
+
+But in the From implementation, the request.body is a JsonValue, and in the new code, they do ByteBuffer::from_vec(request.body). Wait, that doesn't make sense. Because a JsonValue is not a Vec<u8>. Wait, perhaps there's a misunderstanding here.
+
+Wait, the code change in the From block removes the line where body is created as a CString. Now, the code uses ByteBuffer::from_vec(request.body). So this suggests that the request.body in the PingUploadTask is now a Vec<u8>, not a JsonValue. But in the comment, they had "request.body is a JsonValue". However, in the patch, they removed that note.
+
+Wait, looking at the patch's code comments:
+
+In the old code:
+
+// 1. CString::new(...).unwrap() should not fail as we are the ones that created the strings being transformed;
+// 2. serde_json::to_string(&request.body) should not fail as request.body is a JsonValue;
+// 3. serde_json::to_string(&request.headers) should not fail as request.headers is a HashMap of Strings.
+
+Then in the new code:
+
+// 1. CString::new(...).unwrap() should not fail as we are the ones that created the strings being transformed;
+// 2. serde_json::to_string(&request.headers) should not fail as request.headers is a HashMap of Strings.
+
+So the comment about request.body being a JsonValue is removed. So perhaps the request.body in the PingUploadTask is no longer a JsonValue, but a Vec<u8>?
+
+Wait, the original code in the From block for FfiPingUploadTask:
+
+The body was created by serializing the request.body (a JsonValue?) to JSON as a string, then creating a CString from that. The new code is taking request.body, which must be a Vec<u8>, and wrapping it in a ByteBuffer.
+
+So this suggests that the PingUploadTask::Upload's body parameter was changed from a JsonValue to a Vec<u8>.
+
+But in the code, the PingUploadTask is from the upload module. The original code would have request.body as a JsonValue. So this is a code change in the data structure.
+
+But how can the test check that? The test would need to create a PingUploadTask::Upload with a body that's a Vec<u8>, then check that the conversion to FfiPingUploadTask uses ByteBuffer::from_vec on that body.
+
+So perhaps the test can create a sample body, like vec![0, 1, 2], then create a PingUploadTask with that body, then check that the FfiPingUploadTask's Upload body is correctly constructed.
+
+But without being able to access the ByteBuffer's content, how can we test that? Maybe not necessary. The key is that the conversion from the body to ByteBuffer is done correctly.
+
+The test can check that during the conversion, the body is passed correctly. For example, in the test, we can create a PingUploadTask with some data, then check that the FfiPingUploadTask::Upload variant has the correct type for body.
+
+But the type is private, so perhaps that's not possible. Alternatively, the test can check that the Drop implementation for FfiPingUploadTask handles the body correctly.
+
+Wait, in the Drop impl, the old code had:
+
+glean_str_free(*body); which would free the CString. The new code uses:
+
+let body = std::mem::replace(..., ...);
+body.destroy();
+
+So the test could check that the Drop impl correctly calls destroy on the ByteBuffer. But how to test that?
+
+Maybe using a mock ByteBuffer. But since the patch uses the actual ByteBuffer, and the Drop calls destroy, the test could create a scenario where the Drop is called, and ensure it doesn't panic or fail.
+
+But given the constraints, perhaps a simple test is to create a PingUploadTask with a body that would cause the old code (CString::new) to fail, and ensure that the new code doesn't fail.
+
+For example, using a body with a null byte. In the old code, if the JSON string contains a null byte (which is possible if the body is a base64 string with '+'), then converting to CString would fail because CString::new expects a valid slice without embedded nulls. Wait, no: CString::new takes a Vec<u8>, and the error occurs when there is a nul byte. So if the JSON-encoded string has a nul byte, the old code would panic because the unwrap fails. The new code would handle it, as ByteBuffer can take Vec<u8> with any data.
+
+So the test could be to create a body that, when serialized to JSON, contains a nul byte, then check that the FfiPingUploadTask can be created without panicking.
+
+But how to create such a body. Maybe the body in the PingUploadTask is a JSON value. For example, a string containing a nul byte. Let's see.
+
+If the old code serializes the body as a JSON string, and that string includes a nul byte (e.g., the body is the string "\0"), then the JSON string would be "a\0string", which when converted to UTF-8 is valid, but when passed to CString::new would encounter the nul and fail.
+
+In the new code, the body is a Vec<u8> and passed directly to ByteBuffer, avoiding that problem.
+
+So the test could create a PingUploadTask with a body that would generate a JSON string with embedded nuls, and check that the conversion to FfiPingUploadTask does not panic.
+
+But how to simulate that in code?
+
+In the test, perhaps create a PingUploadTask with a body that is a JSON string containing a nul, then when the old code is present, the test panics, but with the new code, it doesn't.
+
+So the test would be something like:
+
+let upload_task = PingUploadTask::Upload {
+    document_id: "...".into(),
+    path: "...".into(),
+    body: json!("\0"), // a string containing a nul
+    headers: ...,
+};
+
+Then, when converting to FfiPingUploadTask, in the old code, CString::new would fail with a nul in the string, causing the unwrap to panic. In the new code, the body is passed as a Vec<u8> to ByteBuffer, which is handled correctly.
+
+But in the new code, how is the body obtained? The old code uses serde_json::to_string on request.body (which is a JsonValue) to get a string, then wraps it in a CString. The new code directly wraps the body as a Vec<u8> into ByteBuffer. So if the request.body is a JsonValue, like a string with a nul, then request.body would need to be converted to bytes.
+
+Wait, this suggests that the PingUploadTask's Upload struct's body field is not a JsonValue anymore. Because in the old code, the body was a JsonValue, but in the new code, request.body is passed to ByteBuffer::from_vec, which suggests that it's a Vec<u8>.
+
+But in the code, the PingUploadTask is from the glean_core::upload::PingUploadTask. So perhaps the body was changed from a JsonValue to a Vec<u8> in the data model. But how does the test reflect this?
+
+The test would need to create an instance of PingUploadTask::Upload with a body that is binary data. However, if the body is previously a JsonValue, then the test can't be written without modifying the PingUploadTask struct. This seems like a deeper code change that isn't captured in the patch provided.
+
+Wait, the code in the patch shows that the new code is:
+
+body: ByteBuffer::from_vec(request.body)
+
+This implies that request.body is a Vec<u8>. So the PingUploadTask's Upload struct's body field must now be a Vec<u8> instead of a JsonValue. But in the original code, request.body was a JsonValue.
+
+This is a conflicting change. So perhaps the patch is part of a larger change where the PingUploadTask::Upload's body is changed from a JsonValue to a Vec<u8>. In that case, the test needs to ensure that when the body is a Vec<u8> with binary data (like a nul byte), the conversion to FfiPingUploadTask does not panic.
+
+So in the test, create a PingUploadTask with a body that is a Vec<u8> containing a nul byte, then check that the conversion to FfiPingUploadTask doesn't fail.
+
+In code, the test would look something like:
+
+#[test]
+fn test_upload_binary_body() {
+    let body = vec![0, 1, 2, 3];
+    // Assuming that PingUploadTask::Upload's body is a Vec<u8>
+    let upload_task = PingUploadTask::Upload {
+        document_id: "doc_id".to_string(),
+        path: "/path".to_string(),
+        body,
+        headers: HashMap::new(),
+    };
+    let ffi_task = FfiPingUploadTask::from(upload_task);
+    // Check that the FfiPingUploadTask::Upload variant has the correct body
+    match ffi_task {
+        FfiPingUploadTask::Upload { body, .. } => {
+            // Check that the body is a ByteBuffer, which we can do by asserting the type
+            // But since we can't check the contents directly, perhaps we can check that the Drop doesn't fail
+            drop(ffi_task);
+        },
+        _ => panic!("Expected Upload variant"),
+    }
+}
+
+The key is that in the old code, the body would be a CString created from the JSON string. But since the body is now a Vec<u8>, the old code would have crashed when trying to create the CString (because of nul bytes), but the new code handles it via ByteBuffer.
+
+But this assumes that the PingUploadTask's Upload::body is a Vec<u8>, which is not shown in the provided patch. However, based on the code change, it's necessary for the test to work.
+
+So the test would verify that creating an Upload task with a binary body (with nuls) doesn't cause panics in the conversion to FfiPingUploadTask, which would fail in the old code but pass in the new code.
+</think>
+
+<Filename>glean-core/ffi/src/upload.rs</Filename>
+<imports>
+use glean_core::upload::{PingUploadTask, Upload};
+use std::collections::HashMap;
+</imports>
+<Rust>
+#[test]
+fn test_upload_binary_body_does_not_panic() {
+    // Create a binary payload with a null byte that would cause CString::new() to fail
+    let payload: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let upload_task = PingUploadTask::Upload {
+        document_id: "test_id".to_string(),
+        path: "/test".to_string(),
+        body: payload,
+        headers: HashMap::new(),
+    };
+    // Conversion to FfiPingUploadTask should not panic
+    let _ = FfiPingUploadTask::from(upload_task);
+}
+</Rust>

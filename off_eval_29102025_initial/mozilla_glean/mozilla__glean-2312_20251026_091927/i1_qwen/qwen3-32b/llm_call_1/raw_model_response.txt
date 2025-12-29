@@ -1,0 +1,350 @@
+<think>
+Okay, let's see. The user provided a patch that removes the dependency on env_logger in the glean-core library. The issue was that Glean shouldn't initialize env_logger by default; that should be the app's responsibility. The patch modifies the glean_enable_logging function so that it only sets up env_logger if the "enable_env_logger" feature is enabled and the target isn't Android or iOS.
+
+So, the test needs to verify that the env_logger is only initialized when the feature is present and the target is appropriate. But how can I test that in Rust? Well, I need to check if the env_logger is being initialized without actually running the code because initializing it once can be tricky to test. Maybe I can test the conditions under which the feature is enabled or not.
+
+Wait, the patch introduces a conditional around the env_logger::try_init() call with the "enable_env_logger" feature. So, in the test, I should check that when the feature is NOT enabled, the code does not attempt to initialize env_logger. But how to simulate that?
+
+In Rust, conditional compilation (cfg attributes) can't be directly tested with functions unless we use some tricks. Oh, right. Maybe I can use the cfg attribute in combination with the test. Since the feature gate is under a cfg, the presence or absence of the feature will determine whether the code is included.
+
+But how to write a test that would fail before the patch and pass after? Before the patch, the code always tried to initialize env_logger (except on Android and iOS). So, if I create a test that is not on Android or iOS and does not have the "enable_env_logger" feature, the code should not attempt to call env_logger::try_init(). However, the problem is that if the code is not compiled when the feature is not enabled, how can I test that.
+
+Wait, the code in the patch is under a cfg that depends on the feature. So, if I write a test that uses the feature "enable_env_logger" and then check for the presence of a certain symbol or behavior. Hmm. Maybe not. Alternatively, the test can be written in such a way that when the env_logger code is compiled in, the test passes. Otherwise, it fails.
+
+Alternatively, maybe create a test that checks whether the env_logger is initialized. But how to detect that. For example, the test could set up RUST_LOG, call glean_enable_logging(), and then check if the logger is initialized. But the problem is that in Rust, the log crate's logger is a global and once initialized, it's hard to reset. So maybe using a test without the feature should not compile any code that uses env_logger.
+
+Alternatively, maybe I can create two tests: one that checks with the feature enabled and one without. However, the user's instruction is to write exactly one test. But how to ensure that the test is different between before and after the patch.
+
+Wait, the issue is that the original code had a check that only excluded Android and iOS, but the patch adds a check for the feature. So, before the patch, when the OS is not Android or iOS, the code always initializes env_logger. After the patch, it only does so when the enable_env_logger feature is enabled.
+
+So, to create a test that would fail before the patch but pass after, perhaps I can create a test for a target that's not Android or iOS, but without the feature. If the test case is written in such a way that when the feature is not present, the code doesn't compile, but that's not the case here. Wait, the code is under #[cfg(...)], so the code with the feature is only compiled when the conditions are met.
+
+But how to test that the code is not being compiled when the feature is not present. Hmm. Perhaps the test can't directly verify that because the code is not present. So maybe this is a case where unit tests are not sufficient, but perhaps integration tests could be used. However, the user is asking for a unit test.
+
+Alternatively, maybe the test can check if a certain log message is output. For example, in the test, set RUST_LOG=trace, call glean_enable_logging, and then check if the trace message is logged. But how to capture that output. That would be more complex and requires a test harness that captures stdout.
+
+But in the given problem, the test must be self-contained and use only the standard library. So perhaps the idea is to use log tracing to verify if the code path is taken.
+
+Alternatively, the test could be written to check if the code compiles when the env_logger is not available. But that's more of a smoke test.
+
+Wait, the original problem is that Glean should not depend on env_logger. So, if the user compiles the library without the feature enabled and not on Android or iOS, but the code still tries to use env_logger, that's a problem. So the patch makes it so that the code is only compiled when the feature is enabled.
+
+So, perhaps a test that is written without the feature and not on Android/iOS, and expects that the code path for env_logger is not present. But how to verify that in a test. Maybe by trying to conditionally check if the code is included. For example, using the cfg! macro in a test.
+
+So, maybe the test can be written as:
+
+#[test]
+#[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
+fn test_glean_enable_logging_without_env_logger() {
+    assert!(!cfg!(feature = "enable_env_logger"));
+    // Then check if the code in the patch's block is not compiled.
+}
+
+Wait, but that's not helpful. The test can't directly check whether the env_logger is being initialized in that case. Because the code is not compiled. So maybe the test can be written to check that the code path is active when the feature is present.
+
+Another approach: create a test that uses the "feature = enable_env_logger" and checks that the code is compiled, and another test that doesn't use the feature and checks that the code isn't compiled. But how to detect that in the test.
+
+Hmm. Maybe using the log crate's functionality. Like, when the code is supposed to initialize the logger, then certain log messages are output. For example, in the patch, after initializing env_logger, it logs a trace message. So, if the test is written to check whether this message is logged when the feature is enabled and not when it's not.
+
+So, here's an idea. Create a test that calls glean_enable_logging, and then checks if the trace message is emitted. The trace message is in the code: log::trace!("stdout logging should be hooked up!"). But how to capture that.
+
+In Rust, the test can be written to override the global logger to capture logs. For example, using the log crate's test support. However, the test would need to set up a dummy logger before calling glean_enable_logging.
+
+But the problem is that if the glean_enable_logging tries to initialize the env_logger again, which might conflict with the test's logger. So, perhaps the test can be written as follows:
+
+In the test, create a test logger that captures any log messages. Then, call glean_enable_logging, and check if the specific trace message is present when the feature is enabled.
+
+But how to handle the feature toggle in the test. Well, Cargo features are compile-time options. So, to test for that, the user would need to run the test with and without the feature. But the user wants a single test that fails before and passes after the patch.
+
+So, perhaps the test can be written to use a cfg attribute that checks for the presence of the feature. For example:
+
+If the test is written with #[cfg(feature = "enable_env_logger")], then in the patch-enabled code, when the feature is present, the code that initializes env_logger is present. But this is not helpful because the test itself would be compiled only when the feature is enabled.
+
+Alternatively, the test can be written to check whether the code is compiled under the correct conditions. For example, in a test that is not on Android or iOS, and with the "enable_env_logger" feature disabled, check that the code path is not present.
+
+But how to check that in code. Maybe the test can have a compilation check. For example, using #[should_panic] if the code is included when it shouldn't be. But that seems tricky.
+
+Alternatively, create a test that checks if a certain function is available only when the feature is enabled. But the code in the patch is under a cfg block, so the code is only compiled when the feature is present.
+
+Hmm. Given the constraints, perhaps the best way is to create a test that sets the RUST_LOG environment variable, calls glean_enable_logging, and checks that the expected trace message is present (or not present) depending on the feature.
+
+But to do that, the test must be able to capture the logs. That's possible by setting up a custom logger.
+
+For example, in the test, create a dummy logger that collects logs and checks if the message is present. Here's how it can be done:
+
+Use the log crate's set_logger function to set up a test logger that records any messages. Then, call glean_enable_logging and check if the specific message is logged.
+
+So, in the test, the code would look like this:
+
+struct TestLogger {
+    messages: Mutex<Vec<String>>,
+}
+
+impl TestLogger {
+    fn new() -> Self {
+        TestLogger {
+            messages: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl log::Log for TestLogger {
+    // Implement all the methods required by log::Log
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Trace
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let msg = record.args().to_string();
+            self.messages.lock().unwrap().push(msg);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+Then, in the test:
+
+TEST_LOGGER = TestLogger::new();
+log::set_logger(&TEST_LOGGER).unwrap();
+
+glean_enable_logging();
+
+Check if the message is in TEST_LOGGER.messages.
+
+But implementing the Log trait for the test logger is a bit involved. However, for the sake of writing a test, this is manageable.
+
+But this is complicated. Considering that the user's test must be self-contained and to the point, perhaps a simpler approach is needed. Maybe using the standard library's features, but that's unlikely.
+
+Alternatively, maybe the test can check for the presence of a static variable or some other compile-time condition. But that's not directly possible.
+
+Alternatively, create a test that uses the "cfg" attribute in the test code to check whether the env_logger code is activated. For example, if the test is written as:
+
+#[test]
+#[cfg(all(
+    not(target_os = "android"),
+    not(target_os = "ios"),
+    not(feature = "enable_env_logger"),
+))]
+fn test_env_logger_not_initialized() {
+    // If the code compiles, then the env_logger block is not included.
+    // So, perhaps call glean_enable_logging and check that the trace message is not logged.
+}
+
+But how to verify that the trace message is not logged. That would require using the same logger setup.
+
+Hmm. Given all these options, the most feasible approach is to create tests with and without the feature, using different #[test] functions and #[cfg] attributes. But the user wants a single test that fails before and passes after the patch.
+
+Alternatively, write a test that is designed to fail before the patch (when the code always initializes env_logger) and pass after (when it only initializes when the feature is present). For example, create a test that runs on a non-Android/IOS OS, does not have the feature enabled, and checks that the logger is not initialized.
+
+But how to check if the logger is initialized. The env_logger::try_init() returns Ok if it was possible to initialize the logger. Maybe the test can simulate that by calling the function and checking if the logger is initialized.
+
+But the actual initialization is under a #[cfg] block, so in the current code, if the feature is not present, the code is not compiled. So, in the test without the feature enabled, the code path that tries to initialize env_logger is not present. Therefore, the test can be written in a way that expects no initialization.
+
+But how to test that. Maybe by using the log crate's functionality to check if the env_logger is in effect. For example, after calling glean_enable_logging(), check if the logger is set to the env_logger.
+
+But the problem is that once a logger is set in the log crate, it can't be changed. Unless we use some hacks. Maybe in the test, we can set a dummy logger first, then call the function, and see if the logger is replaced.
+
+So here's a possible approach:
+
+In the test, use a dummy logger that is set up, then call glean_enable_logging(). If the code was supposed to initialize env_logger, the dummy logger would be replaced, and we can check that. If the code wasn't supposed to initialize, the dummy logger remains.
+
+Here's a sample implementation:
+
+use log::set_logger;
+use log::{LevelFilter, Log, Metadata, Record};
+use log::SetLoggerError;
+
+#[derive(Default)]
+struct DummyLogger {
+    logger_set: bool,
+}
+
+impl Log for DummyLogger {
+    fn enabled(&self, _: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, _: &Record) {
+        self.logger_set = true;
+    }
+
+    fn flush(&self) {}
+}
+
+#[test]
+fn test_env_logger_not_initialized_with_feature_disabled() {
+    let logger = DummyLogger::default();
+    set_logger(Box::new(logger)).unwrap();
+    log::set_max_level(LevelFilter::Trace);
+    
+    // Call the function under test
+    glean_enable_logging();
+    
+    // If the env_logger was initialized, the dummy logger would have been overwritten.
+    // So, if the logger is still our dummy one, it means the code didn't initialize env_logger.
+    // However, how to check if the logger is the same? The problem is that the set_logger function returns Ok if the logger was set, but after that, the previous logger can't be retrieved.
+    
+    // Alternatively, in the DummyLogger, the logger_set flag is not modified unless the function writes a log record.
+    // So, the test can depend on the fact that the dummy logger is not triggered unless the code under test writes a log message.
+    
+    // So, after setting the dummy logger, if the code under test attempts to initialize env_logger (and succeeds), then the dummy logger is no longer in effect. So, a call to log::trace! would not be captured by the dummy logger.
+    
+    // Therefore, after calling glean_enable_logging(), we can check whether the dummy logger was modified by checking the logger_set flag.
+    
+    // Wait, but the code in the patch that uses the env_logger also issues a log::trace! message. So, if the code is compiled, that message is logged, which would set the logger_set to true.
+    
+    // Thus, in the case where the feature is not enabled, the code that logs the trace message is not compiled. Therefore, after calling glean_enable_logging(), the DummyLogger's logger_set flag remains false.
+    
+    // But how to simulate this in a test. The test must be compiled with the feature disabled, and the code for the env_logger is not present. Therefore, the test would not modify the DummyLogger's logger_set.
+    
+    // However, this approach may not work if the test is not being compiled with the feature enabled. But since Cargo tests don't have the feature enabled by default unless configured, perhaps the test can be written in such a way that it expects the code path to be inactive.
+    
+    // However, this requires that the test is run without the feature. But how can a test written inside the same crate conditionally test for features? Features are compile-time, and the test is run under Cargo with or without the feature.
+    
+    // Hmm. This is getting complicated. Maybe the correct approach here is to rely on the feature being enabled or not. So, the user would need to run the test twice: once with the feature enabled and once without. But the user wants a single test that can verify the patch.
+    
+    // Given the constraints, maybe the correct regression test is to write a test that assumes that the code under test will not initialize the env_logger unless the feature is present. So, the test will compile with the feature disabled and check that the code path is not active.
+    
+    // The patch adds a feature gate. Therefore, in the test, when the feature is enabled, the code path is included. When not, it's not. So, perhaps the test can be written with a cfg attribute that toggles on the feature. For example:
+    
+    #[test]
+    #[cfg(feature = "enable_env_logger")]
+    fn test_env_logger_initialized_with_feature_enabled() {
+        // Here, check that calling glean_enable_logging triggers the env_logger
+        // initialization which logs the trace message.
+    }
+    
+    #[test]
+    #[cfg(all(
+        not(feature = "enable_env_logger"),
+        not(target_os = "android"),
+        not(target_os = "ios"),
+    ))]
+    fn test_env_logger_not_initialized_with_feature_disabled() {
+        // Here, check that calling glean_enable_logging does not trigger the
+        // env_logger initialization. But how?
+    }
+    
+    However, the problem is that the second test may be impossible to compile under Android or iOS, but the question is about non-Android/non-iOS platforms.
+    
+    Given the time constraints and the need for a single test that passes after the patch but fails before, perhaps the best approach is to create a test that runs on a fake platform (simulated via cfg attributes) and checks whether the logger is initialized.
+    
+    Given all that, I'll proceed with writing a test that uses a custom logger, captures any log messages, and verifies whether the expected message is present when the feature is enabled and not present when disabled. To simulate the feature toggle, perhaps use the same cfg attributes as the code.
+    
+    The test will need to import the necessary modules and functions. The function under test is glean_enable_logging which is in the lib.rs file. The test needs to use the function under test via super::.
+    
+    The test will need to use log::set_logger and env_logger if needed, but the goal is to check whether the env_logger code is compiled when the feature is not enabled.
+    
+    Wait, the test needs to check that the code path does not exist without the feature. So, if the test is written with a #[cfg(not(feature = "enable_env_logger")))] attribute, then the code in the patch's block is not compiled. Therefore, the test can be written to check that a certain function is not available or that a certain log message is not present.
+    
+    So, putting this all together, the test would be as follows:
+    
+    The test is a #[test] function with #[cfg(not(feature = "enable_env_logger")))] to simulate the environment where the feature is not enabled. It then calls glean_enable_logging and checks that the trace message is not logged.
+    
+    But how to check that. One possible way is to use a custom logger to capture the output. If the code path is active, then the message is present. If not, the message is not there.
+    
+    So, here's the plan:
+    
+    - Create a custom test logger that captures all log messages.
+    - Call glean_enable_logging.
+    - Check that the trace message "stdout logging should be hooked up!" is not present in the captured messages when the feature is disabled.
+    
+    This would be the test that passes after the patch is applied. Before the patch, when the feature is disabled, the code would have initialized the env_logger regardless, thus the message would be present, causing the test to fail.
+    
+    But how to set up the test logger.
+    
+    The Rust log crate allows setting a custom logger with the set_logger function. So, the test can set up a logger, capture any messages, and then check for the presence of the expected trace message.
+    
+    So, the Rust test would look like this:
+    
+    use log::{info, Log, Metadata, Record};
+    
+    struct TestLogger {
+        messages: Vec<String>,
+    }
+    
+    impl TestLogger {
+        fn new() -> TestLogger {
+            TestLogger {
+                messages: vec![],
+            }
+        }
+    }
+    
+    impl Log for TestLogger {
+        fn enabled(&self, _metadata: &Metadata) -> bool {
+            true
+        }
+    
+        fn log(&self, record: &Record) {
+            self.messages.push(format!("{}: {}", record.level(), record.args()));
+        }
+    
+        fn flush(&self) {}
+    }
+    
+    #[test]
+    fn test_glean_enable_logging_does_not_log_without_env_logger_feature() {
+        // Set up a custom logger
+        let logger = TestLogger::new();
+        log::set_logger(Box::new(logger)).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    
+        // Call the function under test
+        glean_enable_logging();
+    
+        // Check that the specific log message is not present
+        assert!(!logger.messages.iter().any(|msg| msg.contains("stdout logging should be hooked up!")));
+    }
+    
+    But in the code before the patch, this test would fail because the message is logged. After the patch, if the feature is not enabled, the message is not logged.
+    
+    However, in the current implementation of the test, the code is not compiled with the feature enabled, so the test would capture no message after the patch. But before the patch, it would capture the message. So the test would pass after the patch and fail before it.
+    
+    However, this test is only effective if the TestLogger is able to capture the logs. Since the code under test is in the same crate, and the test is part of the same crate's test suite, this should work.
+    
+    Therefore, the correct test is to write a test that sets up a logger, calls glean_enable_logging, and asserts that the specific message is not present in the logs. This test would fail before the patch (since the message is always logged) and pass after (since the message is only logged when the feature is enabled).
+    
+    This test requires implementing a custom TestLogger and checking the messages. Since the test needs to be self-contained, it must include the TestLogger implementation.
+    
+    Therefore, the final Rust test code would look like this.
+</think>
+
+<Filename> glean-core/src/lib.rs </Filename>
+<imports>
+use log::{Log, Metadata, Record, LevelFilter};
+use std::sync::Mutex;
+use log::set_logger;
+</imports>
+<Rust>
+#[test]
+fn test_glean_enable_logging_does_not_setup_env_logger() {
+    struct Logger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl Log for Logger {
+        fn enabled(&self, _: &Metadata) -> bool { true }
+        fn log(&self, record: &Record) {
+            self.messages.lock().unwrap().push(format!("{}", record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    let logger = Logger {
+        messages: Mutex::new(Vec::new()),
+    };
+    set_logger(Box::new(logger)).unwrap();
+    log::set_max_level(LevelFilter::Trace);
+
+    unsafe { glean_enable_logging() };
+
+    let messages = logger.messages.lock().unwrap();
+    assert!(
+        !messages.iter().any(|msg| msg.contains("stdout logging should be hooked up!")),
+        "Log message for env_logger initialization was present unexpectedly"
+    );
+}
+</Rust>

@@ -1,0 +1,214 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Replace use of lazy_static with once_cell
+Initially we started using `lazy_static` for all our globals, mostly because our dependencies used it anyway.
+We now are _also_ using `once_cell` for some of these globals.
+We should unify it to a single crate.
+
+Reasons for once_cell: It avoids a macro and instead uses plain Rust code, which IMO is desirable.
+
+Note: our dependencies (notably rkv and ffi-support) still depend on lazy_static, so it won't go away from our dependency tree.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/labeled.rs b/glean-core/ffi/src/labeled.rs
+--- a/glean-core/ffi/src/labeled.rs
++++ b/glean-core/ffi/src/labeled.rs
+@@ -2,7 +2,6 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use lazy_static::lazy_static;
+ use std::convert::TryFrom;
+ 
+ use glean_core::{metrics::*, CommonMetricData, Lifetime};
+@@ -30,10 +29,8 @@ use crate::*;
+ /// * `get_name` - Function name to get a new instance of the underlying metric.
+ macro_rules! impl_labeled_metric {
+     ($metric:ty, $global:ident, $metric_global:ident, $new_name:ident, $destroy_name:ident, $get_name:ident, $test_get_num_recorded_errors:ident) => {
+-        lazy_static! {
+-            static ref $global: ConcurrentHandleMap<LabeledMetric<$metric>> =
+-                ConcurrentHandleMap::new();
+-        }
++        static $global: once_cell::sync::Lazy<ConcurrentHandleMap<LabeledMetric<$metric>>> =
++            once_cell::sync::Lazy::new(ConcurrentHandleMap::new);
+         $crate::define_infallible_handle_map_deleter!($global, $destroy_name);
+ 
+         /// Create a new labeled metric.
+
+diff --git a/glean-core/ffi/src/macros.rs b/glean-core/ffi/src/macros.rs
+--- a/glean-core/ffi/src/macros.rs
++++ b/glean-core/ffi/src/macros.rs
+@@ -43,9 +43,7 @@ macro_rules! define_metric {
+             $op:ident -> $op_fn:ident($($op_argname:ident: $op_argtyp:ty),* $(,)*)
+         ),* $(,)*
+     }) => {
+-        lazy_static::lazy_static! {
+-            pub static ref $metric_map: ffi_support::ConcurrentHandleMap<glean_core::metrics::$metric_type> = ffi_support::ConcurrentHandleMap::new();
+-        }
++        pub static $metric_map: once_cell::sync::Lazy<ffi_support::ConcurrentHandleMap<glean_core::metrics::$metric_type>> = once_cell::sync::Lazy::new(ffi_support::ConcurrentHandleMap::new);
+         $crate::define_infallible_handle_map_deleter!($metric_map, $destroy_fn);
+ 
+         $(
+
+diff --git a/glean-core/ffi/src/ping_type.rs b/glean-core/ffi/src/ping_type.rs
+--- a/glean-core/ffi/src/ping_type.rs
++++ b/glean-core/ffi/src/ping_type.rs
+@@ -3,7 +3,7 @@
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ use ffi_support::{ConcurrentHandleMap, FfiStr};
+-use lazy_static::lazy_static;
++use once_cell::sync::Lazy;
+ 
+ use glean_core::metrics::PingType;
+ 
+@@ -11,9 +11,8 @@ use crate::ffi_string_ext::FallibleToString;
+ use crate::handlemap_ext::HandleMapExtension;
+ use crate::{from_raw_string_array, with_glean_value, with_glean_value_mut, RawStringArray};
+ 
+-lazy_static! {
+-    pub(crate) static ref PING_TYPES: ConcurrentHandleMap<PingType> = ConcurrentHandleMap::new();
+-}
++pub(crate) static PING_TYPES: Lazy<ConcurrentHandleMap<PingType>> =
++    Lazy::new(ConcurrentHandleMap::new);
+ crate::define_infallible_handle_map_deleter!(PING_TYPES, glean_destroy_ping_type);
+ 
+ #[no_mangle]
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -16,7 +16,7 @@ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ 
+ use chrono::{DateTime, FixedOffset};
+-use lazy_static::lazy_static;
++use once_cell::sync::Lazy;
+ use once_cell::sync::OnceCell;
+ use std::sync::Mutex;
+ use uuid::Uuid;
+@@ -57,11 +57,8 @@ use crate::util::{local_now_with_offset, sanitize_application_id};
+ 
+ const GLEAN_SCHEMA_VERSION: u32 = 1;
+ const DEFAULT_MAX_EVENTS: usize = 500;
+-lazy_static! {
+-    static ref KNOWN_CLIENT_ID: Uuid =
+-        Uuid::parse_str("c0ffeec0-ffee-c0ff-eec0-ffeec0ffeec0").unwrap();
+-}
+-
++static KNOWN_CLIENT_ID: Lazy<Uuid> =
++    Lazy::new(|| Uuid::parse_str("c0ffeec0-ffee-c0ff-eec0-ffeec0ffeec0").unwrap());
+ // An internal ping name, not to be touched by anything else
+ pub(crate) const INTERNAL_STORAGE: &str = "glean_internal_info";
+
+diff --git a/glean-core/src/metrics/labeled.rs b/glean-core/src/metrics/labeled.rs
+--- a/glean-core/src/metrics/labeled.rs
++++ b/glean-core/src/metrics/labeled.rs
+@@ -2,7 +2,7 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-use lazy_static::lazy_static;
++use once_cell::sync::Lazy;
+ use regex::Regex;
+ 
+ use crate::common_metric_data::CommonMetricData;
+@@ -13,29 +13,27 @@ use crate::Glean;
+ const MAX_LABELS: usize = 16;
+ const OTHER_LABEL: &str = "__other__";
+ const MAX_LABEL_LENGTH: usize = 61;
+-lazy_static! {
+-    /// This regex is used for matching against labels and should allow for dots, underscores,
+-    /// and/or hyphens. Labels are also limited to starting with either a letter or an
+-    /// underscore character.
+-    /// Some examples of good and bad labels:
+-    ///
+-    /// Good:
+-    /// * `this.is.fine`
+-    /// * `this_is_fine_too`
+-    /// * `this.is_still_fine`
+-    /// * `thisisfine`
+-    /// * `_.is_fine`
+-    /// * `this.is-fine`
+-    /// * `this-is-fine`
+-    /// Bad:
+-    /// * `this.is.not_fine_due_tu_the_length_being_too_long_i_thing.i.guess`
+-    /// * `1.not_fine`
+-    /// * `this.$isnotfine`
+-    /// * `-.not_fine`
+-    static ref LABEL_REGEX: Regex = Regex::new(
+-        "^[a-z_][a-z0-9_-]{0,29}(\\.[a-z_][a-z0-9_-]{0,29})*$"
+-    ).unwrap();
+-}
++
++/// This regex is used for matching against labels and should allow for dots, underscores,
++/// and/or hyphens. Labels are also limited to starting with either a letter or an
++/// underscore character.
++/// Some examples of good and bad labels:
++///
++/// Good:
++/// * `this.is.fine`
++/// * `this_is_fine_too`
++/// * `this.is_still_fine`
++/// * `thisisfine`
++/// * `_.is_fine`
++/// * `this.is-fine`
++/// * `this-is-fine`
++/// Bad:
++/// * `this.is.not_fine_due_tu_the_length_being_too_long_i_thing.i.guess`
++/// * `1.not_fine`
++/// * `this.$isnotfine`
++/// * `-.not_fine`
++static LABEL_REGEX: Lazy<Regex> =
++    Lazy::new(|| Regex::new("^[a-z_][a-z0-9_-]{0,29}(\\.[a-z_][a-z0-9_-]{0,29})*$").unwrap());
+ 
+ /// A labeled metric.
+ ///
+
+
+</patch>
+
+Function signatures
+<Signatures>
+
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

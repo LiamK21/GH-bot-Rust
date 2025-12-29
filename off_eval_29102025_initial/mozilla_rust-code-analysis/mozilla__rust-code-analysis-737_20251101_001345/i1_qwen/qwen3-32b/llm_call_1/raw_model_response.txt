@@ -1,0 +1,197 @@
+<think>
+Okay, let's see. The issue is about splitting metrics into average and sum. Specifically, for LOC metrics, they should now have an average calculated by dividing the sum by the number of spaces. The patch adds average fields to the LOC data.
+
+Looking at the patch in src/metrics/loc.rs, the Stats struct now has a space_count field. The serialization includes the average values. The methods like sloc_average() divide the sloc by space_count.
+
+The existing tests in the patch modify the check_metrics! macro calls to include expected average values. For example, in tests like test_sloc_average, they expect sloc_average to be 5.0 when space_count is 2.
+
+But wait, the test in the patch is using a macro called check_metrics! which probably handles setting up the test environment. However, as a unit test, maybe we need to directly test the methods added. Let me check the functions added.
+
+The patch adds methods to Stats: sloc_average, ploc_average, etc. Each returns the respective value divided by space_count. So a unit test could create a Stats instance with known values and verify these methods.
+
+But the problem is that theStats struct's fields are private. So to test these methods, we need to create a Stats instance and set its fields. But how? If the struct is being modified in the patch, perhaps in the test code we can create a mock Stats instance with specific values.
+
+Alternatively, maybe the test can use the existing helper functions or macros in the test mod. But the user is asking for a standalone test. However, in the existing test mod, they have a check_metrics! macro that probably parses a file and checks metrics.
+
+But for a unit test outside of the macro, perhaps we can create a Stats instance with specific values for sloc and space_count, then call sloc_average() and assert the result.
+
+So, the test would be something like:
+
+Create a Stats instance where sloc is 10 and space_count is 2. The average should be 5.0.
+
+But how to set these fields? The Stats struct's fields are private. Wait, in the patch, the methods like sloc() are public, but the actual data members (like lines, etc.) are private. Hmm.
+
+Wait, the sloc() method is part of the Stats implementation. For example:
+
+pub fn sloc(&self) -> f64 {
+    ...
+}
+
+So maybe to get the sloc, we can call that method. But the test would need to create a Stats instance where the underlying data results in a certain sloc and space_count.
+
+But how to set up that data? For a unit test, perhaps we can use the existing test helpers. However, without those, it's tricky.
+
+Alternatively, look at the test cases in the patch. For example, in the first test case in the patch:
+
+check_metrics!(
+    "simple.c",
+    CppParser,
+    loc,
+    [(sloc, 1, usize)],
+    [(sloc_average, 1.0)]
+);
+
+This implies that when there's one space (space_count=1), sloc is 1, so average is 1/1=1.0.
+
+Another example has space_count=2, sloc=5, average 5/2=2.5. So if the test case in the patch is already covering those scenarios, maybe there's no need for a separate unit test. However, the user wants a regression test that fails before and passes after the patch.
+
+Wait, the patch adds the average fields. So before the patch, the average metrics didn't exist. So a test that expects the average fields to be present would fail before the patch and pass after.
+
+Looking at the server.rs patch, the test expects loc to include "cloc_average" and others. Before the patch, those fields weren't present, so the test would fail.
+
+Therefore, the correct approach is to write a test that checks for the presence of these average fields in the output. But how to do that without relying on the server code?
+
+Alternatively, since the issue is about the Stats struct's average methods, a unit test could directly create a Stats object with specific values and check that the averages are computed correctly.
+
+But since the Stats' fields are private, perhaps the test can be written by creating two Stats instances, merging them, and checking the averages. For example:
+
+Let's create two Stats instances. Each has sloc of 1 and 3, respectively. When merged, the sloc would be 4. The space_count would be 2. Then sloc_average should be 4/2=2.0.
+
+In code:
+
+let mut stats1 = Stats { ... };
+stats1.space_count = 1;
+stats1.lines = ...; // set such that sloc returns 1
+let mut stats2 = Stats { ... };
+stats2.space_count = 1;
+stats2.lines = ...; // set such that sloc returns 3
+stats1.merge(&stats2);
+assert_eq!(stats1.sloc_average(), 2.0);
+
+But how to set the lines? That's tricky unless we know how sloc is computed. The sloc() function counts the number of lines in lines (a FxHashSet<usize>), so to get sloc() as 1, lines could have one entry.
+
+But this might require knowing internal implementation details which could vary. However, given the patch's test cases, this is manageable.
+
+Alternatively, maybe the test can be written by leveraging the existing test cases. For example, using the check_metrics! macro in the patch's test mod. But since the user is asking for a standalone test, perhaps we need to simulate that.
+
+But given the time constraints, perhaps the best approach is to write a test that creates two Stats instances, merges them, and checks the average values. Even though setting up the initial Stats instances might be a bit involved, it's necessary to test the functionality.
+
+So, let's proceed. The test needs to verify that after merging two Stats instances, the space_count is correct and the average is computed correctly.
+
+For example:
+
+- Create two Stats instances, each with space_count 1.
+- For each, set their sloc() to be 1 and 3, respectively (maybe by setting their lines counts appropriately).
+- Merge them: space_count becomes 2, total sloc is 4.
+- Check that sloc_average() is 4.0 / 2.0 = 2.0.
+
+But how to set the lines and other fields to get sloc() to be 1 and 3?
+
+Looking at the sloc() function:
+
+pub fn sloc(&self) -> f64 {
+    (self.lines.len()) as f64
+}
+
+So sloc is the number of lines in the lines FxHashSet. So, if we can set lines.len() to 1 and 3 for the two instances.
+
+So for the test:
+
+- For stats1, set lines to have 1 element.
+- For stats2, set lines to have 3 elements.
+- Merge them. The new lines.len() is 4 (since merge combines the sets?), but space_count is 2.
+
+Thus, sloc_average should be 4 / 2 = 2.0.
+
+So the test code would be:
+
+use std::collections::FxHashSet;
+
+let mut stats1 = Stats::default();
+stats1.lines = FxHashSet::from([1]);
+let mut stats2 = Stats::default();
+stats2.lines = FxHashSet::from([1, 2, 3]); // sloc is 3
+stats1.merge(&stats2); // space_count after merge is 2?
+Wait, no. The initial space_count for each is 1 (as per default). Merging stats1 and stats2 would add their space_count. Looking at the merge method:
+
+In the patch, the merge method for Stats now includes:
+
+self.space_count += other.space_count;
+
+So initially, each Stats instance is created with space_count 1 (as per the default).
+
+So when you merge stats1 (space_count 1) and stats2 (space_count 1), the merged space_count is 2.
+
+After merging, stats1.sloc() is 4 (lines.len() = 1 + 3 = 4?), but wait, merge's code is:
+
+self.lines.extend(&other.lines);
+
+So the merged lines.len() is 1 + 3 = 4. So sloc is 4.0.
+
+So the average is 4.0 / 2.0 = 2.0.
+
+So the test would check this.
+
+Putting that into code:
+
+#[test]
+fn test_loc_average_after_merge() {
+    use std::collections::FxHashSet;
+    use super::Stats;
+
+    let mut stats1 = Stats::default();
+    stats1.lines = FxHashSet::from([1]); // sloc is 1.0
+    stats1.space_count = 1;
+
+    let mut stats2 = Stats::default();
+    stats2.lines = FxHashSet::from([1, 2, 3]); // sloc is 3.0
+    stats2.space_count = 1;
+
+    stats1.merge(&stats2);
+    assert_eq!(stats1.sloc_average(), 2.0);
+}
+
+Wait, but the merge function is called by stats1.merge(&stats2). So after merging, the lines of stats1 will have 4 elements (1,2,3), and space_count is 2.
+
+Yes. So this test would check that the average is correctly computed.
+
+Before the patch, the sloc_average() method doesn't exist, so the test would fail. After the patch, with the new methods, it should pass.
+
+So this is a valid regression test. Now, the file where this test should be added is src/metrics/loc.rs, in the mod tests.
+
+Looking at the patch, the existing tests are in the mod tests. So the new test can be added there, ensuring the test name is unique.
+
+The test function is named test_loc_average_after_merge.
+
+Now, the imports: need to bring in FxHashSet, and the Stats struct. The patch uses FxHashSet from fxhash, so perhaps the test also needs to import that. Also, the Stats struct is in src/metrics/loc.rs.
+
+So the imports would be:
+
+use std::collections::FxHashSet;
+use super::Stats;
+
+But in the existing test code, they have their own imports, but according to the user's instructions, we should include only necessary imports in the <imports> block. Since the test uses FxHashSet and Stats from the current module, the imports are correct.
+
+Thus, the final test code is as described.
+</think>
+
+<Filename>src/metrics/loc.rs</Filename>
+<imports>
+use std::collections::FxHashSet;
+use super::Stats;
+</imports>
+<Rust>
+#[test]
+fn test_loc_average_after_merge() {
+    let mut stats1 = Stats::default();
+    stats1.lines = FxHashSet::from_iter([1, 2]);
+    stats1.space_count = 1;
+    
+    let mut stats2 = Stats::default();
+    stats2.lines = FxHashSet::from_iter([3, 4]);
+    stats2.space_count = 1;
+    
+    stats1.merge(&stats2);
+    assert_eq!(stats1.sloc_average(), 4.0 / 2.0);
+}
+</Rust>

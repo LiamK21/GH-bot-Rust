@@ -1,0 +1,80 @@
+Hi! 🤖 The test below is automatically generated and could serve as a regression test for this PR because it:
+- passes on the PR, 
+- fails in the codebase before the PR, and
+- increases line coverage from 0.00% to 5.48%.
+
+```rust
+use super::{destroy_glean, new_glean, submit_ping_by_name, was_initialize_called, block_on_dispatcher, lock_test};
+use crossbeam_channel::bounded;
+use crossbeam_channel::Sender;
+use std::sync::Mutex;
+use std::path::PathBuf;
+use crate::net::UploadResult;
+use crate::net::PingUploader;
+use tempfile::tempdir;
+
+#[test]
+fn test_source_tags_after_init_race_condition() {
+    let _lock = lock_test();
+
+    destroy_glean(true);
+    assert!(!was_initialize_called());
+
+    let (s, r) = bounded::<Vec<(String, String)>>(1);
+
+    #[derive(Debug)]
+    pub struct FakeUploader {
+        sender: Sender<Vec<(String, String)>>,
+    }
+    impl PingUploader for FakeUploader {
+        fn upload(
+            &self,
+            _url: String,
+            _body: Vec<u8>,
+            headers: Vec<(String, String)>,
+        ) -> UploadResult {
+            self.sender.send(headers).unwrap();
+            UploadResult::HttpStatus(200)
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let tmpname = dir.path().to_path_buf();
+
+    let cfg = crate::Configuration {
+        data_path: tmpname,
+        application_id: "rlb-test".to_string(),
+        upload_enabled: true,
+        max_events: None,
+        delay_ping_lifetime_io: false,
+        channel: Some("testing".to_string()),
+        server_endpoint: Some("invalid-test-host".to_string()),
+        uploader: Some(Box::new(FakeUploader { sender: s })),
+    };
+
+    let _t = new_glean(Some(cfg), true);
+
+    assert!(was_initialize_called());
+    crate::set_source_tags(vec!["valid-tag1".to_string(), "valid-tag2".to_string()]);
+
+    crate::block_on_dispatcher();
+
+    submit_ping_by_name("baseline", Some("background"));
+
+    let headers = r.recv().unwrap();
+    assert_eq!(
+        "valid-tag1,valid-tag2",
+        headers
+            .iter()
+            .find(|kv| kv.0 == "X-Source-Tags")
+            .unwrap()
+            .1
+    );
+}
+```
+
+If you find this regression test useful, feel free to insert it to your test suite.
+Our automated pipeline inserted the test at the end of the `glean-core/rlb/src/test.rs` file before running it.
+
+This is part of our research at the [ZEST](https://www.ifi.uzh.ch/en/zest.html) group of University of Zurich in collaboration with [Mozilla](https://www.mozilla.org).
+If you have any suggestions, questions, or simply want to learn more, feel free to contact us at konstantinos.kitsios@uzh.ch and mcastelluccio@mozilla.com.

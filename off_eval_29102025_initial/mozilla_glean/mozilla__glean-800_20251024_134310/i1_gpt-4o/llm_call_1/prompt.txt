@@ -1,0 +1,224 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Avoid thread-unsafe behavior for global Glean object
+We do our best to use Rust's features to help us with thread safety.
+
+But we might be able to misuse that currently in 2 functions:
+
+* [`setup_glean`](https://github.com/mozilla/glean/blob/4311592bf451259d0c139fa64cf0eec3945de091/glean-core/src/lib.rs#L88-L96)
+* [`global_glean`](https://github.com/mozilla/glean/blob/4311592bf451259d0c139fa64cf0eec3945de091/glean-core/src/lib.rs#L83-L85)
+
+It's fine for all current usage in our wrappers right now.
+We control the order of calls and the Glean object itself is still locked behind a mutex.
+(We also have extensive testing at the boundaries and those didn't crash yet)
+
+We can make that more correct though and avoid the unnecessary unwrap and properly handle the edge cases.
+That will help with implementing the FOG API around it.
+
+One reason for the current code:
+We reset the Glean object in test mode (and test mode is external to Rust). And we can't/don't want to make it all clonable to replace stuff.
+</issue>
+
+Patch:
+<patch>
+diff --git a/glean-core/ffi/src/lib.rs b/glean-core/ffi/src/lib.rs
+--- a/glean-core/ffi/src/lib.rs
++++ b/glean-core/ffi/src/lib.rs
+@@ -48,10 +48,17 @@ where
+     R: IntoFfi,
+ {
+     let mut error = ffi_support::ExternError::success();
+-    let res = ffi_support::abort_on_panic::call_with_result(&mut error, || {
+-        let glean = glean_core::global_glean().lock().unwrap();
+-        callback(&glean)
+-    });
++    let res =
++        ffi_support::abort_on_panic::call_with_result(
++            &mut error,
++            || match glean_core::global_glean() {
++                Some(glean) => {
++                    let glean = glean.lock().unwrap();
++                    callback(&glean)
++                }
++                None => Err(glean_core::Error::not_initialized()),
++            },
++        );
+     handlemap_ext::log_if_error(error);
+     res
+ }
+@@ -69,10 +76,17 @@ where
+     R: IntoFfi,
+ {
+     let mut error = ffi_support::ExternError::success();
+-    let res = ffi_support::abort_on_panic::call_with_result(&mut error, || {
+-        let mut glean = glean_core::global_glean().lock().unwrap();
+-        callback(&mut glean)
+-    });
++    let res =
++        ffi_support::abort_on_panic::call_with_result(
++            &mut error,
++            || match glean_core::global_glean() {
++                Some(glean) => {
++                    let mut glean = glean.lock().unwrap();
++                    callback(&mut glean)
++                }
++                None => Err(glean_core::Error::not_initialized()),
++            },
++        );
+     handlemap_ext::log_if_error(error);
+     res
+ }
+
+diff --git a/glean-core/preview/src/lib.rs b/glean-core/preview/src/lib.rs
+--- a/glean-core/preview/src/lib.rs
++++ b/glean-core/preview/src/lib.rs
+@@ -86,7 +86,8 @@ fn with_glean<F, R>(f: F) -> R
+ where
+     F: Fn(&Glean) -> R,
+ {
+-    let lock = global_glean().lock().unwrap();
++    let glean = global_glean().expect("Global Glean object not initialized");
++    let lock = glean.lock().unwrap();
+     f(&lock)
+ }
+ 
+@@ -94,7 +95,8 @@ fn with_glean_mut<F, R>(f: F) -> R
+ where
+     F: Fn(&mut Glean) -> R,
+ {
+-    let mut lock = global_glean().lock().unwrap();
++    let glean = global_glean().expect("Global Glean object not initialized");
++    let mut lock = glean.lock().unwrap();
+     f(&mut lock)
+ }
+
+diff --git a/glean-core/src/error.rs b/glean-core/src/error.rs
+--- a/glean-core/src/error.rs
++++ b/glean-core/src/error.rs
+@@ -54,6 +54,9 @@ pub enum ErrorKind {
+     /// Unknown error
+     Utf8Error,
+ 
++    /// Glean not initialized
++    NotInitialized,
++
+     #[doc(hidden)]
+     __NonExhaustive,
+ }
+@@ -75,6 +78,13 @@ impl Error {
+             kind: ErrorKind::Utf8Error,
+         }
+     }
++
++    /// Indicates an error that no global Glean object is initialized
++    pub fn not_initialized() -> Error {
++        Error {
++            kind: ErrorKind::NotInitialized,
++        }
++    }
+ }
+ 
+ impl std::error::Error for Error {}
+@@ -92,7 +102,8 @@ impl Display for Error {
+             MemoryUnit(m) => write!(f, "MemoryUnit conversion from {} failed", m),
+             HistogramType(h) => write!(f, "HistogramType conversion from {} failed", h),
+             OsString(s) => write!(f, "OsString conversion from {:?} failed", s),
+-            Utf8Error => write!(f, "Invalid  UTF-8 byte sequence in string."),
++            Utf8Error => write!(f, "Invalid  UTF-8 byte sequence in string"),
++            NotInitialized => write!(f, "Global Glean object missing"),
+             __NonExhaustive => write!(f, "Unknown error"),
+         }
+     }
+
+diff --git a/glean-core/src/lib.rs b/glean-core/src/lib.rs
+--- a/glean-core/src/lib.rs
++++ b/glean-core/src/lib.rs
+@@ -79,17 +79,31 @@ pub(crate) const DELETION_REQUEST_PINGS_DIRECTORY: &str = "deletion_request";
+ static GLEAN: OnceCell<Mutex<Glean>> = OnceCell::new();
+ 
+ /// Get a reference to the global Glean object.
+-///
+-/// Panics if no global Glean object was set.
+-pub fn global_glean() -> &'static Mutex<Glean> {
+-    GLEAN.get().unwrap()
++pub fn global_glean() -> Option<&'static Mutex<Glean>> {
++    GLEAN.get()
+ }
+ 
+ /// Set or replace the global Glean object.
+ pub fn setup_glean(glean: Glean) -> Result<()> {
++    // The `OnceCell` type wrapping our Glean is thread-safe and can only be set once.
++    // Therefore even if our check for it being empty succeeds, setting it could fail if a
++    // concurrent thread is quicker in setting it.
++    // However this will not cause a bigger problem, as the second `set` operation will just fail.
++    // We can log it and move on.
++    //
++    // For all wrappers this is not a problem, as the Glean object is intialized exactly once on
++    // calling `initialize` on the global singleton and further operations check that it has been
++    // initialized.
+     if GLEAN.get().is_none() {
+-        GLEAN.set(Mutex::new(glean)).unwrap();
++        if GLEAN.set(Mutex::new(glean)).is_err() {
++            log::error!(
++                "Global Glean object is initialized already. This probably happened concurrently."
++            )
++        }
+     } else {
++        // We allow overriding the global Glean object to support test mode.
++        // In test mode the Glean object is fully destroyed and recreated.
++        // This all happens behind a mutex and is therefore also thread-safe..
+         let mut lock = GLEAN.get().unwrap().lock().unwrap();
+         *lock = glean;
+     }
+
+
+</patch>
+
+Function signatures
+<Signatures>
+fn with_glean<F, R>(f: F) -> R
+where
+    F: Fn(&Glean) -> R,
+
+fn with_glean_mut<F, R>(f: F) -> R
+where
+    F: Fn(&mut Glean) -> R,
+</Signatures>
+
+You are a software tester at glean and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+

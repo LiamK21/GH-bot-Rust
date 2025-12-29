@@ -1,0 +1,128 @@
+<think>
+Okay, I need to create a regression test for the issue where the test 'tasks_after_shutdown_are_not_processed' is failing intermittently. The problem is that after shutdown, sending a task might result in a SendError, but the previous code was unwrapping it without handling the error. The patch changed that to ignore the result of the launch method.
+
+First, I need to make sure that the test fails before the patch and passes after. The original test was trying to send a task after shutdown and expecting that the task isn't executed. However, unwrap() was causing a panic when SendError occurred, making the test fail intermittently. The fix was to use let _ = ... to ignore the result.
+
+So the new test should verify that after shutdown, attempting to launch a task doesn't cause a panic and that the task isn't executed. The test in the patch is already called 'tasks_after_shutdown_are_not_processed', so the new test name needs to be unique. Maybe something like 'tasks_after_shutdown_are_ignored_without_panic'.
+
+The test needs to set up a dispatcher, start a thread (task) that sends a dispatch after shutdown. Before the patch, the test would panic on the unwrap. After the patch, the send might fail or succeed, but the task shouldn't execute. The test should check that the result vector remains empty.
+
+Wait, the original test's logic was that after shutdown, the task should not be processed. So the new test should ensure that even if the launch returns an error (or succeeds), the task isn't executed. The test in the patch uses Arc to share state and checks if any item was pushed. The new test should replicate that setup but avoid the unwrap, so that it doesn't panic when the error occurs.
+
+So the test needs to:
+
+1. Initialize the dispatcher.
+2. Create an Arc<Mutex<Vec<_>>> to track results.
+3. Start a task (probably in a spawned thread) that calls launch on the dispatcher after shutdown.
+4. Shutdown the dispatcher.
+5. Wait for the dispatcher to join.
+6. Check that the result is empty, which indicates the task wasn't executed.
+
+The original code in the test was doing exactly this. The patch modified the part where the task is launched. So the new test should be a separate test case that checks this scenario, ensuring that the task is not processed, even if the launch doesn't panic.
+
+Wait, but how do we ensure that the task is run after shutdown? The original test was doing that. The new test should replicate that setup but avoid panicking. The test should pass whether the launch fails or succeeds, as the task shouldn't be executed in either case.
+
+So the key is to check that the result vector is empty after the process. The test should not call unwrap on the launch result, and after the patch, it's handled correctly.
+
+Therefore, the correct test would be initializing the dispatcher, cloning the shared result, shutting down, then launching a task after shutdown and ignoring the result, then checking that the result remains empty.
+
+Yes. So the test structure would look like:
+
+Initialize the dispatcher.
+Create a result vector protected by Arc<Mutex<Vec<_>>>.
+Spawn a thread that does:
+   dispatcher.guard().launch(...).ignore the result
+Shutdown the dispatcher.
+Join the dispatcher.
+Check that the result vector is empty.
+
+Wait, but in the original test, the task was launched after shutdown. Oh, right, the code was:
+
+dispatcher.guard().shutdown().unwrap();
+then, inside a block, it tried to launch a task, which might fail. But the test expected that task to not run.
+
+The new test should do the same setup, but make sure that even if the launch fails (or succeeds), the task isn't executed. The test should check that the result remains empty.
+
+So the test code would be similar to the original, but perhaps with different names. Let me check the existing code.
+
+Looking at the patch, the original test's code was using unwrap(). The new code is ignoring the result.
+
+So the new test can be structured as:
+
+Create a new test function, similar to the original, but perhaps with different setup to avoid any overlapping. For example, maybe the test needs to spawn a separate thread to enqueue the task after shutdown to ensure it's processed asynchronously.
+
+Wait, in the original test code, after shutdown, they launch a task that pushes to the result. Then join the dispatcher. The test expects that the task isn't executed, so the result is still empty. But with the previous code, the launch would unwrap(), leading to a panic if SendError occurs. The patch changes this to ignore the error, so the test doesn't panic anymore and can check that the result is empty.
+
+Therefore, the correct test would be a new function that launches a task after shutdown and checks that the result vector is empty.
+
+So in Rust code, the steps would be:
+
+1. Initialize the dispatcher.
+2. Create an Arc<Mutex<Vec<u8>>> to track the results.
+3. Spawn a thread (maybe using std::thread::spawn) that calls the launch method after shutdown, ignoring the result.
+4. Shutdown the dispatcher.
+5. Join the dispatcher.
+6. Check that the result vector is empty.
+
+Wait, but how to handle the guard? The original code uses dispatcher.guard(), which I assume is a way to get a handle to dispatch tasks. So the test needs to have a way to call the guard's launch method.
+
+So the code for the test would be:
+
+let result = Arc::new(Mutex::new(Vec::new()));
+// Clone the result for the task.
+let result_cloned = Arc::clone(&result);
+// The original dispatcher setup would be as per the existing test.
+
+But the existing test code already has this setup. So replicating that setup, but perhaps in a new test.
+
+So the new test could be named something like test_tasks_after_shutdown_do_not_execute. The test would:
+
+- Initialize the dispatcher.
+- Clone the result.
+- Shutdown the dispatcher.
+- Attempt to launch a task after shutdown, ignoring any SendError.
+- Join the dispatcher.
+- Check that the result is empty.
+
+This way, even if the launch succeeds (unlikely after shutdown), the task should not be processed. The key is that the task isn't executed, so the vector remains empty.
+
+Therefore, the Rust code would look similar to the existing test, but ensure that the result is empty. The test must not panic, which would pass after the patch but fail before.
+
+So the final code would be a test function that does all these steps. The imports would include necessary modules and types like Arc, Mutex, dispatcher, etc.
+
+I need to make sure that all necessary imports are included, such as std::sync::{Arc, Mutex}, thread, and the dispatcher's functions. Also, any necessary setup for the dispatcher.
+
+Assuming the existing test has the necessary setup (like creating a new_dispatcher()), the new test can call that. The function under test is the launch method within the dispatcher.
+</think>
+
+<Filename>glean-core/rlb/src/dispatcher/mod.rs</Filename>
+<imports>
+use std::sync::{Arc, Mutex}; 
+use std::thread;
+use super::dispatcher;
+use super::new_dispatcher;
+</imports>
+<Rust>
+#[test]
+fn test_tasks_after_shutdown_do_not_execute() {
+    let (dispatcher, _guard) = new_dispatcher();
+    let result = Arc::new(Mutex::new(Vec::new()));
+    let result_cloned = Arc::clone(&result);
+
+    // Spawn a background thread to attempt task submission after shutdown
+    let handle = thread::spawn(move || {
+        let guard = dispatcher.guard();
+        guard.shutdown().unwrap();
+        let _ = guard.launch(move || {
+            result_cloned.lock().unwrap().push(0);
+        });
+    });
+
+    // Ensure the task is processed and dispatcher is joined
+    handle.join().unwrap();
+    
+    // Verify no task was executed
+    assert!(result.lock().unwrap().is_empty());
+    dispatcher.join().unwrap();
+}
+</Rust>

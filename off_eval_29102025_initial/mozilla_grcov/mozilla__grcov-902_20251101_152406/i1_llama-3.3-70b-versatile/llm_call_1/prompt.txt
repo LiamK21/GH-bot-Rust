@@ -1,0 +1,246 @@
+Before you begin:
+- Keep going until the job is completely solved — don’t stop halfway.
+- If you’re unsure about the behavior, reread the provided patch carefully; do not hallucinate.
+- Plan your approach before writing code by reflecting on whether the test truly fails before and passes after.
+
+Issue:
+<issue>
+Error while executing llvm tools
+I got this error when running the following command.
+```
+grcov . --binary-path target/debug/ . -t html --branch --ignore-not-existing -o ./coverage/  --keep-only *raftstore*
+15:12:17 [ERROR] Error while executing llvm tools: Failed to execute "/Users/calvin/.rustup/toolchains/nightly-2021-04-15-x86_64-apple-darwin/lib/rustlib/x86_64-apple-darwin/bin/llvm-profdata" "merge" "-sparse" "/var/folders/2q/sfkj3vg13z175flb8j9znf9w0000gn/T/.tmpe7XB6K/tidb-engine-ext-99132-10660545001084846649_0_1.profraw" 
+... (Leave out lots of *.profraw files)
+
+Argument list too long (os error 7)
+15:12:20 [ERROR] A panic occurred at /Users/calvin/.cargo/registry/src/github.com-1ecc6299db9ec823/grcov-0.8.2/src/html.rs:458: attempt to divide by zero
+```
+Seems that the argument for llvm-profdata are too long
+</issue>
+
+Patch:
+<patch>
+diff --git a/src/llvm_tools.rs b/src/llvm_tools.rs
+--- a/src/llvm_tools.rs
++++ b/src/llvm_tools.rs
+@@ -1,20 +1,66 @@
+ use cargo_binutils::Tool;
+-use is_executable::IsExecutable;
++use once_cell::sync::OnceCell;
++use std::env::consts::EXE_SUFFIX;
+ use std::ffi::OsStr;
+ use std::fs;
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+-use std::process::Command;
++use std::process::{Command, Stdio};
+ 
+ use log::warn;
+ use walkdir::WalkDir;
+ 
++pub static LLVM_PATH: OnceCell<PathBuf> = OnceCell::new();
++
++pub fn is_binary(path: impl AsRef<Path>) -> bool {
++    if let Ok(oty) = infer::get_from_path(path) {
++        if let Some("dll" | "exe" | "elf" | "mach") = oty.map(|x| x.extension()) {
++            return true;
++        }
++    }
++    false
++}
++
++pub fn run_with_stdin(
++    cmd: impl AsRef<OsStr>,
++    stdin: impl AsRef<str>,
++    args: &[&OsStr],
++) -> Result<Vec<u8>, String> {
++    let mut command = Command::new(cmd.as_ref());
++    let err_fn = |e| format!("Failed to execute {:?}\n{}", cmd.as_ref(), e);
++
++    command
++        .args(args)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped());
++    let mut child = command.spawn().map_err(err_fn)?;
++    child
++        .stdin
++        .as_mut()
++        .unwrap()
++        .write_all(stdin.as_ref().as_bytes())
++        .map_err(err_fn)?;
++
++    let output = child.wait_with_output().map_err(err_fn)?;
++    if !output.status.success() {
++        return Err(format!(
++            "Failure while running {:?}\n{}",
++            command,
++            String::from_utf8_lossy(&output.stderr)
++        ));
++    }
++
++    Ok(output.stdout)
++}
++
+ pub fn run(cmd: impl AsRef<OsStr>, args: &[&OsStr]) -> Result<Vec<u8>, String> {
+     let mut command = Command::new(cmd);
+     command.args(args);
+-    let output = match command.output() {
+-        Ok(output) => output,
+-        Err(e) => return Err(format!("Failed to execute {:?}\n{}", command, e)),
+-    };
++
++    let output = command
++        .output()
++        .map_err(|e| format!("Failed to execute {:?}\n{}", command, e))?;
++
+     if !output.status.success() {
+         return Err(format!(
+             "Failure while running {:?}\n{}",
+@@ -33,15 +79,22 @@ pub fn profraws_to_lcov(
+ ) -> Result<Vec<Vec<u8>>, String> {
+     let profdata_path = working_dir.join("grcov.profdata");
+ 
+-    let mut args = vec![
++    let args = vec![
+         "merge".as_ref(),
++        "-f".as_ref(),
++        "-".as_ref(),
+         "-sparse".as_ref(),
+         "-o".as_ref(),
+         profdata_path.as_ref(),
+     ];
+-    args.splice(2..2, profraw_paths.iter().map(PathBuf::as_ref));
+ 
+-    get_profdata_path().and_then(|p| run(&p, &args))?;
++    let stdin_paths: String = profraw_paths.iter().fold("".into(), |mut a, x| {
++        a.push_str(x.to_string_lossy().as_ref());
++        a.push('\n');
++        a
++    });
++
++    get_profdata_path().and_then(|p| run_with_stdin(&p, &stdin_paths, &args))?;
+ 
+     let metadata = fs::metadata(binary_path)
+         .unwrap_or_else(|e| panic!("Failed to open directory '{:?}': {:?}.", binary_path, e));
+@@ -55,7 +108,7 @@ pub fn profraws_to_lcov(
+             let entry =
+                 entry.unwrap_or_else(|_| panic!("Failed to open directory '{:?}'.", binary_path));
+ 
+-            if entry.path().is_executable() && entry.metadata().unwrap().len() > 0 {
++            if is_binary(entry.path()) && entry.metadata().unwrap().len() > 0 {
+                 paths.push(entry.into_path());
+             }
+         }
+@@ -64,7 +117,7 @@ pub fn profraws_to_lcov(
+     };
+ 
+     let mut results = vec![];
+-    let cov_tool_path = Tool::Cov.path().unwrap();
++    let cov_tool_path = get_cov_path()?;
+ 
+     for binary in binaries {
+         let args = [
+@@ -89,9 +142,30 @@ pub fn profraws_to_lcov(
+ }
+ 
+ fn get_profdata_path() -> Result<PathBuf, String> {
+-    let path = Tool::Profdata.path().map_err(|x| x.to_string())?;
++    let path = if let Some(mut path) = LLVM_PATH.get().cloned() {
++        path.push(format!("llvm-profdata{}", EXE_SUFFIX));
++        path
++    } else {
++        Tool::Profdata.path().map_err(|x| x.to_string())?
++    };
++
++    if !path.exists() {
++        Err(String::from("We couldn't find llvm-profdata. Try installing the llvm-tools component with `rustup component add llvm-tools-preview` or specifying the --llvm-path option."))
++    } else {
++        Ok(path)
++    }
++}
++
++fn get_cov_path() -> Result<PathBuf, String> {
++    let path = if let Some(mut path) = LLVM_PATH.get().cloned() {
++        path.push(format!("llvm-cov{}", EXE_SUFFIX));
++        path
++    } else {
++        Tool::Cov.path().map_err(|x| x.to_string())?
++    };
++
+     if !path.exists() {
+-        Err(String::from("We couldn't find llvm-profdata. Try installing the llvm-tools component with `rustup component add llvm-tools-preview`."))
++        Err(String::from("We couldn't find llvm-cov. Try installing the llvm-tools component with `rustup component add llvm-tools-preview` or specifying the --llvm-path option."))
+     } else {
+         Ok(path)
+     }
+
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -77,6 +77,9 @@ struct Opt {
+     /// Sets the path to the compiled binary to be used.
+     #[structopt(short, long, value_name = "PATH")]
+     binary_path: Option<PathBuf>,
++    /// Sets the path to the LLVM bin directory.
++    #[structopt(long, value_name = "PATH")]
++    llvm_path: Option<PathBuf>,
+     /// Sets a custom output type.
+     #[structopt(
+         short = "t",
+@@ -231,6 +234,10 @@ fn main() {
+             .get_matches(),
+     );
+ 
++    if let Some(path) = opt.llvm_path {
++        LLVM_PATH.set(path).unwrap();
++    }
++
+     let filter_option = opt.filter.map(|filter| match filter {
+         Filter::Covered => true,
+         Filter::Uncovered => false,
+
+
+</patch>
+
+Function signatures
+<Signatures>
+pub fn profraws_to_lcov(
+profraw_paths: &[PathBuf],
+binary_path: &Path,
+working_dir: &Path) -> Result<Vec<Vec<u8>>, String>
+
+fn main() -> ()
+</Signatures>
+
+You are a software tester at grcov and your are reviewing the above <patch> for the above <issue>.
+Identify whether a unit test is needed.
+If there is no test needed or you believe you need additional testing resources beyond the Rust standard library (e.g., mocking libraries) to write a useful unit test, return <NO>.
+If a test is needed, your task is:
+1. Write exactly one rust test `#[test]fn test_...(){...}` block. Do NOT wrap the test inside a 'mod tests' block.
+If the file you are adding the test already contains a test in the <patch>, ensure that the test name is unique.
+2. Your test must fail on the code before the patch, and pass after, hence the test will verify that the patch resolves the issue.
+3. The test must be self-contained and to-the-point.
+4. All 'use' declarations must be inside a <imports>...</imports> block. Additionally:
+   - Do not use group imports.
+  - Import only what is necessary for the test to run and make sure not to have colliding imports.
+  - If the <patch> contains a 'mod tests' block with useful imports, do not add them to the <imports> block.
+  - Use `use super::<function name> for the function under test.
+.  - If multiple 'use' statements are needed, list each on a separate line.
+5. To help you write the test, <Signatures> contains all modified function's:
+  - name
+  - parameters
+  - Return type (assume '()' if empty)
+6. Return only the absolute filename as it is in the <patch> block, the use statements, and rust test (no comments or explanations).
+
+Follow this expected output format, do not deviate from this structure:
+<Filename> ... </Filename>
+<imports> ... </imports>
+<Rust>
+#[test]
+fn test_<describe_behavior>() {
+  <initialize required variables>;
+  <define expected variable>;
+  <generate actual variables>;
+  <compare expected with actual>;
+}</Rust>
+
