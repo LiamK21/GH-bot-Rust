@@ -127,6 +127,8 @@ def _plot_stacked_bar_chart(data: StackedBarChartData, plot_dir: Path):
 
         bottom += counts
     ax.legend(loc="upper right", bbox_to_anchor=(1.15, 1))
+    ax.set_xlabel("Repository", fontweight=500, fontsize=11)
+    ax.set_ylabel("Number of F2PTs generated", fontweight=500, fontsize=11)
     plt.tight_layout()
     fig.savefig(fname=plot_dir / "stacked_bar_chart.png", bbox_inches="tight")
 
