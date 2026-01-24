@@ -16,8 +16,10 @@ load_dotenv()
 MOZILLA_API_URL = "https://api.github.com/repos/mozilla"
 GITHUB_HEADERS = {
     "Accept": "application/json",
-    "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
 }
+if os.getenv('GITHUB_TOKEN'):
+    GITHUB_HEADERS["Authorization"] = f"Bearer {os.getenv('GITHUB_TOKEN')}"
+
 BUGZILLA_GET_BUG_URL = "https://bugzilla.mozilla.org/rest/bug"
 BUGZILLA_PR = {}
 BUGZILLA_HEADERS = {
