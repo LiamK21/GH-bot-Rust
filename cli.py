@@ -190,7 +190,8 @@ class TestGenCLI:
             sys.exit(1)
 
         load_dotenv(env_path)
-        missing_vars = [var for var in ENV_VARIABLES if not os.getenv(var)]
+        required_vars = [var for var in ENV_VARIABLES if var != "GITHUB_TOKEN"]
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
             print(
                 f"❌ Error: Missing environment variables: {', '.join(missing_vars)}. Please run 'testgen configure'."
