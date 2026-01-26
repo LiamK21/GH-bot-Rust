@@ -20,7 +20,7 @@ ALLOWED_REPOS = ["grcov", "glean", "rust-code-analysis"]
 
 ALLOWED_MODELS = [LLM.GPT4o.value, LLM.LLAMA.value, LLM.QWEN3.value]
 
-ENV_VARIABLES = ["GITHUB_TOKEN", "OPENAI_API_KEY", "GROQ_API_KEY"]
+ENV_VARIABLES = ["OPENAI_API_KEY", "GROQ_API_KEY", "GITHUB_TOKEN"]
 
 CLI_DESCRIPTION = (
     "TestGen CLI Tool\n\n"
@@ -163,7 +163,12 @@ class TestGenCLI:
 
         for key in ENV_VARIABLES:
             key_title = key.replace("_", " ").title()
-            api_key = input(f"Enter your {key_title}: ").strip()
+            if key == "GITHUB_TOKEN":
+                api_key = input(f"Enter your {key_title} (optional, press Enter to skip):").strip()
+                if api_key == "":
+                    api_key = None
+            else:
+                api_key = input(f"Enter your {key_title}: ").strip()
 
             if not api_key:
                 print(f"❌ Key empty, skipping {key}.")
@@ -185,7 +190,8 @@ class TestGenCLI:
             sys.exit(1)
 
         load_dotenv(env_path)
-        missing_vars = [var for var in ENV_VARIABLES if not os.getenv(var)]
+        required_vars = [var for var in ENV_VARIABLES if var != "GITHUB_TOKEN"]
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
             print(
                 f"❌ Error: Missing environment variables: {', '.join(missing_vars)}. Please run 'testgen configure'."

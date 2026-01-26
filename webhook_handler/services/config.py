@@ -23,8 +23,9 @@ class Config:
 
         self.HEADER = {
             "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"Bearer {self.github_token}",
         }
+        if self.github_token:
+            self.HEADER["Authorization"] = f"Bearer {self.github_token}"
 
         self.execution_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.curr_attempt = 0
